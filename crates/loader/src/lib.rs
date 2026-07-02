@@ -153,7 +153,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
 /// Read bytes living at a given RVA out of whichever section contains it.
 /// Returns the containing section plus the intra-section offset so callers
 /// can slice `section.data`.
-fn read_at_rva<'a>(sections: &'a [Section], rva: u32) -> Option<(&'a Section, usize)> {
+fn read_at_rva(sections: &[Section], rva: u32) -> Option<(&Section, usize)> {
     for s in sections {
         let vsize = s.virtual_size.max(s.data.len() as u32);
         if rva >= s.rva && rva < s.rva + vsize {
