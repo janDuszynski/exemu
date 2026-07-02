@@ -184,6 +184,25 @@ impl Process {
         wide.extend_from_slice(&[0, 0]);
         mem.poke(cmd_w, &wide)?;
 
+        // --- Sandbox directory rooting the guest filesystem ---------------
+        let sandbox = std::env::temp_dir().join("exemu-sandbox");
+        let _ = std::fs::create_dir_all(&sandbox);
+        // Guest module path (basename only) and its sandbox location. We copy
+        // the executable itself into the sandbox so a program that opens its
+        // own file (e.g. a self-extracting installer reading an appended
+        // archive) finds the real bytes.
+        let module_name = cfg
+            .args
+            .first()
+            .map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s).to_string())
+            .unwrap_or_else(|| "program.exe".into());
+        let module_path_w = format!("C:\\{module_name}");
+        let host_exe = sandbox.join("C").join(&module_name);
+        if let Some(p) = host_exe.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let _ = std::fs::write(&host_exe, pe_bytes);
+
         // --- The OS layer and import resolution ---------------------------
         let mut os = WinOs::new(WinConfig {
             api_base: lay.api_base,
@@ -195,6 +214,8 @@ impl Process {
             echo: cfg.echo,
             trace: cfg.trace,
             is_64bit: image.is_64bit,
+            sandbox: sandbox.to_string_lossy().into_owned(),
+            module_path_w,
         });
 
         // Map the thunk region as real read/write memory. Function imports
