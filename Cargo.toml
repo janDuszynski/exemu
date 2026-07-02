@@ -1,0 +1,43 @@
+# Workspace root for exemu — a Windows PE (.exe) emulator for Apple Silicon.
+#
+# The crates are layered following Clean Architecture. Dependencies point
+# strictly inward toward `core` (the domain), which itself has zero
+# dependencies:
+#
+#   cli ─▶ app ─▶ { loader, memory, cpu, os } ─▶ core
+#
+# `core` defines the domain types and the abstraction traits (Memory, Cpu,
+# Hooks). The outer crates provide concrete implementations. `app` wires
+# them together; nothing in the inner layers knows about the outer ones.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    # Added as each layer is built:
+    #   "crates/loader", "crates/memory", "crates/cpu",
+    #   "crates/os", "crates/app", "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["exemu contributors"]
+repository = "https://github.com/janDuszynski/exe-emulator"
+
+[workspace.dependencies]
+exemu-core = { path = "crates/core" }
+exemu-loader = { path = "crates/loader" }
+exemu-memory = { path = "crates/memory" }
+exemu-cpu = { path = "crates/cpu" }
+exemu-os = { path = "crates/os" }
+exemu-app = { path = "crates/app" }
+
+# Release profile tuned for a fast interpreter loop.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
