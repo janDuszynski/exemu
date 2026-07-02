@@ -47,6 +47,8 @@ pub mod flags {
 pub struct CpuState {
     /// The 16 general-purpose registers, indexed by [`Reg`].
     pub gpr: [u64; 16],
+    /// The 16 128-bit SSE/SSE2 vector registers (`xmm0`..`xmm15`).
+    pub xmm: [u128; 16],
     /// Instruction pointer.
     pub rip: u64,
     /// Status/control flags.
@@ -63,6 +65,7 @@ impl CpuState {
     pub fn new() -> Self {
         CpuState {
             gpr: [0; 16],
+            xmm: [0; 16],
             rip: 0,
             rflags: flags::RESERVED_ONE | flags::IF,
         }

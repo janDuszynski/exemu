@@ -630,6 +630,12 @@ impl Interpreter {
         op2: u8,
         start: u64,
     ) -> Result<Option<Exit>> {
+        // The SSE/SSE2 family (two-byte opcodes with a mandatory prefix) is
+        // handled by its own unit.
+        if crate::sse::is_sse(op2) {
+            self.exec_sse(ctx, mem, op2)?;
+            return Ok(None);
+        }
         match op2 {
             // SYSCALL — surfaced as a distinguished interrupt for the OS loop.
             0x05 => {

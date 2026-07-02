@@ -1,10 +1,12 @@
 //! A self-contained generator for a minimal, *real* 64-bit PE executable.
 //!
 //! The produced `.exe` is a valid Windows console program: it imports
-//! `GetStdHandle`, `WriteFile` and `ExitProcess` from `kernel32.dll`, writes
-//! a line to standard output and exits with code 0. It exists so the
-//! emulator can be exercised end to end without needing a Windows toolchain,
-//! and so the loader/CPU/OS pipeline has a known-good input.
+//! `GetStdHandle`, `WriteFile` and `ExitProcess` from `kernel32.dll`, prints
+//! a greeting, then does a little **SSE2 double-precision arithmetic**
+//! (`(1.5 + 2.25) * 2.0`, truncated to `7`) and prints the result, and exits
+//! with code 0. It exists so the emulator can be exercised end to end without
+//! needing a Windows toolchain, and so the loader/CPU/OS/SSE pipeline has a
+//! known-good input.
 //!
 //! Everything is laid out programmatically and RIP-relative displacements in
 //! the code are patched once the section RVAs are known, so there are no
@@ -17,9 +19,16 @@ const TEXT_RVA: u32 = 0x1000;
 const RDATA_RVA: u32 = 0x2000;
 const PE_OFF: usize = 0x40;
 
-/// The message the sample program prints.
+/// The greeting the sample program prints first.
 pub const SAMPLE_MESSAGE: &str =
     "Hello from exemu! This Windows x64 .exe is running on Apple Silicon.\n";
+
+/// The prefix printed before the SSE-computed number (a single ASCII digit
+/// plus newline follows it at run time).
+pub const SAMPLE_SSE_PREFIX: &str = "SSE2 check: trunc((1.5 + 2.25) * 2.0) = ";
+
+/// The three `double` constants the sample loads into XMM registers.
+const SSE_CONSTS: [f64; 3] = [1.5, 2.25, 2.0];
 
 /// Build the bytes of the sample `.exe`.
 pub fn build() -> Vec<u8> {
@@ -121,7 +130,10 @@ struct Rdata {
     iat_get_std_handle: u32,
     iat_write_file: u32,
     iat_exit_process: u32,
-    msg_rva: u32,
+    msg1_rva: u32,
+    msg2_rva: u32,
+    /// RVAs of the three `double` constants.
+    const_rva: [u32; 3],
 }
 
 impl Rdata {
@@ -152,8 +164,18 @@ impl Rdata {
         pos += dllname.len() as u32;
 
         pos = align_up_u32(pos, 4);
-        let msg_rva = RDATA_RVA + pos;
+        let msg1_rva = RDATA_RVA + pos;
         pos += SAMPLE_MESSAGE.len() as u32;
+        let msg2_rva = RDATA_RVA + pos;
+        pos += SAMPLE_SSE_PREFIX.len() as u32;
+
+        // The double constants, 8-byte aligned so aligned loads would work too.
+        pos = align_up_u32(pos, 8);
+        let mut const_rva = [0u32; 3];
+        for slot in &mut const_rva {
+            *slot = RDATA_RVA + pos;
+            pos += 8;
+        }
 
         // Now emit the bytes.
         let mut b = vec![0u8; pos as usize];
@@ -177,11 +199,17 @@ impl Rdata {
             b[off + 2..off + 2 + n.len()].copy_from_slice(n.as_bytes());
         }
 
-        // DLL name and message.
+        // DLL name, messages and constants.
         let doff = (dllname_rva - RDATA_RVA) as usize;
         b[doff..doff + dllname.len()].copy_from_slice(dllname);
-        let moff = (msg_rva - RDATA_RVA) as usize;
-        b[moff..moff + SAMPLE_MESSAGE.len()].copy_from_slice(SAMPLE_MESSAGE.as_bytes());
+        let m1 = (msg1_rva - RDATA_RVA) as usize;
+        b[m1..m1 + SAMPLE_MESSAGE.len()].copy_from_slice(SAMPLE_MESSAGE.as_bytes());
+        let m2 = (msg2_rva - RDATA_RVA) as usize;
+        b[m2..m2 + SAMPLE_SSE_PREFIX.len()].copy_from_slice(SAMPLE_SSE_PREFIX.as_bytes());
+        for (i, c) in SSE_CONSTS.iter().enumerate() {
+            let off = (const_rva[i] - RDATA_RVA) as usize;
+            b[off..off + 8].copy_from_slice(&c.to_bits().to_le_bytes());
+        }
 
         Rdata {
             bytes: b,
@@ -192,69 +220,91 @@ impl Rdata {
             iat_get_std_handle: iat_off + RDATA_RVA,
             iat_write_file: iat_off + RDATA_RVA + 8,
             iat_exit_process: iat_off + RDATA_RVA + 16,
-            msg_rva,
+            msg1_rva,
+            msg2_rva,
+            const_rva,
         }
     }
 }
 
 /// Emit the `.text` machine code, patching RIP-relative displacements to the
-/// IAT slots and the message using their now-known RVAs.
+/// IAT slots, the messages and the float constants using their known RVAs.
+///
+/// Register usage: `rbx` holds the cached stdout handle; a 2-byte scratch
+/// buffer for the computed digit + newline lives at `[rsp+0x30]`.
 fn build_text(rdata: &Rdata) -> Vec<u8> {
     let mut c: Vec<u8> = Vec::new();
 
-    // sub rsp, 0x28    (shadow space + alignment; also holds the 5th arg)
-    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    // sub rsp, 0x38   (shadow space, the 5th-arg slot at +0x20, scratch at +0x30)
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]);
 
-    // mov ecx, -11     (STD_OUTPUT_HANDLE)
+    // mov ecx, -11 (STD_OUTPUT_HANDLE) ; call GetStdHandle ; mov rbx, rax
     c.extend_from_slice(&[0xB9]);
     c.extend_from_slice(&(-11i32).to_le_bytes());
+    emit_rip(&mut c, &[0xFF, 0x15], rdata.iat_get_std_handle); // call [GetStdHandle]
+    c.extend_from_slice(&[0x48, 0x89, 0xC3]); // mov rbx, rax  (save handle)
 
-    // call [rip+GetStdHandle]
-    emit_rip_call(&mut c, rdata.iat_get_std_handle);
+    // --- WriteFile(stdout, msg1, len1, NULL, NULL) ---
+    emit_write(&mut c, rdata, LenSrc::Rva(rdata.msg1_rva, SAMPLE_MESSAGE.len() as u32));
 
-    // mov rcx, rax     (hFile = returned handle)
-    c.extend_from_slice(&[0x48, 0x89, 0xC1]);
+    // --- SSE2: xmm0 = (1.5 + 2.25) * 2.0 = 7.5 ; eax = (int)7.5 = 7 ---
+    emit_rip(&mut c, &[0xF2, 0x0F, 0x10, 0x05], rdata.const_rva[0]); // movsd xmm0, [1.5]
+    emit_rip(&mut c, &[0xF2, 0x0F, 0x58, 0x05], rdata.const_rva[1]); // addsd xmm0, [2.25]
+    emit_rip(&mut c, &[0xF2, 0x0F, 0x59, 0x05], rdata.const_rva[2]); // mulsd xmm0, [2.0]
+    c.extend_from_slice(&[0xF2, 0x0F, 0x2C, 0xC0]); // cvttsd2si eax, xmm0
 
-    // lea rdx, [rip+msg]
-    emit_rip_lea_rdx(&mut c, rdata.msg_rva);
+    // --- turn the result into ASCII "<digit>\n" at [rsp+0x30] ---
+    c.extend_from_slice(&[0x04, 0x30]); // add al, '0'
+    c.extend_from_slice(&[0x88, 0x44, 0x24, 0x30]); // mov [rsp+0x30], al
+    c.extend_from_slice(&[0xC6, 0x44, 0x24, 0x31, 0x0A]); // mov byte [rsp+0x31], '\n'
 
-    // mov r8d, len     (nNumberOfBytesToWrite)
-    c.extend_from_slice(&[0x41, 0xB8]);
-    c.extend_from_slice(&(SAMPLE_MESSAGE.len() as u32).to_le_bytes());
+    // --- WriteFile(stdout, msg2 prefix, len2, NULL, NULL) ---
+    emit_write(&mut c, rdata, LenSrc::Rva(rdata.msg2_rva, SAMPLE_SSE_PREFIX.len() as u32));
 
-    // xor r9d, r9d     (lpNumberOfBytesWritten = NULL)
-    c.extend_from_slice(&[0x45, 0x31, 0xC9]);
+    // --- WriteFile(stdout, [rsp+0x30], 2, NULL, NULL) — the computed digit ---
+    emit_write(&mut c, rdata, LenSrc::Stack);
 
-    // mov qword [rsp+0x20], 0   (lpOverlapped = NULL, the 5th argument slot)
-    c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]);
-
-    // call [rip+WriteFile]
-    emit_rip_call(&mut c, rdata.iat_write_file);
-
-    // xor ecx, ecx     (uExitCode = 0)
+    // xor ecx, ecx ; call ExitProcess ; int3
     c.extend_from_slice(&[0x31, 0xC9]);
-
-    // call [rip+ExitProcess]
-    emit_rip_call(&mut c, rdata.iat_exit_process);
-
-    // int3             (should be unreachable)
+    emit_rip(&mut c, &[0xFF, 0x15], rdata.iat_exit_process);
     c.push(0xCC);
 
     c
 }
 
-/// `FF 15 <disp32>` — call qword ptr [rip + disp]. `target_rva` is the IAT
-/// slot; disp is relative to the end of this 6-byte instruction.
-fn emit_rip_call(c: &mut Vec<u8>, target_rva: u32) {
-    c.extend_from_slice(&[0xFF, 0x15]);
-    let next_rva = TEXT_RVA as i64 + c.len() as i64 + 4;
-    let disp = target_rva as i64 - next_rva;
-    c.extend_from_slice(&(disp as i32).to_le_bytes());
+/// Where a WriteFile call gets its buffer/length from.
+enum LenSrc {
+    /// A string constant in `.rdata`: (buffer RVA, length).
+    Rva(u32, u32),
+    /// The 2-byte scratch buffer at `[rsp+0x30]`.
+    Stack,
 }
 
-/// `48 8D 15 <disp32>` — lea rdx, [rip + disp].
-fn emit_rip_lea_rdx(c: &mut Vec<u8>, target_rva: u32) {
-    c.extend_from_slice(&[0x48, 0x8D, 0x15]);
+/// Emit a `WriteFile(rbx, buf, len, NULL, NULL)` call sequence.
+fn emit_write(c: &mut Vec<u8>, rdata: &Rdata, src: LenSrc) {
+    c.extend_from_slice(&[0x48, 0x89, 0xD9]); // mov rcx, rbx (hFile)
+    let len = match src {
+        LenSrc::Rva(rva, len) => {
+            emit_rip(c, &[0x48, 0x8D, 0x15], rva); // lea rdx, [rip+buf]
+            len
+        }
+        LenSrc::Stack => {
+            c.extend_from_slice(&[0x48, 0x8D, 0x54, 0x24, 0x30]); // lea rdx, [rsp+0x30]
+            2
+        }
+    };
+    c.extend_from_slice(&[0x41, 0xB8]); // mov r8d, len
+    c.extend_from_slice(&len.to_le_bytes());
+    c.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d (lpNumberOfBytesWritten)
+    c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]); // mov qword [rsp+0x20], 0
+    emit_rip(c, &[0xFF, 0x15], rdata.iat_write_file); // call [WriteFile]
+}
+
+/// Emit an instruction ending in a RIP-relative `disp32`: the fixed
+/// `prefix` bytes (opcode + ModRM with mod=00,rm=101), then the displacement
+/// from the end of the instruction to `target_rva`.
+fn emit_rip(c: &mut Vec<u8>, prefix: &[u8], target_rva: u32) {
+    c.extend_from_slice(prefix);
     let next_rva = TEXT_RVA as i64 + c.len() as i64 + 4;
     let disp = target_rva as i64 - next_rva;
     c.extend_from_slice(&(disp as i32).to_le_bytes());
