@@ -39,10 +39,12 @@ fn sample_exe_runs_and_prints() {
     let result = load_and_run(&bytes, silent_cfg()).expect("sample should run");
 
     assert_eq!(result.exit_code, 0, "program should exit cleanly");
-    assert_eq!(
-        String::from_utf8_lossy(&result.stdout),
-        sample::SAMPLE_MESSAGE,
-        "stdout should be exactly the sample message"
+    let out = String::from_utf8_lossy(&result.stdout);
+    assert!(out.starts_with(sample::SAMPLE_MESSAGE), "greeting missing; got: {out:?}");
+    // The SSE2 computation (1.5 + 2.25) * 2.0 truncates to 7.
+    assert!(
+        out.contains(&format!("{}7", sample::SAMPLE_SSE_PREFIX)),
+        "SSE result line missing; got: {out:?}"
     );
     // A tiny program should finish in well under a hundred instructions.
     assert!(result.steps < 1000, "unexpectedly many steps: {}", result.steps);
