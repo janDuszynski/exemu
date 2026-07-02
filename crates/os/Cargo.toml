@@ -11,5 +11,8 @@ description = "Emulated Windows environment: API thunks and kernel32 implementat
 [dependencies]
 exemu-core = { workspace = true }
 
+[dev-dependencies]
+exemu-memory = { workspace = true }
+
 [lints.rust]
 unsafe_code = "forbid"

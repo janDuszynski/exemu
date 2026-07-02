@@ -32,6 +32,7 @@ const PEB_ADDR: u64 = GS_BASE + 0x2000;
 const ENV_BASE: u64 = 0x0000_0000_5000_0000;
 const ENV_SIZE: u64 = 0x1000;
 const API_BASE: u64 = 0x0000_7EFF_0000_0000;
+const API_SIZE: u64 = 0x0010_0000; // 1 MiB → 128k import slots
 const HEAP_BASE: u64 = 0x0000_0002_0000_0000;
 const HEAP_SIZE: u64 = 0x0400_0000; // 64 MiB
 
@@ -146,9 +147,23 @@ impl Process {
             trace: cfg.trace,
         });
 
+        // Map the thunk region as real read/write memory. Function imports
+        // are intercepted on *execution* (rip match) before any fetch, so
+        // they never touch this backing store; but *data* imports — a DLL
+        // exporting a variable, common in the C runtime — are dereferenced as
+        // memory, and land here instead of faulting. Known CRT data globals
+        // are seeded below; the rest default to zero (their normal initial
+        // value).
+        mem.map(Region::new("imports", API_BASE, API_SIZE, Perm::RW))?;
+
         for imp in &image.imports {
             let thunk = os.resolve_import(&imp.dll, &imp.symbol);
             mem.poke(base + imp.iat_rva as u64, &thunk.to_le_bytes())?;
+            if let exemu_core::ImportSymbol::Named(name) = &imp.symbol {
+                if let Some(value) = data_import_seed(name, cmd_a, cmd_w) {
+                    mem.poke(thunk, &value.to_le_bytes())?;
+                }
+            }
         }
 
         // --- Initial CPU state --------------------------------------------
@@ -288,6 +303,19 @@ fn section_name(raw: &str) -> String {
         "section".to_string()
     } else {
         raw.to_string()
+    }
+}
+
+/// Initial value for a known imported *data* symbol (a variable exported by
+/// a DLL). Returns `None` for symbols that should keep their zero default.
+fn data_import_seed(name: &str, cmd_a: u64, cmd_w: u64) -> Option<u64> {
+    match name {
+        // The C runtime's cached command-line pointers.
+        "_acmdln" => Some(cmd_a),
+        "_wcmdln" => Some(cmd_w),
+        // _fmode (text/binary), _commode (commit mode), environ pointers,
+        // etc. all correctly default to 0, which the zeroed mapping provides.
+        _ => None,
     }
 }
 

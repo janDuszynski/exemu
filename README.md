@@ -118,12 +118,30 @@ exemu sample <out.exe>
   `ExitProcess`, the `Heap*`/`Virtual*` allocators, `GetCommandLine*`,
   `GetModuleHandle*`, plus last-error/console/timing stubs. Unknown imports
   return 0 (optionally traced) so a program keeps running.
+* **Data imports** (a DLL exporting a variable, not a function). The thunk
+  region is mapped as real read/write memory, so the C runtime can
+  dereference globals like `_fmode`/`_commode`; `_acmdln`/`_wcmdln` are
+  seeded with the command line.
+* A slice of the **`msvcrt` C runtime**: `malloc`/`calloc`/`realloc`/`free`,
+  `memcpy`/`memmove`/`memset`/`memcmp`/`strlen`, the `exit` family,
+  `__getmainargs`, and no-op startup hooks (`__set_app_type`, `_initterm`,
+  `_controlfp`, …). Enough that MSVCRT-linked binaries get through CRT
+  startup and into their own `main`.
 
 ### Not implemented (yet)
 
 SSE/AVX and x87 floating point; TLS callbacks and base relocations (images
-load at their preferred base); structured exception handling; the MSVC/UCRT
-import surface; threads; and anything GUI, kernel-mode, or .NET.
+load at their preferred base); table-based structured exception handling
+(`.pdata`/`__C_specific_handler` is a no-op); C++ static initializers
+(`_initterm` is skipped, since servicing it would require re-entrant guest
+calls); threads; and the Win32 **GUI**, **COM**, registry and shell surfaces
+(`user32`/`ole32`/`advapi32`/`shell32`).
+
+As a concrete data point, the 7-Zip GUI installer (`7z…-x64.exe`, MSVC +
+`msvcrt`) now executes ~49k instructions of real CRT and program code before
+stopping at `user32!CreateDialogParamW` — i.e. at the GUI boundary rather
+than in the C runtime. A **console** MSVCRT program that avoids SSE and SEH
+stands a good chance of running; a GUI/COM application does not.
 
 ## Testing
 
