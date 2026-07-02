@@ -62,6 +62,24 @@ impl VirtualMemory {
         self.insert(Region::new(name, base, size, perm), bytes)
     }
 
+    /// A privileged write that bypasses permission checks, modelling what the
+    /// loader/kernel does when it patches an image (e.g. filling the Import
+    /// Address Table, which usually lives in a read-only section). Still
+    /// bounds-checked against a single region.
+    pub fn poke(&mut self, addr: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let m = self.find_mut(addr).ok_or(EmuError::Unmapped { addr, len: data.len() })?;
+        let start = (addr - m.region.base) as usize;
+        let end = start
+            .checked_add(data.len())
+            .filter(|&e| e as u64 <= m.region.size)
+            .ok_or(EmuError::Unmapped { addr, len: data.len() })?;
+        m.bytes[start..end].copy_from_slice(data);
+        Ok(())
+    }
+
     /// The list of mapped regions (for diagnostics / a memory map dump).
     pub fn regions(&self) -> impl Iterator<Item = &Region> {
         self.regions.iter().map(|m| &m.region)
