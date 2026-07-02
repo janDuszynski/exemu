@@ -73,6 +73,13 @@ pub struct WinOs {
     heap_next: u64,
     last_error: u32,
 
+    /// Thunk address whose interception drives sequential `_initterm`
+    /// callbacks (see [`api::InittermFrame`]).
+    initterm_driver: u64,
+    /// Active `_initterm` invocations (a stack, since a constructor may
+    /// itself trigger another `_initterm`).
+    initterm_stack: Vec<api::InittermFrame>,
+
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
@@ -87,16 +94,29 @@ const HANDLE_PROCESS_HEAP: u64 = 0x00AB_0000;
 impl WinOs {
     pub fn new(cfg: WinConfig) -> Self {
         let (api_base, heap_base) = (cfg.api_base, cfg.heap_base);
-        WinOs {
+        let mut os = WinOs {
             cfg,
             thunks: HashMap::new(),
             interned: HashMap::new(),
             next_thunk: api_base,
             heap_next: heap_base,
             last_error: 0,
+            initterm_driver: 0,
+            initterm_stack: Vec::new(),
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
-        }
+        };
+        // Reserve the driver thunk up front so its address is stable.
+        os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
+        os
+    }
+
+    /// Allocate a fresh thunk address bound to `api`.
+    fn alloc_thunk(&mut self, api: Api) -> u64 {
+        let addr = self.next_thunk;
+        self.next_thunk += 8;
+        self.thunks.insert(addr, api);
+        addr
     }
 
     /// Assign (or reuse) a thunk address for an imported symbol. The returned
@@ -122,10 +142,7 @@ impl WinOs {
     /// When the guest's entry function `ret`s to it, the process terminates
     /// with the code in EAX.
     pub fn exit_thunk(&mut self) -> u64 {
-        let addr = self.next_thunk;
-        self.next_thunk += 8;
-        self.thunks.insert(addr, Api::ReturnExit);
-        addr
+        self.alloc_thunk(Api::ReturnExit)
     }
 
     /// Range `[start, end)` of assigned thunk addresses, so the application
@@ -226,6 +243,9 @@ impl Hooks for WinOs {
                 Ok(Some(Exit::Continue))
             }
             api::Outcome::Exit(code) => Ok(Some(Exit::ProcessExit(code))),
+            // The handler has already set rip/rsp (e.g. it is driving a
+            // re-entrant guest call); just keep executing.
+            api::Outcome::Resume => Ok(Some(Exit::Continue)),
         }
     }
 }
