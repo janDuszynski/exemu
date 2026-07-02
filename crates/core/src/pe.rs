@@ -44,9 +44,11 @@ pub struct Import {
     pub iat_rva: u32,
 }
 
-/// A fully parsed 64-bit PE image, ready to be mapped and run.
+/// A fully parsed PE image, ready to be mapped and run.
 #[derive(Debug, Clone)]
 pub struct PeImage {
+    /// True for PE32+ (x86-64), false for PE32 (32-bit x86).
+    pub is_64bit: bool,
     /// Preferred load address from the optional header.
     pub image_base: u64,
     /// Entry point as an RVA (add `image_base` for the virtual address).

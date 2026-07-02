@@ -21,19 +21,17 @@ use reader::Reader;
 const DOS_MAGIC: u16 = 0x5A4D; // "MZ"
 const PE_SIGNATURE: u32 = 0x0000_4550; // "PE\0\0"
 const MACHINE_AMD64: u16 = 0x8664;
+const MACHINE_I386: u16 = 0x014c;
+const OPT_MAGIC_PE32: u16 = 0x10B;
 const OPT_MAGIC_PE32PLUS: u16 = 0x20B;
 
 const E_LFANEW_OFFSET: usize = 0x3C;
 
-// Optional-header field offsets, relative to the start of the optional header.
+// Optional-header field offsets that are identical in PE32 and PE32+.
 const OPT_ENTRY: usize = 16;
-const OPT_IMAGE_BASE: usize = 24;
 const OPT_SIZE_OF_IMAGE: usize = 56;
 const OPT_SIZE_OF_HEADERS: usize = 60;
 const OPT_SUBSYSTEM: usize = 68;
-const OPT_STACK_RESERVE: usize = 72;
-const OPT_NUM_RVA_SIZES: usize = 108;
-const OPT_DATA_DIRS: usize = 112;
 
 // Data-directory indices.
 const DIR_IMPORT: usize = 1;
@@ -44,9 +42,7 @@ const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
-const IMPORT_BY_ORDINAL: u64 = 0x8000_0000_0000_0000;
-
-/// Parse a 64-bit PE executable from its raw bytes.
+/// Parse a PE executable (PE32 or PE32+) from its raw bytes.
 pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     let r = Reader::new(bytes);
 
@@ -62,32 +58,43 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     }
     let coff = pe_off + 4;
     let machine = r.u16(coff)?;
-    if machine != MACHINE_AMD64 {
+    if machine != MACHINE_AMD64 && machine != MACHINE_I386 {
         return Err(EmuError::InvalidPe(format!(
-            "unsupported machine {machine:#06x} (only x86-64/AMD64 is supported)"
+            "unsupported machine {machine:#06x} (only x86-64 and 32-bit x86 are supported)"
         )));
     }
     let num_sections = r.u16(coff + 2)? as usize;
     let size_opt_header = r.u16(coff + 16)? as usize;
 
-    // ---- Optional header (PE32+) -----------------------------------------
+    // ---- Optional header (PE32 or PE32+) ---------------------------------
+    // The two formats share the standard fields but differ in where the
+    // image base and the 64-bit-vs-32-bit quadword fields sit.
     let opt = coff + 20;
-    if r.u16(opt)? != OPT_MAGIC_PE32PLUS {
-        return Err(EmuError::InvalidPe(
-            "not a PE32+ image (only 64-bit executables are supported)".into(),
-        ));
-    }
+    let magic = r.u16(opt)?;
+    let is_64bit = match magic {
+        OPT_MAGIC_PE32PLUS => true,
+        OPT_MAGIC_PE32 => false,
+        other => {
+            return Err(EmuError::InvalidPe(format!("unknown optional-header magic {other:#06x}")))
+        }
+    };
+
     let entry_rva = r.u32(opt + OPT_ENTRY)?;
-    let image_base = r.u64(opt + OPT_IMAGE_BASE)?;
+    // Fields at 56/60/68 are identically placed in both formats; the image
+    // base, stack reserve and directory table are not.
     let size_of_image = r.u32(opt + OPT_SIZE_OF_IMAGE)?;
     let size_of_headers = r.u32(opt + OPT_SIZE_OF_HEADERS)?;
     let subsystem = r.u16(opt + OPT_SUBSYSTEM)?;
-    let stack_reserve = r.u64(opt + OPT_STACK_RESERVE)?;
-    let num_dirs = r.u32(opt + OPT_NUM_RVA_SIZES)? as usize;
+    let (image_base, stack_reserve, num_dirs_off, data_dirs_off) = if is_64bit {
+        (r.u64(opt + 24)?, r.u64(opt + 72)?, 108usize, 112usize)
+    } else {
+        (r.u32(opt + 28)? as u64, r.u32(opt + 72)? as u64, 92usize, 96usize)
+    };
+    let num_dirs = r.u32(opt + num_dirs_off)? as usize;
 
     // Import data directory (may be absent).
     let (import_dir_rva, import_dir_size) = if num_dirs > DIR_IMPORT {
-        let base = opt + OPT_DATA_DIRS + DIR_IMPORT * 8;
+        let base = opt + data_dirs_off + DIR_IMPORT * 8;
         (r.u32(base)?, r.u32(base + 4)?)
     } else {
         (0, 0)
@@ -130,7 +137,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
 
     // ---- Imports ---------------------------------------------------------
     let imports = if import_dir_rva != 0 && import_dir_size != 0 {
-        parse_imports(&sections, import_dir_rva)?
+        parse_imports(&sections, import_dir_rva, is_64bit)?
     } else {
         Vec::new()
     };
@@ -138,6 +145,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     let headers = r.bytes(0, (size_of_headers as usize).min(r.len()))?;
 
     Ok(PeImage {
+        is_64bit,
         image_base,
         entry_rva,
         size_of_image,
@@ -197,9 +205,20 @@ fn cstr_at_rva(sections: &[Section], rva: u32) -> Result<String> {
 }
 
 /// Walk the import directory, producing one [`Import`] per symbol with the
-/// RVA of the IAT slot that must be patched at load time.
-fn parse_imports(sections: &[Section], dir_rva: u32) -> Result<Vec<Import>> {
+/// RVA of the IAT slot that must be patched at load time. Thunk entries are
+/// 8 bytes for PE32+ and 4 bytes for PE32.
+fn parse_imports(sections: &[Section], dir_rva: u32, is_64bit: bool) -> Result<Vec<Import>> {
     let mut imports = Vec::new();
+    let thunk_size = if is_64bit { 8 } else { 4 };
+    let ordinal_flag: u64 = if is_64bit { 1 << 63 } else { 1 << 31 };
+
+    let read_thunk = |sections: &[Section], rva: u32| -> Result<u64> {
+        if is_64bit {
+            slice_u64(sections, rva)
+        } else {
+            slice_u32(sections, rva).map(|v| v as u64)
+        }
+    };
 
     let mut desc = dir_rva;
     loop {
@@ -219,12 +238,12 @@ fn parse_imports(sections: &[Section], dir_rva: u32) -> Result<Vec<Import>> {
 
         let mut i = 0u32;
         loop {
-            let thunk = slice_u64(sections, lookup + i * 8)?;
+            let thunk = read_thunk(sections, lookup + i * thunk_size)?;
             if thunk == 0 {
                 break;
             }
-            let iat_rva = first_thunk + i * 8;
-            let symbol = if thunk & IMPORT_BY_ORDINAL != 0 {
+            let iat_rva = first_thunk + i * thunk_size;
+            let symbol = if thunk & ordinal_flag != 0 {
                 ImportSymbol::Ordinal((thunk & 0xFFFF) as u16)
             } else {
                 let by_name_rva = (thunk & 0x7FFF_FFFF) as u32;
