@@ -17,7 +17,7 @@
 pub mod sample;
 
 use exemu_core::{Cpu, EmuError, Exit, Memory, Perm, Region, Result};
-use exemu_cpu::{Interpreter, GS_BASE};
+use exemu_cpu::{Bits, Interpreter, FS_BASE_32, GS_BASE};
 use exemu_loader as loader;
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
@@ -25,24 +25,67 @@ use exemu_os::{WinConfig, WinOs};
 // ---- Address-space layout policy -------------------------------------------
 
 const PAGE: u64 = 0x1000;
-const STACK_BASE: u64 = 0x0000_0010_0000_0000;
-const STACK_SIZE: u64 = 0x0020_0000; // 2 MiB
 const TEB_SIZE: u64 = 0x1000;
-const PEB_ADDR: u64 = GS_BASE + 0x2000;
-const ENV_BASE: u64 = 0x0000_0000_5000_0000;
 const ENV_SIZE: u64 = 0x1000;
-const API_BASE: u64 = 0x0000_7EFF_0000_0000;
 const API_SIZE: u64 = 0x0010_0000; // 1 MiB → 128k import slots
-const HEAP_BASE: u64 = 0x0000_0002_0000_0000;
-const HEAP_SIZE: u64 = 0x0400_0000; // 64 MiB
 
-// TEB field offsets (x64).
-const TEB_SELF: u64 = 0x30; // NtTib.Self
-const TEB_PEB: u64 = 0x60; // ProcessEnvironmentBlock
-const TEB_STACK_BASE: u64 = 0x08;
-const TEB_STACK_LIMIT: u64 = 0x10;
-// PEB field offsets (x64).
-const PEB_IMAGE_BASE: u64 = 0x10;
+/// Where the various regions live, chosen per bitness so 32-bit processes
+/// stay entirely within the low 4 GiB.
+struct Layout {
+    stack_base: u64,
+    stack_size: u64,
+    heap_base: u64,
+    heap_size: u64,
+    api_base: u64,
+    env_base: u64,
+    teb_base: u64,
+    peb_addr: u64,
+    // TEB/PEB field offsets (they differ between the 32- and 64-bit structs).
+    teb_self: u64,
+    teb_peb: u64,
+    teb_stack_base: u64,
+    teb_stack_limit: u64,
+    peb_image_base: u64,
+}
+
+impl Layout {
+    fn for_bits(is_64bit: bool) -> Layout {
+        if is_64bit {
+            Layout {
+                stack_base: 0x0000_0010_0000_0000,
+                stack_size: 0x0020_0000, // 2 MiB
+                heap_base: 0x0000_0002_0000_0000,
+                heap_size: 0x0400_0000, // 64 MiB
+                api_base: 0x0000_7EFF_0000_0000,
+                env_base: 0x0000_0000_5000_0000,
+                teb_base: GS_BASE,
+                peb_addr: GS_BASE + 0x2000,
+                teb_self: 0x30,
+                teb_peb: 0x60,
+                teb_stack_base: 0x08,
+                teb_stack_limit: 0x10,
+                peb_image_base: 0x10,
+            }
+        } else {
+            // Everything below 4 GiB, clear of a typical image at 0x400000+.
+            Layout {
+                stack_base: 0x0018_0000,
+                stack_size: 0x0020_0000, // 2 MiB, top at 0x0038_0000 (below image)
+                heap_base: 0x1000_0000,
+                heap_size: 0x0400_0000, // 64 MiB
+                api_base: 0x7000_0000,
+                env_base: 0x0010_0000,
+                teb_base: FS_BASE_32,
+                peb_addr: FS_BASE_32 + 0x2000,
+                teb_self: 0x18,  // NT_TIB.Self
+                teb_peb: 0x30,   // ProcessEnvironmentBlock
+                teb_stack_base: 0x04,
+                teb_stack_limit: 0x08,
+                peb_image_base: 0x08,
+            }
+        }
+    }
+}
 
 /// Options controlling a run.
 pub struct RunConfig {
@@ -104,30 +147,36 @@ impl Process {
             mem.map_with_data(section_name(&s.name), addr, size, &s.data, perm)?;
         }
 
+        let lay = Layout::for_bits(image.is_64bit);
+        let ptr_size = if image.is_64bit { 8 } else { 4 };
+
         // --- Stack --------------------------------------------------------
-        mem.map(Region::new("stack", STACK_BASE, STACK_SIZE, Perm::RW))?;
+        mem.map(Region::new("stack", lay.stack_base, lay.stack_size, Perm::RW))?;
 
         // --- Heap arena (bump-allocated by the OS layer) ------------------
-        mem.map(Region::new("heap", HEAP_BASE, HEAP_SIZE, Perm::RW))?;
+        mem.map(Region::new("heap", lay.heap_base, lay.heap_size, Perm::RW))?;
 
-        // --- TEB / PEB behind gs: -----------------------------------------
-        mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW))?;
-        mem.map(Region::new("peb", align_down(PEB_ADDR, PAGE), PAGE, Perm::RW))?;
-        let stack_top = STACK_BASE + STACK_SIZE;
-        mem.poke(GS_BASE + TEB_SELF, &GS_BASE.to_le_bytes())?;
-        mem.poke(GS_BASE + TEB_PEB, &PEB_ADDR.to_le_bytes())?;
-        mem.poke(GS_BASE + TEB_STACK_BASE, &stack_top.to_le_bytes())?;
-        mem.poke(GS_BASE + TEB_STACK_LIMIT, &STACK_BASE.to_le_bytes())?;
-        mem.poke(PEB_ADDR + PEB_IMAGE_BASE, &base.to_le_bytes())?;
+        // --- TEB / PEB behind fs:(32-bit) or gs:(64-bit) ------------------
+        mem.map(Region::new("teb", lay.teb_base, TEB_SIZE, Perm::RW))?;
+        mem.map(Region::new("peb", align_down(lay.peb_addr, PAGE), PAGE, Perm::RW))?;
+        let stack_top = lay.stack_base + lay.stack_size;
+        let write_ptr = |mem: &mut VirtualMemory, addr: u64, val: u64| -> Result<()> {
+            mem.poke(addr, &val.to_le_bytes()[..ptr_size])
+        };
+        write_ptr(&mut mem, lay.teb_base + lay.teb_self, lay.teb_base)?;
+        write_ptr(&mut mem, lay.teb_base + lay.teb_peb, lay.peb_addr)?;
+        write_ptr(&mut mem, lay.teb_base + lay.teb_stack_base, stack_top)?;
+        write_ptr(&mut mem, lay.teb_base + lay.teb_stack_limit, lay.stack_base)?;
+        write_ptr(&mut mem, lay.peb_addr + lay.peb_image_base, base)?;
 
         // --- Command line (ASCII + UTF-16) in the env region --------------
-        mem.map(Region::new("env", ENV_BASE, ENV_SIZE, Perm::RW))?;
+        mem.map(Region::new("env", lay.env_base, ENV_SIZE, Perm::RW))?;
         let cmdline = build_cmdline(&cfg.args);
-        let cmd_a = ENV_BASE;
+        let cmd_a = lay.env_base;
         let mut ascii = cmdline.clone().into_bytes();
         ascii.push(0);
         mem.poke(cmd_a, &ascii)?;
-        let cmd_w = ENV_BASE + 0x400;
+        let cmd_w = lay.env_base + 0x400;
         let mut wide: Vec<u8> = Vec::new();
         for u in cmdline.encode_utf16() {
             wide.extend_from_slice(&u.to_le_bytes());
@@ -137,14 +186,15 @@ impl Process {
 
         // --- The OS layer and import resolution ---------------------------
         let mut os = WinOs::new(WinConfig {
-            api_base: API_BASE,
-            heap_base: HEAP_BASE,
-            heap_size: HEAP_SIZE,
+            api_base: lay.api_base,
+            heap_base: lay.heap_base,
+            heap_size: lay.heap_size,
             image_base: base,
             cmdline_ptr_a: cmd_a,
             cmdline_ptr_w: cmd_w,
             echo: cfg.echo,
             trace: cfg.trace,
+            is_64bit: image.is_64bit,
         });
 
         // Map the thunk region as real read/write memory. Function imports
@@ -154,26 +204,34 @@ impl Process {
         // memory, and land here instead of faulting. Known CRT data globals
         // are seeded below; the rest default to zero (their normal initial
         // value).
-        mem.map(Region::new("imports", API_BASE, API_SIZE, Perm::RW))?;
+        mem.map(Region::new("imports", lay.api_base, API_SIZE, Perm::RW))?;
 
         for imp in &image.imports {
             let thunk = os.resolve_import(&imp.dll, &imp.symbol);
-            mem.poke(base + imp.iat_rva as u64, &thunk.to_le_bytes())?;
+            mem.poke(base + imp.iat_rva as u64, &thunk.to_le_bytes()[..ptr_size])?;
             if let exemu_core::ImportSymbol::Named(name) = &imp.symbol {
                 if let Some(value) = data_import_seed(name, cmd_a, cmd_w) {
-                    mem.poke(thunk, &value.to_le_bytes())?;
+                    mem.poke(thunk, &value.to_le_bytes()[..ptr_size])?;
                 }
             }
         }
 
         // --- Initial CPU state --------------------------------------------
-        let mut cpu = Interpreter::new();
-        // 16-byte align the stack, then push the sentinel return address so
-        // that at entry rsp % 16 == 8, exactly as a real `call entry` leaves it.
-        let mut rsp = (stack_top - 0x100) & !0xf;
+        let mut cpu = Interpreter::with_bits(if image.is_64bit { Bits::B64 } else { Bits::B32 });
+        // Align the stack, then push the sentinel return address so the entry
+        // sees the stack exactly as a real `call entry` would leave it.
         let exit_thunk = os.exit_thunk();
-        rsp -= 8;
-        mem.write_u64(rsp, exit_thunk)?;
+        let rsp = if image.is_64bit {
+            let mut sp = (stack_top - 0x100) & !0xf;
+            sp -= 8;
+            mem.write_u64(sp, exit_thunk)?;
+            sp
+        } else {
+            let mut sp = (stack_top - 0x100) & !0xf;
+            sp -= 4;
+            mem.write_u32(sp, exit_thunk as u32)?;
+            sp
+        };
         cpu.state_mut().set_rsp(rsp);
         cpu.state_mut().rip = image.entry_va();
 

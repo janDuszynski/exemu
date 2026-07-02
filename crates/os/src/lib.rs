@@ -45,6 +45,9 @@ pub struct WinConfig {
     pub echo: bool,
     /// If true, unimplemented API calls are logged to the host stderr.
     pub trace: bool,
+    /// Target bitness: true for x86-64 (System V-ish register args), false
+    /// for 32-bit x86 (stdcall/cdecl stack args, callee cleanup).
+    pub is_64bit: bool,
 }
 
 impl Default for WinConfig {
@@ -58,6 +61,7 @@ impl Default for WinConfig {
             cmdline_ptr_w: 0,
             echo: true,
             trace: false,
+            is_64bit: true,
         }
     }
 }
@@ -171,26 +175,40 @@ impl WinOs {
         &self.stderr_buf
     }
 
-    // ---- Win64 calling-convention helpers --------------------------------
+    // ---- calling-convention helpers --------------------------------------
 
-    /// Integer/pointer argument `i` (0-based) at API entry, where `rsp`
-    /// points at the return address and `[rsp+8 .. rsp+0x28]` is shadow space.
+    /// Integer/pointer argument `i` (0-based) at API entry.
+    ///
+    /// * x86-64: RCX/RDX/R8/R9, then the stack above the 32-byte shadow space.
+    /// * x86-32: all arguments are 4-byte stack slots at `[esp+4 + i*4]`
+    ///   (`[esp]` is the return address). This holds for both stdcall and
+    ///   cdecl — they differ only in who cleans up.
     fn arg(&self, cpu: &CpuState, mem: &dyn Memory, i: usize) -> Result<u64> {
-        Ok(match i {
-            0 => cpu.reg(Reg::Rcx),
-            1 => cpu.reg(Reg::Rdx),
-            2 => cpu.reg(Reg::R8),
-            3 => cpu.reg(Reg::R9),
-            n => mem.read_u64(cpu.rsp() + 0x28 + (n as u64 - 4) * 8)?,
-        })
+        if self.cfg.is_64bit {
+            Ok(match i {
+                0 => cpu.reg(Reg::Rcx),
+                1 => cpu.reg(Reg::Rdx),
+                2 => cpu.reg(Reg::R8),
+                3 => cpu.reg(Reg::R9),
+                n => mem.read_u64(cpu.rsp() + 0x28 + (n as u64 - 4) * 8)?,
+            })
+        } else {
+            Ok(mem.read_u32(cpu.rsp() + 4 + (i as u64) * 4)? as u64)
+        }
     }
 
-    /// Simulate `ret`: pop the return address into `rip`.
-    fn ret(&self, cpu: &mut CpuState, mem: &dyn Memory) -> Result<()> {
+    /// Simulate the callee's `ret`: pop the return address into `rip`, and in
+    /// 32-bit mode additionally clean `stack_args * 4` bytes off the stack for
+    /// stdcall functions (the Win32 default). 64-bit callers clean their own.
+    fn ret(&self, cpu: &mut CpuState, mem: &dyn Memory, stack_args: u32) -> Result<()> {
         let sp = cpu.rsp();
-        let ret = mem.read_u64(sp)?;
-        cpu.set_rsp(sp + 8);
-        cpu.rip = ret;
+        if self.cfg.is_64bit {
+            cpu.rip = mem.read_u64(sp)?;
+            cpu.set_rsp(sp + 8);
+        } else {
+            cpu.rip = mem.read_u32(sp)? as u64;
+            cpu.set_rsp((sp + 4 + stack_args as u64 * 4) & 0xFFFF_FFFF);
+        }
         Ok(())
     }
 
@@ -236,10 +254,15 @@ impl Hooks for WinOs {
         let Some(api) = self.thunks.get(&rip).cloned() else {
             return Ok(None);
         };
+        let argc = api.argc();
         match self.dispatch(&api, cpu, mem)? {
             api::Outcome::Return(value) => {
-                cpu.set_reg(Reg::Rax, value);
-                self.ret(cpu, mem)?;
+                if self.cfg.is_64bit {
+                    cpu.set_reg(Reg::Rax, value);
+                } else {
+                    cpu.gpr_write(0, 4, value); // eax, upper 32 zeroed
+                }
+                self.ret(cpu, mem, argc)?;
                 Ok(Some(Exit::Continue))
             }
             api::Outcome::Exit(code) => Ok(Some(Exit::ProcessExit(code))),
