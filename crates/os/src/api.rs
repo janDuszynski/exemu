@@ -60,6 +60,24 @@ pub enum Api {
     LoadLibraryA,
     FreeLibrary,
     GetProcAddress,
+
+    // --- msvcrt C runtime -------------------------------------------------
+    Malloc,
+    Calloc,
+    Realloc,
+    Free,
+    /// memcpy / memmove (both implemented overlap-safe).
+    Memcpy,
+    Memset,
+    Memcmp,
+    Strlen,
+    /// The C `exit` family — terminate with the argument.
+    CrtExit,
+    /// __getmainargs / __wgetmainargs — populate argc/argv/env.
+    GetMainArgs,
+    /// A CRT startup/teardown hook we can safely no-op, returning 0.
+    CrtNoop,
+
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
@@ -109,6 +127,26 @@ impl Api {
             "LoadLibraryA" => Api::LoadLibraryA,
             "FreeLibrary" => Api::FreeLibrary,
             "GetProcAddress" => Api::GetProcAddress,
+
+            // msvcrt / UCRT C runtime.
+            "malloc" => Api::Malloc,
+            "calloc" => Api::Calloc,
+            "realloc" => Api::Realloc,
+            "free" => Api::Free,
+            "memcpy" | "memmove" => Api::Memcpy,
+            "memset" => Api::Memset,
+            "memcmp" => Api::Memcmp,
+            "strlen" => Api::Strlen,
+            "exit" | "_exit" | "_cexit" | "_c_exit" => Api::CrtExit,
+            "__getmainargs" | "__wgetmainargs" => Api::GetMainArgs,
+            "__set_app_type" | "_set_fmode" | "_get_fmode" | "__setusermatherr"
+            | "_configthreadlocale" | "_controlfp" | "_controlfp_s" | "_initterm"
+            | "_initterm_e" | "__C_specific_handler" | "_XcptFilter" | "_amsg_exit"
+            | "signal" | "_lock" | "_unlock" | "_onexit" | "atexit" | "__dllonexit"
+            | "_setmode" | "setlocale" | "_set_new_mode" | "__p__fmode"
+            | "_configure_narrow_argv" | "_initialize_narrow_environment"
+            | "_get_initial_narrow_environment" | "_set_app_type" => Api::CrtNoop,
+
             _ => Api::Unsupported(format!("{dll}!{name}")),
         }
     }
@@ -298,6 +336,102 @@ impl WinOs {
             Api::LoadLibraryA => ret(0), // pretend the DLL could not be loaded
             Api::FreeLibrary => ret(TRUE),
             Api::GetProcAddress => ret(0),
+
+            // --- msvcrt C runtime --------------------------------------------
+            Api::Malloc => {
+                let size = self.arg(cpu, mem, 0)?;
+                ret(self.heap_alloc(size))
+            }
+            Api::Calloc => {
+                // calloc(num, size): the arena is already zeroed.
+                let num = self.arg(cpu, mem, 0)?;
+                let size = self.arg(cpu, mem, 1)?;
+                ret(self.heap_alloc(num.saturating_mul(size)))
+            }
+            Api::Realloc => {
+                let old = self.arg(cpu, mem, 0)?;
+                let size = self.arg(cpu, mem, 1)?;
+                let new = self.heap_alloc(size);
+                if new != 0 && old != 0 {
+                    for i in 0..size {
+                        let b = mem.read_u8(old + i)?;
+                        mem.write_u8(new + i, b)?;
+                    }
+                }
+                ret(new)
+            }
+            Api::Free => ret(0),
+
+            Api::Memcpy => {
+                // memcpy/memmove(dest, src, n) — return dest, overlap-safe.
+                let dest = self.arg(cpu, mem, 0)?;
+                let src = self.arg(cpu, mem, 1)?;
+                let n = self.arg(cpu, mem, 2)? as usize;
+                let mut tmp = vec![0u8; n];
+                mem.read(src, &mut tmp)?;
+                mem.write(dest, &tmp)?;
+                ret(dest)
+            }
+            Api::Memset => {
+                // memset(dest, c, n) — return dest.
+                let dest = self.arg(cpu, mem, 0)?;
+                let c = self.arg(cpu, mem, 1)? as u8;
+                let n = self.arg(cpu, mem, 2)? as usize;
+                mem.write(dest, &vec![c; n])?;
+                ret(dest)
+            }
+            Api::Memcmp => {
+                let a = self.arg(cpu, mem, 0)?;
+                let b = self.arg(cpu, mem, 1)?;
+                let n = self.arg(cpu, mem, 2)?;
+                let mut result: u64 = 0;
+                for i in 0..n {
+                    let (x, y) = (mem.read_u8(a + i)?, mem.read_u8(b + i)?);
+                    if x != y {
+                        // Sign-extend the byte difference into the return.
+                        result = (x as i32 - y as i32) as i64 as u64;
+                        break;
+                    }
+                }
+                ret(result)
+            }
+            Api::Strlen => {
+                let s = self.arg(cpu, mem, 0)?;
+                let bytes = mem.read_cstr(s, 1 << 20)?;
+                ret(bytes.len() as u64)
+            }
+
+            Api::CrtExit => {
+                let code = self.arg(cpu, mem, 0)? as u32 as i32;
+                Ok(Outcome::Exit(code))
+            }
+
+            Api::GetMainArgs => {
+                // int __getmainargs(int* argc, char*** argv, char*** env,
+                //                   int doWildCard, _startupinfo* startInfo)
+                // Populate a one-element argv from the command line pointer.
+                let argc_ptr = self.arg(cpu, mem, 0)?;
+                let argv_ptr = self.arg(cpu, mem, 1)?;
+                let env_ptr = self.arg(cpu, mem, 2)?;
+                let argv_arr = self.heap_alloc(16); // [arg0, NULL]
+                if argv_arr != 0 {
+                    mem.write_u64(argv_arr, self.cfg.cmdline_ptr_a)?;
+                    mem.write_u64(argv_arr + 8, 0)?;
+                }
+                if argc_ptr != 0 {
+                    mem.write_u32(argc_ptr, 1)?;
+                }
+                if argv_ptr != 0 {
+                    mem.write_u64(argv_ptr, argv_arr)?;
+                }
+                if env_ptr != 0 {
+                    let env_arr = self.heap_alloc(8); // just a NULL terminator
+                    mem.write_u64(env_ptr, env_arr)?;
+                }
+                ret(0)
+            }
+
+            Api::CrtNoop => ret(0),
 
             Api::Unsupported(name) => {
                 if self.cfg.trace {
