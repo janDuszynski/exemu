@@ -1,21 +1,24 @@
 # exemu — a Windows `.exe` emulator for Apple Silicon
 
-`exemu` loads a Windows **PE** (Portable Executable) `.exe` built for
-`x86-64` and runs it on an Apple **M-series** (ARM64) Mac — no Windows, no
-Rosetta, no virtual machine. It parses the executable, maps it into a
-virtual address space, interprets the guest's x86-64 instructions in
-software, and services the Windows API calls the program makes by
-implementing them natively on the host.
+`exemu` loads a Windows **PE** (Portable Executable) `.exe` — either 32-bit
+(`x86`) or 64-bit (`x86-64`) — and runs it on an Apple **M-series** (ARM64)
+Mac, with no Windows, no Rosetta, and no virtual machine. It parses the
+executable, maps it into a virtual address space, interprets the guest's
+x86 instructions in software, and services the Windows API calls the program
+makes by implementing them natively on the host.
 
 It is written in **Rust** for speed and memory safety, and organized with
 **Clean Architecture** so each concern (parsing, memory, CPU, OS) is an
 independent, testable crate behind a trait.
 
 > **Scope.** This is a from-scratch userland emulator built for clarity and
-> extensibility. It implements a practical subset of the x86-64 instruction
-> set and a handful of `kernel32` APIs — enough to load and run real
-> freestanding console programs end to end. It is not a drop-in replacement
-> for Wine, and it does not emulate the NT kernel, the GUI, or the .NET CLR.
+> extensibility. It implements a broad subset of the x86/x86-64 instruction
+> set (including SSE2), ~200 Win32 functions, and a host-backed sandbox
+> filesystem — enough to run real console programs end to end and to drive
+> real installers a long way into their logic. It is **not** a drop-in
+> replacement for Wine: it does not render a GUI, and it does not emulate
+> the NT kernel, COM, or the .NET CLR, so graphical installers run their
+> startup and extraction but cannot present their wizard.
 
 ## Architecture
 
@@ -109,15 +112,31 @@ exemu sample <out.exe>
 
 ## What works today
 
-* PE32+ parsing: headers, sections, and imports (by name or ordinal).
-* A practical subset of x86-64: the ALU family, `MOV`/`LEA`/`MOVZX`/`MOVSX`,
+* **Both bitnesses**: PE32 (32-bit `x86`) and PE32+ (64-bit `x86-64`),
+  parsing headers, sections, and imports (by name or ordinal). The CPU has
+  a 32-bit and a 64-bit mode (REX-vs-inc/dec, RIP-relative-vs-absolute
+  addressing, 4-vs-8-byte stack, `fs:`-vs-`gs:` TEB).
+* A broad instruction subset: the ALU family, `MOV`/`LEA`/`MOVZX`/`MOVSX`,
   stack ops, `CALL`/`RET`, the full `Jcc`/`SETcc`/`CMOVcc` condition set,
-  shifts/rotates, `MUL`/`IMUL`/`DIV`/`IDIV`, `REP MOVS`/`STOS`, with
-  faithful EFLAGS.
-* `kernel32` essentials: `GetStdHandle`, `WriteFile`, `WriteConsoleA/W`,
-  `ExitProcess`, the `Heap*`/`Virtual*` allocators, `GetCommandLine*`,
-  `GetModuleHandle*`, plus last-error/console/timing stubs. Unknown imports
-  return 0 (optionally traced) so a program keeps running.
+  shifts/rotates, `SHLD`/`SHRD`, `MUL`/`IMUL`/`DIV`/`IDIV`, the `BT` bit-test
+  family, `BSF`/`BSR`/`BSWAP`, `XADD`/`CMPXCHG`, `LOOP`/`JECXZ`, the string
+  ops (`MOVS`/`STOS`/`CMPS`/`LODS`/`SCAS` with `REP`/`REPE`/`REPNE`), and
+  **SSE/SSE2** (moves, logical, scalar+packed float arithmetic, compares and
+  conversions) — all with faithful EFLAGS.
+* **~200 Win32 functions** across `kernel32`/`user32`/`gdi32`/`advapi32`/
+  `shell32`/`ole32`/`comctl32`: console I/O, the `Heap*`/`Global*`/`Virtual*`
+  allocators, the `lstr*` string family, `CharNext`/`CharPrev`, command
+  line, module handles, and timing/console stubs. Every function — even the
+  unimplemented ones — carries its **stdcall argument count**, so 32-bit
+  callee stack cleanup stays correct and stub calls don't corrupt the stack.
+  Handle-returning stubs yield a non-null fake handle so setup proceeds.
+* A **host-backed sandbox filesystem**: `CreateFileW`/`ReadFile`/`WriteFile`/
+  `CloseHandle`, `CreateDirectoryW`, `GetTempPathW`/`GetTempFileNameW`,
+  `GetFileSize`/`SetFilePointer`/`GetFileAttributesW`/`DeleteFileW`, and
+  `GetModuleFileNameW`. Guest paths map into a sandbox dir; the executable is
+  copied in so a self-extractor can read its own appended archive.
+* Data imports, `_initterm` static-constructor execution via re-entrant
+  guest calls, and a slice of the `msvcrt` C runtime.
 * **Data imports** (a DLL exporting a variable, not a function). The thunk
   region is mapped as real read/write memory, so the C runtime can
   dereference globals like `_fmode`/`_commode`; `_acmdln`/`_wcmdln` are
@@ -137,17 +156,25 @@ exemu sample <out.exe>
 
 ### Not implemented (yet)
 
-SSE/AVX and x87 floating point; TLS callbacks and base relocations (images
-load at their preferred base); table-based structured exception handling
+AVX and x87 floating point; TLS callbacks and base relocations (images load
+at their preferred base); table-based structured exception handling
 (`.pdata`/`__C_specific_handler` is a no-op — fine unless an exception is
-actually thrown); threads; and the Win32 **GUI**, **COM**, registry and
-shell surfaces (`user32`/`ole32`/`advapi32`/`shell32`).
+actually thrown); real threads; a **rendering GUI** and a real window
+message loop; **COM** object creation; and the registry (Reg* calls are
+stubbed).
 
-As a concrete data point, the 7-Zip GUI installer (`7z…-x64.exe`, MSVC +
-`msvcrt`) now executes ~49k instructions of real CRT and program code before
-stopping at `user32!CreateDialogParamW` — i.e. at the GUI boundary rather
-than in the C runtime. A **console** MSVCRT program that avoids SSE and SEH
-stands a good chance of running; a GUI/COM application does not.
+### What real installers do today
+
+| Executable | Kind | Result |
+| ---------- | ---- | ------ |
+| generated `hello.exe` | 64-bit console | **runs fully**, prints output incl. an SSE2 computation, exits 0 |
+| Firefox Installer | 32-bit, UPX-packed | runs its ~2.2M-instruction self-decompression stub to a clean exit |
+| SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for ~45M instructions before a fault deep in unpacked code |
+| 7-Zip installer | 64-bit MSVC GUI | runs CRT startup + program logic (~49k instructions), stops at `CreateDialogParamW` (the GUI boundary) |
+
+A **console** program stands a good chance of running to completion; a
+graphical installer runs its startup and (for self-extractors) its
+extraction, but cannot present a wizard without a rendering GUI.
 
 ## Testing
 
