@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod fs;
 
 use std::collections::HashMap;
 
@@ -48,6 +49,11 @@ pub struct WinConfig {
     /// Target bitness: true for x86-64 (System V-ish register args), false
     /// for 32-bit x86 (stdcall/cdecl stack args, callee cleanup).
     pub is_64bit: bool,
+    /// Host directory that roots the guest filesystem. Empty disables file
+    /// I/O (operations then fail as they did before).
+    pub sandbox: String,
+    /// The guest path of the running module, reported by GetModuleFileNameW.
+    pub module_path_w: String,
 }
 
 impl Default for WinConfig {
@@ -62,6 +68,8 @@ impl Default for WinConfig {
             echo: true,
             trace: false,
             is_64bit: true,
+            sandbox: String::new(),
+            module_path_w: "C:\\program.exe".into(),
         }
     }
 }
@@ -83,6 +91,12 @@ pub struct WinOs {
     /// Active `_initterm` invocations (a stack, since a constructor may
     /// itself trigger another `_initterm`).
     initterm_stack: Vec<api::InittermFrame>,
+
+    /// Open guest file handles → host file objects.
+    files: std::collections::HashMap<u64, fs::OpenFile>,
+    next_handle: u64,
+    /// Monotonic source of unique temp-file numbers.
+    temp_counter: u32,
 
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
@@ -107,6 +121,9 @@ impl WinOs {
             last_error: 0,
             initterm_driver: 0,
             initterm_stack: Vec::new(),
+            files: std::collections::HashMap::new(),
+            next_handle: 0x0000_1000,
+            temp_counter: 0,
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
         };
