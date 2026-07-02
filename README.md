@@ -57,13 +57,84 @@ orchestrates them.
 
 ```sh
 cargo build --release
-cargo run -p exemu-cli -- run path/to/program.exe
+
+# Generate a self-contained demo .exe (no Windows toolchain needed),
+# inspect it, then run it:
+./target/release/exemu sample hello.exe
+./target/release/exemu info   hello.exe
+./target/release/exemu run    hello.exe
 ```
 
-## Status
+Running the generated binary prints:
 
-Under active construction. See the git history — each architectural layer
-lands as its own commit.
+```
+Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
+
+[exemu] process exited with code 0 after 13 instructions
+```
+
+`file(1)` confirms the generated `hello.exe` is a genuine
+`PE32+ executable (console) x86-64, for MS Windows`.
+
+### CLI
+
+```
+exemu run <file.exe> [--trace] [--no-echo] [-- <args>...]
+exemu info <file.exe>
+exemu sample <out.exe>
+```
+
+* `run` maps the image, resolves imports, and interprets it to completion,
+  exiting with the guest's exit code. `--trace` logs calls to unimplemented
+  Windows APIs; `--no-echo` suppresses mirroring guest output to the host.
+* `info` dumps headers, sections and imports.
+* `sample` writes the built-in Hello-World PE to disk.
+
+## How it runs a `.exe`
+
+1. **Load** — `exemu-loader` validates the DOS/PE/COFF/optional headers,
+   reads the section table and walks the import directory.
+2. **Map** — `exemu-app` maps headers and sections at the image base with
+   per-section permissions, and sets up a stack, a heap arena, and a
+   TEB/PEB pair reachable through the `gs:` segment.
+3. **Bind imports** — each imported symbol is assigned a synthetic *thunk*
+   address by `exemu-os`, which the loader writes into the Import Address
+   Table. There are no real DLLs in the address space.
+4. **Interpret** — `exemu-cpu` fetches, decodes and executes x86-64
+   instructions one at a time.
+5. **Service APIs** — before each instruction, the OS layer is asked whether
+   `rip` is one of its thunks. If so it reads the arguments per the Windows
+   x64 ABI, runs the call natively (e.g. `WriteFile` → host `stdout`), sets
+   `rax`, and simulates the `ret`.
+
+## What works today
+
+* PE32+ parsing: headers, sections, and imports (by name or ordinal).
+* A practical subset of x86-64: the ALU family, `MOV`/`LEA`/`MOVZX`/`MOVSX`,
+  stack ops, `CALL`/`RET`, the full `Jcc`/`SETcc`/`CMOVcc` condition set,
+  shifts/rotates, `MUL`/`IMUL`/`DIV`/`IDIV`, `REP MOVS`/`STOS`, with
+  faithful EFLAGS.
+* `kernel32` essentials: `GetStdHandle`, `WriteFile`, `WriteConsoleA/W`,
+  `ExitProcess`, the `Heap*`/`Virtual*` allocators, `GetCommandLine*`,
+  `GetModuleHandle*`, plus last-error/console/timing stubs. Unknown imports
+  return 0 (optionally traced) so a program keeps running.
+
+### Not implemented (yet)
+
+SSE/AVX and x87 floating point; TLS callbacks and base relocations (images
+load at their preferred base); structured exception handling; the MSVC/UCRT
+import surface; threads; and anything GUI, kernel-mode, or .NET.
+
+## Testing
+
+```sh
+cargo test --workspace   # loader, memory, interpreter, and end-to-end
+cargo clippy --workspace --all-targets
+```
+
+The interpreter has hand-assembled unit tests (arithmetic, loops, calls,
+signed compares, division, `rep stos`, flags), and the app crate runs the
+generated `.exe` through the entire pipeline and asserts on its output.
 
 ## License
 

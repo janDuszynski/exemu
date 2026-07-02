@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build, test, lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # Apple Silicon is the primary target; also prove it is portable.
+        os: [macos-14, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Smoke test the sample executable
+        run: |
+          cargo run -q -p exemu-cli -- sample /tmp/hello.exe
+          cargo run -q -p exemu-cli -- run /tmp/hello.exe | tee /tmp/out.txt
+          grep -q "Apple Silicon" /tmp/out.txt

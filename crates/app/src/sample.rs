@@ -73,16 +73,31 @@ pub fn build() -> Vec<u8> {
     put_u32(&mut f, opt + 108, 16); // NumberOfRvaAndSizes
 
     // Data directories: [1] = Import, [12] = IAT.
-    let dd = opt + 112;
-    put_u32(&mut f, dd + 1 * 8, RDATA_RVA + rdata.import_dir_off); // Import table RVA
-    put_u32(&mut f, dd + 1 * 8 + 4, rdata.import_dir_size); // Import table size
-    put_u32(&mut f, dd + 12 * 8, RDATA_RVA + rdata.iat_off); // IAT RVA
-    put_u32(&mut f, dd + 12 * 8 + 4, rdata.iat_size); // IAT size
+    let dir = |i: usize| opt + 112 + i * 8;
+    put_u32(&mut f, dir(1), RDATA_RVA + rdata.import_dir_off); // Import table RVA
+    put_u32(&mut f, dir(1) + 4, rdata.import_dir_size); // Import table size
+    put_u32(&mut f, dir(12), RDATA_RVA + rdata.iat_off); // IAT RVA
+    put_u32(&mut f, dir(12) + 4, rdata.iat_size); // IAT size
 
     // ---- Section table -----------------------------------------------------
     let sec = opt + OPT_HEADER_SIZE;
-    write_section(&mut f, sec, b".text", text.len() as u32, TEXT_RVA, text_raw as u32, text_ptr as u32, 0x6000_0020);
-    write_section(&mut f, sec + 40, b".rdata", rdata.bytes.len() as u32, RDATA_RVA, rdata_raw as u32, rdata_ptr as u32, 0x4000_0040);
+    // 0x60000020 = CODE | EXECUTE | READ ; 0x40000040 = INITIALIZED_DATA | READ
+    write_section(&mut f, sec, SecHeader {
+        name: b".text",
+        vsize: text.len() as u32,
+        vaddr: TEXT_RVA,
+        raw_size: text_raw as u32,
+        raw_ptr: text_ptr as u32,
+        chars: 0x6000_0020,
+    });
+    write_section(&mut f, sec + 40, SecHeader {
+        name: b".rdata",
+        vsize: rdata.bytes.len() as u32,
+        vaddr: RDATA_RVA,
+        raw_size: rdata_raw as u32,
+        raw_ptr: rdata_ptr as u32,
+        chars: 0x4000_0040,
+    });
 
     // ---- Section bodies ----------------------------------------------------
     f[text_ptr..text_ptr + text.len()].copy_from_slice(&text);
@@ -247,22 +262,23 @@ fn emit_rip_lea_rdx(c: &mut Vec<u8>, target_rva: u32) {
 
 // ---- byte-level helpers ----------------------------------------------------
 
-fn write_section(
-    f: &mut [u8],
-    at: usize,
-    name: &[u8],
+/// The fields of an `IMAGE_SECTION_HEADER` the sample needs to set.
+struct SecHeader<'a> {
+    name: &'a [u8],
     vsize: u32,
     vaddr: u32,
     raw_size: u32,
     raw_ptr: u32,
     chars: u32,
-) {
-    f[at..at + name.len()].copy_from_slice(name);
-    put_u32(f, at + 8, vsize);
-    put_u32(f, at + 12, vaddr);
-    put_u32(f, at + 16, raw_size);
-    put_u32(f, at + 20, raw_ptr);
-    put_u32(f, at + 36, chars);
+}
+
+fn write_section(f: &mut [u8], at: usize, s: SecHeader) {
+    f[at..at + s.name.len()].copy_from_slice(s.name);
+    put_u32(f, at + 8, s.vsize);
+    put_u32(f, at + 12, s.vaddr);
+    put_u32(f, at + 16, s.raw_size);
+    put_u32(f, at + 20, s.raw_ptr);
+    put_u32(f, at + 36, s.chars);
 }
 
 #[inline]
