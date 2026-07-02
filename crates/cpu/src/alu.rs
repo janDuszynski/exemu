@@ -105,6 +105,47 @@ pub fn dec(s: &mut CpuState, a: u64, size: u8) -> u64 {
     r
 }
 
+/// SHLD: shift `dst` left by `count`, feeding in the high bits of `src`.
+pub fn shld(s: &mut CpuState, dst: u64, src: u64, count: u64, size: u8) -> u64 {
+    let bits = size as u32 * 8;
+    let count = (count & if size == 8 { 0x3f } else { 0x1f }) as u32;
+    if count == 0 {
+        return dst & mask(size);
+    }
+    let m = mask(size);
+    let (dst, src) = (dst & m, src & m);
+    let res = if count >= bits {
+        // Undefined for count >= width; approximate with src shifted.
+        (src << (count - bits)) & m
+    } else {
+        ((dst << count) | (src >> (bits - count))) & m
+    };
+    let cf = (dst >> (bits - count)) & 1 != 0;
+    s.set_flag(flags::CF, cf);
+    set_szp(s, res, size);
+    res
+}
+
+/// SHRD: shift `dst` right by `count`, feeding in the low bits of `src`.
+pub fn shrd(s: &mut CpuState, dst: u64, src: u64, count: u64, size: u8) -> u64 {
+    let bits = size as u32 * 8;
+    let count = (count & if size == 8 { 0x3f } else { 0x1f }) as u32;
+    if count == 0 {
+        return dst & mask(size);
+    }
+    let m = mask(size);
+    let (dst, src) = (dst & m, src & m);
+    let res = if count >= bits {
+        (src >> (count - bits)) & m
+    } else {
+        ((dst >> count) | (src << (bits - count))) & m
+    };
+    let cf = (dst >> (count - 1)) & 1 != 0;
+    s.set_flag(flags::CF, cf);
+    set_szp(s, res, size);
+    res
+}
+
 /// Shift/rotate kinds selected by the ModRM `reg` field of group 2.
 #[derive(Clone, Copy)]
 pub enum Shift {
