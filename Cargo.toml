@@ -17,8 +17,9 @@ members = [
     "crates/loader",
     "crates/memory",
     "crates/cpu",
+    "crates/os",
     # Added as each layer is built:
-    #   "crates/os", "crates/app", "crates/cli",
+    #   "crates/app", "crates/cli",
 ]
 
 [workspace.package]
