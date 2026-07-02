@@ -1,0 +1,15 @@
+[package]
+name = "exemu-os"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Emulated Windows environment: API thunks and kernel32 implementations (exemu Hooks)."
+
+[dependencies]
+exemu-core = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

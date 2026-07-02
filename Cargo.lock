@@ -27,3 +27,10 @@ version = "0.1.0"
 dependencies = [
  "exemu-core",
 ]
+
+[[package]]
+name = "exemu-os"
+version = "0.1.0"
+dependencies = [
+ "exemu-core",
+]
