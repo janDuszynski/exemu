@@ -243,6 +243,29 @@ impl Interpreter {
                 alu::logic(&mut self.state, a & imm, size);
             }
 
+            // ---- MOV AL/eAX <-> moffs (absolute address) ----------------
+            0xA0..=0xA3 => {
+                // The offset is an address-size immediate (4 or 8 bytes).
+                let mut addr = if ctx.bits == Bits::B64 { ctx.u64(mem)? } else { ctx.u32(mem)? as u64 };
+                if ctx.pfx.seg == 0x64 {
+                    addr = addr.wrapping_add(if ctx.bits == Bits::B64 { FS_BASE } else { FS_BASE_32 });
+                } else if ctx.pfx.seg == 0x65 {
+                    addr = addr.wrapping_add(GS_BASE);
+                }
+                addr &= self.addr_mask();
+                let size = if opcode & 1 == 0 { 1 } else { Self::opsize(&ctx) };
+                match opcode {
+                    0xA0 | 0xA1 => {
+                        let v = mem.read_uint(addr, size)?;
+                        self.state.gpr_write(0, size, v);
+                    }
+                    _ => {
+                        let v = self.state.gpr_read(0, size);
+                        mem.write_uint(addr, size, v)?;
+                    }
+                }
+            }
+
             // ---- String ops: MOVS / STOS / CMPS / LODS / SCAS -----------
             0xA4 | 0xA5 => {
                 let size = if opcode == 0xA4 { 1 } else { Self::opsize(&ctx) };

@@ -96,11 +96,28 @@ pub enum Api {
     /// A CRT startup/teardown hook we can safely no-op, returning 0.
     CrtNoop,
 
+    // --- Win32 string helpers (kernel32/user32) ---------------------------
+    CharNextA,
+    CharNextW,
+    CharPrevW,
+    LstrlenA,
+    LstrlenW,
+    LstrcpyW,
+    LstrcpynW,
+    LstrcatW,
+    LstrcmpW,
+    LstrcmpiW,
+    /// A handle/pointer-returning Win32 stub that must be non-null for the
+    /// caller to proceed; returns a fake handle. Carries its stdcall argc.
+    FakeHandle { sym: String, argc: u32 },
+
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
-    /// A recognized-by-shape but unimplemented import (`dll!name`).
-    Unsupported(String),
+    /// A recognized-by-shape but unimplemented import (`dll!name`). We still
+    /// record its stdcall argument count (from a table) so 32-bit stack
+    /// cleanup stays correct even though the behavior is a stub.
+    Unsupported { sym: String, argc: u32 },
 }
 
 impl Api {
@@ -158,6 +175,18 @@ impl Api {
             "exit" | "_exit" | "_cexit" | "_c_exit" => Api::CrtExit,
             "__getmainargs" | "__wgetmainargs" => Api::GetMainArgs,
             "_initterm" | "_initterm_e" => Api::Initterm,
+
+            // Win32 string helpers.
+            "CharNextA" => Api::CharNextA,
+            "CharNextW" => Api::CharNextW,
+            "CharPrevW" => Api::CharPrevW,
+            "lstrlenA" => Api::LstrlenA,
+            "lstrlenW" => Api::LstrlenW,
+            "lstrcpyW" | "lstrcpyA" => Api::LstrcpyW,
+            "lstrcpynW" | "lstrcpynA" => Api::LstrcpynW,
+            "lstrcatW" | "lstrcatA" => Api::LstrcatW,
+            "lstrcmpW" | "lstrcmpA" => Api::LstrcmpW,
+            "lstrcmpiW" | "lstrcmpiA" => Api::LstrcmpiW,
             "__set_app_type" | "_set_fmode" | "_get_fmode" | "__setusermatherr"
             | "_configthreadlocale" | "_controlfp" | "_controlfp_s"
             | "__C_specific_handler" | "_XcptFilter" | "_amsg_exit"
@@ -166,7 +195,20 @@ impl Api {
             | "_configure_narrow_argv" | "_initialize_narrow_environment"
             | "_get_initial_narrow_environment" | "_set_app_type" => Api::CrtNoop,
 
-            _ => Api::Unsupported(format!("{dll}!{name}")),
+            // Handle/pointer-returning Win32 functions: return a non-null
+            // fake handle so GUI setup "succeeds" and the program proceeds.
+            "GetDC" | "BeginPaint" | "CreateWindowExW" | "CreateDialogParamW" | "RegisterClassW"
+            | "LoadCursorW" | "LoadIconW" | "LoadImageW" | "LoadBitmapW" | "GetSystemMenu"
+            | "CreatePopupMenu" | "GetDlgItem" | "CreateBrushIndirect" | "CreateFontIndirectW"
+            | "FindWindowExW" | "SetTimer" | "GetStockObject" | "SelectObject" => Api::FakeHandle {
+                sym: format!("{dll}!{name}"),
+                argc: win32_argc(dll, name).unwrap_or(0),
+            },
+
+            _ => Api::Unsupported {
+                sym: format!("{dll}!{name}"),
+                argc: win32_argc(dll, name).unwrap_or(0),
+            },
         }
     }
 
@@ -211,16 +253,132 @@ impl Api {
             Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
             | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
             | Api::CrtNoop | Api::InittermDriver | Api::ReturnExit => 0,
-            // Unknown: we cannot know the stdcall footprint. Leave the stack
-            // as-is (caller-cleanup guess); logged elsewhere.
-            Api::Unsupported(_) => 0,
+            // Win32 string helpers.
+            Api::CharNextA | Api::CharNextW | Api::LstrlenA | Api::LstrlenW => 1,
+            Api::CharPrevW | Api::LstrcpyW | Api::LstrcatW | Api::LstrcmpW | Api::LstrcmpiW => 2,
+            Api::LstrcpynW => 3,
+            // Fake-handle and unimplemented stubs carry their looked-up
+            // stdcall footprint so the stack stays balanced.
+            Api::FakeHandle { argc, .. } | Api::Unsupported { argc, .. } => *argc,
         }
     }
+}
+
+/// Stdcall argument count (number of 4-byte stack parameters) for common
+/// Win32 functions, so 32-bit callee stack cleanup is correct even when the
+/// function is only a stub. `None` means unknown (caller-cleanup fallback).
+/// `wsprintf*` are intentionally cdecl (variadic) → 0.
+pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
+    // A few ordinal imports we recognize by (dll, ordinal).
+    if let Some(ord) = name.strip_prefix("#ord") {
+        return match (dll, ord) {
+            ("comctl32.dll", "17") => Some(0), // InitCommonControls
+            _ => None,
+        };
+    }
+    let n = match name {
+        // --- 0 args ---
+        "GetCommandLineW" | "GetLastError" | "GetTickCount" | "GetVersion" | "GetCurrentProcess"
+        | "CloseClipboard" | "CreatePopupMenu" | "EmptyClipboard" | "GetMessagePos"
+        | "OleUninitialize" | "wsprintfW" | "wsprintfA" => 0,
+
+        // --- 1 arg ---
+        "CloseHandle" | "FindClose" | "FreeLibrary" | "GetFileAttributesW" | "DeleteFileW"
+        | "GlobalFree" | "GlobalLock" | "GlobalUnlock" | "RemoveDirectoryW"
+        | "SetCurrentDirectoryW" | "GetModuleHandleA" | "GetModuleHandleW" | "Sleep"
+        | "SetErrorMode" | "lstrlenA" | "lstrlenW" | "DestroyWindow" | "GetDC" | "IsWindow"
+        | "IsWindowEnabled" | "IsWindowVisible" | "OpenClipboard" | "PostQuitMessage"
+        | "RegisterClassW" | "SetCursor" | "SetForegroundWindow" | "GetSysColor"
+        | "GetSystemMetrics" | "TranslateMessage" | "DispatchMessageW" | "MessageBoxIndirectW"
+        | "DeleteObject" | "CreateBrushIndirect" | "CreateFontIndirectW" | "RegCloseKey"
+        | "SHBrowseForFolderW" | "SHFileOperationW" | "OleInitialize" | "CoTaskMemFree"
+        | "ImageList_Destroy" => 1,
+
+        // --- 2 args ---
+        "CompareFileTime" | "CreateDirectoryW" | "GetFileSize" | "GlobalAlloc" | "MoveFileW"
+        | "SetEnvironmentVariableW" | "SetFileAttributesW" | "WaitForSingleObject"
+        | "GetExitCodeProcess" | "GetTempPathW" | "GetSystemDirectoryW" | "GetWindowsDirectoryW"
+        | "EnableWindow" | "EndDialog" | "EndPaint" | "ExitWindowsEx" | "GetClientRect"
+        | "GetDlgItem" | "GetSystemMenu" | "GetWindowLongW" | "GetWindowRect" | "LoadBitmapW"
+        | "LoadCursorW" | "ReleaseDC" | "ScreenToClient" | "SetClipboardData" | "SetWindowTextW"
+        | "ShowWindow" | "BeginPaint" | "GetDeviceCaps" | "SelectObject" | "SetBkColor"
+        | "SetBkMode" | "SetTextColor" | "RegDeleteKeyW" | "RegDeleteValueW"
+        | "SHGetPathFromIDListW" | "lstrcatW" | "lstrcmpW" | "lstrcmpiA" | "lstrcmpiW"
+        | "lstrcpyA" | "lstrcpyW" => 2,
+
+        // --- 3 args ---
+        "ExpandEnvironmentStringsW" | "CopyFileW" | "SetFileSecurityW" | "LoadLibraryExW"
+        | "GetShortPathNameW" | "MoveFileExW" | "CheckDlgButton" | "EnableMenuItem"
+        | "InvalidateRect" | "SetClassLongW" | "SetDlgItemTextW" | "SetWindowLongW"
+        | "GetClassInfoW" | "OpenProcessToken" | "LookupPrivilegeValueW"
+        | "SHGetSpecialFolderLocation" | "ImageList_AddMasked" | "MulDiv" | "lstrcpynW" => 3,
+
+        // --- 4 args ---
+        "GetModuleFileNameW" | "GetFullPathNameW" | "SetFilePointer" | "SetFileTime"
+        | "GetTempFileNameW" | "WritePrivateProfileStringW" | "AppendMenuW" | "DefWindowProcW"
+        | "FindWindowExW" | "GetDlgItemTextW" | "MessageBoxW" | "SendMessageW" | "GetMessageW"
+        | "SetTimer" | "SystemParametersInfoW" | "DrawTextW" | "FillRect" | "RegEnumKeyW" => 4,
+
+        // --- 5 args ---
+        "ReadFile" | "WriteFile" | "GetDiskFreeSpaceW" | "CallWindowProcW" | "CreateDialogParamW"
+        | "DialogBoxParamW" | "PeekMessageW" | "RegOpenKeyExW" | "SHGetFileInfoW"
+        | "CoCreateInstance" | "ImageList_Create" => 5,
+
+        // --- 6 args ---
+        "GetPrivateProfileStringW" | "SearchPathW" | "MultiByteToWideChar" | "CreateThread"
+        | "LoadImageW" | "AdjustTokenPrivileges" | "RegQueryValueExW" | "RegSetValueExW"
+        | "ShellExecuteW" => 6,
+
+        // --- 7 args ---
+        "CreateFileW" | "SetWindowPos" | "SendMessageTimeoutW" | "TrackPopupMenu" => 7,
+
+        // --- 8, 9, 10, 12 args ---
+        "WideCharToMultiByte" | "RegEnumValueW" => 8,
+        "RegCreateKeyExW" => 9,
+        "CreateProcessW" => 10,
+        "CreateWindowExW" => 12,
+
+        _ => return None,
+    };
+    Some(n)
 }
 
 /// Windows TRUE / FALSE as BOOL return values.
 const TRUE: u64 = 1;
 const FALSE: u64 = 0;
+
+/// A non-null sentinel returned by handle/pointer-returning stubs so callers
+/// treat the operation as having succeeded and keep running.
+const FAKE_HANDLE: u64 = 0x00CA_FE00;
+
+/// Length of a NUL-terminated UTF-16 string in code units.
+fn wstrlen(mem: &dyn Memory, addr: u64) -> Result<usize> {
+    let mut n = 0usize;
+    while mem.read_u16(addr + (n as u64) * 2)? != 0 {
+        n += 1;
+        if n > (1 << 20) {
+            break;
+        }
+    }
+    Ok(n)
+}
+
+/// Compare two NUL-terminated UTF-16 strings, optionally case-folding ASCII.
+fn wstrcmp(mem: &dyn Memory, a: u64, b: u64, fold: bool) -> Result<i32> {
+    let f = |c: u16| if fold && (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
+    let mut i = 0u64;
+    loop {
+        let x = f(mem.read_u16(a + i * 2)?);
+        let y = f(mem.read_u16(b + i * 2)?);
+        if x != y {
+            return Ok(if x < y { -1 } else { 1 });
+        }
+        if x == 0 {
+            return Ok(0);
+        }
+        i += 1;
+    }
+}
 
 impl WinOs {
     pub(crate) fn dispatch(
@@ -532,9 +690,84 @@ impl WinOs {
 
             Api::CrtNoop => ret(0),
 
-            Api::Unsupported(name) => {
+            // --- Win32 string helpers ---------------------------------------
+            Api::CharNextA => {
+                let p = self.arg(cpu, mem, 0)?;
+                ret(if mem.read_u8(p)? == 0 { p } else { p + 1 })
+            }
+            Api::CharNextW => {
+                let p = self.arg(cpu, mem, 0)?;
+                ret(if mem.read_u16(p)? == 0 { p } else { p + 2 })
+            }
+            Api::CharPrevW => {
+                let start = self.arg(cpu, mem, 0)?;
+                let p = self.arg(cpu, mem, 1)?;
+                ret(if p <= start { start } else { p - 2 })
+            }
+            Api::LstrlenA => {
+                let p = self.arg(cpu, mem, 0)?;
+                ret(if p == 0 { 0 } else { mem.read_cstr(p, 1 << 20)?.len() as u64 })
+            }
+            Api::LstrlenW => {
+                let p = self.arg(cpu, mem, 0)?;
+                ret(if p == 0 { 0 } else { wstrlen(mem, p)? as u64 })
+            }
+            Api::LstrcpyW => {
+                let dst = self.arg(cpu, mem, 0)?;
+                let src = self.arg(cpu, mem, 1)?;
+                let n = wstrlen(mem, src)?;
+                for i in 0..=n {
+                    let w = mem.read_u16(src + (i as u64) * 2)?;
+                    mem.write_u16(dst + (i as u64) * 2, w)?;
+                }
+                ret(dst)
+            }
+            Api::LstrcpynW => {
+                // lstrcpynW(dst, src, count): copy up to count-1 wchars, NUL-terminate.
+                let dst = self.arg(cpu, mem, 0)?;
+                let src = self.arg(cpu, mem, 1)?;
+                let count = self.arg(cpu, mem, 2)? as usize;
+                if count > 0 {
+                    let mut i = 0usize;
+                    while i + 1 < count {
+                        let w = mem.read_u16(src + (i as u64) * 2)?;
+                        mem.write_u16(dst + (i as u64) * 2, w)?;
+                        if w == 0 {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    // Ensure NUL termination at the last written slot.
+                    let last = if i + 1 >= count { count - 1 } else { i };
+                    if mem.read_u16(dst + (last as u64) * 2).unwrap_or(1) != 0 {
+                        mem.write_u16(dst + (last as u64) * 2, 0)?;
+                    }
+                }
+                ret(dst)
+            }
+            Api::LstrcatW => {
+                let dst = self.arg(cpu, mem, 0)?;
+                let src = self.arg(cpu, mem, 1)?;
+                let dlen = wstrlen(mem, dst)?;
+                let slen = wstrlen(mem, src)?;
+                for i in 0..=slen {
+                    let w = mem.read_u16(src + (i as u64) * 2)?;
+                    mem.write_u16(dst + ((dlen + i) as u64) * 2, w)?;
+                }
+                ret(dst)
+            }
+            Api::LstrcmpW | Api::LstrcmpiW => {
+                let a = self.arg(cpu, mem, 0)?;
+                let b = self.arg(cpu, mem, 1)?;
+                let fold = matches!(api, Api::LstrcmpiW);
+                ret(wstrcmp(mem, a, b, fold)? as u64)
+            }
+
+            Api::FakeHandle { .. } => ret(FAKE_HANDLE),
+
+            Api::Unsupported { sym, .. } => {
                 if self.cfg.trace {
-                    eprintln!("[exemu] unimplemented API {name} -> returning 0");
+                    eprintln!("[exemu] unimplemented API {sym} -> returning 0");
                 }
                 ret(0)
             }

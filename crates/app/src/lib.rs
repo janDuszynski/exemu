@@ -136,14 +136,14 @@ impl Process {
         for s in &image.sections {
             let addr = base + s.rva as u64;
             let size = align_up((s.virtual_size as u64).max(s.data.len() as u64), PAGE).max(PAGE);
-            // Always at least readable; add write/exec from the section flags.
-            let mut perm = Perm::READ;
-            if s.writable {
-                perm = perm.union(Perm::WRITE);
-            }
-            if s.executable {
-                perm = perm.union(Perm::EXEC);
-            }
+            // Map every section read/write/execute. Real-world installers and
+            // packers routinely execute code they generate or unpack into
+            // "data" sections (and write to "code" sections), which a strict
+            // DEP model would fault. Running arbitrary binaries matters more
+            // here than reproducing page-permission enforcement.
+            let mut perm = Perm::RWX;
+            let _ = (s.writable, s.executable); // characteristics kept for `info`
+            perm = perm.union(if s.readable { Perm::READ } else { Perm::NONE });
             mem.map_with_data(section_name(&s.name), addr, size, &s.data, perm)?;
         }
 
@@ -246,13 +246,23 @@ impl Process {
     /// Run until the process exits (or the step cap / a fault is hit).
     pub fn run(mut self) -> Result<RunResult> {
         let mut steps: u64 = 0;
+        // Rolling window of the most recent instruction pointers, for the
+        // fault report (helps trace how a bad jump was reached).
+        const TAIL: usize = 24;
+        let mut recent: std::collections::VecDeque<u64> = std::collections::VecDeque::with_capacity(TAIL + 1);
         let exit_code = loop {
             if self.max_steps != 0 && steps >= self.max_steps {
                 return Err(EmuError::Os(format!(
                     "instruction budget exhausted after {steps} steps (possible infinite loop)"
                 )));
             }
+            recent.push_back(self.cpu.state().rip);
+            if recent.len() > TAIL {
+                recent.pop_front();
+            }
+
             let outcome = self.cpu.step(&mut self.mem, &mut self.os);
+            let tail = || recent.iter().copied().collect::<Vec<_>>();
             match outcome {
                 Ok(Exit::Continue) => steps += 1,
                 Ok(Exit::ProcessExit(code)) => break code,
@@ -261,12 +271,13 @@ impl Process {
                     return Err(self.fault(
                         EmuError::Unsupported("direct SYSCALL instruction (no syscall layer emulated)".into()),
                         steps,
+                        &tail(),
                     ));
                 }
                 Ok(Exit::Interrupt(n)) => {
-                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps));
+                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &tail()));
                 }
-                Err(e) => return Err(self.fault(e, steps)),
+                Err(e) => return Err(self.fault(e, steps, &tail())),
             }
         };
 
@@ -281,7 +292,7 @@ impl Process {
     /// Wrap a fault with a diagnostic snapshot: the faulting instruction
     /// pointer, the bytes there (if fetchable), and the register file. This
     /// turns an opaque "unmapped memory access" into an actionable location.
-    fn fault(&self, err: EmuError, steps: u64) -> EmuError {
+    fn fault(&self, err: EmuError, steps: u64, recent: &[u64]) -> EmuError {
         use std::fmt::Write;
         let s = self.cpu.state();
         let mut o = String::new();
@@ -333,6 +344,12 @@ impl Process {
             }
             Err(_) => {
                 let _ = write!(o, "  (cannot fetch instruction bytes at rip — page not mapped/executable)");
+            }
+        }
+        if !recent.is_empty() {
+            let _ = write!(o, "\n  recent rip trail (oldest→newest):");
+            for r in recent {
+                let _ = write!(o, " {r:#x}");
             }
         }
         EmuError::Os(o)
