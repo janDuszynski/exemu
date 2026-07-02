@@ -296,7 +296,7 @@ impl Interpreter {
             if ctx.pfx.seg == 0x65 {
                 base = GS_BASE;
             } else if ctx.pfx.seg == 0x64 {
-                base = FS_BASE;
+                base = fs_base(ctx.bits);
             }
             ctx.rm = Rm::Mem { base, disp, rip_rel };
             return Ok(());
@@ -318,7 +318,7 @@ impl Interpreter {
         if ctx.pfx.seg == 0x65 {
             base = base.wrapping_add(GS_BASE);
         } else if ctx.pfx.seg == 0x64 {
-            base = base.wrapping_add(FS_BASE);
+            base = base.wrapping_add(fs_base(ctx.bits));
         }
 
         ctx.rm = Rm::Mem { base, disp, rip_rel: false };
@@ -438,11 +438,22 @@ impl Interpreter {
     }
 }
 
-/// Fixed virtual bases for the GS/FS segment overrides. The OS layer maps a
-/// page at [`GS_BASE`] so `gs:[0x60]`-style PEB/TEB probes resolve. These are
-/// public so the OS crate can install matching pages.
+/// Fixed virtual bases for the GS/FS segment overrides. In 64-bit mode the
+/// TEB lives at [`GS_BASE`] (`gs:[0x30]`/`gs:[0x60]`); in 32-bit mode it lives
+/// at [`FS_BASE_32`] (`fs:[0x18]`/`fs:[0x30]`), which must be a 32-bit
+/// address. The OS layer maps matching pages. All are public so it can.
 pub const GS_BASE: u64 = 0x0000_7FFF_0000_0000;
 pub const FS_BASE: u64 = 0x0000_7FFE_0000_0000;
+pub const FS_BASE_32: u64 = 0x7EFD_0000;
+
+/// The FS segment base for the current mode.
+#[inline]
+fn fs_base(bits: Bits) -> u64 {
+    match bits {
+        Bits::B32 => FS_BASE_32,
+        Bits::B64 => FS_BASE,
+    }
+}
 
 /// Convenience accessor used by the SIB/base math above.
 trait RegAt {
