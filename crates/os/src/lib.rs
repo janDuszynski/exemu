@@ -134,6 +134,17 @@ impl WinOs {
         (self.cfg.api_base, self.next_thunk)
     }
 
+    /// Reverse-lookup: which imported `dll!symbol` a thunk address belongs to.
+    /// Used to produce a precise diagnostic when the guest dereferences an
+    /// import thunk as data (i.e. the symbol was a data export, not a
+    /// function).
+    pub fn symbol_for_thunk(&self, addr: u64) -> Option<String> {
+        self.interned
+            .iter()
+            .find(|(_, &a)| a == addr)
+            .map(|((dll, name), _)| format!("{dll}!{name}"))
+    }
+
     /// Captured standard output produced by the guest.
     pub fn captured_stdout(&self) -> &[u8] {
         &self.stdout_buf

@@ -179,18 +179,21 @@ impl Process {
                     "instruction budget exhausted after {steps} steps (possible infinite loop)"
                 )));
             }
-            match self.cpu.step(&mut self.mem, &mut self.os)? {
-                Exit::Continue => steps += 1,
-                Exit::ProcessExit(code) => break code,
-                Exit::Halted => break 0,
-                Exit::Interrupt(0x80) => {
-                    return Err(EmuError::Unsupported(
-                        "direct SYSCALL instruction (no syscall layer emulated)".into(),
+            let outcome = self.cpu.step(&mut self.mem, &mut self.os);
+            match outcome {
+                Ok(Exit::Continue) => steps += 1,
+                Ok(Exit::ProcessExit(code)) => break code,
+                Ok(Exit::Halted) => break 0,
+                Ok(Exit::Interrupt(0x80)) => {
+                    return Err(self.fault(
+                        EmuError::Unsupported("direct SYSCALL instruction (no syscall layer emulated)".into()),
+                        steps,
                     ));
                 }
-                Exit::Interrupt(n) => {
-                    return Err(EmuError::Os(format!("unhandled interrupt {n:#x} at {:#x}", self.cpu.state().rip)));
+                Ok(Exit::Interrupt(n)) => {
+                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps));
                 }
+                Err(e) => return Err(self.fault(e, steps)),
             }
         };
 
@@ -200,6 +203,66 @@ impl Process {
             stdout: self.os.captured_stdout().to_vec(),
             stderr: self.os.captured_stderr().to_vec(),
         })
+    }
+
+    /// Wrap a fault with a diagnostic snapshot: the faulting instruction
+    /// pointer, the bytes there (if fetchable), and the register file. This
+    /// turns an opaque "unmapped memory access" into an actionable location.
+    fn fault(&self, err: EmuError, steps: u64) -> EmuError {
+        use std::fmt::Write;
+        let s = self.cpu.state();
+        let mut o = String::new();
+        let _ = writeln!(o, "{err}");
+
+        // If the fault touched an import thunk, the guest is treating an
+        // imported *function* slot as data — the tell-tale of a data export
+        // (very common in the MSVCRT C runtime, e.g. _fmode/_commode).
+        if let EmuError::Unmapped { addr, .. } = &err {
+            let (lo, hi) = self.os.thunk_range();
+            if *addr >= lo && *addr < hi {
+                let sym = self.os.symbol_for_thunk(*addr).unwrap_or_else(|| "<unknown import>".into());
+                let _ = writeln!(
+                    o,
+                    "  note: {addr:#018x} is the import thunk for {sym}.\n\
+                     \x20       the guest is dereferencing it as data, so {sym} is a *data* export,\n\
+                     \x20       not a function. exemu resolves imports as call targets only; data\n\
+                     \x20       imports (common in msvcrt/UCRT startup) are not supported."
+                );
+            }
+        }
+
+        let _ = writeln!(o, "  faulted after {steps} instructions");
+        let _ = writeln!(
+            o,
+            "  rip={:#018x}  rsp={:#018x}  rbp={:#018x}  rflags={:#06x}",
+            s.rip,
+            s.rsp(),
+            s.reg(exemu_core::Reg::Rbp),
+            s.rflags
+        );
+        for row in s.gpr.chunks(4).enumerate() {
+            let (r, regs) = row;
+            let _ = write!(o, "  ");
+            for (i, v) in regs.iter().enumerate() {
+                let name = exemu_core::Reg::NAMES[r * 4 + i];
+                let _ = write!(o, "{name:>3}={v:#018x}  ");
+            }
+            o.push('\n');
+        }
+        // Instruction bytes at rip, if the page is executable/readable.
+        let mut buf = [0u8; 16];
+        match self.mem.fetch(s.rip, &mut buf) {
+            Ok(()) => {
+                let _ = write!(o, "  bytes @ rip:");
+                for b in buf {
+                    let _ = write!(o, " {b:02x}");
+                }
+            }
+            Err(_) => {
+                let _ = write!(o, "  (cannot fetch instruction bytes at rip — page not mapped/executable)");
+            }
+        }
+        EmuError::Os(o)
     }
 }
 
