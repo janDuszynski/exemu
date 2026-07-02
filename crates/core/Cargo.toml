@@ -1,0 +1,15 @@
+[package]
+name = "exemu-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Domain layer for the exemu PE emulator: pure types and abstraction traits, no dependencies."
+
+[dependencies]
+# Intentionally empty. The domain layer must not depend on anything.
+
+[lints.rust]
+unsafe_code = "forbid"
