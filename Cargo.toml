@@ -15,9 +15,9 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/loader",
+    "crates/memory",
     # Added as each layer is built:
-    #   "crates/memory", "crates/cpu",
-    #   "crates/os", "crates/app", "crates/cli",
+    #   "crates/cpu", "crates/os", "crates/app", "crates/cli",
 ]
 
 [workspace.package]
