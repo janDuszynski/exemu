@@ -17,6 +17,7 @@ impl Interpreter {
             cur: start,
             reg: 0,
             rm: Rm::Reg(0),
+            bits: self.bits,
         };
 
         self.read_prefixes(&mut ctx, mem)?;
@@ -25,44 +26,82 @@ impl Interpreter {
         // The regular ALU opcodes 0x00..=0x3D share one handler.
         if opcode < 0x40 && (opcode & 7) < 6 {
             self.alu_regular(&mut ctx, mem, opcode)?;
-            self.state.rip = ctx.cur;
+            self.state.rip = ctx.cur & self.addr_mask();
             return Ok(Exit::Continue);
         }
 
         match opcode {
-            // ---- PUSH/POP r64 -------------------------------------------
+            // ---- INC/DEC r32 (32-bit mode only; REX otherwise) ----------
+            0x40..=0x4F => {
+                let r = opcode & 7;
+                let size = Self::opsize(&ctx);
+                let v = self.state.gpr_read(r, size);
+                let res = if opcode < 0x48 {
+                    alu::inc(&mut self.state, v, size)
+                } else {
+                    alu::dec(&mut self.state, v, size)
+                };
+                self.state.gpr_write(r, size, res);
+            }
+
+            // ---- PUSH/POP r64/r32 ---------------------------------------
             0x50..=0x57 => {
                 let r = (opcode & 7) | (ctx.pfx.b() << 3);
                 let v = self.state.gpr[r as usize];
-                self.push64(mem, v)?;
+                self.push_stack(mem, v)?;
             }
             0x58..=0x5F => {
                 let r = (opcode & 7) | (ctx.pfx.b() << 3);
-                let v = self.pop64(mem)?;
-                self.state.gpr[r as usize] = v;
+                let v = self.pop_stack(mem)?;
+                self.state.gpr[r as usize] = v & self.addr_mask();
+            }
+
+            // ---- PUSHA / POPA (32-bit only) -----------------------------
+            0x60 => {
+                let esp = self.state.rsp();
+                for r in [0u8, 1, 2, 3] {
+                    let v = self.state.gpr_read(r, 4);
+                    self.push_stack(mem, v)?;
+                }
+                self.push_stack(mem, esp)?; // original esp
+                for r in [5u8, 6, 7] {
+                    let v = self.state.gpr_read(r, 4);
+                    self.push_stack(mem, v)?;
+                }
+            }
+            0x61 => {
+                for r in [7u8, 6, 5] {
+                    let v = self.pop_stack(mem)?;
+                    self.state.gpr_write(r, 4, v);
+                }
+                let _esp = self.pop_stack(mem)?; // discard saved esp
+                for r in [3u8, 2, 1, 0] {
+                    let v = self.pop_stack(mem)?;
+                    self.state.gpr_write(r, 4, v);
+                }
             }
 
             0x68 => {
                 let imm = alu::sext(ctx.u32(mem)? as u64, 4);
-                self.push64(mem, imm)?;
+                self.push_stack(mem, imm)?;
             }
             0x6A => {
                 let imm = alu::sext(ctx.u8(mem)? as u64, 1);
-                self.push64(mem, imm)?;
+                self.push_stack(mem, imm)?;
             }
 
             // ---- MOVSXD r64, r/m32 --------------------------------------
             0x63 => {
                 self.read_modrm(&mut ctx, mem)?;
                 let v = self.read_rm(&ctx, &*mem, 4)?;
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(&ctx);
                 self.write_reg_field(&ctx, size, alu::sext(v, 4) & alu::mask(size));
             }
 
             // ---- IMUL r, r/m, imm ---------------------------------------
             0x69 | 0x6B => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(&ctx);
                 let imm = if opcode == 0x6B {
                     alu::sext(ctx.u8(mem)? as u64, 1)
                 } else {
@@ -84,7 +123,7 @@ impl Interpreter {
             // ---- Group 1: r/m, imm --------------------------------------
             0x80 | 0x81 | 0x83 => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = if opcode == 0x80 { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode == 0x80 { 1 } else { Self::opsize(&ctx) };
                 let op = ctx.reg & 7;
                 let imm = match opcode {
                     0x80 => ctx.u8(mem)? as u64,
@@ -101,7 +140,7 @@ impl Interpreter {
             // ---- TEST r/m, r --------------------------------------------
             0x84 | 0x85 => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = if opcode == 0x84 { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode == 0x84 { 1 } else { Self::opsize(&ctx) };
                 let a = self.read_rm(&ctx, &*mem, size)?;
                 let b = self.read_reg_field(&ctx, size);
                 alu::logic(&mut self.state, a & b, size);
@@ -110,7 +149,7 @@ impl Interpreter {
             // ---- XCHG r/m, r --------------------------------------------
             0x86 | 0x87 => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = if opcode == 0x86 { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode == 0x86 { 1 } else { Self::opsize(&ctx) };
                 let a = self.read_rm(&ctx, &*mem, size)?;
                 let b = self.read_reg_field(&ctx, size);
                 self.write_rm(&ctx, mem, size, b)?;
@@ -120,13 +159,13 @@ impl Interpreter {
             // ---- MOV r/m<->r --------------------------------------------
             0x88 | 0x89 => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = if opcode == 0x88 { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode == 0x88 { 1 } else { Self::opsize(&ctx) };
                 let v = self.read_reg_field(&ctx, size);
                 self.write_rm(&ctx, mem, size, v)?;
             }
             0x8A | 0x8B => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = if opcode == 0x8A { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode == 0x8A { 1 } else { Self::opsize(&ctx) };
                 let v = self.read_rm(&ctx, &*mem, size)?;
                 self.write_reg_field(&ctx, size, v);
             }
@@ -134,7 +173,7 @@ impl Interpreter {
             // ---- LEA r, m -----------------------------------------------
             0x8D => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(&ctx);
                 let addr = ctx.rm_addr();
                 self.write_reg_field(&ctx, size, addr);
             }
@@ -142,15 +181,16 @@ impl Interpreter {
             // ---- POP r/m (group 1A) -------------------------------------
             0x8F => {
                 self.read_modrm(&mut ctx, mem)?;
-                let v = self.pop64(mem)?;
-                self.write_rm(&ctx, mem, 8, v)?;
+                let v = self.pop_stack(mem)?;
+                let w = self.stack_width();
+                self.write_rm(&ctx, mem, w, v)?;
             }
 
             // ---- XCHG rAX, r / NOP / PAUSE ------------------------------
             0x90..=0x97 => {
                 let r = (opcode & 7) | (ctx.pfx.b() << 3);
                 if r != 0 {
-                    let size = Self::opsize(&ctx.pfx);
+                    let size = Self::opsize(&ctx);
                     let a = self.state.gpr_read(0, size);
                     let b = self.state.gpr_read(r, size);
                     self.state.gpr_write(0, size, b);
@@ -173,10 +213,21 @@ impl Interpreter {
                 }
             }
             0x99 => {
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(&ctx);
                 let a = self.state.gpr_read(0, size);
                 let hi = if a & alu::sign_bit(size) != 0 { alu::mask(size) } else { 0 };
                 self.state.gpr_write(2, size, hi);
+            }
+
+            // ---- PUSHF / POPF -------------------------------------------
+            0x9C => {
+                let flags = self.state.rflags;
+                self.push_stack(mem, flags)?;
+            }
+            0x9D => {
+                let v = self.pop_stack(mem)?;
+                // Keep the reserved bit set; ignore privileged/high bits.
+                self.state.rflags = (v & 0x0000_0000_00FC_FFD5) | flags::RESERVED_ONE;
             }
 
             // ---- TEST AL/eAX, imm ---------------------------------------
@@ -186,7 +237,7 @@ impl Interpreter {
                 alu::logic(&mut self.state, a & imm, 1);
             }
             0xA9 => {
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(&ctx);
                 let imm = self.imm_z(&mut ctx, mem, size)?;
                 let a = self.state.gpr_read(0, size);
                 alu::logic(&mut self.state, a & imm, size);
@@ -194,11 +245,11 @@ impl Interpreter {
 
             // ---- String ops: MOVS / STOS (with optional REP) ------------
             0xA4 | 0xA5 => {
-                let size = if opcode == 0xA4 { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode == 0xA4 { 1 } else { Self::opsize(&ctx) };
                 self.string_movs(mem, &ctx, size)?;
             }
             0xAA | 0xAB => {
-                let size = if opcode == 0xAA { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode == 0xAA { 1 } else { Self::opsize(&ctx) };
                 self.string_stos(mem, &ctx, size)?;
             }
 
@@ -226,7 +277,7 @@ impl Interpreter {
             // ---- Group 2 shifts -----------------------------------------
             0xC0 | 0xC1 | 0xD0 | 0xD1 | 0xD2 | 0xD3 => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = if opcode & 1 == 0 { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode & 1 == 0 { 1 } else { Self::opsize(&ctx) };
                 let kind = Shift::from_reg(ctx.reg);
                 let count = match opcode {
                     0xC0 | 0xC1 => ctx.u8(mem)? as u64,
@@ -241,13 +292,13 @@ impl Interpreter {
             // ---- RET -----------------------------------------------------
             0xC2 => {
                 let extra = ctx.u16(mem)? as u64;
-                let ret = self.pop64(mem)?;
+                let ret = self.pop_stack(mem)?;
                 self.state.set_rsp(self.state.rsp().wrapping_add(extra));
                 self.state.rip = ret;
                 return Ok(Exit::Continue);
             }
             0xC3 => {
-                let ret = self.pop64(mem)?;
+                let ret = self.pop_stack(mem)?;
                 self.state.rip = ret;
                 return Ok(Exit::Continue);
             }
@@ -260,7 +311,7 @@ impl Interpreter {
             }
             0xC7 => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(&ctx);
                 let imm = self.imm_z(&mut ctx, mem, size)?;
                 self.write_rm(&ctx, mem, size, imm)?;
             }
@@ -269,7 +320,7 @@ impl Interpreter {
             0xC9 => {
                 let bp = self.state.reg(exemu_core::Reg::Rbp);
                 self.state.set_rsp(bp);
-                let v = self.pop64(mem)?;
+                let v = self.pop_stack(mem)?;
                 self.state.set_reg(exemu_core::Reg::Rbp, v);
             }
 
@@ -285,7 +336,7 @@ impl Interpreter {
             0xE8 => {
                 let rel = ctx.u32(mem)? as i32 as i64;
                 let ret = ctx.cur;
-                self.push64(mem, ret)?;
+                self.push_stack(mem, ret)?;
                 self.state.rip = ret.wrapping_add(rel as u64);
                 return Ok(Exit::Continue);
             }
@@ -306,7 +357,7 @@ impl Interpreter {
             // ---- Group 3: F6/F7 -----------------------------------------
             0xF6 | 0xF7 => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = if opcode == 0xF6 { 1 } else { Self::opsize(&ctx.pfx) };
+                let size = if opcode == 0xF6 { 1 } else { Self::opsize(&ctx) };
                 match ctx.reg & 7 {
                     0 | 1 => {
                         let imm = if size == 1 {
@@ -364,7 +415,7 @@ impl Interpreter {
             // ---- Group 5: INC/DEC/CALL/JMP/PUSH r/m ---------------------
             0xFF => {
                 self.read_modrm(&mut ctx, mem)?;
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(&ctx);
                 match ctx.reg & 7 {
                     0 => {
                         let v = self.read_rm(&ctx, &*mem, size)?;
@@ -377,22 +428,25 @@ impl Interpreter {
                         self.write_rm(&ctx, mem, size, r)?;
                     }
                     2 => {
-                        // CALL r/m64
-                        let target = self.read_rm(&ctx, &*mem, 8)?;
+                        // CALL r/m (indirect, pointer-width operand)
+                        let w = self.stack_width();
+                        let target = self.read_rm(&ctx, &*mem, w)?;
                         let ret = ctx.cur;
-                        self.push64(mem, ret)?;
-                        self.state.rip = target;
+                        self.push_stack(mem, ret)?;
+                        self.state.rip = target & self.addr_mask();
                         return Ok(Exit::Continue);
                     }
                     4 => {
-                        // JMP r/m64
-                        let target = self.read_rm(&ctx, &*mem, 8)?;
-                        self.state.rip = target;
+                        // JMP r/m (indirect)
+                        let w = self.stack_width();
+                        let target = self.read_rm(&ctx, &*mem, w)?;
+                        self.state.rip = target & self.addr_mask();
                         return Ok(Exit::Continue);
                     }
                     6 => {
-                        let v = self.read_rm(&ctx, &*mem, 8)?;
-                        self.push64(mem, v)?;
+                        let w = self.stack_width();
+                        let v = self.read_rm(&ctx, &*mem, w)?;
+                        self.push_stack(mem, v)?;
                     }
                     other => {
                         return Err(EmuError::Unsupported(format!("group5 /{other} at {start:#x}")));
@@ -416,7 +470,7 @@ impl Interpreter {
             }
         }
 
-        self.state.rip = ctx.cur;
+        self.state.rip = ctx.cur & self.addr_mask();
         Ok(Exit::Continue)
     }
 
@@ -425,7 +479,7 @@ impl Interpreter {
     fn alu_regular(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, opcode: u8) -> Result<()> {
         let op = opcode >> 3;
         let form = opcode & 7;
-        let size = if form % 2 == 0 && form != 5 { 1 } else { Self::opsize(&ctx.pfx) };
+        let size = if form % 2 == 0 && form != 5 { 1 } else { Self::opsize(ctx) };
         match form {
             0 | 1 => {
                 self.read_modrm(ctx, mem)?;
@@ -664,7 +718,7 @@ impl Interpreter {
             // CMOVcc r, r/m
             0x40..=0x4F => {
                 self.read_modrm(ctx, mem)?;
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(ctx);
                 let v = self.read_rm(ctx, &*mem, size)?;
                 if self.cond(op2 & 0xF) {
                     self.write_reg_field(ctx, size, v);
@@ -689,7 +743,7 @@ impl Interpreter {
             // IMUL r, r/m
             0xAF => {
                 self.read_modrm(ctx, mem)?;
-                let size = Self::opsize(&ctx.pfx);
+                let size = Self::opsize(ctx);
                 let a = self.read_reg_field(ctx, size);
                 let b = self.read_rm(ctx, &*mem, size)?;
                 let r = self.imul_trunc(a, b, size);
@@ -700,14 +754,14 @@ impl Interpreter {
             0xB6 | 0xB7 => {
                 self.read_modrm(ctx, mem)?;
                 let src_size = if op2 == 0xB6 { 1 } else { 2 };
-                let dst = Self::opsize(&ctx.pfx);
+                let dst = Self::opsize(ctx);
                 let v = self.read_rm(ctx, &*mem, src_size)?;
                 self.write_reg_field(ctx, dst, v & alu::mask(src_size));
             }
             0xBE | 0xBF => {
                 self.read_modrm(ctx, mem)?;
                 let src_size = if op2 == 0xBE { 1 } else { 2 };
-                let dst = Self::opsize(&ctx.pfx);
+                let dst = Self::opsize(ctx);
                 let v = self.read_rm(ctx, &*mem, src_size)?;
                 self.write_reg_field(ctx, dst, alu::sext(v, src_size) & alu::mask(dst));
             }

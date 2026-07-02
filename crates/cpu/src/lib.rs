@@ -21,20 +21,64 @@ mod alu;
 use exemu_core::cpu::flags;
 use exemu_core::{Cpu, CpuState, EmuError, Exit, Hooks, Memory, Result};
 
-/// The interpreter. Owns nothing but the architectural state; memory and OS
-/// hooks are passed in per step so the same CPU can drive different worlds.
-#[derive(Default)]
+/// Processor operating mode: 32-bit (protected/IA-32) or 64-bit (long mode).
+/// Selects default operand/address size, REX-vs-inc/dec decoding, stack
+/// width and RIP-relative-vs-absolute addressing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Bits {
+    B32,
+    B64,
+}
+
+/// The interpreter. Owns nothing but the architectural state and the CPU
+/// mode; memory and OS hooks are passed in per step so the same CPU can
+/// drive different worlds.
 pub struct Interpreter {
     state: CpuState,
+    bits: Bits,
+}
+
+impl Default for Interpreter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Interpreter {
+    /// A fresh 64-bit interpreter.
     pub fn new() -> Self {
-        Interpreter { state: CpuState::new() }
+        Interpreter { state: CpuState::new(), bits: Bits::B64 }
+    }
+
+    /// A fresh interpreter in the given mode.
+    pub fn with_bits(bits: Bits) -> Self {
+        Interpreter { state: CpuState::new(), bits }
     }
 
     pub fn with_state(state: CpuState) -> Self {
-        Interpreter { state }
+        Interpreter { state, bits: Bits::B64 }
+    }
+
+    pub fn bits(&self) -> Bits {
+        self.bits
+    }
+
+    /// Address-space mask: full 64-bit, or 32-bit in protected mode.
+    #[inline]
+    fn addr_mask(&self) -> u64 {
+        match self.bits {
+            Bits::B64 => u64::MAX,
+            Bits::B32 => 0xFFFF_FFFF,
+        }
+    }
+
+    /// Stack slot / push-pop width in bytes.
+    #[inline]
+    fn stack_width(&self) -> u8 {
+        match self.bits {
+            Bits::B64 => 8,
+            Bits::B32 => 4,
+        }
     }
 }
 
@@ -108,6 +152,18 @@ struct Ctx {
     reg: u8,
     /// Decoded r/m location (valid once ModRM has been read).
     rm: Rm,
+    /// Processor mode for this instruction.
+    bits: Bits,
+}
+
+impl Ctx {
+    #[inline]
+    fn addr_mask(&self) -> u64 {
+        match self.bits {
+            Bits::B64 => u64::MAX,
+            Bits::B32 => 0xFFFF_FFFF,
+        }
+    }
 }
 
 impl Ctx {
@@ -136,10 +192,11 @@ impl Ctx {
     }
 
     /// Final address of a memory r/m operand, resolving RIP-relative against
-    /// the end of the instruction (`cur` must already point past it).
+    /// the end of the instruction (`cur` must already point past it) and
+    /// masking to the address width of the current mode.
     #[inline]
     fn rm_addr(&self) -> u64 {
-        match self.rm {
+        let a = match self.rm {
             Rm::Mem { base, disp, rip_rel } => {
                 if rip_rel {
                     self.cur.wrapping_add(disp as u64)
@@ -148,19 +205,21 @@ impl Ctx {
                 }
             }
             Rm::Reg(_) => 0,
-        }
+        };
+        a & self.addr_mask()
     }
 }
 
 // --- The interpreter proper --------------------------------------------------
 
 impl Interpreter {
-    /// Operand size in bytes from the prefixes (default 4, REX.W → 8, 0x66 → 2).
+    /// Operand size in bytes: default 4, `0x66` → 2, and REX.W → 8 in 64-bit
+    /// mode (there is no REX in 32-bit mode).
     #[inline]
-    fn opsize(pfx: &Prefixes) -> u8 {
-        if pfx.w() {
+    fn opsize(ctx: &Ctx) -> u8 {
+        if ctx.bits == Bits::B64 && ctx.pfx.w() {
             8
-        } else if pfx.p66 {
+        } else if ctx.pfx.p66 {
             2
         } else {
             4
@@ -172,13 +231,14 @@ impl Interpreter {
             let b = ctx.u8(mem)?;
             match b {
                 0x66 => ctx.pfx.p66 = true,
-                0x67 => {} // address-size override: we always use 64-bit addressing
+                0x67 => {} // address-size override: handled per-mode elsewhere
                 0xF0 => {} // LOCK: no-op for a single-threaded interpreter
                 0xF2 | 0xF3 => ctx.pfx.rep = b,
                 0x2E | 0x36 | 0x3E | 0x26 => {} // CS/SS/DS/ES overrides: flat model
                 0x64 | 0x65 => ctx.pfx.seg = b, // FS/GS
-                0x40..=0x4F => {
-                    // REX must be the last prefix; consume and stop.
+                // 0x40..=0x4F are REX prefixes only in 64-bit mode; in 32-bit
+                // mode they are inc/dec r32 opcodes, so fall through to decode.
+                0x40..=0x4F if ctx.bits == Bits::B64 => {
                     ctx.pfx.rex = b;
                     ctx.pfx.has_rex = true;
                     return Ok(());
@@ -229,9 +289,16 @@ impl Interpreter {
                 base = base.wrapping_add(self.state.reg_at(base_reg));
             }
         } else if rm == 5 && mod_ == 0 {
-            // RIP-relative disp32.
+            // 64-bit: RIP-relative disp32. 32-bit: absolute disp32.
             let disp = ctx.u32(mem)? as i32 as i64;
-            ctx.rm = Rm::Mem { base: 0, disp, rip_rel: true };
+            let rip_rel = ctx.bits == Bits::B64;
+            let mut base = 0u64;
+            if ctx.pfx.seg == 0x65 {
+                base = GS_BASE;
+            } else if ctx.pfx.seg == 0x64 {
+                base = FS_BASE;
+            }
+            ctx.rm = Rm::Mem { base, disp, rip_rel };
             return Ok(());
         } else {
             base = self.state.reg_at(rm | (ctx.pfx.b() << 3));
@@ -308,17 +375,22 @@ impl Interpreter {
     }
 
     // ---- stack -----------------------------------------------------------
+    //
+    // The slot width follows the CPU mode: 8 bytes in long mode, 4 in
+    // protected mode. `rsp`/`esp` arithmetic is masked to the address width.
 
-    fn push64(&mut self, mem: &mut dyn Memory, val: u64) -> Result<()> {
-        let sp = self.state.rsp().wrapping_sub(8);
+    fn push_stack(&mut self, mem: &mut dyn Memory, val: u64) -> Result<()> {
+        let w = self.stack_width();
+        let sp = self.state.rsp().wrapping_sub(w as u64) & self.addr_mask();
         self.state.set_rsp(sp);
-        mem.write_u64(sp, val)
+        mem.write_uint(sp, w, val)
     }
 
-    fn pop64(&mut self, mem: &mut dyn Memory) -> Result<u64> {
-        let sp = self.state.rsp();
-        let v = mem.read_u64(sp)?;
-        self.state.set_rsp(sp.wrapping_add(8));
+    fn pop_stack(&mut self, mem: &mut dyn Memory) -> Result<u64> {
+        let w = self.stack_width();
+        let sp = self.state.rsp() & self.addr_mask();
+        let v = mem.read_uint(sp, w)?;
+        self.state.set_rsp(sp.wrapping_add(w as u64) & self.addr_mask());
         Ok(v)
     }
 
