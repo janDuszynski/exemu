@@ -60,6 +60,9 @@ pub enum Api {
     LoadLibraryA,
     FreeLibrary,
     GetProcAddress,
+    /// Not an import: the sentinel return address pushed under the entry
+    /// point. If the entry `ret`s here, terminate with the code in EAX.
+    ReturnExit,
     /// A recognized-by-shape but unimplemented import (`dll!name`).
     Unsupported(String),
 }
@@ -126,6 +129,11 @@ impl WinOs {
         match api {
             Api::ExitProcess => {
                 let code = self.arg(cpu, mem, 0)? as u32 as i32;
+                Ok(Outcome::Exit(code))
+            }
+            Api::ReturnExit => {
+                // The entry function returned; its exit code is in EAX.
+                let code = cpu.gpr_read(0, 4) as u32 as i32;
                 Ok(Outcome::Exit(code))
             }
             Api::TerminateProcess => {

@@ -1,0 +1,19 @@
+[package]
+name = "exemu-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Application layer: loads a PE, builds the process image, and runs the emulation loop."
+
+[dependencies]
+exemu-core = { workspace = true }
+exemu-loader = { workspace = true }
+exemu-memory = { workspace = true }
+exemu-cpu = { workspace = true }
+exemu-os = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

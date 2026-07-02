@@ -1,0 +1,21 @@
+[package]
+name = "exemu-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Command-line front-end for the exemu Windows PE emulator."
+
+[[bin]]
+name = "exemu"
+path = "src/main.rs"
+
+[dependencies]
+exemu-core = { workspace = true }
+exemu-loader = { workspace = true }
+exemu-app = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
