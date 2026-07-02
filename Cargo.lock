@@ -3,6 +3,26 @@
 version = 3
 
 [[package]]
+name = "exemu-app"
+version = "0.1.0"
+dependencies = [
+ "exemu-core",
+ "exemu-cpu",
+ "exemu-loader",
+ "exemu-memory",
+ "exemu-os",
+]
+
+[[package]]
+name = "exemu-cli"
+version = "0.1.0"
+dependencies = [
+ "exemu-app",
+ "exemu-core",
+ "exemu-loader",
+]
+
+[[package]]
 name = "exemu-core"
 version = "0.1.0"
 

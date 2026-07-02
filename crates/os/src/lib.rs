@@ -118,6 +118,16 @@ impl WinOs {
         addr
     }
 
+    /// Allocate the sentinel "return address" placed beneath the entry point.
+    /// When the guest's entry function `ret`s to it, the process terminates
+    /// with the code in EAX.
+    pub fn exit_thunk(&mut self) -> u64 {
+        let addr = self.next_thunk;
+        self.next_thunk += 8;
+        self.thunks.insert(addr, Api::ReturnExit);
+        addr
+    }
+
     /// Range `[start, end)` of assigned thunk addresses, so the application
     /// can (optionally) reserve it in the memory map.
     pub fn thunk_range(&self) -> (u64, u64) {
