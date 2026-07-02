@@ -1,0 +1,15 @@
+[package]
+name = "exemu-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Region-based guest virtual memory implementing the exemu-core Memory trait."
+
+[dependencies]
+exemu-core = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -12,3 +12,10 @@ version = "0.1.0"
 dependencies = [
  "exemu-core",
 ]
+
+[[package]]
+name = "exemu-memory"
+version = "0.1.0"
+dependencies = [
+ "exemu-core",
+]
