@@ -124,18 +124,24 @@ exemu sample <out.exe>
   seeded with the command line.
 * A slice of the **`msvcrt` C runtime**: `malloc`/`calloc`/`realloc`/`free`,
   `memcpy`/`memmove`/`memset`/`memcmp`/`strlen`, the `exit` family,
-  `__getmainargs`, and no-op startup hooks (`__set_app_type`, `_initterm`,
-  `_controlfp`, …). Enough that MSVCRT-linked binaries get through CRT
-  startup and into their own `main`.
+  `__getmainargs`, and no-op startup hooks (`__set_app_type`, `_controlfp`,
+  …). Enough that MSVCRT-linked binaries get through CRT startup and into
+  their own `main`.
+* **Re-entrant guest calls**: `_initterm` actually runs the initializer
+  table (C/C++ static constructors) *as real guest calls*, in order, before
+  returning. It does this with a driver-thunk state machine — an API handler
+  seats a call frame pointing at a sentinel thunk, and each return advances
+  to the next callback — so no nested interpreter loop is needed. This is
+  the general mechanism any callback-taking API (`atexit`, `qsort`, window
+  procedures) would build on.
 
 ### Not implemented (yet)
 
 SSE/AVX and x87 floating point; TLS callbacks and base relocations (images
 load at their preferred base); table-based structured exception handling
-(`.pdata`/`__C_specific_handler` is a no-op); C++ static initializers
-(`_initterm` is skipped, since servicing it would require re-entrant guest
-calls); threads; and the Win32 **GUI**, **COM**, registry and shell surfaces
-(`user32`/`ole32`/`advapi32`/`shell32`).
+(`.pdata`/`__C_specific_handler` is a no-op — fine unless an exception is
+actually thrown); threads; and the Win32 **GUI**, **COM**, registry and
+shell surfaces (`user32`/`ole32`/`advapi32`/`shell32`).
 
 As a concrete data point, the 7-Zip GUI installer (`7z…-x64.exe`, MSVC +
 `msvcrt`) now executes ~49k instructions of real CRT and program code before

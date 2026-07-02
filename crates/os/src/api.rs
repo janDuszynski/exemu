@@ -5,7 +5,9 @@
 //! arguments already in guest registers/stack and returns an [`Outcome`]
 //! (a return value, or process termination).
 
-use exemu_core::{CpuState, Memory, Result};
+use std::collections::VecDeque;
+
+use exemu_core::{CpuState, Memory, Reg, Result};
 
 use crate::{WinOs, HANDLE_PROCESS_HEAP, HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT};
 
@@ -15,6 +17,18 @@ pub(crate) enum Outcome {
     Return(u64),
     /// Terminate the process with this exit code.
     Exit(i32),
+    /// The handler has already set `rip`/`rsp` itself (it is driving a
+    /// re-entrant guest call). Leave the CPU untouched and keep executing.
+    Resume,
+}
+
+/// One in-flight `_initterm` invocation: the constructors still to call, the
+/// address to return to when they are all done, and the stack pointer at
+/// `_initterm` entry (which points at that return address).
+pub(crate) struct InittermFrame {
+    pub remaining: VecDeque<u64>,
+    pub ret: u64,
+    pub saved_rsp: u64,
 }
 
 /// Every Windows symbol the emulator implements natively. Anything else
@@ -75,6 +89,10 @@ pub enum Api {
     CrtExit,
     /// __getmainargs / __wgetmainargs — populate argc/argv/env.
     GetMainArgs,
+    /// _initterm / _initterm_e — run a table of initializer callbacks.
+    Initterm,
+    /// Not an import: the thunk that sequences `_initterm` callbacks.
+    InittermDriver,
     /// A CRT startup/teardown hook we can safely no-op, returning 0.
     CrtNoop,
 
@@ -139,9 +157,10 @@ impl Api {
             "strlen" => Api::Strlen,
             "exit" | "_exit" | "_cexit" | "_c_exit" => Api::CrtExit,
             "__getmainargs" | "__wgetmainargs" => Api::GetMainArgs,
+            "_initterm" | "_initterm_e" => Api::Initterm,
             "__set_app_type" | "_set_fmode" | "_get_fmode" | "__setusermatherr"
-            | "_configthreadlocale" | "_controlfp" | "_controlfp_s" | "_initterm"
-            | "_initterm_e" | "__C_specific_handler" | "_XcptFilter" | "_amsg_exit"
+            | "_configthreadlocale" | "_controlfp" | "_controlfp_s"
+            | "__C_specific_handler" | "_XcptFilter" | "_amsg_exit"
             | "signal" | "_lock" | "_unlock" | "_onexit" | "atexit" | "__dllonexit"
             | "_setmode" | "setlocale" | "_set_new_mode" | "__p__fmode"
             | "_configure_narrow_argv" | "_initialize_narrow_environment"
@@ -431,6 +450,39 @@ impl WinOs {
                 ret(0)
             }
 
+            // _initterm(first, last): call each non-null function pointer in
+            // [first, last). We drive them as real guest calls (so C++ static
+            // constructors actually run) via the InittermDriver thunk.
+            Api::Initterm => {
+                let first = self.arg(cpu, mem, 0)?;
+                let last = self.arg(cpu, mem, 1)?;
+                let saved_rsp = cpu.rsp();
+                let ret_addr = mem.read_u64(saved_rsp)?;
+
+                let mut fns = VecDeque::new();
+                let mut p = first;
+                while p < last {
+                    let f = mem.read_u64(p)?;
+                    if f != 0 {
+                        fns.push_back(f);
+                    }
+                    p += 8;
+                }
+
+                match fns.pop_front() {
+                    None => Ok(Outcome::Return(0)), // nothing to initialize
+                    Some(first_fn) => {
+                        self.initterm_stack.push(InittermFrame { remaining: fns, ret: ret_addr, saved_rsp });
+                        let driver = self.initterm_driver;
+                        setup_call(cpu, mem, first_fn, driver, saved_rsp)?;
+                        Ok(Outcome::Resume)
+                    }
+                }
+            }
+            // A constructor just returned to the driver thunk: run the next
+            // one, or return to _initterm's original caller when done.
+            Api::InittermDriver => self.initterm_advance(cpu, mem),
+
             Api::CrtNoop => ret(0),
 
             Api::Unsupported(name) => {
@@ -451,4 +503,47 @@ impl WinOs {
         self.emit(is_err, &bytes);
         Ok(())
     }
+
+    /// Called when a `_initterm` callback returns to the driver thunk. Runs
+    /// the next callback, or unwinds back to `_initterm`'s original caller.
+    fn initterm_advance(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let next = self
+            .initterm_stack
+            .last_mut()
+            .and_then(|f| f.remaining.pop_front());
+
+        match next {
+            Some(func) => {
+                let base = self.initterm_stack.last().unwrap().saved_rsp;
+                let driver = self.initterm_driver;
+                setup_call(cpu, mem, func, driver, base)?;
+                Ok(Outcome::Resume)
+            }
+            None => {
+                // All callbacks done: return to _initterm's caller with 0.
+                let frame = self.initterm_stack.pop().expect("driver without frame");
+                cpu.set_rsp(frame.saved_rsp + 8);
+                cpu.rip = frame.ret;
+                cpu.set_reg(Reg::Rax, 0);
+                Ok(Outcome::Resume)
+            }
+        }
+    }
+}
+
+/// Set up a Windows x64 call frame below `base_rsp` and point the CPU at
+/// `func` with `ret_addr` as its return address. Reserves the 32-byte shadow
+/// space and leaves `rsp % 16 == 8`, exactly as a real `call` would.
+fn setup_call(
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+    func: u64,
+    ret_addr: u64,
+    base_rsp: u64,
+) -> Result<()> {
+    let sp = (base_rsp & !0xf) - 0x20 - 8;
+    mem.write_u64(sp, ret_addr)?;
+    cpu.set_rsp(sp);
+    cpu.rip = func;
+    Ok(())
 }
