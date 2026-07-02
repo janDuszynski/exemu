@@ -794,6 +794,40 @@ impl Interpreter {
         Ok(())
     }
 
+    /// BT/BTS/BTR/BTC: test bit `idx` of the r/m operand into CF, then set,
+    /// reset or complement it. `op2` selects the variant.
+    fn bit_op(&mut self, ctx: &Ctx, mem: &mut dyn Memory, op2: u8, size: u8, idx: u64) -> Result<()> {
+        let modify = |v: u64, bit: u32| -> u64 {
+            match op2 {
+                0xAB => v | (1u64 << bit),  // BTS
+                0xB3 => v & !(1u64 << bit), // BTR
+                0xBB => v ^ (1u64 << bit),  // BTC
+                _ => v,                     // BT
+            }
+        };
+        match ctx.rm {
+            Rm::Reg(i) => {
+                let bit = (idx % (size as u64 * 8)) as u32;
+                let val = self.state.gpr_read(i, size);
+                self.state.set_flag(flags::CF, (val >> bit) & 1 != 0);
+                if op2 != 0xA3 {
+                    self.state.gpr_write(i, size, modify(val, bit));
+                }
+            }
+            Rm::Mem { .. } => {
+                let base = ctx.rm_addr();
+                let addr = (base as i64 + (idx as i64).div_euclid(8)) as u64 & self.addr_mask();
+                let bit = (idx & 7) as u32;
+                let byte = mem.read_u8(addr)?;
+                self.state.set_flag(flags::CF, (byte >> bit) & 1 != 0);
+                if op2 != 0xA3 {
+                    mem.write_u8(addr, modify(byte as u64, bit) as u8)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Decrement the count and evaluate the REPE/REPNE termination condition
     /// for CMPS/SCAS. Returns true when the repetition should stop.
     fn rep_string_break(&mut self, rep: u8) -> bool {
@@ -894,6 +928,90 @@ impl Interpreter {
                 let dst = Self::opsize(ctx);
                 let v = self.read_rm(ctx, &*mem, src_size)?;
                 self.write_reg_field(ctx, dst, alu::sext(v, src_size) & alu::mask(dst));
+            }
+
+            // ---- SHLD / SHRD --------------------------------------------
+            0xA4 | 0xA5 | 0xAC | 0xAD => {
+                self.read_modrm(ctx, mem)?;
+                let size = Self::opsize(ctx);
+                let count = if op2 & 1 == 0 { ctx.u8(mem)? as u64 } else { self.state.gpr_read(1, 1) };
+                let dst = self.read_rm(ctx, &*mem, size)?;
+                let src = self.read_reg_field(ctx, size);
+                let r = if op2 < 0xAC {
+                    alu::shld(&mut self.state, dst, src, count, size)
+                } else {
+                    alu::shrd(&mut self.state, dst, src, count, size)
+                };
+                self.write_rm(ctx, mem, size, r)?;
+            }
+
+            // ---- BT / BTS / BTR / BTC (reg bit index) -------------------
+            0xA3 | 0xAB | 0xB3 | 0xBB => {
+                self.read_modrm(ctx, mem)?;
+                let size = Self::opsize(ctx);
+                let idx = self.read_reg_field(ctx, size);
+                self.bit_op(ctx, mem, op2, size, idx)?;
+            }
+            // ---- Group 8: BT/BTS/BTR/BTC r/m, imm8 ----------------------
+            0xBA => {
+                self.read_modrm(ctx, mem)?;
+                let size = Self::opsize(ctx);
+                let idx = ctx.u8(mem)? as u64;
+                let sub = match ctx.reg & 7 {
+                    4 => 0xA3, // BT
+                    5 => 0xAB, // BTS
+                    6 => 0xB3, // BTR
+                    _ => 0xBB, // BTC
+                };
+                self.bit_op(ctx, mem, sub, size, idx)?;
+            }
+
+            // ---- BSF / BSR ----------------------------------------------
+            0xBC | 0xBD => {
+                self.read_modrm(ctx, mem)?;
+                let size = Self::opsize(ctx);
+                let v = self.read_rm(ctx, &*mem, size)? & alu::mask(size);
+                if v == 0 {
+                    self.state.set_flag(flags::ZF, true);
+                } else {
+                    self.state.set_flag(flags::ZF, false);
+                    let idx = if op2 == 0xBC { v.trailing_zeros() } else { 63 - v.leading_zeros() };
+                    self.write_reg_field(ctx, size, idx as u64);
+                }
+            }
+
+            // ---- BSWAP r32/r64 ------------------------------------------
+            0xC8..=0xCF => {
+                let r = (op2 & 7) | (ctx.pfx.b() << 3);
+                let size = if ctx.pfx.w() { 8 } else { 4 };
+                let v = self.state.gpr_read(r, size);
+                let swapped = if size == 8 { v.swap_bytes() } else { (v as u32).swap_bytes() as u64 };
+                self.state.gpr_write(r, size, swapped);
+            }
+
+            // ---- XADD ---------------------------------------------------
+            0xC0 | 0xC1 => {
+                self.read_modrm(ctx, mem)?;
+                let size = if op2 == 0xC0 { 1 } else { Self::opsize(ctx) };
+                let dst = self.read_rm(ctx, &*mem, size)?;
+                let src = self.read_reg_field(ctx, size);
+                let sum = alu::add(&mut self.state, dst, src, 0, size);
+                self.write_reg_field(ctx, size, dst);
+                self.write_rm(ctx, mem, size, sum)?;
+            }
+            // ---- CMPXCHG ------------------------------------------------
+            0xB0 | 0xB1 => {
+                self.read_modrm(ctx, mem)?;
+                let size = if op2 == 0xB0 { 1 } else { Self::opsize(ctx) };
+                let dst = self.read_rm(ctx, &*mem, size)?;
+                let acc = self.state.gpr_read(0, size);
+                alu::sub(&mut self.state, acc, dst, 0, size); // sets ZF on equality
+                if self.state.flag(flags::ZF) {
+                    let src = self.read_reg_field(ctx, size);
+                    self.write_rm(ctx, mem, size, src)?;
+                } else {
+                    self.state.gpr_write(0, size, dst); // acc = dst
+                }
             }
 
             other => {

@@ -200,6 +200,54 @@ fn rep_stosb_fills_memory() {
 }
 
 #[test]
+fn shld_shifts_in_from_source() {
+    // mov eax,0x12345678 ; mov ebx,0x9ABCDEF0 ; shld eax,ebx,8 ; hlt
+    // eax = (eax<<8) | (ebx>>24) = 0x3456789A
+    let code = [
+        0xB8, 0x78, 0x56, 0x34, 0x12, // mov eax, 0x12345678
+        0xBB, 0xF0, 0xDE, 0xBC, 0x9A, // mov ebx, 0x9ABCDEF0
+        0x0F, 0xA4, 0xD8, 0x08, // shld eax, ebx, 8
+        0xF4,
+    ];
+    assert_eq!(rax(&run(&code)) & 0xffff_ffff, 0x3456_789A);
+}
+
+#[test]
+fn bt_imm_sets_carry_and_setcc() {
+    // mov eax,0x100 ; bt eax,8 ; setc bl ; movzx eax,bl ; hlt → eax=1
+    let code = [
+        0xB8, 0x00, 0x01, 0x00, 0x00, // mov eax, 0x100
+        0x0F, 0xBA, 0xE0, 0x08, // bt eax, 8
+        0x0F, 0x92, 0xC3, // setc bl
+        0x0F, 0xB6, 0xC3, // movzx eax, bl
+        0xF4,
+    ];
+    assert_eq!(rax(&run(&code)), 1);
+}
+
+#[test]
+fn bsf_finds_lowest_set_bit() {
+    // mov eax,0x10 ; bsf eax,eax ; hlt → eax=4
+    let code = [
+        0xB8, 0x10, 0x00, 0x00, 0x00, // mov eax, 0x10
+        0x0F, 0xBC, 0xC0, // bsf eax, eax
+        0xF4,
+    ];
+    assert_eq!(rax(&run(&code)), 4);
+}
+
+#[test]
+fn bswap_reverses_bytes() {
+    // mov eax,0x11223344 ; bswap eax ; hlt → eax=0x44332211
+    let code = [
+        0xB8, 0x44, 0x33, 0x22, 0x11, // mov eax, 0x11223344
+        0x0F, 0xC8, // bswap eax
+        0xF4,
+    ];
+    assert_eq!(rax(&run(&code)) & 0xffff_ffff, 0x4433_2211);
+}
+
+#[test]
 fn overflow_flag_on_signed_add() {
     // mov eax, 0x7FFFFFFF ; add eax, 1 ; hlt → OF set, SF set
     let code = [
