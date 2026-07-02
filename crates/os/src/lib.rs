@@ -254,6 +254,9 @@ impl Hooks for WinOs {
         let Some(api) = self.thunks.get(&rip).cloned() else {
             return Ok(None);
         };
+        if self.cfg.trace {
+            eprintln!("[exemu] call {api:?}  (thunk {rip:#x})");
+        }
         let argc = api.argc();
         match self.dispatch(&api, cpu, mem)? {
             api::Outcome::Return(value) => {
