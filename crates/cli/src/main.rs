@@ -119,7 +119,8 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let image = exemu_loader::parse(&bytes).map_err(|e| e.to_string())?;
 
-    println!("PE64 image: {path}");
+    println!("PE image: {path}");
+    println!("  format       : {}", if image.is_64bit { "PE32+ (x86-64)" } else { "PE32 (x86-32)" });
     println!("  image base   : {:#018x}", image.image_base);
     println!("  entry point  : {:#018x} (rva {:#x})", image.entry_va(), image.entry_rva);
     println!("  size of image: {:#x}", image.size_of_image);
