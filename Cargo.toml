@@ -14,8 +14,9 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/loader",
     # Added as each layer is built:
-    #   "crates/loader", "crates/memory", "crates/cpu",
+    #   "crates/memory", "crates/cpu",
     #   "crates/os", "crates/app", "crates/cli",
 ]
 
