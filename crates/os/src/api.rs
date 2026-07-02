@@ -111,6 +111,22 @@ pub enum Api {
     /// caller to proceed; returns a fake handle. Carries its stdcall argc.
     FakeHandle { sym: String, argc: u32 },
 
+    // --- Filesystem (host-backed sandbox) ---------------------------------
+    CreateFileW,
+    ReadFileApi,
+    CloseHandle,
+    CreateDirectoryW,
+    GetTempPathW,
+    GetTempFileNameW,
+    GetFileSizeApi,
+    SetFilePointerApi,
+    GetFileAttributesW,
+    DeleteFileW,
+    GetModuleFileNameW,
+    GlobalAlloc,
+    GlobalLock,
+    GlobalFreeUnlock,
+
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
@@ -187,6 +203,22 @@ impl Api {
             "lstrcatW" | "lstrcatA" => Api::LstrcatW,
             "lstrcmpW" | "lstrcmpA" => Api::LstrcmpW,
             "lstrcmpiW" | "lstrcmpiA" => Api::LstrcmpiW,
+
+            // Filesystem.
+            "CreateFileW" => Api::CreateFileW,
+            "ReadFile" => Api::ReadFileApi,
+            "CloseHandle" => Api::CloseHandle,
+            "CreateDirectoryW" => Api::CreateDirectoryW,
+            "GetTempPathW" => Api::GetTempPathW,
+            "GetTempFileNameW" => Api::GetTempFileNameW,
+            "GetFileSize" => Api::GetFileSizeApi,
+            "SetFilePointer" => Api::SetFilePointerApi,
+            "GetFileAttributesW" => Api::GetFileAttributesW,
+            "DeleteFileW" => Api::DeleteFileW,
+            "GetModuleFileNameW" | "GetModuleFileNameA" => Api::GetModuleFileNameW,
+            "GlobalAlloc" | "LocalAlloc" => Api::GlobalAlloc,
+            "GlobalLock" | "LocalLock" | "GlobalHandle" => Api::GlobalLock,
+            "GlobalFree" | "GlobalUnlock" | "LocalFree" | "LocalUnlock" => Api::GlobalFreeUnlock,
             "__set_app_type" | "_set_fmode" | "_get_fmode" | "__setusermatherr"
             | "_configthreadlocale" | "_controlfp" | "_controlfp_s"
             | "__C_specific_handler" | "_XcptFilter" | "_amsg_exit"
@@ -257,6 +289,14 @@ impl Api {
             Api::CharNextA | Api::CharNextW | Api::LstrlenA | Api::LstrlenW => 1,
             Api::CharPrevW | Api::LstrcpyW | Api::LstrcatW | Api::LstrcmpW | Api::LstrcmpiW => 2,
             Api::LstrcpynW => 3,
+            // Filesystem.
+            Api::CloseHandle | Api::DeleteFileW | Api::GetFileAttributesW | Api::GlobalLock
+            | Api::GlobalFreeUnlock => 1,
+            Api::CreateDirectoryW | Api::GetTempPathW | Api::GetFileSizeApi | Api::GlobalAlloc => 2,
+            Api::GetModuleFileNameW => 3,
+            Api::SetFilePointerApi | Api::GetTempFileNameW => 4,
+            Api::ReadFileApi => 5,
+            Api::CreateFileW => 7,
             // Fake-handle and unimplemented stubs carry their looked-up
             // stdcall footprint so the stack stays balanced.
             Api::FakeHandle { argc, .. } | Api::Unsupported { argc, .. } => *argc,
@@ -351,6 +391,24 @@ const FALSE: u64 = 0;
 /// treat the operation as having succeeded and keep running.
 const FAKE_HANDLE: u64 = 0x00CA_FE00;
 
+/// Read a NUL-terminated UTF-16 string from guest memory into a `String`.
+fn read_wstr(mem: &dyn Memory, addr: u64) -> Result<String> {
+    if addr == 0 {
+        return Ok(String::new());
+    }
+    let mut units = Vec::new();
+    let mut i = 0u64;
+    loop {
+        let w = mem.read_u16(addr + i * 2)?;
+        if w == 0 || i > (1 << 16) {
+            break;
+        }
+        units.push(w);
+        i += 1;
+    }
+    Ok(String::from_utf16_lossy(&units))
+}
+
 /// Length of a NUL-terminated UTF-16 string in code units.
 fn wstrlen(mem: &dyn Memory, addr: u64) -> Result<usize> {
     let mut n = 0usize;
@@ -419,9 +477,16 @@ impl WinOs {
                 let buf = self.arg(cpu, mem, 1)?;
                 let n = self.arg(cpu, mem, 2)? as usize;
                 let written_ptr = self.arg(cpu, mem, 3)?;
-                self.write_stream(handle, buf, n, mem)?;
+                let written = if self.is_file_handle(handle) {
+                    let mut data = vec![0u8; n];
+                    mem.read(buf, &mut data)?;
+                    self.write_file_handle(handle, &data).unwrap_or(0)
+                } else {
+                    self.write_stream(handle, buf, n, mem)?;
+                    n
+                };
                 if written_ptr != 0 {
-                    mem.write_u32(written_ptr, n as u32)?;
+                    mem.write_u32(written_ptr, written as u32)?;
                 }
                 ret(TRUE)
             }
@@ -762,6 +827,95 @@ impl WinOs {
                 let fold = matches!(api, Api::LstrcmpiW);
                 ret(wstrcmp(mem, a, b, fold)? as u64)
             }
+
+            // --- Filesystem -------------------------------------------------
+            Api::CreateFileW => {
+                let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+                let access = self.arg(cpu, mem, 1)?;
+                let disposition = self.arg(cpu, mem, 4)?;
+                ret(self.create_file(&name, access, disposition))
+            }
+            Api::ReadFileApi => {
+                let handle = self.arg(cpu, mem, 0)?;
+                let buf = self.arg(cpu, mem, 1)?;
+                let n = self.arg(cpu, mem, 2)? as usize;
+                let read_ptr = self.arg(cpu, mem, 3)?;
+                let mut tmp = vec![0u8; n];
+                let got = self.read_file(handle, &mut tmp).unwrap_or(0);
+                mem.write(buf, &tmp[..got])?;
+                if read_ptr != 0 {
+                    mem.write_u32(read_ptr, got as u32)?;
+                }
+                ret(TRUE)
+            }
+            Api::CloseHandle => {
+                let handle = self.arg(cpu, mem, 0)?;
+                self.close_handle(handle);
+                ret(TRUE)
+            }
+            Api::CreateDirectoryW => {
+                let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+                ret(self.create_directory(&name) as u64)
+            }
+            Api::GetTempPathW => {
+                // Report a guest temp directory that maps into the sandbox.
+                let len = self.arg(cpu, mem, 0)? as usize;
+                let buf = self.arg(cpu, mem, 1)?;
+                let n = WinOs::write_wstr(mem, buf, "C:\\Temp\\", len)?;
+                ret(n)
+            }
+            Api::GetTempFileNameW => {
+                let dir = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+                let prefix = read_wstr(mem, self.arg(cpu, mem, 1)?)?;
+                let unique = self.arg(cpu, mem, 2)? as u32;
+                let buf = self.arg(cpu, mem, 3)?;
+                let (name, u) = self.temp_file_name(&dir, &prefix, unique);
+                WinOs::write_wstr(mem, buf, &name, 260)?;
+                ret(u as u64)
+            }
+            Api::GetFileSizeApi => {
+                let handle = self.arg(cpu, mem, 0)?;
+                let high_ptr = self.arg(cpu, mem, 1)?;
+                let size = self.file_size(handle).unwrap_or(0);
+                if high_ptr != 0 {
+                    mem.write_u32(high_ptr, (size >> 32) as u32)?;
+                }
+                ret(size & 0xFFFF_FFFF)
+            }
+            Api::SetFilePointerApi => {
+                let handle = self.arg(cpu, mem, 0)?;
+                let dist = self.arg(cpu, mem, 1)? as u32 as i32 as i64;
+                let method = self.arg(cpu, mem, 3)?;
+                ret(self.set_file_pointer(handle, dist, method))
+            }
+            Api::GetFileAttributesW => {
+                let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+                ret(self.file_attributes(&name))
+            }
+            Api::DeleteFileW => {
+                let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+                ret(self.delete_file(&name) as u64)
+            }
+            Api::GetModuleFileNameW => {
+                let buf = self.arg(cpu, mem, 1)?;
+                let size = self.arg(cpu, mem, 2)? as usize;
+                let path = self.cfg.module_path_w.clone();
+                let n = WinOs::write_wstr(mem, buf, &path, size)?;
+                ret(n)
+            }
+
+            // Global/Local memory: back it with the heap arena. Since we use
+            // GMEM_FIXED semantics, the "handle" is the pointer itself and
+            // GlobalLock is the identity.
+            Api::GlobalAlloc => {
+                let size = self.arg(cpu, mem, 1)?;
+                ret(self.heap_alloc(size))
+            }
+            Api::GlobalLock => {
+                let h = self.arg(cpu, mem, 0)?;
+                ret(h)
+            }
+            Api::GlobalFreeUnlock => ret(0),
 
             Api::FakeHandle { .. } => ret(FAKE_HANDLE),
 
