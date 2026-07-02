@@ -243,7 +243,7 @@ impl Interpreter {
                 alu::logic(&mut self.state, a & imm, size);
             }
 
-            // ---- String ops: MOVS / STOS (with optional REP) ------------
+            // ---- String ops: MOVS / STOS / CMPS / LODS / SCAS -----------
             0xA4 | 0xA5 => {
                 let size = if opcode == 0xA4 { 1 } else { Self::opsize(&ctx) };
                 self.string_movs(mem, &ctx, size)?;
@@ -251,6 +251,18 @@ impl Interpreter {
             0xAA | 0xAB => {
                 let size = if opcode == 0xAA { 1 } else { Self::opsize(&ctx) };
                 self.string_stos(mem, &ctx, size)?;
+            }
+            0xA6 | 0xA7 => {
+                let size = if opcode == 0xA6 { 1 } else { Self::opsize(&ctx) };
+                self.string_cmps(mem, &ctx, size)?;
+            }
+            0xAC | 0xAD => {
+                let size = if opcode == 0xAC { 1 } else { Self::opsize(&ctx) };
+                self.string_lods(mem, &ctx, size)?;
+            }
+            0xAE | 0xAF => {
+                let size = if opcode == 0xAE { 1 } else { Self::opsize(&ctx) };
+                self.string_scas(mem, &ctx, size)?;
             }
 
             // ---- MOV r8, imm8 -------------------------------------------
@@ -330,6 +342,31 @@ impl Interpreter {
                 let n = ctx.u8(mem)?;
                 self.state.rip = ctx.cur;
                 return Ok(Exit::Interrupt(n));
+            }
+
+            // ---- LOOP / LOOPE / LOOPNE / JECXZ --------------------------
+            0xE0..=0xE3 => {
+                let rel = ctx.u8(mem)? as i8 as i64;
+                let target = ctx.cur.wrapping_add(rel as u64) & self.addr_mask();
+                let csize: u8 = if ctx.bits == Bits::B64 { 8 } else { 4 };
+                let taken = if opcode == 0xE3 {
+                    // JECXZ/JRCXZ: branch if the count is zero (no decrement).
+                    self.state.gpr_read(1, csize) == 0
+                } else {
+                    // Decrement the count *without* touching flags; the
+                    // LOOPE/LOOPNE condition tests the pre-existing ZF.
+                    let cmask = alu::mask(csize);
+                    let c = self.state.gpr_read(1, csize).wrapping_sub(1) & cmask;
+                    self.state.gpr_write(1, csize, c);
+                    let nonzero = c != 0;
+                    match opcode {
+                        0xE0 => nonzero && !self.state.flag(flags::ZF), // LOOPNE
+                        0xE1 => nonzero && self.state.flag(flags::ZF),  // LOOPE
+                        _ => nonzero,                                   // LOOP
+                    }
+                };
+                self.state.rip = if taken { target } else { ctx.cur & self.addr_mask() };
+                return Ok(Exit::Continue);
             }
 
             // ---- CALL rel32 / JMP rel32 / JMP rel8 ----------------------
@@ -672,6 +709,76 @@ impl Interpreter {
             self.state.set_reg(exemu_core::Reg::Rcx, 0);
         }
         Ok(())
+    }
+
+    /// SCAS[B/W/D/Q]: compare the accumulator with `[rdi]`, advance rdi.
+    /// With REPE/REPNE, repeat while the count is non-zero and ZF matches.
+    fn string_scas(&mut self, mem: &mut dyn Memory, ctx: &Ctx, size: u8) -> Result<()> {
+        let step = if self.state.flag(flags::DF) { (size as u64).wrapping_neg() } else { size as u64 };
+        let acc = self.state.gpr_read(0, size);
+        let rep = ctx.pfx.rep;
+        loop {
+            if rep != 0 && self.state.reg(exemu_core::Reg::Rcx) == 0 {
+                break;
+            }
+            let di = self.state.reg(exemu_core::Reg::Rdi);
+            let v = mem.read_uint(di, size)?;
+            alu::sub(&mut self.state, acc, v, 0, size); // CMP acc, [rdi]
+            self.state.set_reg(exemu_core::Reg::Rdi, di.wrapping_add(step) & self.addr_mask());
+            if rep == 0 || self.rep_string_break(rep) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// CMPS[B/W/D/Q]: compare `[rsi]` with `[rdi]`, advance both.
+    fn string_cmps(&mut self, mem: &mut dyn Memory, ctx: &Ctx, size: u8) -> Result<()> {
+        let step = if self.state.flag(flags::DF) { (size as u64).wrapping_neg() } else { size as u64 };
+        let rep = ctx.pfx.rep;
+        loop {
+            if rep != 0 && self.state.reg(exemu_core::Reg::Rcx) == 0 {
+                break;
+            }
+            let si = self.state.reg(exemu_core::Reg::Rsi);
+            let di = self.state.reg(exemu_core::Reg::Rdi);
+            let a = mem.read_uint(si, size)?;
+            let b = mem.read_uint(di, size)?;
+            alu::sub(&mut self.state, a, b, 0, size); // CMP [rsi], [rdi]
+            self.state.set_reg(exemu_core::Reg::Rsi, si.wrapping_add(step) & self.addr_mask());
+            self.state.set_reg(exemu_core::Reg::Rdi, di.wrapping_add(step) & self.addr_mask());
+            if rep == 0 || self.rep_string_break(rep) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// LODS[B/W/D/Q]: load `[rsi]` into the accumulator, advance rsi.
+    fn string_lods(&mut self, mem: &mut dyn Memory, ctx: &Ctx, size: u8) -> Result<()> {
+        let step = if self.state.flag(flags::DF) { (size as u64).wrapping_neg() } else { size as u64 };
+        let mut count = if ctx.pfx.rep != 0 { self.state.reg(exemu_core::Reg::Rcx) } else { 1 };
+        while count > 0 {
+            let si = self.state.reg(exemu_core::Reg::Rsi);
+            let v = mem.read_uint(si, size)?;
+            self.state.gpr_write(0, size, v);
+            self.state.set_reg(exemu_core::Reg::Rsi, si.wrapping_add(step) & self.addr_mask());
+            count -= 1;
+        }
+        if ctx.pfx.rep != 0 {
+            self.state.set_reg(exemu_core::Reg::Rcx, 0);
+        }
+        Ok(())
+    }
+
+    /// Decrement the count and evaluate the REPE/REPNE termination condition
+    /// for CMPS/SCAS. Returns true when the repetition should stop.
+    fn rep_string_break(&mut self, rep: u8) -> bool {
+        let c = self.state.reg(exemu_core::Reg::Rcx).wrapping_sub(1) & self.addr_mask();
+        self.state.set_reg(exemu_core::Reg::Rcx, c);
+        let zf = self.state.flag(flags::ZF);
+        // REPE (F3): stop when ZF==0. REPNE (F2): stop when ZF==1.
+        c == 0 || (rep == 0xF3 && !zf) || (rep == 0xF2 && zf)
     }
 
     /// Two-byte (0x0F) opcode group. Returns `Some(exit)` only for the rare

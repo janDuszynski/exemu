@@ -169,6 +169,53 @@ impl Api {
             _ => Api::Unsupported(format!("{dll}!{name}")),
         }
     }
+
+    /// Number of 4-byte stack arguments to clean off in 32-bit stdcall mode
+    /// (the Win32 default: the callee pops its arguments). cdecl functions
+    /// (the C runtime) and internal thunks return 0. Ignored in 64-bit mode.
+    pub(crate) fn argc(&self) -> u32 {
+        match self {
+            Api::GetStdHandle => 1,
+            Api::WriteFile => 5,
+            Api::WriteConsoleA | Api::WriteConsoleW => 5,
+            Api::ExitProcess => 1,
+            Api::TerminateProcess => 2,
+            Api::GetCommandLineA | Api::GetCommandLineW => 0,
+            Api::GetModuleHandleA | Api::GetModuleHandleW => 1,
+            Api::GetProcessHeap => 0,
+            Api::HeapAlloc => 3,
+            Api::HeapReAlloc => 4,
+            Api::HeapFree => 3,
+            Api::VirtualAlloc => 4,
+            Api::VirtualFree => 3,
+            Api::GetLastError => 0,
+            Api::SetLastError => 1,
+            Api::GetCurrentProcessId | Api::GetCurrentThreadId | Api::GetCurrentProcess => 0,
+            Api::IsDebuggerPresent => 0,
+            Api::Sleep => 1,
+            Api::QueryPerformanceCounter => 1,
+            Api::QueryPerformanceFrequency => 1,
+            Api::GetSystemTimeAsFileTime => 1,
+            Api::GetTickCount => 0,
+            Api::GetACP => 0,
+            Api::SetConsoleCP | Api::SetConsoleOutputCP => 1,
+            Api::GetConsoleMode => 2,
+            Api::SetConsoleMode => 2,
+            Api::GetStartupInfoA | Api::GetStartupInfoW => 1,
+            Api::GetEnvironmentStringsW => 0,
+            Api::FreeEnvironmentStringsW => 1,
+            Api::LoadLibraryA => 1,
+            Api::FreeLibrary => 1,
+            Api::GetProcAddress => 2,
+            // cdecl C runtime and internal thunks: caller cleans up.
+            Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
+            | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
+            | Api::CrtNoop | Api::InittermDriver | Api::ReturnExit => 0,
+            // Unknown: we cannot know the stdcall footprint. Leave the stack
+            // as-is (caller-cleanup guess); logged elsewhere.
+            Api::Unsupported(_) => 0,
+        }
+    }
 }
 
 /// Windows TRUE / FALSE as BOOL return values.

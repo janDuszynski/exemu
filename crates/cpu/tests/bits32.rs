@@ -5,7 +5,7 @@
 //! `disp32` addressing instead of RIP-relative.
 
 use exemu_core::hooks::NoHooks;
-use exemu_core::{Cpu, Exit, Memory, Perm, Reg, Region};
+use exemu_core::{Cpu, Exit, Memory, Perm, Region};
 use exemu_cpu::{Bits, Interpreter};
 
 const CODE: u64 = 0x0040_0000;
