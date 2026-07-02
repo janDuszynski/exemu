@@ -384,3 +384,4 @@ impl RegAt for CpuState {
 }
 
 mod exec;
+mod sse;
