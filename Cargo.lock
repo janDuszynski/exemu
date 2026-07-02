@@ -7,6 +7,14 @@ name = "exemu-core"
 version = "0.1.0"
 
 [[package]]
+name = "exemu-cpu"
+version = "0.1.0"
+dependencies = [
+ "exemu-core",
+ "exemu-memory",
+]
+
+[[package]]
 name = "exemu-loader"
 version = "0.1.0"
 dependencies = [
