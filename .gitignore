@@ -13,3 +13,8 @@ Cargo.lock.orig
 
 # Generated sample binaries produced by tests / the `sample` subcommand
 /samples/*.exe
+
+# Local project knowledge base (custom .know files) — never committed.
+# See knowledge/index.know
+*.know
+
