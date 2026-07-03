@@ -40,6 +40,10 @@ pub(crate) struct CbFrame {
     pub ret_addr: u64,
     pub final_rsp: u64,
     pub result: u64,
+    /// A modal dialog loop: when the queue drains, keep pumping the window and
+    /// dispatching WM_COMMANDs to the dialog proc until it calls EndDialog
+    /// (which sets `dialog_result`); then return that value to the caller.
+    pub modal: bool,
 }
 
 /// Every Windows symbol the emulator implements natively. Anything else
@@ -488,6 +492,7 @@ const WM_GETTEXTLENGTH: u32 = 0x000E;
 const WM_INITDIALOG: u64 = 0x0110;
 const WM_COMMAND: u64 = 0x0111;
 const IDOK: u32 = 1;
+const IDCANCEL: u32 = 2;
 // Progress-bar (msctls_progress32) messages.
 const PBM_SETRANGE: u32 = 0x0401;
 const PBM_SETPOS: u32 = 0x0402;
@@ -913,29 +918,35 @@ impl WinOs {
                     return ret(hwnd);
                 }
 
-                // Try to show a real window for a modeless dialog whose
-                // template we parsed. `lpTemplate` is a MAKEINTRESOURCE id.
+                // Try to show a real window for any dialog whose template we
+                // parsed. `lpTemplate` is a MAKEINTRESOURCE id.
                 let mut interactive = false;
-                if !*modal && template_id < 0x1_0000 {
+                if template_id < 0x1_0000 {
                     if let Some(tpl) = self.dialogs.get(&(template_id as u32)).cloned() {
                         self.gui.open(&tpl);
                         interactive = self.gui.is_open();
                     }
                 }
 
-                let result = if *modal { IDOK as u64 } else { hwnd };
                 if interactive {
-                    // Real window: only run WM_INITDIALOG now; the user drives
-                    // the buttons through the message loop.
+                    // Run WM_INITDIALOG. A modeless dialog then returns its
+                    // hwnd and the app's own message loop drives it; a modal
+                    // dialog enters its own pump loop (see cb_advance) and
+                    // returns the EndDialog value.
+                    self.dialog_result = None;
                     let calls = vec![(dlgproc, vec![hwnd, WM_INITDIALOG, 0, init_param])];
-                    self.invoke_callbacks(cpu, mem, calls, result, 5)
+                    let result = if *modal { IDCANCEL as u64 } else { hwnd };
+                    self.invoke_callbacks(cpu, mem, calls, result, 5, *modal)
                 } else {
-                    // Headless: WM_INITDIALOG then a synthetic Install click.
+                    // Headless: WM_INITDIALOG then a synthetic click on the
+                    // default (IDOK) button so a dialog that gates work on it
+                    // proceeds without a user.
+                    let result = if *modal { IDOK as u64 } else { hwnd };
                     let calls = vec![
                         (dlgproc, vec![hwnd, WM_INITDIALOG, 0, init_param]),
                         (dlgproc, vec![hwnd, WM_COMMAND, IDOK as u64, 0]),
                     ];
-                    self.invoke_callbacks(cpu, mem, calls, result, 5)
+                    self.invoke_callbacks(cpu, mem, calls, result, 5, false)
                 }
             }
 
@@ -998,7 +1009,7 @@ impl WinOs {
                         Some(exemu_core::GuiEvent::Command(id)) => {
                             self.write_msg(mem, lp)?;
                             let (dlgproc, hwnd) = (self.dlgproc, self.dialog_hwnd);
-                            self.invoke_callbacks(cpu, mem, vec![(dlgproc, vec![hwnd, WM_COMMAND, id as u64, 0])], 1, 4)
+                            self.invoke_callbacks(cpu, mem, vec![(dlgproc, vec![hwnd, WM_COMMAND, id as u64, 0])], 1, 4, false)
                         }
                         None => {
                             self.write_msg(mem, lp)?;
@@ -1026,7 +1037,7 @@ impl WinOs {
                         Some(exemu_core::GuiEvent::Command(id)) => {
                             self.write_msg(mem, lp)?;
                             let (dlgproc, hwnd) = (self.dlgproc, self.dialog_hwnd);
-                            self.invoke_callbacks(cpu, mem, vec![(dlgproc, vec![hwnd, WM_COMMAND, id as u64, 0])], TRUE, 5)
+                            self.invoke_callbacks(cpu, mem, vec![(dlgproc, vec![hwnd, WM_COMMAND, id as u64, 0])], TRUE, 5, false)
                         }
                         None => ret(FALSE),
                     };
@@ -1066,6 +1077,9 @@ impl WinOs {
                 ret(0)
             }
             Api::EndDialogApi => {
+                // Ends a modal dialog with the given result; closes the window.
+                let result = self.arg(cpu, mem, 1)?;
+                self.dialog_result = Some(result);
                 self.gui.close();
                 self.quit_posted = true;
                 ret(TRUE)
@@ -1381,6 +1395,7 @@ impl WinOs {
         calls: Vec<(u64, Vec<u64>)>,
         result: u64,
         argc: u32,
+        modal: bool,
     ) -> Result<Outcome> {
         let mut q: VecDeque<(u64, Vec<u64>)> = calls.into();
         let Some((func, args)) = q.pop_front() else {
@@ -1394,42 +1409,54 @@ impl WinOs {
         };
         let cleanup = if self.cfg.is_64bit { 0 } else { argc as u64 * 4 };
         let final_rsp = saved_rsp + ret_slot + cleanup;
-        if self.cfg.trace {
-            eprintln!("[exemu]   -> invoke {} callback(s), first fn {func:#x} args {args:?}", q.len() + 1);
-        }
-        self.cb_stack.push(CbFrame { remaining: q, ret_addr, final_rsp, result });
+        self.cb_stack.push(CbFrame { remaining: q, ret_addr, final_rsp, result, modal });
         let driver = self.cb_driver;
         self.setup_call_args(cpu, mem, func, &args, driver, saved_rsp)?;
         Ok(Outcome::Resume)
     }
 
     /// Called when a guest callback returns to the callback driver thunk. Runs
-    /// the next queued callback, or returns to the original API's caller.
+    /// the next queued callback, drives a modal dialog loop, or returns to the
+    /// original API's caller.
     fn cb_advance(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let next = self.cb_stack.last_mut().and_then(|f| f.remaining.pop_front());
-        match next {
-            Some((func, args)) => {
-                if self.cfg.trace {
-                    eprintln!("[exemu]   -> next callback fn {func:#x} args {args:?} (eax was {:#x})", cpu.gpr_read(0, 4));
+        if let Some((func, args)) = next {
+            let base = self.cb_stack.last().unwrap().final_rsp - if self.cfg.is_64bit { 8 } else { 4 };
+            let driver = self.cb_driver;
+            self.setup_call_args(cpu, mem, func, &args, driver, base)?;
+            return Ok(Outcome::Resume);
+        }
+
+        // Queue drained. If this is a modal dialog loop that has not ended,
+        // pump the window for the next user action and dispatch it.
+        let modal = self.cb_stack.last().map(|f| f.modal).unwrap_or(false);
+        if modal && self.dialog_result.is_none() {
+            match self.gui.pump(true) {
+                Some(exemu_core::GuiEvent::Command(id)) => {
+                    let (dlgproc, hwnd) = (self.dlgproc, self.dialog_hwnd);
+                    let base =
+                        self.cb_stack.last().unwrap().final_rsp - if self.cfg.is_64bit { 8 } else { 4 };
+                    let driver = self.cb_driver;
+                    self.setup_call_args(cpu, mem, dlgproc, &[hwnd, WM_COMMAND, id as u64, 0], driver, base)?;
+                    return Ok(Outcome::Resume);
                 }
-                let base = self.cb_stack.last().unwrap().final_rsp
-                    - if self.cfg.is_64bit { 8 } else { 4 };
-                let driver = self.cb_driver;
-                self.setup_call_args(cpu, mem, func, &args, driver, base)?;
-                Ok(Outcome::Resume)
-            }
-            None => {
-                let f = self.cb_stack.pop().expect("cb driver without frame");
-                cpu.set_rsp(f.final_rsp);
-                cpu.rip = f.ret_addr;
-                if self.cfg.is_64bit {
-                    cpu.set_reg(Reg::Rax, f.result);
-                } else {
-                    cpu.gpr_write(0, 4, f.result);
+                Some(exemu_core::GuiEvent::Close) | None => {
+                    self.dialog_result = Some(IDCANCEL as u64);
                 }
-                Ok(Outcome::Resume)
             }
         }
+
+        // Return to the API's caller. A modal dialog returns its EndDialog value.
+        let f = self.cb_stack.pop().expect("cb driver without frame");
+        let result = if f.modal { self.dialog_result.take().unwrap_or(IDCANCEL as u64) } else { f.result };
+        cpu.set_rsp(f.final_rsp);
+        cpu.rip = f.ret_addr;
+        if self.cfg.is_64bit {
+            cpu.set_reg(Reg::Rax, result);
+        } else {
+            cpu.gpr_write(0, 4, result);
+        }
+        Ok(Outcome::Resume)
     }
 
     /// Push a progress control's current percentage to the GUI (rendered as

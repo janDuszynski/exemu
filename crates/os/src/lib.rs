@@ -112,6 +112,9 @@ pub struct WinOs {
     dlgproc: u64,
     dialog_hwnd: u64,
     quit_posted: bool,
+    /// Set by EndDialog to terminate an active modal dialog loop (the value
+    /// is what DialogBoxParam returns).
+    dialog_result: Option<u64>,
     /// Progress-bar state by control id: (min, max, pos).
     progress: std::collections::HashMap<u32, (i64, i64, i64)>,
 
@@ -153,6 +156,7 @@ impl WinOs {
             dlgproc: 0,
             dialog_hwnd: 0,
             quit_posted: false,
+            dialog_result: None,
             progress: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             next_handle: 0x0000_1000,
