@@ -4,7 +4,7 @@
 //! mapping, import resolution/IAT patching, the interpreter and the OS
 //! layer — with no host toolchain involved.
 
-use exemu_app::{sample, load_and_run, Process, RunConfig};
+use exemu_app::{gui_sample, sample, load_and_run, Process, RunConfig};
 
 fn silent_cfg() -> RunConfig {
     RunConfig { echo: false, trace: true, ..RunConfig::default() }
@@ -47,6 +47,39 @@ fn sample_exe_runs_and_prints() {
         "SSE result line missing; got: {out:?}"
     );
     // A tiny program should finish in well under a hundred instructions.
+    assert!(result.steps < 1000, "unexpectedly many steps: {}", result.steps);
+}
+
+#[test]
+fn gui_sample_parses_with_multiple_dll_imports() {
+    let bytes = gui_sample::build();
+    let image = exemu_loader::parse(&bytes).expect("gui sample should parse");
+    let dlls: std::collections::HashSet<_> = image.imports.iter().map(|i| i.dll.as_str()).collect();
+    assert!(dlls.contains("user32.dll"), "missing user32 imports");
+    assert!(dlls.contains("gdi32.dll"), "missing gdi32 imports");
+    assert!(dlls.contains("kernel32.dll"), "missing kernel32 imports");
+    let names: Vec<_> = image
+        .imports
+        .iter()
+        .filter_map(|i| match &i.symbol {
+            exemu_core::ImportSymbol::Named(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    for expected in ["RegisterClassW", "CreateWindowExW", "TextOutW", "BeginPaint"] {
+        assert!(names.contains(&expected), "missing import {expected}");
+    }
+}
+
+#[test]
+fn gui_sample_runs_to_a_clean_exit() {
+    // Headless (NoGui): the window class registers, the window "creates", the
+    // message loop runs and dispatches to the WndProc, and the program exits 0
+    // — exercising the whole RegisterClass/CreateWindowEx/GDI path even with
+    // no display attached.
+    let bytes = gui_sample::build();
+    let result = load_and_run(&bytes, silent_cfg()).expect("gui sample should run");
+    assert_eq!(result.exit_code, 0, "gui sample should exit cleanly");
     assert!(result.steps < 1000, "unexpectedly many steps: {}", result.steps);
 }
 

@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gui_sample;
 pub mod sample;
 
 use exemu_core::{Cpu, EmuError, Exit, Memory, Perm, Region, Result};
