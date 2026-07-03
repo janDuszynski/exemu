@@ -203,7 +203,7 @@ impl WinOs {
 
     /// GetProcAddress(hModule, name-or-ordinal). `name_ptr` is a string
     /// pointer unless its high bits are zero and value < 0x10000 (an ordinal).
-    pub(crate) fn get_proc_address(&mut self, mem: &dyn Memory, hmodule: u64, name_ptr: u64) -> Result<u64> {
+    pub(crate) fn get_proc_address(&mut self, mem: &mut dyn Memory, hmodule: u64, name_ptr: u64) -> Result<u64> {
         // Plugin export lookup.
         if let Some(exports) = self.dll.exports.get(&hmodule) {
             let by_ord = name_ptr < 0x1_0000;
@@ -224,7 +224,15 @@ impl WinOs {
             if name.is_empty() {
                 return Ok(0);
             }
-            return Ok(self.resolve_import(&dll, &ImportSymbol::Named(name)));
+            let thunk = self.resolve_import(&dll, &ImportSymbol::Named(name.clone()));
+            // A few CRT *data* exports are pointers a program dereferences
+            // rather than calls. When one is resolved dynamically, its thunk
+            // slot must hold the real value or the guest reads, e.g., a null
+            // command line and faults.
+            if let Some(v) = data_export_value(&self.cfg, &name) {
+                self.write_ptr(mem, thunk, v)?;
+            }
+            return Ok(thunk);
         }
         Ok(0)
     }
@@ -251,6 +259,16 @@ impl WinOs {
             return find_in_tree(std::path::Path::new(&self.cfg.sandbox), name, 0);
         }
         None
+    }
+}
+
+/// Value for a known CRT *data* export (a variable a DLL exports, not a
+/// function). `None` means the zero default is correct.
+fn data_export_value(cfg: &crate::WinConfig, name: &str) -> Option<u64> {
+    match name {
+        "_acmdln" => Some(cfg.cmdline_ptr_a),
+        "_wcmdln" => Some(cfg.cmdline_ptr_w),
+        _ => None,
     }
 }
 

@@ -135,6 +135,9 @@ pub struct WinOs {
     next_handle: u64,
     /// Monotonic source of unique temp-file numbers.
     temp_counter: u32,
+    /// Writable backing cells for the CRT global-accessor family (`__p__fmode`
+    /// etc.), one per distinct name, allocated lazily from the heap arena.
+    crt_globals: std::collections::HashMap<String, u64>,
 
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
@@ -175,6 +178,7 @@ impl WinOs {
             files: std::collections::HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,
+            crt_globals: std::collections::HashMap::new(),
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
         };
@@ -283,6 +287,24 @@ impl WinOs {
         }
     }
 
+    /// Read a pointer-sized value (4 bytes in 32-bit mode, 8 in 64-bit).
+    pub(crate) fn read_ptr(&self, mem: &dyn Memory, addr: u64) -> Result<u64> {
+        if self.cfg.is_64bit {
+            mem.read_u64(addr)
+        } else {
+            Ok(mem.read_u32(addr)? as u64)
+        }
+    }
+
+    /// Write a pointer-sized value (4 bytes in 32-bit mode, 8 in 64-bit).
+    pub(crate) fn write_ptr(&self, mem: &mut dyn Memory, addr: u64, val: u64) -> Result<()> {
+        if self.cfg.is_64bit {
+            mem.write_u64(addr, val)
+        } else {
+            mem.write_u32(addr, val as u32)
+        }
+    }
+
     /// Simulate the callee's `ret`: pop the return address into `rip`, and in
     /// 32-bit mode additionally clean `stack_args * 4` bytes off the stack for
     /// stdcall functions (the Win32 default). 64-bit callers clean their own.
@@ -332,6 +354,35 @@ impl WinOs {
                 0
             }
         }
+    }
+
+    /// Address of the writable cell backing a CRT global accessor such as
+    /// `__p__fmode`. The C runtime startup does `*__p__fmode() = _fmode;`, so
+    /// the accessor must hand back a real, writable pointer — returning 0
+    /// (the old stub behaviour) makes the guest store through null. Cells are
+    /// pointer-sized, zero-initialised, and stable for the life of the process.
+    /// `_acmdln`/`_wcmdln` are seeded so `__getmainargs` sees the command line.
+    pub(crate) fn crt_global(&mut self, mem: &mut dyn Memory, name: &str) -> Result<u64> {
+        if let Some(&cell) = self.crt_globals.get(name) {
+            return Ok(cell);
+        }
+        let cell = self.heap_alloc(8);
+        // Seed the command-line accessors; the rest keep their zero default,
+        // which is the correct initial value for _fmode/_commode/argc/etc.
+        let seed = match name {
+            "__p__acmdln" => self.cfg.cmdline_ptr_a,
+            "__p__wcmdln" => self.cfg.cmdline_ptr_w,
+            _ => 0,
+        };
+        if seed != 0 && cell != 0 {
+            if self.cfg.is_64bit {
+                mem.write_u64(cell, seed)?;
+            } else {
+                mem.write_u32(cell, seed as u32)?;
+            }
+        }
+        self.crt_globals.insert(name.to_string(), cell);
+        Ok(cell)
     }
 }
 
