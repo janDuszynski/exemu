@@ -18,6 +18,7 @@ members = [
     "crates/memory",
     "crates/cpu",
     "crates/os",
+    "crates/gui",
     "crates/app",
     "crates/cli",
 ]
@@ -36,6 +37,7 @@ exemu-loader = { path = "crates/loader" }
 exemu-memory = { path = "crates/memory" }
 exemu-cpu = { path = "crates/cpu" }
 exemu-os = { path = "crates/os" }
+exemu-gui = { path = "crates/gui" }
 exemu-app = { path = "crates/app" }
 
 # Release profile tuned for a fast interpreter loop.

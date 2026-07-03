@@ -165,6 +165,9 @@ pub enum Api {
     /// interface pointer and return an error HRESULT) instead of returning
     /// S_OK with a null interface, which callers dereference and crash on.
     CoCreateInstanceApi,
+    DestroyWindowApi,
+    PostQuitMessageApi,
+    EndDialogApi,
 
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
@@ -277,6 +280,9 @@ impl Api {
             "PeekMessageW" => Api::PeekMessageApi,
             "IsDialogMessageW" | "IsDialogMessage" => Api::IsDialogMessageApi,
             "CoCreateInstance" | "CoGetClassObject" => Api::CoCreateInstanceApi,
+            "DestroyWindow" => Api::DestroyWindowApi,
+            "PostQuitMessage" => Api::PostQuitMessageApi,
+            "EndDialog" => Api::EndDialogApi,
             "GlobalAlloc" | "LocalAlloc" => Api::GlobalAlloc,
             "GlobalLock" | "LocalLock" | "GlobalHandle" => Api::GlobalLock,
             "GlobalFree" | "GlobalUnlock" | "LocalFree" | "LocalUnlock" => Api::GlobalFreeUnlock,
@@ -363,7 +369,8 @@ impl Api {
             // GUI.
             Api::CallbackDriver => 0,
             Api::GetDlgItemApi | Api::GetWindowTextApi => 2,
-            Api::SetWindowTextApi | Api::IsDialogMessageApi => 2,
+            Api::SetWindowTextApi | Api::IsDialogMessageApi | Api::EndDialogApi => 2,
+            Api::DestroyWindowApi | Api::PostQuitMessageApi => 1,
             Api::SetDlgItemTextW => 3,
             Api::GetDlgItemTextW | Api::SendMessageApi | Api::GetMessageApi => 4,
             Api::PeekMessageApi => 5,
@@ -891,36 +898,60 @@ impl WinOs {
             Api::CreateDialogParam { modal } => {
                 // CreateDialogParamW(hInst, lpTemplate, hWndParent, lpDlgProc,
                 //                    dwInitParam) / DialogBoxParamW(same).
+                let template_id = self.arg(cpu, mem, 1)?;
                 let dlgproc = self.arg(cpu, mem, 3)?;
                 let init_param = self.arg(cpu, mem, 4)?;
                 let hwnd = HWND_DIALOG;
+                self.dlgproc = dlgproc;
+                self.dialog_hwnd = hwnd;
                 if dlgproc == 0 {
                     return ret(hwnd);
                 }
-                // Drive the dialog: WM_INITDIALOG, then a synthetic click on
-                // the default/OK ("Install") button, so an installer that
-                // gates work on that button actually runs it.
-                let calls = vec![
-                    (dlgproc, vec![hwnd, WM_INITDIALOG, 0, init_param]),
-                    (dlgproc, vec![hwnd, WM_COMMAND, IDOK as u64, 0]),
-                ];
-                // Modeless returns the hwnd; modal returns the EndDialog value
-                // (we use IDOK). The API argc is 5 for both.
+
+                // Try to show a real window for a modeless dialog whose
+                // template we parsed. `lpTemplate` is a MAKEINTRESOURCE id.
+                let mut interactive = false;
+                if !*modal && template_id < 0x1_0000 {
+                    if let Some(tpl) = self.dialogs.get(&(template_id as u32)).cloned() {
+                        self.gui.open(&tpl);
+                        interactive = self.gui.is_open();
+                    }
+                }
+
                 let result = if *modal { IDOK as u64 } else { hwnd };
-                self.invoke_callbacks(cpu, mem, calls, result, 5)
+                if interactive {
+                    // Real window: only run WM_INITDIALOG now; the user drives
+                    // the buttons through the message loop.
+                    let calls = vec![(dlgproc, vec![hwnd, WM_INITDIALOG, 0, init_param])];
+                    self.invoke_callbacks(cpu, mem, calls, result, 5)
+                } else {
+                    // Headless: WM_INITDIALOG then a synthetic Install click.
+                    let calls = vec![
+                        (dlgproc, vec![hwnd, WM_INITDIALOG, 0, init_param]),
+                        (dlgproc, vec![hwnd, WM_COMMAND, IDOK as u64, 0]),
+                    ];
+                    self.invoke_callbacks(cpu, mem, calls, result, 5)
+                }
             }
 
             Api::SetDlgItemTextW => {
                 let id = self.arg(cpu, mem, 1)? as u32;
-                let text = read_wstr_units(mem, self.arg(cpu, mem, 2)?)?;
-                self.controls.insert(id, text);
+                let units = read_wstr_units(mem, self.arg(cpu, mem, 2)?)?;
+                self.gui.set_text(id, &String::from_utf16_lossy(&units));
+                self.controls.insert(id, units);
                 ret(TRUE)
             }
             Api::GetDlgItemTextW => {
                 let id = self.arg(cpu, mem, 1)? as u32;
                 let buf = self.arg(cpu, mem, 2)?;
                 let max = self.arg(cpu, mem, 3)? as usize;
-                let text = self.controls.get(&id).cloned().unwrap_or_default();
+                // Prefer any text the user edited in the real window.
+                let text = self
+                    .gui
+                    .get_text(id)
+                    .map(|s| s.encode_utf16().collect::<Vec<u16>>())
+                    .or_else(|| self.controls.get(&id).cloned())
+                    .unwrap_or_default();
                 ret(write_wstr_units(mem, buf, &text, max)?)
             }
             Api::GetDlgItemApi => {
@@ -951,6 +982,25 @@ impl WinOs {
             // report WM_QUIT (return 0) to end the loop.
             Api::GetMessageApi => {
                 let lp = self.arg(cpu, mem, 0)?;
+                if self.quit_posted {
+                    self.quit_posted = false;
+                    return ret(0);
+                }
+                if self.gui_active() {
+                    // Block on the window until the user acts.
+                    return match self.gui.pump(true) {
+                        Some(exemu_core::GuiEvent::Close) => ret(0), // WM_QUIT
+                        Some(exemu_core::GuiEvent::Command(id)) => {
+                            self.write_msg(mem, lp)?;
+                            let (dlgproc, hwnd) = (self.dlgproc, self.dialog_hwnd);
+                            self.invoke_callbacks(cpu, mem, vec![(dlgproc, vec![hwnd, WM_COMMAND, id as u64, 0])], 1, 4)
+                        }
+                        None => {
+                            self.write_msg(mem, lp)?;
+                            ret(1)
+                        }
+                    };
+                }
                 if self.msg_pumps > 0 {
                     self.msg_pumps -= 1;
                     self.write_msg(mem, lp)?;
@@ -962,6 +1012,20 @@ impl WinOs {
             // PeekMessageW(lpMsg, hWnd, min, max, wRemoveMsg): same budget.
             Api::PeekMessageApi => {
                 let lp = self.arg(cpu, mem, 0)?;
+                if self.gui_active() {
+                    return match self.gui.pump(false) {
+                        Some(exemu_core::GuiEvent::Close) => {
+                            self.quit_posted = true;
+                            ret(FALSE)
+                        }
+                        Some(exemu_core::GuiEvent::Command(id)) => {
+                            self.write_msg(mem, lp)?;
+                            let (dlgproc, hwnd) = (self.dlgproc, self.dialog_hwnd);
+                            self.invoke_callbacks(cpu, mem, vec![(dlgproc, vec![hwnd, WM_COMMAND, id as u64, 0])], TRUE, 5)
+                        }
+                        None => ret(FALSE),
+                    };
+                }
                 if self.msg_pumps > 0 {
                     self.msg_pumps -= 1;
                     self.write_msg(mem, lp)?;
@@ -987,6 +1051,19 @@ impl WinOs {
                     }
                 }
                 ret(0x8004_0154) // REGDB_E_CLASSNOTREG
+            }
+            Api::DestroyWindowApi => {
+                self.gui.close();
+                ret(TRUE)
+            }
+            Api::PostQuitMessageApi => {
+                self.quit_posted = true;
+                ret(0)
+            }
+            Api::EndDialogApi => {
+                self.gui.close();
+                self.quit_posted = true;
+                ret(TRUE)
             }
 
             Api::SendMessageApi => {

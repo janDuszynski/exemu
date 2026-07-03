@@ -13,12 +13,14 @@
 
 pub mod cpu;
 pub mod error;
+pub mod gui;
 pub mod hooks;
 pub mod memory;
 pub mod pe;
 
 pub use cpu::{Cpu, CpuState, Exit, Reg, flags};
 pub use error::{EmuError, Result};
+pub use gui::{Control, ControlKind, DialogTemplate, Gui, GuiEvent, NoGui};
 pub use hooks::Hooks;
 pub use memory::{Memory, Perm, Region};
 pub use pe::{Import, ImportSymbol, PeImage, Section};

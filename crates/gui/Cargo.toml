@@ -1,0 +1,14 @@
+[package]
+name = "exemu-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A minifb-backed renderer for Windows dialogs, implementing exemu_core::Gui."
+
+[dependencies]
+exemu-core = { workspace = true }
+minifb = "0.27"
+font8x8 = "0.3"

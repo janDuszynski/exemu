@@ -62,6 +62,7 @@ COMMANDS:\n\
 RUN OPTIONS:\n\
     --trace       Log calls to unimplemented Windows APIs\n\
     --no-echo     Do not mirror guest console output to the host\n\
+    --gui         Render dialogs in a real window (drive them yourself)\n\
     --max-steps N Instruction budget (0 = unlimited; default 2e9)\n\
     -- <args>     Pass the remaining arguments to the guest program\n\
 \n\
@@ -76,6 +77,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut path: Option<&str> = None;
     let mut trace = false;
     let mut echo = true;
+    let mut gui = false;
     let mut max_steps: Option<u64> = None;
     let mut guest_args: Vec<String> = Vec::new();
 
@@ -84,6 +86,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         match rest[i].as_str() {
             "--trace" => trace = true,
             "--no-echo" => echo = false,
+            "--gui" => gui = true,
             "--max-steps" => {
                 i += 1;
                 let v = rest.get(i).ok_or("--max-steps needs a value (0 = unlimited)")?;
@@ -114,7 +117,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut argv = vec![path.to_string()];
     argv.extend(guest_args);
 
-    let mut cfg = RunConfig { args: argv, echo, trace, ..RunConfig::default() };
+    let mut cfg = RunConfig { args: argv, echo, trace, gui, ..RunConfig::default() };
     if let Some(m) = max_steps {
         cfg.max_steps = m;
     }
@@ -215,6 +218,20 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
         match &imp.symbol {
             ImportSymbol::Named(n) => println!("      {n}"),
             ImportSymbol::Ordinal(o) => println!("      #{o}"),
+        }
+    }
+
+    let dialogs = exemu_loader::parse_dialogs(&bytes);
+    if !dialogs.is_empty() {
+        let mut ids: Vec<_> = dialogs.keys().copied().collect();
+        ids.sort();
+        println!("\n  dialogs ({}):", dialogs.len());
+        for id in ids {
+            let d = &dialogs[&id];
+            println!("    #{id} \"{}\" ({}x{} du, {} controls)", d.title, d.cx, d.cy, d.controls.len());
+            for c in &d.controls {
+                println!("      id={:<5} {:?} {:?}", c.id, c.kind, c.text);
+            }
         }
     }
 

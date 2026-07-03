@@ -103,6 +103,16 @@ pub struct WinOs {
     /// message-loop before reporting `WM_QUIT`, so deferred-work loops run.
     msg_pumps: u32,
 
+    /// The windowing backend (NoGui = headless auto-drive).
+    gui: Box<dyn exemu_core::Gui>,
+    /// Dialog templates parsed from the image, by resource id.
+    dialogs: std::collections::HashMap<u32, exemu_core::DialogTemplate>,
+    /// The active dialog's procedure and window handle (when a real window is
+    /// shown), and whether the guest posted a quit.
+    dlgproc: u64,
+    dialog_hwnd: u64,
+    quit_posted: bool,
+
     /// Open guest file handles → host file objects.
     files: std::collections::HashMap<u64, fs::OpenFile>,
     next_handle: u64,
@@ -136,6 +146,11 @@ impl WinOs {
             cb_stack: Vec::new(),
             controls: std::collections::HashMap::new(),
             msg_pumps: 8,
+            gui: Box::new(exemu_core::NoGui),
+            dialogs: std::collections::HashMap::new(),
+            dlgproc: 0,
+            dialog_hwnd: 0,
+            quit_posted: false,
             files: std::collections::HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,
@@ -146,6 +161,23 @@ impl WinOs {
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
         os.cb_driver = os.alloc_thunk(Api::CallbackDriver);
         os
+    }
+
+    /// Install a windowing backend and the image's dialog templates. With a
+    /// real backend, `CreateDialogParamW` shows a window and the message loop
+    /// blocks on user input instead of auto-driving the Install button.
+    pub fn set_gui(
+        &mut self,
+        gui: Box<dyn exemu_core::Gui>,
+        dialogs: std::collections::HashMap<u32, exemu_core::DialogTemplate>,
+    ) {
+        self.gui = gui;
+        self.dialogs = dialogs;
+    }
+
+    /// Whether a real (non-headless) window backend is installed and showing.
+    fn gui_active(&self) -> bool {
+        self.gui.is_open()
     }
 
     /// Allocate a fresh thunk address bound to `api`.
