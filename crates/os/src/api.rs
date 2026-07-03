@@ -488,6 +488,11 @@ const WM_GETTEXTLENGTH: u32 = 0x000E;
 const WM_INITDIALOG: u64 = 0x0110;
 const WM_COMMAND: u64 = 0x0111;
 const IDOK: u32 = 1;
+// Progress-bar (msctls_progress32) messages.
+const PBM_SETRANGE: u32 = 0x0401;
+const PBM_SETPOS: u32 = 0x0402;
+const PBM_DELTAPOS: u32 = 0x0403;
+const PBM_SETRANGE32: u32 = 0x0406;
 
 /// Recover the control id from a synthetic control handle, if it is one.
 fn control_id(hwnd: u64) -> Option<u32> {
@@ -1086,6 +1091,37 @@ impl WinOs {
                     (WM_GETTEXTLENGTH, Some(id)) => {
                         ret(self.controls.get(&id).map(|t| t.len()).unwrap_or(0) as u64)
                     }
+                    // Progress-bar updates → drive the rendered bar.
+                    (PBM_SETRANGE, Some(id)) => {
+                        let (min, max) = (lparam as u16 as i64, (lparam >> 16) as u16 as i64);
+                        self.progress.entry(id).or_insert((0, 100, 0));
+                        if let Some(p) = self.progress.get_mut(&id) {
+                            *p = (min, max.max(min + 1), p.2);
+                        }
+                        self.sync_progress(id);
+                        ret(0)
+                    }
+                    (PBM_SETRANGE32, Some(id)) => {
+                        let (min, max) = (wparam as u32 as i32 as i64, lparam as u32 as i32 as i64);
+                        let cur = self.progress.get(&id).map(|p| p.2).unwrap_or(0);
+                        self.progress.insert(id, (min, max.max(min + 1), cur));
+                        self.sync_progress(id);
+                        ret(0)
+                    }
+                    (PBM_SETPOS, Some(id)) => {
+                        let e = self.progress.entry(id).or_insert((0, 100, 0));
+                        let prev = e.2;
+                        e.2 = wparam as i64;
+                        self.sync_progress(id);
+                        ret(prev as u64)
+                    }
+                    (PBM_DELTAPOS, Some(id)) => {
+                        let e = self.progress.entry(id).or_insert((0, 100, 0));
+                        let prev = e.2;
+                        e.2 = prev + wparam as i64;
+                        self.sync_progress(id);
+                        ret(prev as u64)
+                    }
                     _ => ret(0),
                 }
             }
@@ -1393,6 +1429,16 @@ impl WinOs {
                 }
                 Ok(Outcome::Resume)
             }
+        }
+    }
+
+    /// Push a progress control's current percentage to the GUI (rendered as
+    /// the bar fill).
+    fn sync_progress(&mut self, id: u32) {
+        if let Some(&(min, max, pos)) = self.progress.get(&id) {
+            let span = (max - min).max(1) as f64;
+            let pct = (((pos - min).max(0) as f64 / span) * 100.0).round() as u32;
+            self.gui.set_text(id, &pct.min(100).to_string());
         }
     }
 

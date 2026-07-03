@@ -10,7 +10,7 @@
 
 mod render;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use exemu_core::gui::{ControlKind, DialogTemplate, Gui, GuiEvent};
@@ -57,6 +57,12 @@ fn default_button(tpl: &DialogTemplate) -> u32 {
         .unwrap_or(1)
 }
 
+fn button_label(tpl: Option<&DialogTemplate>, id: u32) -> String {
+    tpl.and_then(|t| t.controls.iter().find(|c| c.id == id))
+        .map(|c| c.text.replace('&', ""))
+        .unwrap_or_else(|| id.to_string())
+}
+
 fn seed_texts(tpl: &DialogTemplate) -> HashMap<u32, String> {
     tpl.controls
         .iter()
@@ -78,6 +84,9 @@ pub struct MinifbGui {
     /// Input is ignored for this many initial pump iterations, so the
     /// keystroke that launched the program isn't taken as a button press.
     warmup: u32,
+    /// Buttons already activated — greyed and non-clickable (one-shot), so a
+    /// second click can't re-trigger the action while it runs.
+    disabled: HashSet<u32>,
 }
 
 impl Default for MinifbGui {
@@ -96,12 +105,13 @@ impl MinifbGui {
             default_id: 1,
             prev_down: false,
             warmup: 0,
+            disabled: HashSet::new(),
         }
     }
 
     fn repaint(&mut self) {
         if let Some(tpl) = &self.tpl {
-            self.r.paint(tpl, &self.texts);
+            self.r.paint(tpl, &self.texts, &self.disabled);
         }
         let (w, h) = (self.r.w, self.r.h);
         if let Some(win) = self.window.as_mut() {
@@ -125,6 +135,7 @@ impl Gui for MinifbGui {
         self.tpl = Some(tpl.clone());
         self.prev_down = false;
         self.warmup = 40; // ~0.3s of ignored input
+        self.disabled.clear();
         self.repaint();
         let is_open = self.window.as_ref().map(|w| w.is_open()).unwrap_or(false);
         let label = tpl
@@ -189,7 +200,12 @@ impl Gui for MinifbGui {
             if self.warmup > 0 {
                 self.warmup -= 1;
             } else {
-                if enter {
+                // Each activation is one-shot: disable the button so the
+                // action can't be re-triggered while it runs.
+                if enter && !self.disabled.contains(&self.default_id) {
+                    self.disabled.insert(self.default_id);
+                    self.repaint();
+                    eprintln!("[exemu-gui] Enter -> \"{}\" (working…)", button_label(self.tpl.as_ref(), self.default_id));
                     return Some(GuiEvent::Command(self.default_id));
                 }
                 if esc {
@@ -197,6 +213,9 @@ impl Gui for MinifbGui {
                 }
                 if pressed {
                     if let Some(id) = self.r.hit_test(pos.0 as usize, pos.1 as usize) {
+                        self.disabled.insert(id);
+                        self.repaint();
+                        eprintln!("[exemu-gui] clicked \"{}\" (working…)", button_label(self.tpl.as_ref(), id));
                         return Some(GuiEvent::Command(id));
                     }
                 }
@@ -234,6 +253,7 @@ pub struct OffscreenGui {
     texts: HashMap<u32, String>,
     default_id: u32,
     shot: u32,
+    set_calls: u32,
     clicked: bool,
     open: bool,
 }
@@ -249,6 +269,7 @@ impl OffscreenGui {
             texts: HashMap::new(),
             default_id: 1,
             shot: 0,
+            set_calls: 0,
             clicked: false,
             open: false,
         }
@@ -256,7 +277,7 @@ impl OffscreenGui {
 
     fn snapshot(&mut self, tag: &str) {
         let Some(tpl) = self.tpl.clone() else { return };
-        self.r.paint(&tpl, &self.texts);
+        self.r.paint(&tpl, &self.texts, &HashSet::new());
         let path = self.dir.join(format!("dialog-{:02}-{tag}.png", self.shot));
         self.shot += 1;
         if let Ok(file) = std::fs::File::create(&path) {
@@ -285,7 +306,12 @@ impl Gui for OffscreenGui {
 
     fn set_text(&mut self, id: u32, text: &str) {
         self.texts.insert(id, text.to_string());
-        self.snapshot("settext");
+        // Throttle: capture the first change and then every ~25th (progress
+        // updates fire constantly), to keep a handful of frames.
+        self.set_calls += 1;
+        if self.set_calls <= 1 || self.set_calls % 25 == 0 {
+            self.snapshot("frame");
+        }
     }
 
     fn get_text(&self, id: u32) -> Option<String> {

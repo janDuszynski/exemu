@@ -112,6 +112,8 @@ pub struct WinOs {
     dlgproc: u64,
     dialog_hwnd: u64,
     quit_posted: bool,
+    /// Progress-bar state by control id: (min, max, pos).
+    progress: std::collections::HashMap<u32, (i64, i64, i64)>,
 
     /// Open guest file handles → host file objects.
     files: std::collections::HashMap<u64, fs::OpenFile>,
@@ -151,6 +153,7 @@ impl WinOs {
             dlgproc: 0,
             dialog_hwnd: 0,
             quit_posted: false,
+            progress: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,
