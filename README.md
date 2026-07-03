@@ -167,14 +167,21 @@ stubbed).
 
 | Executable | Kind | Result |
 | ---------- | ---- | ------ |
+| **7-Zip installer** | 64-bit MSVC GUI | **installs end to end** — drives its dialog, "clicks" Install, decompresses its LZMA archive, and writes all 107 files (validated: `7z.exe` is a real PE, `readme.txt` the genuine text) + registry, exits 0 (~496M instructions) |
 | generated `hello.exe` | 64-bit console | **runs fully**, prints output incl. an SSE2 computation, exits 0 |
 | Firefox Installer | 32-bit, UPX-packed | runs its ~2.2M-instruction self-decompression stub to a clean exit |
 | SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for ~45M instructions before a fault deep in unpacked code |
-| 7-Zip installer | 64-bit MSVC GUI | runs CRT startup + program logic (~49k instructions), stops at `CreateDialogParamW` (the GUI boundary) |
 
-A **console** program stands a good chance of running to completion; a
-graphical installer runs its startup and (for self-extractors) its
-extraction, but cannot present a wizard without a rendering GUI.
+exemu drives a real GUI installer's dialog procedure (via a re-entrant
+guest-call mechanism) — invoking `WM_INITDIALOG` and a synthetic Install
+click, round-tripping control text, and pumping a bounded message loop — so
+a self-extracting installer runs its real extraction and writes its files to
+a host sandbox. It still does **not render** a window or handle arbitrary
+user interaction; the Install path is driven automatically.
+
+Extraction is compute-heavy (LZMA), so a real installer needs a raised step
+budget: `exemu run --max-steps 800000000 installer.exe`. Files land under
+`$TMPDIR/exemu-sandbox`.
 
 ## Testing
 
