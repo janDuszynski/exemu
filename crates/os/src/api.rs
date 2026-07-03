@@ -126,6 +126,10 @@ pub enum Api {
     GlobalAlloc,
     GlobalLock,
     GlobalFreeUnlock,
+    GetVersion,
+    GetVersionEx,
+    GetSystemDirectoryW,
+    GetWindowsDirectoryW,
 
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
@@ -216,6 +220,10 @@ impl Api {
             "GetFileAttributesW" => Api::GetFileAttributesW,
             "DeleteFileW" => Api::DeleteFileW,
             "GetModuleFileNameW" | "GetModuleFileNameA" => Api::GetModuleFileNameW,
+            "GetVersion" => Api::GetVersion,
+            "GetVersionExW" | "GetVersionExA" => Api::GetVersionEx,
+            "GetSystemDirectoryW" => Api::GetSystemDirectoryW,
+            "GetWindowsDirectoryW" | "GetSystemWindowsDirectoryW" => Api::GetWindowsDirectoryW,
             "GlobalAlloc" | "LocalAlloc" => Api::GlobalAlloc,
             "GlobalLock" | "LocalLock" | "GlobalHandle" => Api::GlobalLock,
             "GlobalFree" | "GlobalUnlock" | "LocalFree" | "LocalUnlock" => Api::GlobalFreeUnlock,
@@ -292,7 +300,10 @@ impl Api {
             // Filesystem.
             Api::CloseHandle | Api::DeleteFileW | Api::GetFileAttributesW | Api::GlobalLock
             | Api::GlobalFreeUnlock => 1,
-            Api::CreateDirectoryW | Api::GetTempPathW | Api::GetFileSizeApi | Api::GlobalAlloc => 2,
+            Api::GetVersion => 0,
+            Api::GetVersionEx => 1,
+            Api::CreateDirectoryW | Api::GetTempPathW | Api::GetFileSizeApi | Api::GlobalAlloc
+            | Api::GetSystemDirectoryW | Api::GetWindowsDirectoryW => 2,
             Api::GetModuleFileNameW => 3,
             Api::SetFilePointerApi | Api::GetTempFileNameW => 4,
             Api::ReadFileApi => 5,
@@ -916,6 +927,33 @@ impl WinOs {
                 ret(h)
             }
             Api::GlobalFreeUnlock => ret(0),
+
+            // --- Environment / version -------------------------------------
+            // Report Windows 6.2 (build 9200): LOWORD = minor<<8 | major,
+            // HIWORD = build (top bit clear ⇒ build present).
+            Api::GetVersion => ret(0x23F0_0206),
+            Api::GetVersionEx => {
+                // Fill an OSVERSIONINFO(EX)W: major/minor/build/platform.
+                let p = self.arg(cpu, mem, 0)?;
+                if p != 0 {
+                    mem.write_u32(p + 4, 6)?; // dwMajorVersion
+                    mem.write_u32(p + 8, 2)?; // dwMinorVersion
+                    mem.write_u32(p + 12, 9200)?; // dwBuildNumber
+                    mem.write_u32(p + 16, 2)?; // VER_PLATFORM_WIN32_NT
+                    mem.write_u16(p + 20, 0)?; // szCSDVersion[0] = NUL
+                }
+                ret(TRUE)
+            }
+            Api::GetSystemDirectoryW => {
+                let buf = self.arg(cpu, mem, 0)?;
+                let size = self.arg(cpu, mem, 1)? as usize;
+                ret(WinOs::write_wstr(mem, buf, "C:\\Windows\\System32", size)?)
+            }
+            Api::GetWindowsDirectoryW => {
+                let buf = self.arg(cpu, mem, 0)?;
+                let size = self.arg(cpu, mem, 1)? as usize;
+                ret(WinOs::write_wstr(mem, buf, "C:\\Windows", size)?)
+            }
 
             Api::FakeHandle { .. } => ret(FAKE_HANDLE),
 
