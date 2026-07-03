@@ -66,6 +66,15 @@ pub enum Api {
     HeapReAlloc,
     VirtualAlloc,
     VirtualFree,
+    /// VirtualProtect: every page is already RWX, so a protection change is a
+    /// no-op — report success and write a plausible old protection out.
+    VirtualProtect,
+    /// EncodePointer/DecodePointer (and the Rtl*/System variants): the CRT's
+    /// pointer-obfuscation pair. The only invariant that matters is that
+    /// Decode(Encode(p)) == p, so both are the identity on their argument.
+    /// Returning 0 here (the old stub behaviour) turns a guarded call through
+    /// an "encoded" function pointer into a null call — a hard fault.
+    EncodeDecodePointer,
     GetLastError,
     SetLastError,
     GetCurrentProcessId,
@@ -228,6 +237,11 @@ impl Api {
             "HeapReAlloc" => Api::HeapReAlloc,
             "VirtualAlloc" => Api::VirtualAlloc,
             "VirtualFree" => Api::VirtualFree,
+            "VirtualProtect" => Api::VirtualProtect,
+            "EncodePointer" | "DecodePointer" | "EncodeSystemPointer"
+            | "DecodeSystemPointer" | "RtlEncodePointer" | "RtlDecodePointer" => {
+                Api::EncodeDecodePointer
+            }
             "GetLastError" => Api::GetLastError,
             "SetLastError" => Api::SetLastError,
             "GetCurrentProcessId" => Api::GetCurrentProcessId,
@@ -423,6 +437,8 @@ impl Api {
             Api::HeapFree => 3,
             Api::VirtualAlloc => 4,
             Api::VirtualFree => 3,
+            Api::VirtualProtect => 4,
+            Api::EncodeDecodePointer => 1,
             Api::GetLastError => 0,
             Api::SetLastError => 1,
             Api::GetCurrentProcessId | Api::GetCurrentThreadId | Api::GetCurrentProcess => 0,
@@ -846,6 +862,23 @@ impl WinOs {
                 ret(self.heap_alloc(size))
             }
             Api::VirtualFree => ret(TRUE),
+            Api::VirtualProtect => {
+                // VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect).
+                // Pages are already mapped RWX, so there is nothing to change;
+                // write back a plausible previous protection and succeed. This
+                // is what UPX-style packers and CRT relocation code depend on.
+                let old_ptr = self.arg(cpu, mem, 3)?;
+                if old_ptr != 0 {
+                    mem.write_u32(old_ptr, 0x40)?; // PAGE_EXECUTE_READWRITE
+                }
+                ret(TRUE)
+            }
+            Api::EncodeDecodePointer => {
+                // Identity: Decode(Encode(p)) == p. Preserve the pointer so a
+                // later guarded call through it lands on real code, not null.
+                let p = self.arg(cpu, mem, 0)?;
+                ret(p)
+            }
 
             Api::GetLastError => ret(self.last_error as u64),
             Api::SetLastError => {
