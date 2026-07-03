@@ -60,9 +60,14 @@ COMMANDS:\n\
     sample   Generate a self-contained demo .exe (Hello World via kernel32)\n\
 \n\
 RUN OPTIONS:\n\
-    --trace     Log calls to unimplemented Windows APIs\n\
-    --no-echo   Do not mirror guest console output to the host\n\
-    -- <args>   Pass the remaining arguments to the guest program\n",
+    --trace       Log calls to unimplemented Windows APIs\n\
+    --no-echo     Do not mirror guest console output to the host\n\
+    --max-steps N Instruction budget (0 = unlimited; default 2e9)\n\
+    -- <args>     Pass the remaining arguments to the guest program\n\
+\n\
+Files a program writes (e.g. an installer's extracted files) go to a host\n\
+sandbox under $TMPDIR/exemu-sandbox. For real installers, build with\n\
+--release; a debug build is ~10x slower.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -114,13 +119,51 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         cfg.max_steps = m;
     }
     let proc = Process::load(&bytes, &cfg).map_err(|e| e.to_string())?;
-    let result = proc.run().map_err(|e| e.to_string())?;
+    // The guest filesystem lives here regardless of how the run ends.
+    let sandbox = std::env::temp_dir().join("exemu-sandbox");
+    let run = proc.run();
 
+    report_sandbox(&sandbox);
+
+    let result = run.map_err(|e| e.to_string())?;
     eprintln!(
         "\n[exemu] process exited with code {} after {} instructions",
         result.exit_code, result.steps
     );
     Ok(result.exit_code as u8)
+}
+
+/// List what the guest wrote into the sandbox filesystem, so the user knows
+/// where an installer's extracted files actually went.
+fn report_sandbox(sandbox: &std::path::Path) {
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    collect(&p, out);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(sandbox, &mut files);
+    if files.is_empty() {
+        return;
+    }
+    files.sort();
+    eprintln!("\n[exemu] guest filesystem: {}", sandbox.display());
+    eprintln!("[exemu] {} file(s) created by the program; for example:", files.len());
+    for p in files.iter().take(12) {
+        if let Ok(rel) = p.strip_prefix(sandbox) {
+            eprintln!("          {}", rel.display());
+        }
+    }
+    if files.len() > 12 {
+        eprintln!("          … and {} more", files.len() - 12);
+    }
 }
 
 fn cmd_info(rest: &[String]) -> Result<u8, String> {

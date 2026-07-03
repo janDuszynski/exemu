@@ -101,7 +101,9 @@ pub struct RunConfig {
 
 impl Default for RunConfig {
     fn default() -> Self {
-        RunConfig { args: vec!["program.exe".into()], echo: true, trace: false, max_steps: 50_000_000 }
+        // High enough for a real installer's decompression (7-Zip needs
+        // ~500M) while still bounding a runaway loop.
+        RunConfig { args: vec!["program.exe".into()], echo: true, trace: false, max_steps: 2_000_000_000 }
     }
 }
 
@@ -111,6 +113,9 @@ pub struct RunResult {
     pub steps: u64,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Host directory rooting the guest filesystem (where files the program
+    /// created — e.g. an installer's extracted files — actually landed).
+    pub sandbox: String,
 }
 
 /// A loaded, ready-to-run process.
@@ -118,6 +123,7 @@ pub struct Process {
     mem: VirtualMemory,
     cpu: Interpreter,
     os: WinOs,
+    sandbox: String,
     entry: u64,
     max_steps: u64,
 }
@@ -256,7 +262,14 @@ impl Process {
         cpu.state_mut().set_rsp(rsp);
         cpu.state_mut().rip = image.entry_va();
 
-        Ok(Process { mem, cpu, os, entry: image.entry_va(), max_steps: cfg.max_steps })
+        Ok(Process {
+            mem,
+            cpu,
+            os,
+            sandbox: sandbox.to_string_lossy().into_owned(),
+            entry: image.entry_va(),
+            max_steps: cfg.max_steps,
+        })
     }
 
     /// The entry-point virtual address.
@@ -310,6 +323,7 @@ impl Process {
             steps,
             stdout: self.os.captured_stdout().to_vec(),
             stderr: self.os.captured_stderr().to_vec(),
+            sandbox: self.sandbox.clone(),
         })
     }
 
