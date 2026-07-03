@@ -106,6 +106,11 @@ pub enum Api {
     InittermDriver,
     /// A CRT startup/teardown hook we can safely no-op, returning 0.
     CrtNoop,
+    // C stdio output (routed to the host console).
+    Fputs,
+    Fputc,
+    Fwrite,
+    Puts,
 
     // --- Win32 string helpers (kernel32/user32) ---------------------------
     CharNextA,
@@ -225,6 +230,10 @@ impl Api {
             "exit" | "_exit" | "_cexit" | "_c_exit" => Api::CrtExit,
             "__getmainargs" | "__wgetmainargs" => Api::GetMainArgs,
             "_initterm" | "_initterm_e" => Api::Initterm,
+            "fputs" => Api::Fputs,
+            "fputc" | "putc" | "putchar" => Api::Fputc,
+            "fwrite" => Api::Fwrite,
+            "puts" => Api::Puts,
 
             // Win32 string helpers.
             "CharNextA" => Api::CharNextA,
@@ -281,7 +290,11 @@ impl Api {
 
             // Handle/pointer-returning Win32 functions: return a non-null
             // fake handle so GUI setup "succeeds" and the program proceeds.
-            "GetDC" | "BeginPaint" | "CreateWindowExW" | "RegisterClassW"
+            // BOOL-returning functions that must report success (non-zero)
+            // so callers don't treat setup as failed and bail/throw.
+            "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "FlushConsoleInputBuffer"
+            | "SetHandleCount" | "SetThreadPriority"
+            | "GetDC" | "BeginPaint" | "CreateWindowExW" | "RegisterClassW"
             | "LoadCursorW" | "LoadIconW" | "LoadImageW" | "LoadBitmapW" | "GetSystemMenu"
             | "CreatePopupMenu" | "CreateBrushIndirect" | "CreateFontIndirectW"
             | "FindWindowExW" | "SetTimer" | "GetStockObject" | "SelectObject" => Api::FakeHandle {
@@ -336,7 +349,8 @@ impl Api {
             // cdecl C runtime and internal thunks: caller cleans up.
             Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
             | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
-            | Api::CrtNoop | Api::InittermDriver | Api::ReturnExit => 0,
+            | Api::CrtNoop | Api::InittermDriver | Api::ReturnExit
+            | Api::Fputs | Api::Fputc | Api::Fwrite | Api::Puts => 0,
             // Win32 string helpers.
             Api::CharNextA | Api::CharNextW | Api::LstrlenA | Api::LstrlenW => 1,
             Api::CharPrevW | Api::LstrcpyW | Api::LstrcatW | Api::LstrcmpW | Api::LstrcmpiW => 2,
@@ -386,7 +400,10 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "OleUninitialize" | "wsprintfW" | "wsprintfA" => 0,
 
         // --- 1 arg ---
-        "CloseHandle" | "FindClose" | "FreeLibrary" | "GetFileAttributesW" | "DeleteFileW"
+        "SetConsoleTitleW" | "FlushConsoleInputBuffer" | "SetHandleCount"
+        | "InitializeCriticalSection" | "DeleteCriticalSection" | "EnterCriticalSection"
+        | "LeaveCriticalSection"
+        | "CloseHandle" | "FindClose" | "FreeLibrary" | "GetFileAttributesW" | "DeleteFileW"
         | "GlobalFree" | "GlobalLock" | "GlobalUnlock" | "RemoveDirectoryW"
         | "SetCurrentDirectoryW" | "GetModuleHandleA" | "GetModuleHandleW" | "Sleep"
         | "SetErrorMode" | "lstrlenA" | "lstrlenW" | "DestroyWindow" | "GetDC" | "IsWindow"
@@ -398,7 +415,8 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "ImageList_Destroy" => 1,
 
         // --- 2 args ---
-        "CompareFileTime" | "CreateDirectoryW" | "GetFileSize" | "GlobalAlloc" | "MoveFileW"
+        "SetConsoleCtrlHandler" | "SetThreadPriority"
+        | "CompareFileTime" | "CreateDirectoryW" | "GetFileSize" | "GlobalAlloc" | "MoveFileW"
         | "SetEnvironmentVariableW" | "SetFileAttributesW" | "WaitForSingleObject"
         | "GetExitCodeProcess" | "GetTempPathW" | "GetSystemDirectoryW" | "GetWindowsDirectoryW"
         | "EnableWindow" | "EndDialog" | "EndPaint" | "ExitWindowsEx" | "GetClientRect"
@@ -996,6 +1014,38 @@ impl WinOs {
             }
 
             Api::CrtNoop => ret(0),
+
+            // --- C stdio output → host console ------------------------------
+            // The FILE* stream (last arg) is opaque to us; route to stdout.
+            Api::Fputs => {
+                let s = self.arg(cpu, mem, 0)?;
+                let bytes = mem.read_cstr(s, 1 << 20)?;
+                self.emit(false, &bytes);
+                ret(0)
+            }
+            Api::Fputc => {
+                let c = self.arg(cpu, mem, 0)? as u8;
+                self.emit(false, &[c]);
+                ret(c as u64)
+            }
+            Api::Fwrite => {
+                // fwrite(ptr, size, count, stream)
+                let ptr = self.arg(cpu, mem, 0)?;
+                let size = self.arg(cpu, mem, 1)?;
+                let count = self.arg(cpu, mem, 2)?;
+                let n = (size * count) as usize;
+                let mut buf = vec![0u8; n];
+                mem.read(ptr, &mut buf)?;
+                self.emit(false, &buf);
+                ret(count)
+            }
+            Api::Puts => {
+                let s = self.arg(cpu, mem, 0)?;
+                let mut bytes = mem.read_cstr(s, 1 << 20)?;
+                bytes.push(b'\n');
+                self.emit(false, &bytes);
+                ret(0)
+            }
 
             // --- Win32 string helpers ---------------------------------------
             Api::CharNextA => {
