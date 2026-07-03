@@ -12,3 +12,4 @@ description = "A minifb-backed renderer for Windows dialogs, implementing exemu_
 exemu-core = { workspace = true }
 minifb = "0.27"
 font8x8 = "0.3"
+png = "0.17"
