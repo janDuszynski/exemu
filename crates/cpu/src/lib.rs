@@ -281,8 +281,14 @@ impl Interpreter {
             }
 
             if sib & 7 == 5 && mod_ == 0 {
-                // No base register; disp32 follows.
+                // No base register; disp32 follows. Still honor a segment
+                // override (e.g. `gs:[disp32]` for TEB / stack-probe access).
                 let disp = ctx.u32(mem)? as i32 as i64;
+                if ctx.pfx.seg == 0x65 {
+                    base = base.wrapping_add(GS_BASE);
+                } else if ctx.pfx.seg == 0x64 {
+                    base = base.wrapping_add(fs_base(ctx.bits));
+                }
                 ctx.rm = Rm::Mem { base, disp, rip_rel: false };
                 return Ok(());
             } else {
