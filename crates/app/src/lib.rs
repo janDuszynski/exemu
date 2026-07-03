@@ -246,10 +246,16 @@ impl Process {
             }
         }
 
-        // --- Optional real GUI backend ------------------------------------
+        // --- Optional GUI backend -----------------------------------------
+        // EXEMU_GUI_SHOT=<dir> selects the offscreen PNG renderer (for
+        // headless testing); otherwise a live minifb window.
         if cfg.gui {
             let dialogs = loader::parse_dialogs(pe_bytes);
-            os.set_gui(Box::new(exemu_gui::MinifbGui::new()), dialogs);
+            let gui: Box<dyn exemu_core::Gui> = match std::env::var_os("EXEMU_GUI_SHOT") {
+                Some(dir) => Box::new(exemu_gui::OffscreenGui::new(std::path::PathBuf::from(dir))),
+                None => Box::new(exemu_gui::MinifbGui::new()),
+            };
+            os.set_gui(gui, dialogs);
         }
 
         // --- Initial CPU state --------------------------------------------
