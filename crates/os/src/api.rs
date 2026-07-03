@@ -195,6 +195,8 @@ pub enum Api {
     /// Accepted window/GDI stubs that just return `r` (ShowWindow,
     /// UpdateWindow, TranslateMessage, DeleteObject, ...).
     WinStub { r: u64, argc: u32 },
+    /// wsprintf(A/W): format into a caller buffer (subset of format specs).
+    WsprintfApi { wide: bool },
 
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
@@ -365,6 +367,32 @@ impl Api {
                 Api::WinStub { r, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
+            // wsprintf: real (subset) formatting — installers rely on it.
+            "wsprintfW" | "wsprintfA" => Api::WsprintfApi { wide: name.ends_with('W') },
+
+            // Registry: report every key/value as absent, so an installer's
+            // "already installed?" probes cleanly take the not-found path
+            // instead of getting a bogus ERROR_SUCCESS with a garbage handle.
+            "RegOpenKeyExW" | "RegOpenKeyExA" | "RegOpenKeyW" | "RegOpenKeyA" | "RegQueryValueExW"
+            | "RegQueryValueExA" | "RegQueryValueW" | "RegQueryValueA" | "RegEnumKeyExW"
+            | "RegEnumKeyW" | "RegEnumValueW" | "RegQueryInfoKeyW" | "RegGetValueW" => {
+                Api::WinStub { r: 2, argc: win32_argc(dll, name).unwrap_or(0) } // ERROR_FILE_NOT_FOUND
+            }
+            "RegCloseKey" | "RegCreateKeyExW" | "RegCreateKeyExA" | "RegSetValueExW"
+            | "RegSetValueExA" | "RegDeleteKeyW" | "RegDeleteValueW" | "RegFlushKey"
+            | "RegDeleteKeyExW" | "RegNotifyChangeKeyValue" => {
+                Api::WinStub { r: 0, argc: win32_argc(dll, name).unwrap_or(0) } // ERROR_SUCCESS
+            }
+
+            // Directory enumeration against nothing: no matches.
+            "FindFirstFileW" | "FindFirstFileA" | "FindFirstFileExW" => {
+                Api::WinStub { r: u64::MAX, argc: win32_argc(dll, name).unwrap_or(0) } // INVALID_HANDLE_VALUE
+            }
+            "FindNextFileW" | "FindNextFileA" => {
+                Api::WinStub { r: FALSE, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+            "FindClose" => Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) },
+
             _ => Api::Unsupported {
                 sym: format!("{dll}!{name}"),
                 argc: win32_argc(dll, name).unwrap_or(0),
@@ -447,6 +475,8 @@ impl Api {
             Api::DefWindowProcApi | Api::MoveToExApi | Api::SetPixelApi => 4,
             Api::RectangleApi | Api::TextOutApi => 5,
             Api::CreateWindowExApi => 12,
+            // Variadic cdecl — caller cleans up.
+            Api::WsprintfApi { .. } => 0,
             // Fake-handle, stub and unimplemented carry their looked-up
             // stdcall footprint so the stack stays balanced.
             Api::WinStub { argc, .. }
@@ -500,7 +530,8 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "ShowWindow" | "BeginPaint" | "GetDeviceCaps" | "SelectObject" | "SetBkColor"
         | "SetBkMode" | "SetTextColor" | "RegDeleteKeyW" | "RegDeleteValueW"
         | "SHGetPathFromIDListW" | "lstrcatW" | "lstrcmpW" | "lstrcmpiA" | "lstrcmpiW"
-        | "lstrcpyA" | "lstrcpyW" => 2,
+        | "lstrcpyA" | "lstrcpyW" | "FindFirstFileW" | "FindFirstFileA" | "FindNextFileW"
+        | "FindNextFileA" | "RegNotifyChangeKeyValue" => 2,
 
         // --- 3 args ---
         "ExpandEnvironmentStringsW" | "CopyFileW" | "SetFileSecurityW" | "LoadLibraryExW"
@@ -523,16 +554,17 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         // --- 6 args ---
         "GetPrivateProfileStringW" | "SearchPathW" | "MultiByteToWideChar" | "CreateThread"
         | "LoadImageW" | "AdjustTokenPrivileges" | "RegQueryValueExW" | "RegSetValueExW"
-        | "ShellExecuteW" => 6,
+        | "ShellExecuteW" | "FindFirstFileExW" => 6,
 
         // --- 7 args ---
-        "CreateFileW" | "SetWindowPos" | "SendMessageTimeoutW" | "TrackPopupMenu" => 7,
+        "CreateFileW" | "SetWindowPos" | "SendMessageTimeoutW" | "TrackPopupMenu"
+        | "RegGetValueW" => 7,
 
         // --- 8, 9, 10, 12 args ---
-        "WideCharToMultiByte" | "RegEnumValueW" => 8,
+        "WideCharToMultiByte" | "RegEnumValueW" | "RegEnumKeyExW" => 8,
         "RegCreateKeyExW" => 9,
         "CreateProcessW" => 10,
-        "CreateWindowExW" => 12,
+        "CreateWindowExW" | "RegQueryInfoKeyW" => 12,
 
         _ => return None,
     };
@@ -620,6 +652,24 @@ pub(crate) fn read_wstr(mem: &dyn Memory, addr: u64) -> Result<String> {
         i += 1;
     }
     Ok(String::from_utf16_lossy(&units))
+}
+
+/// Read a NUL-terminated ANSI (byte) string from guest memory.
+pub(crate) fn read_astr(mem: &dyn Memory, addr: u64) -> Result<String> {
+    if addr == 0 {
+        return Ok(String::new());
+    }
+    let mut bytes = Vec::new();
+    let mut i = 0u64;
+    loop {
+        let b = mem.read_u8(addr + i)?;
+        if b == 0 || i > (1 << 20) {
+            break;
+        }
+        bytes.push(b);
+        i += 1;
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Length of a NUL-terminated UTF-16 string in code units.
@@ -1285,6 +1335,12 @@ impl WinOs {
                 ret(c as u64)
             }
             Api::WinStub { r, .. } => ret(*r),
+            Api::WsprintfApi { wide } => {
+                let out = self.arg(cpu, mem, 0)?;
+                let fmt_ptr = self.arg(cpu, mem, 1)?;
+                let n = self.wsprintf(cpu, mem, out, fmt_ptr, *wide)?;
+                ret(n as u64)
+            }
 
             Api::SendMessageApi => {
                 // Handle the text messages against a control's store; else 0.
@@ -1659,6 +1715,96 @@ impl WinOs {
             cpu.gpr_write(0, 4, result);
         }
         Ok(Outcome::Resume)
+    }
+
+    /// wsprintf(A/W): format `fmt_ptr` with the variadic args (which begin at
+    /// arg index 2) into `out`. Supports %s/%S, %d/%i, %u, %x/%X, %c, %p and
+    /// %% with optional width and `0`/`-` flags — the common installer cases.
+    /// Returns the number of characters written (excluding the NUL).
+    fn wsprintf(&self, cpu: &CpuState, mem: &mut dyn Memory, out: u64, fmt_ptr: u64, wide: bool) -> Result<usize> {
+        let fmt = if wide { read_wstr(mem, fmt_ptr)? } else { read_astr(mem, fmt_ptr)? };
+        let mut result = String::new();
+        let mut argi = 2usize;
+        let mut chars = fmt.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                result.push(c);
+                continue;
+            }
+            let (mut left, mut zero) = (false, false);
+            while let Some(f) = chars.peek() {
+                match f {
+                    '-' => left = true,
+                    '0' => zero = true,
+                    '+' | ' ' | '#' => {}
+                    _ => break,
+                }
+                chars.next();
+            }
+            let mut width = 0usize;
+            while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                width = width * 10 + d as usize;
+                chars.next();
+            }
+            if chars.peek() == Some(&'.') {
+                chars.next();
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    chars.next();
+                }
+            }
+            while matches!(chars.peek(), Some('l' | 'h' | 'w' | 'I' | 'L')) {
+                chars.next();
+            }
+            let conv = chars.next().unwrap_or('%');
+            let mut next = |s: &Self| -> Result<u64> {
+                let v = s.arg(cpu, mem, argi);
+                argi += 1;
+                v
+            };
+            let is_num = matches!(conv, 'd' | 'i' | 'u' | 'x' | 'X' | 'p');
+            let text = match conv {
+                '%' => "%".to_string(),
+                'd' | 'i' => (next(self)? as i32 as i64).to_string(),
+                'u' => (next(self)? as u32).to_string(),
+                'x' => format!("{:x}", next(self)? as u32),
+                'X' => format!("{:X}", next(self)? as u32),
+                'p' => format!("{:08X}", next(self)? as u32),
+                'c' => char::from_u32(next(self)? as u32 & 0xffff).unwrap_or('?').to_string(),
+                's' => {
+                    let p = next(self)?;
+                    if wide { read_wstr(mem, p)? } else { read_astr(mem, p)? }
+                }
+                'S' => {
+                    let p = next(self)?;
+                    if wide { read_astr(mem, p)? } else { read_wstr(mem, p)? }
+                }
+                other => {
+                    result.push('%');
+                    other.to_string()
+                }
+            };
+            let pad = width.saturating_sub(text.chars().count());
+            if pad > 0 && !left {
+                result.push_str(&(if zero && is_num { "0" } else { " " }).repeat(pad));
+            }
+            result.push_str(&text);
+            if pad > 0 && left {
+                result.push_str(&" ".repeat(pad));
+            }
+        }
+        if wide {
+            let units: Vec<u16> = result.encode_utf16().collect();
+            for (i, u) in units.iter().enumerate() {
+                mem.write_u16(out + i as u64 * 2, *u)?;
+            }
+            mem.write_u16(out + units.len() as u64 * 2, 0)?;
+            Ok(units.len())
+        } else {
+            let bytes = result.as_bytes();
+            mem.write(out, bytes)?;
+            mem.write_u8(out + bytes.len() as u64, 0)?;
+            Ok(bytes.len())
+        }
     }
 
     /// Push a progress control's current percentage to the GUI (rendered as
