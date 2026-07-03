@@ -2,7 +2,7 @@
 //! Shared by the live [`crate::MinifbGui`] window and the offscreen
 //! [`crate::OffscreenGui`] (which saves PNGs for headless testing).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use exemu_core::gui::{Control, ControlKind, DialogTemplate};
 use font8x8::UnicodeFonts;
@@ -14,11 +14,17 @@ pub const PAD: usize = 8;
 
 const C_BG: u32 = 0x00F0_F0F0;
 const C_TEXT: u32 = 0x0000_0000;
+const C_GRAY_TEXT: u32 = 0x00A0_A0A0;
 const C_WHITE: u32 = 0x00FF_FFFF;
 const C_BTN: u32 = 0x00E1_E1E1;
+const C_BTN_DIS: u32 = 0x00D0_D0D0;
 const C_BORDER: u32 = 0x00A0_A0A0;
 const C_DKBORDER: u32 = 0x0050_5050;
 const C_PROGRESS: u32 = 0x0006_B025;
+
+/// Extra pixels added around a button's clickable area, so a near-miss still
+/// registers.
+const HIT_PAD: usize = 5;
 
 #[derive(Clone)]
 pub struct Rect {
@@ -115,7 +121,8 @@ impl Renderer {
     }
 
     /// Paint the whole dialog from `tpl` + current `texts`, refreshing `hits`.
-    pub fn paint(&mut self, tpl: &DialogTemplate, texts: &HashMap<u32, String>) {
+    /// Controls in `disabled` are greyed and not clickable.
+    pub fn paint(&mut self, tpl: &DialogTemplate, texts: &HashMap<u32, String>, disabled: &HashSet<u32>) {
         for px in self.buf.iter_mut() {
             *px = C_BG;
         }
@@ -123,31 +130,46 @@ impl Renderer {
         for ctl in &tpl.controls {
             let r = self.du_to_px(ctl);
             let text = texts.get(&ctl.id).cloned().unwrap_or_else(|| ctl.text.clone());
+            let off = disabled.contains(&ctl.id);
+            let push_hit = |hits: &mut Vec<(u32, Rect)>, id: u32, r: &Rect| {
+                hits.push((
+                    id,
+                    Rect {
+                        x: r.x.saturating_sub(HIT_PAD),
+                        y: r.y.saturating_sub(HIT_PAD),
+                        w: r.w + 2 * HIT_PAD,
+                        h: r.h + 2 * HIT_PAD,
+                    },
+                ));
+            };
             match ctl.kind {
                 ControlKind::Static => self.text(&text, r.x, r.y + 2, C_TEXT),
                 ControlKind::Edit => {
                     self.fill(&r, C_WHITE);
                     self.frame(&r, C_BORDER);
                     self.text(&text, r.x + 3, r.y + r.h.saturating_sub(8) / 2, C_TEXT);
-                    self.hits.push((ctl.id, r));
                 }
                 ControlKind::Button { default } => {
-                    self.fill(&r, C_BTN);
-                    self.frame(&r, if default { C_DKBORDER } else { C_BORDER });
-                    if default {
+                    self.fill(&r, if off { C_BTN_DIS } else { C_BTN });
+                    self.frame(&r, if default && !off { C_DKBORDER } else { C_BORDER });
+                    if default && !off {
                         let inner = Rect { x: r.x + 1, y: r.y + 1, w: r.w.saturating_sub(2), h: r.h.saturating_sub(2) };
                         self.frame(&inner, C_DKBORDER);
                     }
                     // Drop the '&' accelerator marker for display.
-                    self.text_centered(&text.replace('&', ""), &r, C_TEXT);
-                    self.hits.push((ctl.id, r));
+                    self.text_centered(&text.replace('&', ""), &r, if off { C_GRAY_TEXT } else { C_TEXT });
+                    if !off {
+                        push_hit(&mut self.hits, ctl.id, &r);
+                    }
                 }
                 ControlKind::Check => {
                     let box_r = Rect { x: r.x, y: r.y + r.h.saturating_sub(12) / 2, w: 12, h: 12 };
                     self.fill(&box_r, C_WHITE);
                     self.frame(&box_r, C_BORDER);
-                    self.text(&text, r.x + 16, r.y + r.h.saturating_sub(8) / 2, C_TEXT);
-                    self.hits.push((ctl.id, r));
+                    self.text(&text, r.x + 16, r.y + r.h.saturating_sub(8) / 2, if off { C_GRAY_TEXT } else { C_TEXT });
+                    if !off {
+                        push_hit(&mut self.hits, ctl.id, &r);
+                    }
                 }
                 ControlKind::Progress => {
                     self.fill(&r, C_WHITE);
