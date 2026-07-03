@@ -118,6 +118,10 @@ pub enum Api {
     InittermDriver,
     /// A CRT startup/teardown hook we can safely no-op, returning 0.
     CrtNoop,
+    /// A CRT global-accessor (`__p__fmode`, `__p__commode`, `__p___argc`, …):
+    /// returns a writable pointer to a per-name backing cell. The CRT does
+    /// `*__p__fmode() = _fmode`, so this must be a real pointer, not 0.
+    CrtGlobalPtr { name: String },
     // C stdio output (routed to the host console).
     Fputs,
     Fputc,
@@ -205,6 +209,10 @@ pub enum Api {
     WinStub { r: u64, argc: u32 },
     /// wsprintf(A/W): format into a caller buffer (subset of format specs).
     WsprintfApi { wide: bool },
+    /// MessageBox(A/W): echo the caption/text to the console and answer IDOK,
+    /// so a program that reports status or an error keeps running instead of
+    /// getting a bogus 0 (not a valid dialog result).
+    MessageBoxApi { wide: bool },
     /// LoadLibrary(Ex)(A/W): load a DLL, return a module handle. `argc` is 1
     /// for the plain form and 3 for the Ex form (32-bit stack cleanup).
     LoadLibraryApi { wide: bool, argc: u32 },
@@ -338,19 +346,33 @@ impl Api {
             | "_configthreadlocale" | "_controlfp" | "_controlfp_s"
             | "__C_specific_handler" | "_XcptFilter" | "_amsg_exit"
             | "signal" | "_lock" | "_unlock" | "_onexit" | "atexit" | "__dllonexit"
-            | "_setmode" | "setlocale" | "_set_new_mode" | "__p__fmode"
+            | "_setmode" | "setlocale" | "_set_new_mode"
             | "_configure_narrow_argv" | "_initialize_narrow_environment"
             | "_get_initial_narrow_environment" | "_set_app_type" => Api::CrtNoop,
+
+            // The CRT global-accessor family (`__p__fmode`, `__p___argc`, …):
+            // every such function returns a pointer to a runtime global.
+            n if n.starts_with("__p_") => Api::CrtGlobalPtr { name: n.to_string() },
 
             // Handle/pointer-returning Win32 functions: return a non-null
             // fake handle so GUI setup "succeeds" and the program proceeds.
             // BOOL-returning functions that must report success (non-zero)
             // so callers don't treat setup as failed and bail/throw.
-            "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "FlushConsoleInputBuffer"
+            "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "SetConsoleTitleA"
+            | "FlushConsoleInputBuffer"
             | "SetHandleCount" | "SetThreadPriority"
-            | "GetDC" | "GetWindowDC" | "LoadCursorW" | "LoadIconW" | "LoadImageW"
+            | "GetDC" | "GetWindowDC" | "LoadCursorW" | "LoadCursorA" | "LoadIconW" | "LoadIconA"
+            | "LoadImageW" | "LoadImageA"
             | "LoadBitmapW" | "GetSystemMenu" | "CreatePopupMenu" | "CreateBrushIndirect"
-            | "CreateFontIndirectW" | "FindWindowExW" | "SetTimer" | "GetModuleHandleExW" => {
+            | "CreateFontIndirectW" | "FindWindowExW" | "SetTimer" | "GetModuleHandleExW"
+            // Window-station / desktop / window handles: a console app that
+            // probes its station (Total Commander does) treats a null result
+            // as "no interactive session" and exits with an error box, so hand
+            // back a non-null handle and let it proceed.
+            | "GetProcessWindowStation" | "GetThreadDesktop" | "OpenDesktopW"
+            | "OpenInputDesktopW" | "GetDesktopWindow" | "GetActiveWindow"
+            | "GetForegroundWindow" | "GetShellWindow" | "GetCurrentThread"
+            | "GetConsoleWindow" => {
                 Api::FakeHandle { sym: format!("{dll}!{name}"), argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
@@ -388,6 +410,7 @@ impl Api {
 
             // wsprintf: real (subset) formatting — installers rely on it.
             "wsprintfW" | "wsprintfA" => Api::WsprintfApi { wide: name.ends_with('W') },
+            "MessageBoxW" | "MessageBoxA" => Api::MessageBoxApi { wide: name.ends_with('W') },
 
             // Registry: report every key/value as absent, so an installer's
             // "already installed?" probes cleanly take the not-found path
@@ -461,7 +484,7 @@ impl Api {
             // cdecl C runtime and internal thunks: caller cleans up.
             Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
             | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
-            | Api::CrtNoop | Api::InittermDriver | Api::ReturnExit
+            | Api::CrtNoop | Api::CrtGlobalPtr { .. } | Api::InittermDriver | Api::ReturnExit
             | Api::Fputs | Api::Fputc | Api::Fwrite | Api::Puts => 0,
             // Win32 string helpers.
             Api::CharNextA | Api::CharNextW | Api::LstrlenA | Api::LstrlenW => 1,
@@ -498,6 +521,7 @@ impl Api {
             Api::CreateWindowExApi => 12,
             // Variadic cdecl — caller cleans up.
             Api::WsprintfApi { .. } => 0,
+            Api::MessageBoxApi { .. } => 4,
             // Fake-handle, stub and unimplemented carry their looked-up
             // stdcall footprint so the stack stays balanced.
             Api::WinStub { argc, .. }
@@ -523,7 +547,10 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         // --- 0 args ---
         "GetCommandLineW" | "GetLastError" | "GetTickCount" | "GetVersion" | "GetCurrentProcess"
         | "CloseClipboard" | "CreatePopupMenu" | "EmptyClipboard" | "GetMessagePos"
-        | "OleUninitialize" | "wsprintfW" | "wsprintfA" => 0,
+        | "OleUninitialize" | "wsprintfW" | "wsprintfA"
+        | "GetProcessWindowStation" | "GetDesktopWindow" | "GetActiveWindow"
+        | "GetForegroundWindow" | "GetShellWindow" | "GetCurrentThread"
+        | "GetConsoleWindow" | "SetConsoleTitleA" => 0,
 
         // --- 1 arg ---
         "SetConsoleTitleW" | "FlushConsoleInputBuffer" | "SetHandleCount"
@@ -538,7 +565,7 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "GetSystemMetrics" | "TranslateMessage" | "DispatchMessageW" | "MessageBoxIndirectW"
         | "DeleteObject" | "CreateBrushIndirect" | "CreateFontIndirectW" | "RegCloseKey"
         | "SHBrowseForFolderW" | "SHFileOperationW" | "OleInitialize" | "CoTaskMemFree"
-        | "ImageList_Destroy" => 1,
+        | "ImageList_Destroy" | "GetThreadDesktop" | "LoadCursorA" | "LoadIconA" => 1,
 
         // --- 2 args ---
         "SetConsoleCtrlHandler" | "SetThreadPriority"
@@ -559,13 +586,15 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "GetShortPathNameW" | "MoveFileExW" | "CheckDlgButton" | "EnableMenuItem"
         | "InvalidateRect" | "SetClassLongW" | "SetDlgItemTextW" | "SetWindowLongW"
         | "GetClassInfoW" | "OpenProcessToken" | "LookupPrivilegeValueW"
-        | "SHGetSpecialFolderLocation" | "ImageList_AddMasked" | "MulDiv" | "lstrcpynW" => 3,
+        | "SHGetSpecialFolderLocation" | "ImageList_AddMasked" | "MulDiv" | "lstrcpynW"
+        | "OpenInputDesktopW" => 3,
 
         // --- 4 args ---
         "GetModuleFileNameW" | "GetFullPathNameW" | "SetFilePointer" | "SetFileTime"
         | "GetTempFileNameW" | "WritePrivateProfileStringW" | "AppendMenuW" | "DefWindowProcW"
         | "FindWindowExW" | "GetDlgItemTextW" | "MessageBoxW" | "SendMessageW" | "GetMessageW"
-        | "SetTimer" | "SystemParametersInfoW" | "DrawTextW" | "FillRect" | "RegEnumKeyW" => 4,
+        | "SetTimer" | "SystemParametersInfoW" | "DrawTextW" | "FillRect" | "RegEnumKeyW"
+        | "OpenDesktopW" => 4,
 
         // --- 5 args ---
         "ReadFile" | "WriteFile" | "GetDiskFreeSpaceW" | "CallWindowProcW" | "CreateDialogParamW"
@@ -574,8 +603,8 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
 
         // --- 6 args ---
         "GetPrivateProfileStringW" | "SearchPathW" | "MultiByteToWideChar" | "CreateThread"
-        | "LoadImageW" | "AdjustTokenPrivileges" | "RegQueryValueExW" | "RegSetValueExW"
-        | "ShellExecuteW" | "FindFirstFileExW" => 6,
+        | "LoadImageW" | "LoadImageA" | "AdjustTokenPrivileges" | "RegQueryValueExW"
+        | "RegSetValueExW" | "ShellExecuteW" | "FindFirstFileExW" => 6,
 
         // --- 7 args ---
         "CreateFileW" | "SetWindowPos" | "SendMessageTimeoutW" | "TrackPopupMenu"
@@ -949,7 +978,16 @@ impl WinOs {
             Api::GetProcAddress => {
                 let hmodule = self.arg(cpu, mem, 0)?;
                 let name_ptr = self.arg(cpu, mem, 1)?;
-                ret(self.get_proc_address(mem, hmodule, name_ptr)?)
+                let addr = self.get_proc_address(mem, hmodule, name_ptr)?;
+                if self.cfg.trace {
+                    let what = if name_ptr < 0x1_0000 {
+                        format!("#{name_ptr}")
+                    } else {
+                        read_astr(mem, name_ptr).unwrap_or_default()
+                    };
+                    eprintln!("[exemu]   GetProcAddress({hmodule:#x}, \"{what}\") -> {addr:#x}");
+                }
+                ret(addr)
             }
 
             // --- msvcrt C runtime --------------------------------------------
@@ -1050,19 +1088,24 @@ impl WinOs {
             // [first, last). We drive them as real guest calls (so C++ static
             // constructors actually run) via the InittermDriver thunk.
             Api::Initterm => {
+                // _initterm(first, last): call each non-null function pointer in
+                // the table [first, last). Entries — and the return address on
+                // the stack — are pointer-sized, so this must respect bitness
+                // (a 32-bit table has 4-byte slots, not 8).
                 let first = self.arg(cpu, mem, 0)?;
                 let last = self.arg(cpu, mem, 1)?;
                 let saved_rsp = cpu.rsp();
-                let ret_addr = mem.read_u64(saved_rsp)?;
+                let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
+                let ret_addr = self.read_ptr(mem, saved_rsp)?;
 
                 let mut fns = VecDeque::new();
                 let mut p = first;
                 while p < last {
-                    let f = mem.read_u64(p)?;
+                    let f = self.read_ptr(mem, p)?;
                     if f != 0 {
                         fns.push_back(f);
                     }
-                    p += 8;
+                    p += ptr;
                 }
 
                 match fns.pop_front() {
@@ -1070,7 +1113,7 @@ impl WinOs {
                     Some(first_fn) => {
                         self.initterm_stack.push(InittermFrame { remaining: fns, ret: ret_addr, saved_rsp });
                         let driver = self.initterm_driver;
-                        setup_call(cpu, mem, first_fn, driver, saved_rsp)?;
+                        self.setup_call_args(cpu, mem, first_fn, &[], driver, saved_rsp)?;
                         Ok(Outcome::Resume)
                     }
                 }
@@ -1404,6 +1447,19 @@ impl WinOs {
                 let n = self.wsprintf(cpu, mem, out, fmt_ptr, *wide)?;
                 ret(n as u64)
             }
+            Api::MessageBoxApi { wide } => {
+                // MessageBox(hWnd, lpText, lpCaption, uType). Surface the text
+                // on the console so the user sees what the program wanted to
+                // say, then answer IDOK.
+                let text_ptr = self.arg(cpu, mem, 1)?;
+                let caption_ptr = self.arg(cpu, mem, 2)?;
+                let text = if *wide { read_wstr(mem, text_ptr)? } else { read_astr(mem, text_ptr)? };
+                let caption =
+                    if *wide { read_wstr(mem, caption_ptr)? } else { read_astr(mem, caption_ptr)? };
+                let caption = if caption.is_empty() { "Message".to_string() } else { caption };
+                self.emit(true, format!("[MessageBox] {caption}: {text}\n").as_bytes());
+                ret(IDOK as u64)
+            }
 
             Api::SendMessageApi => {
                 // Handle the text messages against a control's store; else 0.
@@ -1461,6 +1517,11 @@ impl WinOs {
             }
 
             Api::CrtNoop => ret(0),
+            Api::CrtGlobalPtr { name } => {
+                let name = name.clone();
+                let cell = self.crt_global(mem, &name)?;
+                ret(cell)
+            }
 
             // --- C stdio output → host console ------------------------------
             // The FILE* stream (last arg) is opaque to us; route to stdout.
@@ -1969,34 +2030,19 @@ impl WinOs {
             Some(func) => {
                 let base = self.initterm_stack.last().unwrap().saved_rsp;
                 let driver = self.initterm_driver;
-                setup_call(cpu, mem, func, driver, base)?;
+                self.setup_call_args(cpu, mem, func, &[], driver, base)?;
                 Ok(Outcome::Resume)
             }
             None => {
-                // All callbacks done: return to _initterm's caller with 0.
+                // All callbacks done: return to _initterm's caller with 0,
+                // popping the pointer-sized return slot.
+                let ptr = if self.cfg.is_64bit { 8 } else { 4 };
                 let frame = self.initterm_stack.pop().expect("driver without frame");
-                cpu.set_rsp(frame.saved_rsp + 8);
+                cpu.set_rsp(frame.saved_rsp + ptr);
                 cpu.rip = frame.ret;
                 cpu.set_reg(Reg::Rax, 0);
                 Ok(Outcome::Resume)
             }
         }
     }
-}
-
-/// Set up a Windows x64 call frame below `base_rsp` and point the CPU at
-/// `func` with `ret_addr` as its return address. Reserves the 32-byte shadow
-/// space and leaves `rsp % 16 == 8`, exactly as a real `call` would.
-fn setup_call(
-    cpu: &mut CpuState,
-    mem: &mut dyn Memory,
-    func: u64,
-    ret_addr: u64,
-    base_rsp: u64,
-) -> Result<()> {
-    let sp = (base_rsp & !0xf) - 0x20 - 8;
-    mem.write_u64(sp, ret_addr)?;
-    cpu.set_rsp(sp);
-    cpu.rip = func;
-    Ok(())
 }
