@@ -13,12 +13,14 @@ independent, testable crate behind a trait.
 
 > **Scope.** This is a from-scratch userland emulator built for clarity and
 > extensibility. It implements a broad subset of the x86/x86-64 instruction
-> set (including SSE2), ~200 Win32 functions, and a host-backed sandbox
-> filesystem — enough to run real console programs end to end and to drive
-> real installers a long way into their logic. It is **not** a drop-in
-> replacement for Wine: it does not render a GUI, and it does not emulate
-> the NT kernel, COM, or the .NET CLR, so graphical installers run their
-> startup and extraction but cannot present their wizard.
+> set (including SSE2), ~200 Win32 functions, a host-backed sandbox
+> filesystem, and a lightweight **dialog renderer** — enough to run real
+> console programs end to end and to drive real dialog-based GUI apps
+> (`--gui`) interactively. It is **not** a drop-in replacement for Wine: it
+> does not emulate the NT kernel, COM, or the .NET CLR, and it only renders
+> apps whose UI is a standard `RT_DIALOG` template (installers, config
+> dialogs) — not arbitrary custom-drawn `CreateWindowEx` windows, and not
+> with Windows' native theming.
 
 ## Architecture
 
@@ -154,14 +156,30 @@ exemu sample <out.exe>
   the general mechanism any callback-taking API (`atexit`, `qsort`, window
   procedures) would build on.
 
+### GUI (`--gui`)
+
+`exemu run --gui <app.exe>` renders the program's dialogs in a real window
+and lets you drive them. It is **generic**: the window is built entirely
+from whatever `RT_DIALOG` resource the loaded exe contains — parsed control
+positions/classes/text, standard controls (button/edit/static/check/progress),
+the default (`IDOK`) and cancel (`IDCANCEL`) buttons — with nothing keyed to
+any particular program. Both modeless (`CreateDialogParamW`) and modal
+(`DialogBoxParamW`) dialogs are interactive; the dialog procedure receives
+`WM_INITDIALOG`, real `WM_COMMAND`s on button clicks, control-text messages,
+and progress-bar updates (`PBM_*`). Without `--gui`, dialogs auto-drive
+headlessly (the default button is "clicked" so batch runs proceed).
+
+Limitations: the drawing is a plain software renderer (bitmap font, flat
+controls), not Windows' native theme; and only dialog-template UIs are shown
+— apps that build custom windows via `CreateWindowEx` are not rendered.
+
 ### Not implemented (yet)
 
 AVX and x87 floating point; TLS callbacks and base relocations (images load
 at their preferred base); table-based structured exception handling
 (`.pdata`/`__C_specific_handler` is a no-op — fine unless an exception is
-actually thrown); real threads; a **rendering GUI** and a real window
-message loop; **COM** object creation; and the registry (Reg* calls are
-stubbed).
+actually thrown); real threads; native-themed / custom-drawn windows;
+**COM** object creation; and the registry (Reg* calls are stubbed).
 
 ### What real installers do today
 
@@ -173,12 +191,10 @@ stubbed).
 | Firefox Installer | 32-bit, UPX-packed | runs its ~2.2M-instruction self-decompression stub to a clean exit |
 | SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for ~45M instructions before a fault deep in unpacked code |
 
-exemu drives a real GUI installer's dialog procedure (via a re-entrant
-guest-call mechanism) — invoking `WM_INITDIALOG` and a synthetic Install
-click, round-tripping control text, and pumping a bounded message loop — so
-a self-extracting installer runs its real extraction and writes its files to
-a host sandbox. It still does **not render** a window or handle arbitrary
-user interaction; the Install path is driven automatically.
+7-Zip is only an example — the same generic path drives any dialog-based
+installer. With `--gui` you click Install in a real window (progress bar and
+all); without it, the default button auto-drives so a self-extractor runs
+its real extraction and writes its files to the host sandbox.
 
 Extraction is compute-heavy (LZMA), so a real installer needs a raised step
 budget: `exemu run --max-steps 800000000 installer.exe`. Files land under
