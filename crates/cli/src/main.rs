@@ -71,6 +71,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut path: Option<&str> = None;
     let mut trace = false;
     let mut echo = true;
+    let mut max_steps: Option<u64> = None;
     let mut guest_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -78,6 +79,11 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         match rest[i].as_str() {
             "--trace" => trace = true,
             "--no-echo" => echo = false,
+            "--max-steps" => {
+                i += 1;
+                let v = rest.get(i).ok_or("--max-steps needs a value (0 = unlimited)")?;
+                max_steps = Some(v.replace('_', "").parse().map_err(|_| "bad --max-steps value")?);
+            }
             "--" => {
                 guest_args.extend(rest[i + 1..].iter().cloned());
                 break;
@@ -103,7 +109,10 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut argv = vec![path.to_string()];
     argv.extend(guest_args);
 
-    let cfg = RunConfig { args: argv, echo, trace, ..RunConfig::default() };
+    let mut cfg = RunConfig { args: argv, echo, trace, ..RunConfig::default() };
+    if let Some(m) = max_steps {
+        cfg.max_steps = m;
+    }
     let proc = Process::load(&bytes, &cfg).map_err(|e| e.to_string())?;
     let result = proc.run().map_err(|e| e.to_string())?;
 

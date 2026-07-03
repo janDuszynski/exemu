@@ -92,6 +92,17 @@ pub struct WinOs {
     /// itself trigger another `_initterm`).
     initterm_stack: Vec<api::InittermFrame>,
 
+    /// Thunk that drives general guest callbacks (window/dialog procs).
+    cb_driver: u64,
+    /// Active guest-callback sequences (see [`api::CbFrame`]).
+    cb_stack: Vec<api::CbFrame>,
+    /// Dialog-control text by control id (single active dialog assumed),
+    /// stored as UTF-16 code units. Backs Get/SetDlgItemTextW & WM_GET/SETTEXT.
+    controls: std::collections::HashMap<u32, Vec<u16>>,
+    /// Remaining `WM_NULL` iterations `GetMessageW`/`PeekMessageW` will hand a
+    /// message-loop before reporting `WM_QUIT`, so deferred-work loops run.
+    msg_pumps: u32,
+
     /// Open guest file handles → host file objects.
     files: std::collections::HashMap<u64, fs::OpenFile>,
     next_handle: u64,
@@ -121,14 +132,19 @@ impl WinOs {
             last_error: 0,
             initterm_driver: 0,
             initterm_stack: Vec::new(),
+            cb_driver: 0,
+            cb_stack: Vec::new(),
+            controls: std::collections::HashMap::new(),
+            msg_pumps: 8,
             files: std::collections::HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
         };
-        // Reserve the driver thunk up front so its address is stable.
+        // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
+        os.cb_driver = os.alloc_thunk(Api::CallbackDriver);
         os
     }
 
@@ -271,7 +287,7 @@ impl Hooks for WinOs {
         let Some(api) = self.thunks.get(&rip).cloned() else {
             return Ok(None);
         };
-        if self.cfg.trace {
+        if self.cfg.trace && !matches!(api, Api::CallbackDriver | Api::InittermDriver) {
             eprintln!("[exemu] call {api:?}  (thunk {rip:#x})");
         }
         let argc = api.argc();
