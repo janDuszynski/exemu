@@ -273,9 +273,12 @@ impl Process {
         let mut recent: std::collections::VecDeque<u64> = std::collections::VecDeque::with_capacity(TAIL + 1);
         let exit_code = loop {
             if self.max_steps != 0 && steps >= self.max_steps {
-                return Err(EmuError::Os(format!(
-                    "instruction budget exhausted after {steps} steps (possible infinite loop)"
-                )));
+                let tail: Vec<u64> = recent.iter().copied().collect();
+                return Err(self.fault(
+                    EmuError::Os(format!("instruction budget exhausted after {steps} steps")),
+                    steps,
+                    &tail,
+                ));
             }
             recent.push_back(self.cpu.state().rip);
             if recent.len() > TAIL {

@@ -31,6 +31,17 @@ pub(crate) struct InittermFrame {
     pub saved_rsp: u64,
 }
 
+/// A queued sequence of guest callbacks (e.g. a dialog proc receiving
+/// WM_INITDIALOG then WM_COMMAND). Each entry is `(func, args)`; `args` are
+/// passed per the ABI. When the queue drains, control returns to `ret_addr`
+/// with `rsp = final_rsp` and the API's result in the accumulator.
+pub(crate) struct CbFrame {
+    pub remaining: VecDeque<(u64, Vec<u64>)>,
+    pub ret_addr: u64,
+    pub final_rsp: u64,
+    pub result: u64,
+}
+
 /// Every Windows symbol the emulator implements natively. Anything else
 /// becomes [`Api::Unsupported`] and returns 0.
 #[derive(Debug, Clone)]
@@ -131,6 +142,25 @@ pub enum Api {
     GetSystemDirectoryW,
     GetWindowsDirectoryW,
 
+    // --- GUI: dialog driving + control text -------------------------------
+    /// Not an import: drives a queued sequence of guest callbacks.
+    CallbackDriver,
+    /// CreateDialogParamW / DialogBoxParamW — invoke the DLGPROC.
+    CreateDialogParam { modal: bool },
+    SetDlgItemTextW,
+    GetDlgItemTextW,
+    GetDlgItemApi,
+    SendMessageApi,
+    SetWindowTextApi,
+    GetWindowTextApi,
+    GetMessageApi,
+    PeekMessageApi,
+    IsDialogMessageApi,
+    /// COM object creation — we have no COM, so fail cleanly (null out the
+    /// interface pointer and return an error HRESULT) instead of returning
+    /// S_OK with a null interface, which callers dereference and crash on.
+    CoCreateInstanceApi,
+
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
@@ -224,6 +254,20 @@ impl Api {
             "GetVersionExW" | "GetVersionExA" => Api::GetVersionEx,
             "GetSystemDirectoryW" => Api::GetSystemDirectoryW,
             "GetWindowsDirectoryW" | "GetSystemWindowsDirectoryW" => Api::GetWindowsDirectoryW,
+
+            // GUI dialog driving.
+            "CreateDialogParamW" => Api::CreateDialogParam { modal: false },
+            "DialogBoxParamW" => Api::CreateDialogParam { modal: true },
+            "SetDlgItemTextW" => Api::SetDlgItemTextW,
+            "GetDlgItemTextW" => Api::GetDlgItemTextW,
+            "GetDlgItem" => Api::GetDlgItemApi,
+            "SendMessageW" | "PostMessageW" => Api::SendMessageApi,
+            "SetWindowTextW" => Api::SetWindowTextApi,
+            "GetWindowTextW" => Api::GetWindowTextApi,
+            "GetMessageW" => Api::GetMessageApi,
+            "PeekMessageW" => Api::PeekMessageApi,
+            "IsDialogMessageW" | "IsDialogMessage" => Api::IsDialogMessageApi,
+            "CoCreateInstance" | "CoGetClassObject" => Api::CoCreateInstanceApi,
             "GlobalAlloc" | "LocalAlloc" => Api::GlobalAlloc,
             "GlobalLock" | "LocalLock" | "GlobalHandle" => Api::GlobalLock,
             "GlobalFree" | "GlobalUnlock" | "LocalFree" | "LocalUnlock" => Api::GlobalFreeUnlock,
@@ -237,9 +281,9 @@ impl Api {
 
             // Handle/pointer-returning Win32 functions: return a non-null
             // fake handle so GUI setup "succeeds" and the program proceeds.
-            "GetDC" | "BeginPaint" | "CreateWindowExW" | "CreateDialogParamW" | "RegisterClassW"
+            "GetDC" | "BeginPaint" | "CreateWindowExW" | "RegisterClassW"
             | "LoadCursorW" | "LoadIconW" | "LoadImageW" | "LoadBitmapW" | "GetSystemMenu"
-            | "CreatePopupMenu" | "GetDlgItem" | "CreateBrushIndirect" | "CreateFontIndirectW"
+            | "CreatePopupMenu" | "CreateBrushIndirect" | "CreateFontIndirectW"
             | "FindWindowExW" | "SetTimer" | "GetStockObject" | "SelectObject" => Api::FakeHandle {
                 sym: format!("{dll}!{name}"),
                 argc: win32_argc(dll, name).unwrap_or(0),
@@ -302,6 +346,14 @@ impl Api {
             | Api::GlobalFreeUnlock => 1,
             Api::GetVersion => 0,
             Api::GetVersionEx => 1,
+            // GUI.
+            Api::CallbackDriver => 0,
+            Api::GetDlgItemApi | Api::GetWindowTextApi => 2,
+            Api::SetWindowTextApi | Api::IsDialogMessageApi => 2,
+            Api::SetDlgItemTextW => 3,
+            Api::GetDlgItemTextW | Api::SendMessageApi | Api::GetMessageApi => 4,
+            Api::PeekMessageApi => 5,
+            Api::CreateDialogParam { .. } | Api::CoCreateInstanceApi => 5,
             Api::CreateDirectoryW | Api::GetTempPathW | Api::GetFileSizeApi | Api::GlobalAlloc
             | Api::GetSystemDirectoryW | Api::GetWindowsDirectoryW => 2,
             Api::GetModuleFileNameW => 3,
@@ -401,6 +453,57 @@ const FALSE: u64 = 0;
 /// A non-null sentinel returned by handle/pointer-returning stubs so callers
 /// treat the operation as having succeeded and keep running.
 const FAKE_HANDLE: u64 = 0x00CA_FE00;
+
+// Synthetic window handles and the window messages the GUI shim understands.
+const HWND_DIALOG: u64 = 0x00D1_A000;
+const HWND_CONTROL: u64 = 0x00C0_0000; // control handle = HWND_CONTROL | id
+const WM_SETTEXT: u32 = 0x000C;
+const WM_GETTEXT: u32 = 0x000D;
+const WM_GETTEXTLENGTH: u32 = 0x000E;
+const WM_INITDIALOG: u64 = 0x0110;
+const WM_COMMAND: u64 = 0x0111;
+const IDOK: u32 = 1;
+
+/// Recover the control id from a synthetic control handle, if it is one.
+fn control_id(hwnd: u64) -> Option<u32> {
+    if (HWND_CONTROL..HWND_CONTROL + 0x1_0000).contains(&hwnd) {
+        Some((hwnd - HWND_CONTROL) as u32)
+    } else {
+        None
+    }
+}
+
+/// Read a NUL-terminated UTF-16 string as code units (no terminator).
+fn read_wstr_units(mem: &dyn Memory, addr: u64) -> Result<Vec<u16>> {
+    let mut v = Vec::new();
+    if addr == 0 {
+        return Ok(v);
+    }
+    let mut i = 0u64;
+    loop {
+        let w = mem.read_u16(addr + i * 2)?;
+        if w == 0 || i > (1 << 16) {
+            break;
+        }
+        v.push(w);
+        i += 1;
+    }
+    Ok(v)
+}
+
+/// Write UTF-16 code units + NUL into a guest buffer bounded by `max` units.
+/// Returns the number of units written (excluding the terminator).
+fn write_wstr_units(mem: &mut dyn Memory, addr: u64, units: &[u16], max: usize) -> Result<u64> {
+    if addr == 0 || max == 0 {
+        return Ok(0);
+    }
+    let n = units.len().min(max - 1);
+    for (i, u) in units.iter().take(n).enumerate() {
+        mem.write_u16(addr + (i as u64) * 2, *u)?;
+    }
+    mem.write_u16(addr + (n as u64) * 2, 0)?;
+    Ok(n as u64)
+}
 
 /// Read a NUL-terminated UTF-16 string from guest memory into a `String`.
 fn read_wstr(mem: &dyn Memory, addr: u64) -> Result<String> {
@@ -763,6 +866,134 @@ impl WinOs {
             // A constructor just returned to the driver thunk: run the next
             // one, or return to _initterm's original caller when done.
             Api::InittermDriver => self.initterm_advance(cpu, mem),
+            // A guest callback (window/dialog proc) returned: advance the queue.
+            Api::CallbackDriver => self.cb_advance(cpu, mem),
+
+            // --- GUI: drive the dialog procedure ---------------------------
+            Api::CreateDialogParam { modal } => {
+                // CreateDialogParamW(hInst, lpTemplate, hWndParent, lpDlgProc,
+                //                    dwInitParam) / DialogBoxParamW(same).
+                let dlgproc = self.arg(cpu, mem, 3)?;
+                let init_param = self.arg(cpu, mem, 4)?;
+                let hwnd = HWND_DIALOG;
+                if dlgproc == 0 {
+                    return ret(hwnd);
+                }
+                // Drive the dialog: WM_INITDIALOG, then a synthetic click on
+                // the default/OK ("Install") button, so an installer that
+                // gates work on that button actually runs it.
+                let calls = vec![
+                    (dlgproc, vec![hwnd, WM_INITDIALOG, 0, init_param]),
+                    (dlgproc, vec![hwnd, WM_COMMAND, IDOK as u64, 0]),
+                ];
+                // Modeless returns the hwnd; modal returns the EndDialog value
+                // (we use IDOK). The API argc is 5 for both.
+                let result = if *modal { IDOK as u64 } else { hwnd };
+                self.invoke_callbacks(cpu, mem, calls, result, 5)
+            }
+
+            Api::SetDlgItemTextW => {
+                let id = self.arg(cpu, mem, 1)? as u32;
+                let text = read_wstr_units(mem, self.arg(cpu, mem, 2)?)?;
+                self.controls.insert(id, text);
+                ret(TRUE)
+            }
+            Api::GetDlgItemTextW => {
+                let id = self.arg(cpu, mem, 1)? as u32;
+                let buf = self.arg(cpu, mem, 2)?;
+                let max = self.arg(cpu, mem, 3)? as usize;
+                let text = self.controls.get(&id).cloned().unwrap_or_default();
+                ret(write_wstr_units(mem, buf, &text, max)?)
+            }
+            Api::GetDlgItemApi => {
+                // Return a synthetic control handle encoding the id.
+                let id = self.arg(cpu, mem, 1)? as u32;
+                ret(HWND_CONTROL | id as u64)
+            }
+            Api::SetWindowTextApi => {
+                let hwnd = self.arg(cpu, mem, 0)?;
+                if let Some(id) = control_id(hwnd) {
+                    let text = read_wstr_units(mem, self.arg(cpu, mem, 1)?)?;
+                    self.controls.insert(id, text);
+                }
+                ret(TRUE)
+            }
+            Api::GetWindowTextApi => {
+                let hwnd = self.arg(cpu, mem, 0)?;
+                let buf = self.arg(cpu, mem, 1)?;
+                let max = self.arg(cpu, mem, 2)? as usize;
+                let text = control_id(hwnd)
+                    .and_then(|id| self.controls.get(&id).cloned())
+                    .unwrap_or_default();
+                ret(write_wstr_units(mem, buf, &text, max)?)
+            }
+            // GetMessageW(lpMsg, hWnd, min, max): hand back a WM_NULL message
+            // (return 1) a bounded number of times so a message loop's body
+            // runs (many installers defer real work to a loop iteration), then
+            // report WM_QUIT (return 0) to end the loop.
+            Api::GetMessageApi => {
+                let lp = self.arg(cpu, mem, 0)?;
+                if self.msg_pumps > 0 {
+                    self.msg_pumps -= 1;
+                    self.write_msg(mem, lp)?;
+                    ret(1)
+                } else {
+                    ret(0)
+                }
+            }
+            // PeekMessageW(lpMsg, hWnd, min, max, wRemoveMsg): same budget.
+            Api::PeekMessageApi => {
+                let lp = self.arg(cpu, mem, 0)?;
+                if self.msg_pumps > 0 {
+                    self.msg_pumps -= 1;
+                    self.write_msg(mem, lp)?;
+                    ret(TRUE)
+                } else {
+                    ret(FALSE)
+                }
+            }
+            // IsDialogMessageW: claim the message was handled so the loop
+            // skips Translate/Dispatch and proceeds to its own logic.
+            Api::IsDialogMessageApi => ret(TRUE),
+
+            // CoCreateInstance(rclsid, pUnkOuter, ctx, riid, ppv): no COM, so
+            // null the out-pointer and return REGDB_E_CLASSNOTREG. Callers
+            // then take their failure path instead of dereferencing null.
+            Api::CoCreateInstanceApi => {
+                let ppv = self.arg(cpu, mem, 4)?;
+                if ppv != 0 {
+                    if self.cfg.is_64bit {
+                        mem.write_u64(ppv, 0)?;
+                    } else {
+                        mem.write_u32(ppv, 0)?;
+                    }
+                }
+                ret(0x8004_0154) // REGDB_E_CLASSNOTREG
+            }
+
+            Api::SendMessageApi => {
+                // Handle the text messages against a control's store; else 0.
+                let hwnd = self.arg(cpu, mem, 0)?;
+                let msg = self.arg(cpu, mem, 1)? as u32;
+                let wparam = self.arg(cpu, mem, 2)?;
+                let lparam = self.arg(cpu, mem, 3)?;
+                let id = control_id(hwnd);
+                match (msg, id) {
+                    (WM_SETTEXT, Some(id)) => {
+                        let t = read_wstr_units(mem, lparam)?;
+                        self.controls.insert(id, t);
+                        ret(TRUE)
+                    }
+                    (WM_GETTEXT, Some(id)) => {
+                        let t = self.controls.get(&id).cloned().unwrap_or_default();
+                        ret(write_wstr_units(mem, lparam, &t, wparam as usize)?)
+                    }
+                    (WM_GETTEXTLENGTH, Some(id)) => {
+                        ret(self.controls.get(&id).map(|t| t.len()).unwrap_or(0) as u64)
+                    }
+                    _ => ret(0),
+                }
+            }
 
             Api::CrtNoop => ret(0),
 
@@ -973,6 +1204,120 @@ impl WinOs {
         mem.read(buf, &mut bytes)?;
         let is_err = handle == HANDLE_STDERR;
         self.emit(is_err, &bytes);
+        Ok(())
+    }
+
+    /// Invoke a sequence of guest callbacks, then return `result` to the
+    /// current API's caller. `argc` is the API's own stdcall footprint (for
+    /// 32-bit stack cleanup on the final return). Returns `Outcome::Resume`
+    /// once the first callback is set up, or `Return(result)` if empty.
+    pub(crate) fn invoke_callbacks(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+        calls: Vec<(u64, Vec<u64>)>,
+        result: u64,
+        argc: u32,
+    ) -> Result<Outcome> {
+        let mut q: VecDeque<(u64, Vec<u64>)> = calls.into();
+        let Some((func, args)) = q.pop_front() else {
+            return Ok(Outcome::Return(result));
+        };
+        let saved_rsp = cpu.rsp();
+        let (ret_addr, ret_slot) = if self.cfg.is_64bit {
+            (mem.read_u64(saved_rsp)?, 8u64)
+        } else {
+            (mem.read_u32(saved_rsp)? as u64, 4u64)
+        };
+        let cleanup = if self.cfg.is_64bit { 0 } else { argc as u64 * 4 };
+        let final_rsp = saved_rsp + ret_slot + cleanup;
+        if self.cfg.trace {
+            eprintln!("[exemu]   -> invoke {} callback(s), first fn {func:#x} args {args:?}", q.len() + 1);
+        }
+        self.cb_stack.push(CbFrame { remaining: q, ret_addr, final_rsp, result });
+        let driver = self.cb_driver;
+        self.setup_call_args(cpu, mem, func, &args, driver, saved_rsp)?;
+        Ok(Outcome::Resume)
+    }
+
+    /// Called when a guest callback returns to the callback driver thunk. Runs
+    /// the next queued callback, or returns to the original API's caller.
+    fn cb_advance(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let next = self.cb_stack.last_mut().and_then(|f| f.remaining.pop_front());
+        match next {
+            Some((func, args)) => {
+                if self.cfg.trace {
+                    eprintln!("[exemu]   -> next callback fn {func:#x} args {args:?} (eax was {:#x})", cpu.gpr_read(0, 4));
+                }
+                let base = self.cb_stack.last().unwrap().final_rsp
+                    - if self.cfg.is_64bit { 8 } else { 4 };
+                let driver = self.cb_driver;
+                self.setup_call_args(cpu, mem, func, &args, driver, base)?;
+                Ok(Outcome::Resume)
+            }
+            None => {
+                let f = self.cb_stack.pop().expect("cb driver without frame");
+                cpu.set_rsp(f.final_rsp);
+                cpu.rip = f.ret_addr;
+                if self.cfg.is_64bit {
+                    cpu.set_reg(Reg::Rax, f.result);
+                } else {
+                    cpu.gpr_write(0, 4, f.result);
+                }
+                Ok(Outcome::Resume)
+            }
+        }
+    }
+
+    /// Write a `WM_NULL` MSG struct (targeting the dialog) into a guest
+    /// buffer, for GetMessage/PeekMessage. Layout differs by bitness.
+    fn write_msg(&self, mem: &mut dyn Memory, lp: u64) -> Result<()> {
+        if lp == 0 {
+            return Ok(());
+        }
+        let n = if self.cfg.is_64bit { 48 } else { 28 };
+        for i in 0..n {
+            mem.write_u8(lp + i, 0)?;
+        }
+        // hwnd = the dialog; message = WM_NULL (0, already zeroed).
+        if self.cfg.is_64bit {
+            mem.write_u64(lp, HWND_DIALOG)?;
+        } else {
+            mem.write_u32(lp, HWND_DIALOG as u32)?;
+        }
+        Ok(())
+    }
+
+    /// Set up a guest call to `func` with `args`, returning to `ret_thunk`.
+    /// 64-bit: first four args in RCX/RDX/R8/R9 over a 32-byte shadow.
+    /// 32-bit: args pushed right-to-left (stdcall; the callee cleans them).
+    fn setup_call_args(
+        &self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+        func: u64,
+        args: &[u64],
+        ret_thunk: u64,
+        base_rsp: u64,
+    ) -> Result<()> {
+        if self.cfg.is_64bit {
+            for (i, &a) in args.iter().take(4).enumerate() {
+                cpu.set_reg([Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9][i], a);
+            }
+            let sp = (base_rsp & !0xf) - 0x20 - 8;
+            mem.write_u64(sp, ret_thunk)?;
+            cpu.set_rsp(sp);
+        } else {
+            let mut sp = base_rsp & !0xf;
+            for &a in args.iter().rev() {
+                sp -= 4;
+                mem.write_u32(sp, a as u32)?;
+            }
+            sp -= 4;
+            mem.write_u32(sp, ret_thunk as u32)?;
+            cpu.set_rsp(sp);
+        }
+        cpu.rip = func;
         Ok(())
     }
 
