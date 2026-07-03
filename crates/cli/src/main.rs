@@ -12,7 +12,7 @@
 
 use std::process::ExitCode;
 
-use exemu_app::{sample, Process, RunConfig};
+use exemu_app::{gui_sample, sample, Process, RunConfig};
 use exemu_core::ImportSymbol;
 
 fn main() -> ExitCode {
@@ -33,6 +33,7 @@ fn run(args: Vec<String>) -> Result<u8, String> {
         Some("run") => cmd_run(it.as_slice()),
         Some("info") => cmd_info(it.as_slice()),
         Some("sample") => cmd_sample(it.as_slice()),
+        Some("gui-sample") => cmd_gui_sample(it.as_slice()),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_help();
             Ok(0)
@@ -53,11 +54,13 @@ USAGE:\n\
     exemu run <file.exe> [--trace] [--no-echo] [-- <args>...]\n\
     exemu info <file.exe>\n\
     exemu sample <out.exe>\n\
+    exemu gui-sample <out.exe>\n\
 \n\
 COMMANDS:\n\
-    run      Load and execute a PE64 executable\n\
-    info     Print headers, sections and imports of a PE64 file\n\
-    sample   Generate a self-contained demo .exe (Hello World via kernel32)\n\
+    run        Load and execute a PE64 executable\n\
+    info       Print headers, sections and imports of a PE64 file\n\
+    sample     Generate a console demo .exe (Hello World via kernel32)\n\
+    gui-sample Generate a GUI demo .exe (a real window; run with --gui)\n\
 \n\
 RUN OPTIONS:\n\
     --trace       Log calls to unimplemented Windows APIs\n\
@@ -244,6 +247,17 @@ fn cmd_sample(rest: &[String]) -> Result<u8, String> {
     std::fs::write(path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
     println!(
         "wrote {} bytes to {path} — try:  exemu run {path}",
+        bytes.len()
+    );
+    Ok(0)
+}
+
+fn cmd_gui_sample(rest: &[String]) -> Result<u8, String> {
+    let path = rest.first().ok_or("gui-sample: missing <out.exe>")?;
+    let bytes = gui_sample::build();
+    std::fs::write(path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
+    println!(
+        "wrote {} bytes to {path} — a real GUI window; try:  exemu run --gui {path}",
         bytes.len()
     );
     Ok(0)
