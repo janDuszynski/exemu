@@ -52,6 +52,20 @@ pub enum GuiEvent {
     Command(u32),
     /// The window's close box was clicked.
     Close,
+    /// The mouse was pressed at a client-area position (custom windows).
+    MouseDown(i32, i32),
+}
+
+/// A primitive drawing operation issued by the emulated GDI into a custom
+/// window's framebuffer. Colors are `0x00RRGGBB`.
+#[derive(Debug, Clone)]
+pub enum DrawOp {
+    Clear(u32),
+    FillRect { x: i32, y: i32, w: i32, h: i32, color: u32 },
+    FrameRect { x: i32, y: i32, w: i32, h: i32, color: u32 },
+    Text { x: i32, y: i32, text: String, color: u32 },
+    Line { x0: i32, y0: i32, x1: i32, y1: i32, color: u32 },
+    Pixel { x: i32, y: i32, color: u32 },
 }
 
 /// A windowing backend. Implemented by `exemu-gui`; the OS layer holds a
@@ -71,6 +85,19 @@ pub trait Gui {
     fn is_open(&self) -> bool;
     /// Close the window.
     fn close(&mut self);
+
+    // ---- custom (non-dialog) windows, drawn by the emulated GDI ----------
+
+    /// Open a blank client-area window of the given pixel size. Default no-op.
+    fn open_window(&mut self, _title: &str, _w: u32, _h: u32) {}
+    /// Apply a GDI drawing operation to the window's framebuffer. Default no-op.
+    fn draw(&mut self, _op: &DrawOp) {}
+    /// Flush accumulated drawing to the screen (EndPaint / a pump tick).
+    fn present(&mut self) {}
+    /// Client-area size in pixels, if a custom window is open.
+    fn client_size(&self) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// A no-op backend for headless runs and tests.

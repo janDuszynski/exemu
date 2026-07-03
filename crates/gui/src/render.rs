@@ -192,6 +192,54 @@ impl Renderer {
         self.hits.iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| *id)
     }
 
+    /// Apply one emulated-GDI drawing op to the framebuffer (for custom
+    /// windows). Negative coordinates are clamped into the buffer.
+    pub fn apply(&mut self, op: &exemu_core::DrawOp) {
+        use exemu_core::DrawOp::*;
+        let clamp = |v: i32| v.max(0) as usize;
+        let rect = |x: i32, y: i32, w: i32, h: i32| Rect {
+            x: clamp(x),
+            y: clamp(y),
+            w: w.max(0) as usize,
+            h: h.max(0) as usize,
+        };
+        match op {
+            Clear(c) => self.buf.iter_mut().for_each(|p| *p = *c),
+            FillRect { x, y, w, h, color } => self.fill(&rect(*x, *y, *w, *h), *color),
+            FrameRect { x, y, w, h, color } => self.frame(&rect(*x, *y, *w, *h), *color),
+            Text { x, y, text, color } => self.text(text, clamp(*x), clamp(*y), *color),
+            Line { x0, y0, x1, y1, color } => self.line(*x0, *y0, *x1, *y1, *color),
+            Pixel { x, y, color } => self.px(clamp(*x), clamp(*y), *color),
+        }
+    }
+
+    fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
+        // Bresenham.
+        let (mut x0, mut y0) = (x0, y0);
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        loop {
+            if x0 >= 0 && y0 >= 0 {
+                self.px(x0 as usize, y0 as usize, color);
+            }
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
     /// The framebuffer as tightly-packed RGBA bytes (for PNG output).
     pub fn to_rgba(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.w * self.h * 4);
