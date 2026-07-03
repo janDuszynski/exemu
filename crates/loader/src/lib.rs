@@ -12,6 +12,9 @@
 #![forbid(unsafe_code)]
 
 mod reader;
+mod resources;
+
+pub use resources::parse_dialogs;
 
 use exemu_core::{EmuError, Import, ImportSymbol, PeImage, Result, Section};
 use reader::Reader;

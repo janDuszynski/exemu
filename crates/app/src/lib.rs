@@ -97,13 +97,16 @@ pub struct RunConfig {
     pub trace: bool,
     /// Safety cap on executed instructions (0 = unlimited).
     pub max_steps: u64,
+    /// Render dialogs in a real window and let the user drive them, instead
+    /// of headlessly auto-clicking the default button.
+    pub gui: bool,
 }
 
 impl Default for RunConfig {
     fn default() -> Self {
         // High enough for a real installer's decompression (7-Zip needs
         // ~500M) while still bounding a runaway loop.
-        RunConfig { args: vec!["program.exe".into()], echo: true, trace: false, max_steps: 2_000_000_000 }
+        RunConfig { args: vec!["program.exe".into()], echo: true, trace: false, max_steps: 2_000_000_000, gui: false }
     }
 }
 
@@ -241,6 +244,12 @@ impl Process {
                     mem.poke(thunk, &value.to_le_bytes()[..ptr_size])?;
                 }
             }
+        }
+
+        // --- Optional real GUI backend ------------------------------------
+        if cfg.gui {
+            let dialogs = loader::parse_dialogs(pe_bytes);
+            os.set_gui(Box::new(exemu_gui::MinifbGui::new()), dialogs);
         }
 
         // --- Initial CPU state --------------------------------------------

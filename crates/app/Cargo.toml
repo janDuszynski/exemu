@@ -14,6 +14,7 @@ exemu-loader = { workspace = true }
 exemu-memory = { workspace = true }
 exemu-cpu = { workspace = true }
 exemu-os = { workspace = true }
+exemu-gui = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
