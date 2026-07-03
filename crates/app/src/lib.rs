@@ -38,6 +38,8 @@ struct Layout {
     heap_base: u64,
     heap_size: u64,
     api_base: u64,
+    dll_base: u64,
+    dll_size: u64,
     env_base: u64,
     teb_base: u64,
     peb_addr: u64,
@@ -58,6 +60,8 @@ impl Layout {
                 heap_base: 0x0000_0002_0000_0000,
                 heap_size: 0x0400_0000, // 64 MiB
                 api_base: 0x0000_7EFF_0000_0000,
+                dll_base: 0x0000_0006_0000_0000,
+                dll_size: 0x0800_0000, // 128 MiB
                 env_base: 0x0000_0000_5000_0000,
                 teb_base: GS_BASE,
                 peb_addr: GS_BASE + 0x2000,
@@ -75,6 +79,8 @@ impl Layout {
                 heap_base: 0x1000_0000,
                 heap_size: 0x0400_0000, // 64 MiB
                 api_base: 0x7000_0000,
+                dll_base: 0x2000_0000,
+                dll_size: 0x0400_0000, // 64 MiB (below the 4 GiB ceiling)
                 env_base: 0x0010_0000,
                 teb_base: FS_BASE_32,
                 peb_addr: FS_BASE_32 + 0x2000,
@@ -141,7 +147,9 @@ impl Process {
         // --- Map headers and sections at the preferred image base ---------
         let base = image.image_base;
         let hdr_len = align_up(image.size_of_headers as u64, PAGE).max(PAGE);
-        mem.map_with_data("headers", base, hdr_len, &image.headers, Perm::READ)?;
+        // Writable: packers (UPX etc.) reconstruct headers/import tables in
+        // place at the image base as they unpack.
+        mem.map_with_data("headers", base, hdr_len, &image.headers, Perm::RWX)?;
 
         for s in &image.sections {
             let addr = base + s.rva as u64;
@@ -165,6 +173,10 @@ impl Process {
 
         // --- Heap arena (bump-allocated by the OS layer) ------------------
         mem.map(Region::new("heap", lay.heap_base, lay.heap_size, Perm::RW))?;
+
+        // --- DLL arena (RWX: LoadLibrary maps plugin DLLs here and the
+        //     interpreter executes their code) ------------------------------
+        mem.map(Region::new("dlls", lay.dll_base, lay.dll_size, Perm::RWX))?;
 
         // --- TEB / PEB behind fs:(32-bit) or gs:(64-bit) ------------------
         mem.map(Region::new("teb", lay.teb_base, TEB_SIZE, Perm::RW))?;
@@ -226,6 +238,8 @@ impl Process {
             is_64bit: image.is_64bit,
             sandbox: sandbox.to_string_lossy().into_owned(),
             module_path_w,
+            dll_base: lay.dll_base,
+            dll_size: lay.dll_size,
         });
 
         // Map the thunk region as real read/write memory. Function imports

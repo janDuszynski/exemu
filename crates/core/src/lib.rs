@@ -23,4 +23,4 @@ pub use error::{EmuError, Result};
 pub use gui::{Control, ControlKind, DialogTemplate, DrawOp, Gui, GuiEvent, NoGui};
 pub use hooks::Hooks;
 pub use memory::{Memory, Perm, Region};
-pub use pe::{Import, ImportSymbol, PeImage, Section};
+pub use pe::{Export, Import, ImportSymbol, PeImage, Reloc, Section};

@@ -16,7 +16,7 @@ mod resources;
 
 pub use resources::parse_dialogs;
 
-use exemu_core::{EmuError, Import, ImportSymbol, PeImage, Result, Section};
+use exemu_core::{EmuError, Export, Import, ImportSymbol, PeImage, Reloc, Result, Section};
 use reader::Reader;
 
 // --- On-disk constants -------------------------------------------------------
@@ -37,7 +37,9 @@ const OPT_SIZE_OF_HEADERS: usize = 60;
 const OPT_SUBSYSTEM: usize = 68;
 
 // Data-directory indices.
+const DIR_EXPORT: usize = 0;
 const DIR_IMPORT: usize = 1;
+const DIR_BASERELOC: usize = 5;
 
 // Section characteristics bits.
 const SCN_CNT_UNINIT_DATA: u32 = 0x0000_0080;
@@ -95,13 +97,18 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     };
     let num_dirs = r.u32(opt + num_dirs_off)? as usize;
 
-    // Import data directory (may be absent).
-    let (import_dir_rva, import_dir_size) = if num_dirs > DIR_IMPORT {
-        let base = opt + data_dirs_off + DIR_IMPORT * 8;
-        (r.u32(base)?, r.u32(base + 4)?)
-    } else {
-        (0, 0)
+    // Data directories (each may be absent).
+    let dir = |i: usize| -> Result<(u32, u32)> {
+        if num_dirs > i {
+            let b = opt + data_dirs_off + i * 8;
+            Ok((r.u32(b)?, r.u32(b + 4)?))
+        } else {
+            Ok((0, 0))
+        }
     };
+    let (import_dir_rva, import_dir_size) = dir(DIR_IMPORT)?;
+    let (export_dir_rva, export_dir_size) = dir(DIR_EXPORT)?;
+    let (reloc_dir_rva, reloc_dir_size) = dir(DIR_BASERELOC)?;
 
     // ---- Section table ---------------------------------------------------
     let sec_table = opt + size_opt_header;
@@ -145,6 +152,20 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         Vec::new()
     };
 
+    // ---- Exports (DLLs) --------------------------------------------------
+    let (exports, dll_name) = if export_dir_rva != 0 && export_dir_size != 0 {
+        parse_exports(&sections, export_dir_rva).unwrap_or_default()
+    } else {
+        (Vec::new(), None)
+    };
+
+    // ---- Base relocations ------------------------------------------------
+    let relocations = if reloc_dir_rva != 0 && reloc_dir_size != 0 {
+        parse_relocs(&sections, reloc_dir_rva, reloc_dir_size).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let headers = r.bytes(0, (size_of_headers as usize).min(r.len()))?;
 
     Ok(PeImage {
@@ -157,8 +178,73 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         stack_reserve,
         sections,
         imports,
+        exports,
+        relocations,
+        dll_name,
         headers,
     })
+}
+
+/// Parse the export directory into a flat list of exports (resolving name and
+/// ordinal tables) plus the module's own name.
+fn parse_exports(sections: &[Section], dir_rva: u32) -> Result<(Vec<Export>, Option<String>)> {
+    let ordinal_base = slice_u32(sections, dir_rva + 16)?;
+    let num_funcs = slice_u32(sections, dir_rva + 20)?;
+    let num_names = slice_u32(sections, dir_rva + 24)?;
+    let funcs_rva = slice_u32(sections, dir_rva + 28)?;
+    let names_rva = slice_u32(sections, dir_rva + 32)?;
+    let ords_rva = slice_u32(sections, dir_rva + 36)?;
+    let name_ptr = slice_u32(sections, dir_rva + 12)?;
+    let dll_name = if name_ptr != 0 { cstr_at_rva(sections, name_ptr).ok() } else { None };
+
+    // Map each function index → its exported name (if any).
+    let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    for i in 0..num_names {
+        let name_rva = slice_u32(sections, names_rva + i * 4)?;
+        let ord_index = slice_u16(sections, ords_rva + i * 2)? as u32; // index into funcs
+        if let Ok(nm) = cstr_at_rva(sections, name_rva) {
+            names.insert(ord_index, nm);
+        }
+    }
+
+    let mut exports = Vec::new();
+    for i in 0..num_funcs {
+        let func_rva = slice_u32(sections, funcs_rva + i * 4)?;
+        if func_rva == 0 {
+            continue; // empty slot
+        }
+        exports.push(Export {
+            name: names.get(&i).cloned(),
+            ordinal: (ordinal_base + i) as u16,
+            rva: func_rva,
+        });
+    }
+    Ok((exports, dll_name))
+}
+
+/// Parse the base-relocation blocks into a flat list of fixups.
+fn parse_relocs(sections: &[Section], dir_rva: u32, dir_size: u32) -> Result<Vec<Reloc>> {
+    let mut relocs = Vec::new();
+    let mut off = 0u32;
+    while off + 8 <= dir_size {
+        let page_rva = slice_u32(sections, dir_rva + off)?;
+        let block_size = slice_u32(sections, dir_rva + off + 4)?;
+        if block_size < 8 {
+            break;
+        }
+        let entries = (block_size - 8) / 2;
+        for e in 0..entries {
+            let v = slice_u16(sections, dir_rva + off + 8 + e * 2)?;
+            let kind = (v >> 12) as u8;
+            let word_off = (v & 0x0FFF) as u32;
+            if kind != 0 {
+                // Skip IMAGE_REL_BASED_ABSOLUTE (0), a padding no-op.
+                relocs.push(Reloc { rva: page_rva + word_off, kind });
+            }
+        }
+        off += block_size;
+    }
+    Ok(relocs)
 }
 
 /// Read bytes living at a given RVA out of whichever section contains it.
@@ -172,6 +258,16 @@ fn read_at_rva(sections: &[Section], rva: u32) -> Option<(&Section, usize)> {
         }
     }
     None
+}
+
+fn slice_u16(sections: &[Section], rva: u32) -> Result<u16> {
+    let (s, off) = read_at_rva(sections, rva)
+        .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} not in any section")))?;
+    let b = s
+        .data
+        .get(off..off + 2)
+        .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} past section data")))?;
+    Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
 fn slice_u32(sections: &[Section], rva: u32) -> Result<u32> {

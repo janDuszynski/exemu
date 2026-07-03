@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod dll;
 mod fs;
 mod gdi;
 
@@ -55,6 +56,10 @@ pub struct WinConfig {
     pub sandbox: String,
     /// The guest path of the running module, reported by GetModuleFileNameW.
     pub module_path_w: String,
+    /// RWX arena where dynamically loaded DLLs are mapped
+    /// `[dll_base, dll_base + dll_size)`.
+    pub dll_base: u64,
+    pub dll_size: u64,
 }
 
 impl Default for WinConfig {
@@ -71,6 +76,8 @@ impl Default for WinConfig {
             is_64bit: true,
             sandbox: String::new(),
             module_path_w: "C:\\program.exe".into(),
+            dll_base: 0x0000_0006_0000_0000,
+            dll_size: 0x0800_0000, // 128 MiB
         }
     }
 }
@@ -120,6 +127,8 @@ pub struct WinOs {
     progress: std::collections::HashMap<u32, (i64, i64, i64)>,
     /// Custom (CreateWindowEx) window + GDI state.
     gdi: gdi::Gdi,
+    /// Dynamically loaded DLLs (LoadLibrary/GetProcAddress).
+    dll: dll::Loader,
 
     /// Open guest file handles → host file objects.
     files: std::collections::HashMap<u64, fs::OpenFile>,
@@ -162,6 +171,7 @@ impl WinOs {
             dialog_result: None,
             progress: std::collections::HashMap::new(),
             gdi: gdi::Gdi::default(),
+            dll: dll::Loader::default(),
             files: std::collections::HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,
