@@ -14,13 +14,14 @@ independent, testable crate behind a trait.
 > **Scope.** This is a from-scratch userland emulator built for clarity and
 > extensibility. It implements a broad subset of the x86/x86-64 instruction
 > set (including SSE2), ~200 Win32 functions, a host-backed sandbox
-> filesystem, and a lightweight **dialog renderer** — enough to run real
-> console programs end to end and to drive real dialog-based GUI apps
-> (`--gui`) interactively. It is **not** a drop-in replacement for Wine: it
-> does not emulate the NT kernel, COM, or the .NET CLR, and it only renders
-> apps whose UI is a standard `RT_DIALOG` template (installers, config
-> dialogs) — not arbitrary custom-drawn `CreateWindowEx` windows, and not
-> with Windows' native theming.
+> filesystem, and a lightweight **window + GDI renderer** — enough to run
+> real console programs end to end and to drive real GUI apps (`--gui`)
+> interactively, both dialog-template UIs and custom `CreateWindowEx`
+> windows. It is **not** a drop-in replacement for Wine: it does not emulate
+> the NT kernel, COM, or the .NET CLR, and its rendering is a software
+> subset (solid fills, frames, text, lines) — **not** Windows' native
+> theming, GDI+, or DirectX — so visually complex apps hit unimplemented
+> drawing calls.
 
 ## Architecture
 
@@ -158,28 +159,41 @@ exemu sample <out.exe>
 
 ### GUI (`--gui`)
 
-`exemu run --gui <app.exe>` renders the program's dialogs in a real window
-and lets you drive them. It is **generic**: the window is built entirely
-from whatever `RT_DIALOG` resource the loaded exe contains — parsed control
-positions/classes/text, standard controls (button/edit/static/check/progress),
-the default (`IDOK`) and cancel (`IDCANCEL`) buttons — with nothing keyed to
-any particular program. Both modeless (`CreateDialogParamW`) and modal
-(`DialogBoxParamW`) dialogs are interactive; the dialog procedure receives
-`WM_INITDIALOG`, real `WM_COMMAND`s on button clicks, control-text messages,
-and progress-bar updates (`PBM_*`). Without `--gui`, dialogs auto-drive
-headlessly (the default button is "clicked" so batch runs proceed).
+`exemu run --gui <app.exe>` renders the program's UI in a real window and
+lets you drive it. Two kinds of GUI are handled, both **generic** (keyed
+only to what the loaded exe itself contains):
+
+- **Dialog-template UIs** (installers, config dialogs). The window is built
+  from the exe's `RT_DIALOG` resource — parsed control positions/classes/
+  text, standard controls (button/edit/static/check/progress), and the
+  default (`IDOK`)/cancel (`IDCANCEL`) buttons. Modeless (`CreateDialogParamW`)
+  and modal (`DialogBoxParamW`) dialogs are both interactive; the dialog
+  procedure receives `WM_INITDIALOG`, real `WM_COMMAND`s on clicks, control-
+  text messages, and progress-bar updates (`PBM_*`).
+- **Custom windows** (`RegisterClass` + `CreateWindowEx`). The window is
+  bound to the app's own `WndProc`; the message loop delivers `WM_PAINT`
+  then mouse input, `DispatchMessage` routes them to the `WndProc`, and a
+  **GDI subset** (`BeginPaint`/`EndPaint`, `FillRect`, `Rectangle`,
+  `TextOut`, `MoveTo`/`LineTo`, `SetPixel`, pens/brushes/colors) paints the
+  client area. Try it: `exemu gui-sample /tmp/win.exe && exemu run --gui
+  /tmp/win.exe`.
+
+Without `--gui`, dialogs auto-drive headlessly (the default button is
+"clicked" so batch runs proceed).
 
 Limitations: the drawing is a plain software renderer (bitmap font, flat
-controls), not Windows' native theme; and only dialog-template UIs are shown
-— apps that build custom windows via `CreateWindowEx` are not rendered.
+fills), **not** Windows' native theme, GDI+, or DirectX; the GDI covers
+solid fills/frames/text/lines, not bitmaps, regions, or advanced brushes.
+Complex apps will hit unimplemented calls.
 
 ### Not implemented (yet)
 
-AVX and x87 floating point; TLS callbacks and base relocations (images load
-at their preferred base); table-based structured exception handling
+AVX and x87 floating point; native-themed / GDI+ / DirectX rendering (the
+GDI is a solid-fill/text subset); TLS callbacks and base relocations (images
+load at their preferred base); table-based structured exception handling
 (`.pdata`/`__C_specific_handler` is a no-op — fine unless an exception is
-actually thrown); real threads; native-themed / custom-drawn windows;
-**COM** object creation; and the registry (Reg* calls are stubbed).
+actually thrown); real threads; **COM** object creation; and the registry
+(Reg* calls are stubbed).
 
 ### What real installers do today
 
