@@ -18,6 +18,33 @@ use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 use render::Renderer;
 
+/// Promote this (terminal-launched) process to a foreground GUI app so its
+/// window actually appears and can receive keyboard/mouse focus. Without
+/// this, a minifb window on macOS is created but stays invisible/unfocusable
+/// and `is_open()` reports false. No-op off macOS.
+#[cfg(target_os = "macos")]
+fn become_foreground_app() {
+    #[repr(C)]
+    struct ProcessSerialNumber {
+        high: u32,
+        low: u32,
+    }
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn TransformProcessType(psn: *const ProcessSerialNumber, state: u32) -> i32;
+    }
+    const K_CURRENT_PROCESS: u32 = 2;
+    const K_TO_FOREGROUND: u32 = 1;
+    let psn = ProcessSerialNumber { high: 0, low: K_CURRENT_PROCESS };
+    // Safe: a simple, idempotent Carbon call with a stack-local PSN.
+    unsafe {
+        TransformProcessType(&psn, K_TO_FOREGROUND);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn become_foreground_app() {}
+
 fn default_button(tpl: &DialogTemplate) -> u32 {
     tpl.controls
         .iter()
@@ -77,6 +104,8 @@ impl MinifbGui {
 
 impl Gui for MinifbGui {
     fn open(&mut self, tpl: &DialogTemplate) {
+        // Must happen before the window is created so it appears + focuses.
+        become_foreground_app();
         let (w, h) = Renderer::size_for(tpl);
         let title = if tpl.title.is_empty() { "exemu" } else { &tpl.title };
         let opts = WindowOptions { resize: false, ..WindowOptions::default() };
@@ -86,15 +115,18 @@ impl Gui for MinifbGui {
         self.default_id = default_button(tpl);
         self.tpl = Some(tpl.clone());
         self.prev_down = false;
-        if self.window.is_some() {
-            let label = tpl
-                .controls
-                .iter()
-                .find(|c| c.id == self.default_id)
-                .map(|c| c.text.replace('&', ""))
-                .unwrap_or_else(|| "OK".into());
-            eprintln!("[exemu-gui] window \"{title}\" is open — click it, then press Enter to {label} (Esc = cancel)");
-        }
+        self.repaint();
+        let is_open = self.window.as_ref().map(|w| w.is_open()).unwrap_or(false);
+        let label = tpl
+            .controls
+            .iter()
+            .find(|c| c.id == self.default_id)
+            .map(|c| c.text.replace('&', ""))
+            .unwrap_or_else(|| "OK".into());
+        eprintln!(
+            "[exemu-gui] window \"{title}\": created={} open={is_open} — click it, then press Enter to {label} (Esc cancels)",
+            self.window.is_some()
+        );
         self.repaint();
     }
 
@@ -167,7 +199,10 @@ impl Gui for MinifbGui {
     }
 
     fn is_open(&self) -> bool {
-        self.window.as_ref().map(|w| w.is_open()).unwrap_or(false)
+        // "A window exists" — the interactive path stays engaged while the
+        // window is alive; the user actually closing it is detected inside
+        // `pump` (which returns `Close`) and by `close()`.
+        self.window.is_some()
     }
 
     fn close(&mut self) {
