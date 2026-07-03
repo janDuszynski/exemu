@@ -20,6 +20,7 @@
 
 mod api;
 mod fs;
+mod gdi;
 
 use std::collections::HashMap;
 
@@ -117,6 +118,8 @@ pub struct WinOs {
     dialog_result: Option<u64>,
     /// Progress-bar state by control id: (min, max, pos).
     progress: std::collections::HashMap<u32, (i64, i64, i64)>,
+    /// Custom (CreateWindowEx) window + GDI state.
+    gdi: gdi::Gdi,
 
     /// Open guest file handles → host file objects.
     files: std::collections::HashMap<u64, fs::OpenFile>,
@@ -158,6 +161,7 @@ impl WinOs {
             quit_posted: false,
             dialog_result: None,
             progress: std::collections::HashMap::new(),
+            gdi: gdi::Gdi::default(),
             files: std::collections::HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,

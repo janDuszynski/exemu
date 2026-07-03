@@ -173,6 +173,29 @@ pub enum Api {
     PostQuitMessageApi,
     EndDialogApi,
 
+    // --- custom (CreateWindowEx) windows + GDI ----------------------------
+    RegisterClassApi { ex: bool },
+    CreateWindowExApi,
+    DefWindowProcApi,
+    DispatchMessageApi,
+    BeginPaintApi,
+    EndPaintApi,
+    GetClientRectApi,
+    FillRectApi,
+    RectangleApi,
+    TextOutApi,
+    SetTextColorApi,
+    CreateSolidBrushApi,
+    CreatePenApi,
+    GetStockObjectApi,
+    SelectObjectApi,
+    MoveToExApi,
+    LineToApi,
+    SetPixelApi,
+    /// Accepted window/GDI stubs that just return `r` (ShowWindow,
+    /// UpdateWindow, TranslateMessage, DeleteObject, ...).
+    WinStub { r: u64, argc: u32 },
+
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
@@ -304,13 +327,43 @@ impl Api {
             // so callers don't treat setup as failed and bail/throw.
             "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "FlushConsoleInputBuffer"
             | "SetHandleCount" | "SetThreadPriority"
-            | "GetDC" | "BeginPaint" | "CreateWindowExW" | "RegisterClassW"
-            | "LoadCursorW" | "LoadIconW" | "LoadImageW" | "LoadBitmapW" | "GetSystemMenu"
-            | "CreatePopupMenu" | "CreateBrushIndirect" | "CreateFontIndirectW"
-            | "FindWindowExW" | "SetTimer" | "GetStockObject" | "SelectObject" => Api::FakeHandle {
-                sym: format!("{dll}!{name}"),
-                argc: win32_argc(dll, name).unwrap_or(0),
-            },
+            | "GetDC" | "GetWindowDC" | "LoadCursorW" | "LoadIconW" | "LoadImageW"
+            | "LoadBitmapW" | "GetSystemMenu" | "CreatePopupMenu" | "CreateBrushIndirect"
+            | "CreateFontIndirectW" | "FindWindowExW" | "SetTimer" | "GetModuleHandleExW" => {
+                Api::FakeHandle { sym: format!("{dll}!{name}"), argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+
+            // Custom windows + GDI.
+            "RegisterClassW" | "RegisterClassA" => Api::RegisterClassApi { ex: false },
+            "RegisterClassExW" | "RegisterClassExA" => Api::RegisterClassApi { ex: true },
+            "CreateWindowExW" | "CreateWindowExA" => Api::CreateWindowExApi,
+            "DefWindowProcW" | "DefWindowProcA" => Api::DefWindowProcApi,
+            "DispatchMessageW" | "DispatchMessageA" => Api::DispatchMessageApi,
+            "BeginPaint" => Api::BeginPaintApi,
+            "EndPaint" => Api::EndPaintApi,
+            "GetClientRect" => Api::GetClientRectApi,
+            "FillRect" => Api::FillRectApi,
+            "Rectangle" => Api::RectangleApi,
+            "TextOutW" | "TextOutA" => Api::TextOutApi,
+            "SetTextColor" => Api::SetTextColorApi,
+            "CreateSolidBrush" => Api::CreateSolidBrushApi,
+            "CreatePen" => Api::CreatePenApi,
+            "GetStockObject" => Api::GetStockObjectApi,
+            "SelectObject" => Api::SelectObjectApi,
+            "MoveToEx" => Api::MoveToExApi,
+            "LineTo" => Api::LineToApi,
+            "SetPixel" | "SetPixelV" => Api::SetPixelApi,
+            // Accepted no-effect window/GDI stubs.
+            "ShowWindow" | "UpdateWindow" | "TranslateMessage" | "DeleteObject" | "InvalidateRect"
+            | "SetBkColor" | "SetBkMode" | "ReleaseDC" | "GetSysColor" | "GetSystemMetrics"
+            | "SetWindowPos" | "MoveWindow" | "ValidateRect" => {
+                let r = match name {
+                    "GetSysColor" => 0x00C0_C0C0,
+                    "GetSystemMetrics" => 0,
+                    _ => TRUE,
+                };
+                Api::WinStub { r, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
 
             _ => Api::Unsupported {
                 sym: format!("{dll}!{name}"),
@@ -385,9 +438,20 @@ impl Api {
             Api::SetFilePointerApi | Api::GetTempFileNameW => 4,
             Api::ReadFileApi => 5,
             Api::CreateFileW => 7,
-            // Fake-handle and unimplemented stubs carry their looked-up
+            // Custom windows + GDI.
+            Api::RegisterClassApi { .. } | Api::CreateSolidBrushApi | Api::GetStockObjectApi
+            | Api::DispatchMessageApi => 1,
+            Api::BeginPaintApi | Api::EndPaintApi | Api::GetClientRectApi | Api::SetTextColorApi
+            | Api::SelectObjectApi => 2,
+            Api::FillRectApi | Api::CreatePenApi | Api::LineToApi => 3,
+            Api::DefWindowProcApi | Api::MoveToExApi | Api::SetPixelApi => 4,
+            Api::RectangleApi | Api::TextOutApi => 5,
+            Api::CreateWindowExApi => 12,
+            // Fake-handle, stub and unimplemented carry their looked-up
             // stdcall footprint so the stack stays balanced.
-            Api::FakeHandle { argc, .. } | Api::Unsupported { argc, .. } => *argc,
+            Api::WinStub { argc, .. }
+            | Api::FakeHandle { argc, .. }
+            | Api::Unsupported { argc, .. } => *argc,
         }
     }
 }
@@ -481,7 +545,7 @@ const FALSE: u64 = 0;
 
 /// A non-null sentinel returned by handle/pointer-returning stubs so callers
 /// treat the operation as having succeeded and keep running.
-const FAKE_HANDLE: u64 = 0x00CA_FE00;
+pub(crate) const FAKE_HANDLE: u64 = 0x00CA_FE00;
 
 // Synthetic window handles and the window messages the GUI shim understands.
 const HWND_DIALOG: u64 = 0x00D1_A000;
@@ -541,7 +605,7 @@ fn write_wstr_units(mem: &mut dyn Memory, addr: u64, units: &[u16], max: usize) 
 }
 
 /// Read a NUL-terminated UTF-16 string from guest memory into a `String`.
-fn read_wstr(mem: &dyn Memory, addr: u64) -> Result<String> {
+pub(crate) fn read_wstr(mem: &dyn Memory, addr: u64) -> Result<String> {
     if addr == 0 {
         return Ok(String::new());
     }
@@ -1002,10 +1066,26 @@ impl WinOs {
                     self.quit_posted = false;
                     return ret(0);
                 }
+                // A custom (GDI-drawn) window: deliver WM_PAINT, then mouse
+                // input, as real messages the app dispatches to its WndProc.
+                if self.is_custom_window() {
+                    if self.gdi.paint_pending {
+                        self.gdi.paint_pending = false;
+                        self.write_msg_full(mem, lp, crate::gdi::HWND_CUSTOM, crate::gdi::WM_PAINT, 0, 0)?;
+                        return ret(1);
+                    }
+                    return match self.gui.pump(true) {
+                        Some(exemu_core::GuiEvent::MouseDown(x, y)) => {
+                            let lparam = (((y as u32 & 0xffff) << 16) | (x as u32 & 0xffff)) as u64;
+                            self.write_msg_full(mem, lp, crate::gdi::HWND_CUSTOM, crate::gdi::WM_LBUTTONDOWN, 0, lparam)?;
+                            ret(1)
+                        }
+                        _ => ret(0), // Close / nothing → WM_QUIT
+                    };
+                }
                 if self.gui_active() {
                     // Block on the window until the user acts.
                     return match self.gui.pump(true) {
-                        Some(exemu_core::GuiEvent::Close) => ret(0), // WM_QUIT
                         Some(exemu_core::GuiEvent::Command(id)) => {
                             self.write_msg(mem, lp)?;
                             let (dlgproc, hwnd) = (self.dlgproc, self.dialog_hwnd);
@@ -1015,6 +1095,7 @@ impl WinOs {
                             self.write_msg(mem, lp)?;
                             ret(1)
                         }
+                        _ => ret(0), // Close → WM_QUIT
                     };
                 }
                 if self.msg_pumps > 0 {
@@ -1030,16 +1111,16 @@ impl WinOs {
                 let lp = self.arg(cpu, mem, 0)?;
                 if self.gui_active() {
                     return match self.gui.pump(false) {
-                        Some(exemu_core::GuiEvent::Close) => {
-                            self.quit_posted = true;
-                            ret(FALSE)
-                        }
                         Some(exemu_core::GuiEvent::Command(id)) => {
                             self.write_msg(mem, lp)?;
                             let (dlgproc, hwnd) = (self.dlgproc, self.dialog_hwnd);
                             self.invoke_callbacks(cpu, mem, vec![(dlgproc, vec![hwnd, WM_COMMAND, id as u64, 0])], TRUE, 5, false)
                         }
-                        None => ret(FALSE),
+                        Some(exemu_core::GuiEvent::Close) => {
+                            self.quit_posted = true;
+                            ret(FALSE)
+                        }
+                        _ => ret(FALSE),
                     };
                 }
                 if self.msg_pumps > 0 {
@@ -1084,6 +1165,126 @@ impl WinOs {
                 self.quit_posted = true;
                 ret(TRUE)
             }
+
+            // --- custom (CreateWindowEx) windows + GDI ---------------------
+            Api::RegisterClassApi { ex } => {
+                let wc = self.arg(cpu, mem, 0)?;
+                ret(self.register_class(mem, wc, *ex)?)
+            }
+            Api::CreateWindowExApi => {
+                let class_ptr = self.arg(cpu, mem, 1)?;
+                let name_ptr = self.arg(cpu, mem, 2)?;
+                let w = self.arg(cpu, mem, 6)? as u32 as i64;
+                let h = self.arg(cpu, mem, 7)? as u32 as i64;
+                let lp_param = self.arg(cpu, mem, 11)?;
+                let hwnd = self.create_window(mem, class_ptr, name_ptr, w, h)?;
+                if hwnd != crate::gdi::HWND_CUSTOM {
+                    return ret(hwnd);
+                }
+                // Deliver WM_CREATE with a minimal CREATESTRUCT (lpCreateParams).
+                let cs = self.heap_alloc(80);
+                if cs != 0 {
+                    mem.write_u64(cs, lp_param)?;
+                }
+                let wndproc = self.gdi.wndproc;
+                self.invoke_callbacks(cpu, mem, vec![(wndproc, vec![hwnd, crate::gdi::WM_CREATE, 0, cs])], hwnd, 12, false)
+            }
+            Api::DefWindowProcApi => {
+                let msg = self.arg(cpu, mem, 1)?;
+                if msg == crate::gdi::WM_DESTROY {
+                    self.quit_posted = true;
+                } else if msg == crate::gdi::WM_CLOSE {
+                    self.gui.close();
+                    self.quit_posted = true;
+                }
+                ret(0)
+            }
+            Api::DispatchMessageApi => {
+                let lp = self.arg(cpu, mem, 0)?;
+                let (hwnd, message, wparam, lparam) = self.read_msg(mem, lp)?;
+                let wndproc = self.gdi.wndproc;
+                if wndproc == 0 {
+                    return ret(0);
+                }
+                self.invoke_callbacks(cpu, mem, vec![(wndproc, vec![hwnd, message, wparam, lparam])], 0, 1, false)
+            }
+            Api::BeginPaintApi => {
+                let ps = self.arg(cpu, mem, 1)?;
+                ret(self.begin_paint(mem, ps)?)
+            }
+            Api::EndPaintApi => {
+                self.end_paint();
+                ret(TRUE)
+            }
+            Api::GetClientRectApi => {
+                let rect = self.arg(cpu, mem, 1)?;
+                self.get_client_rect(mem, rect)?;
+                ret(TRUE)
+            }
+            Api::FillRectApi => {
+                let rect = self.arg(cpu, mem, 1)?;
+                let brush = self.arg(cpu, mem, 2)?;
+                self.gdi_fill_rect(mem, rect, brush)?;
+                ret(TRUE)
+            }
+            Api::RectangleApi => {
+                let (l, t, r, b) = (
+                    self.arg(cpu, mem, 1)? as i32,
+                    self.arg(cpu, mem, 2)? as i32,
+                    self.arg(cpu, mem, 3)? as i32,
+                    self.arg(cpu, mem, 4)? as i32,
+                );
+                self.gdi_rectangle(l, t, r, b);
+                ret(TRUE)
+            }
+            Api::TextOutApi => {
+                let (x, y) = (self.arg(cpu, mem, 1)? as i32, self.arg(cpu, mem, 2)? as i32);
+                let s = self.arg(cpu, mem, 3)?;
+                let count = self.arg(cpu, mem, 4)? as usize;
+                let mut units = read_wstr_units(mem, s)?;
+                if count < units.len() {
+                    units.truncate(count);
+                }
+                self.gdi_text_out(x, y, &String::from_utf16_lossy(&units));
+                ret(TRUE)
+            }
+            Api::SetTextColorApi => {
+                let c = self.arg(cpu, mem, 1)? as u32;
+                ret(self.set_text_color(c))
+            }
+            Api::CreateSolidBrushApi => {
+                let c = self.arg(cpu, mem, 0)? as u32;
+                ret(self.create_solid_brush(c))
+            }
+            Api::CreatePenApi => {
+                let c = self.arg(cpu, mem, 2)? as u32;
+                ret(self.create_pen(c))
+            }
+            Api::GetStockObjectApi => {
+                let i = self.arg(cpu, mem, 0)?;
+                ret(self.get_stock_object(i))
+            }
+            Api::SelectObjectApi => {
+                let obj = self.arg(cpu, mem, 1)?;
+                ret(self.select_object(obj))
+            }
+            Api::MoveToExApi => {
+                let (x, y) = (self.arg(cpu, mem, 1)? as i32, self.arg(cpu, mem, 2)? as i32);
+                self.gdi_move_to(x, y);
+                ret(TRUE)
+            }
+            Api::LineToApi => {
+                let (x, y) = (self.arg(cpu, mem, 1)? as i32, self.arg(cpu, mem, 2)? as i32);
+                self.gdi_line_to(x, y);
+                ret(TRUE)
+            }
+            Api::SetPixelApi => {
+                let (x, y) = (self.arg(cpu, mem, 1)? as i32, self.arg(cpu, mem, 2)? as i32);
+                let c = self.arg(cpu, mem, 3)? as u32;
+                self.gdi_set_pixel(x, y, c);
+                ret(c as u64)
+            }
+            Api::WinStub { r, .. } => ret(*r),
 
             Api::SendMessageApi => {
                 // Handle the text messages against a control's store; else 0.
@@ -1440,7 +1641,8 @@ impl WinOs {
                     self.setup_call_args(cpu, mem, dlgproc, &[hwnd, WM_COMMAND, id as u64, 0], driver, base)?;
                     return Ok(Outcome::Resume);
                 }
-                Some(exemu_core::GuiEvent::Close) | None => {
+                _ => {
+                    // Close / no event → cancel the modal dialog.
                     self.dialog_result = Some(IDCANCEL as u64);
                 }
             }
@@ -1472,6 +1674,12 @@ impl WinOs {
     /// Write a `WM_NULL` MSG struct (targeting the dialog) into a guest
     /// buffer, for GetMessage/PeekMessage. Layout differs by bitness.
     fn write_msg(&self, mem: &mut dyn Memory, lp: u64) -> Result<()> {
+        // hwnd = the dialog; message = WM_NULL.
+        self.write_msg_full(mem, lp, HWND_DIALOG, 0, 0, 0)
+    }
+
+    /// Write a full MSG (hwnd, message, wParam, lParam) into a guest buffer.
+    fn write_msg_full(&self, mem: &mut dyn Memory, lp: u64, hwnd: u64, message: u64, wparam: u64, lparam: u64) -> Result<()> {
         if lp == 0 {
             return Ok(());
         }
@@ -1479,13 +1687,32 @@ impl WinOs {
         for i in 0..n {
             mem.write_u8(lp + i, 0)?;
         }
-        // hwnd = the dialog; message = WM_NULL (0, already zeroed).
         if self.cfg.is_64bit {
-            mem.write_u64(lp, HWND_DIALOG)?;
+            mem.write_u64(lp, hwnd)?;
+            mem.write_u32(lp + 8, message as u32)?;
+            mem.write_u64(lp + 16, wparam)?;
+            mem.write_u64(lp + 24, lparam)?;
         } else {
-            mem.write_u32(lp, HWND_DIALOG as u32)?;
+            mem.write_u32(lp, hwnd as u32)?;
+            mem.write_u32(lp + 4, message as u32)?;
+            mem.write_u32(lp + 8, wparam as u32)?;
+            mem.write_u32(lp + 12, lparam as u32)?;
         }
         Ok(())
+    }
+
+    /// Read a MSG (hwnd, message, wParam, lParam) from a guest buffer.
+    fn read_msg(&self, mem: &dyn Memory, lp: u64) -> Result<(u64, u64, u64, u64)> {
+        if self.cfg.is_64bit {
+            Ok((mem.read_u64(lp)?, mem.read_u32(lp + 8)? as u64, mem.read_u64(lp + 16)?, mem.read_u64(lp + 24)?))
+        } else {
+            Ok((
+                mem.read_u32(lp)? as u64,
+                mem.read_u32(lp + 4)? as u64,
+                mem.read_u32(lp + 8)? as u64,
+                mem.read_u32(lp + 12)? as u64,
+            ))
+        }
     }
 
     /// Set up a guest call to `func` with `args`, returning to `ret_thunk`.

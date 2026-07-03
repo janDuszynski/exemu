@@ -87,6 +87,8 @@ pub struct MinifbGui {
     /// Buttons already activated — greyed and non-clickable (one-shot), so a
     /// second click can't re-trigger the action while it runs.
     disabled: HashSet<u32>,
+    /// True when showing a custom (GDI-drawn) window rather than a dialog.
+    custom: bool,
 }
 
 impl Default for MinifbGui {
@@ -106,12 +108,45 @@ impl MinifbGui {
             prev_down: false,
             warmup: 0,
             disabled: HashSet::new(),
+            custom: false,
+        }
+    }
+
+    /// Input pump for a custom (GDI-drawn) window: returns a client-area
+    /// mouse press or the window-close event; painting is driven by the OS
+    /// layer's WM_PAINT.
+    fn pump_custom(&mut self, block: bool) -> Option<GuiEvent> {
+        loop {
+            if !self.window.as_ref().map(|w| w.is_open()).unwrap_or(false) {
+                return Some(GuiEvent::Close);
+            }
+            self.repaint();
+            let (down, pos) = self
+                .window
+                .as_mut()
+                .map(|w| (w.get_mouse_down(MouseButton::Left), w.get_mouse_pos(MouseMode::Clamp).unwrap_or((0.0, 0.0))))
+                .unwrap_or((false, (0.0, 0.0)));
+            let pressed = down && !self.prev_down;
+            self.prev_down = down;
+            if self.warmup > 0 {
+                self.warmup -= 1;
+            } else if pressed {
+                return Some(GuiEvent::MouseDown(pos.0 as i32, pos.1 as i32));
+            }
+            if !block {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
         }
     }
 
     fn repaint(&mut self) {
-        if let Some(tpl) = &self.tpl {
-            self.r.paint(tpl, &self.texts, &self.disabled);
+        // A custom window keeps whatever the guest's GDI drew; only dialogs
+        // are re-composited from their template here.
+        if !self.custom {
+            if let Some(tpl) = &self.tpl {
+                self.r.paint(tpl, &self.texts, &self.disabled);
+            }
         }
         let (w, h) = (self.r.w, self.r.h);
         if let Some(win) = self.window.as_mut() {
@@ -138,6 +173,7 @@ impl Gui for MinifbGui {
         self.prev_down = false;
         self.warmup = 40; // ~0.3s of ignored input
         self.disabled.clear();
+        self.custom = false;
         self.repaint();
         let is_open = self.window.as_ref().map(|w| w.is_open()).unwrap_or(false);
         let label = tpl
@@ -162,7 +198,41 @@ impl Gui for MinifbGui {
         self.texts.get(&id).cloned()
     }
 
+    fn open_window(&mut self, title: &str, w: u32, h: u32) {
+        let (w, h) = ((w as usize).clamp(120, 1600), (h as usize).clamp(80, 1000));
+        let opts = WindowOptions { resize: false, topmost: true, ..WindowOptions::default() };
+        self.window = Window::new(title, w, h, opts).ok();
+        become_foreground_app();
+        self.r = Renderer::new(w, h);
+        self.r.apply(&exemu_core::DrawOp::Clear(0x00C0_C0C0));
+        self.custom = true;
+        self.prev_down = false;
+        self.warmup = 20;
+        self.tpl = None;
+        eprintln!("[exemu-gui] custom window \"{title}\" {w}x{h} — GDI-drawn; close it to continue");
+        self.repaint();
+    }
+
+    fn draw(&mut self, op: &exemu_core::DrawOp) {
+        self.r.apply(op);
+    }
+
+    fn present(&mut self) {
+        self.repaint();
+    }
+
+    fn client_size(&self) -> Option<(u32, u32)> {
+        if self.custom {
+            Some((self.r.w as u32, self.r.h as u32))
+        } else {
+            None
+        }
+    }
+
     fn pump(&mut self, block: bool) -> Option<GuiEvent> {
+        if self.custom {
+            return self.pump_custom(block);
+        }
         let mut iter = 0u32;
         loop {
             let win_open = self.window.as_ref().map(|w| w.is_open()).unwrap_or(false);
@@ -258,6 +328,7 @@ pub struct OffscreenGui {
     set_calls: u32,
     clicked: bool,
     open: bool,
+    custom: bool,
 }
 
 impl OffscreenGui {
@@ -274,13 +345,19 @@ impl OffscreenGui {
             set_calls: 0,
             clicked: false,
             open: false,
+            custom: false,
         }
     }
 
     fn snapshot(&mut self, tag: &str) {
-        let Some(tpl) = self.tpl.clone() else { return };
-        self.r.paint(&tpl, &self.texts, &HashSet::new());
-        let path = self.dir.join(format!("dialog-{:02}-{tag}.png", self.shot));
+        // Dialogs are composited from their template; custom windows keep
+        // whatever the guest's GDI drew.
+        if !self.custom {
+            let Some(tpl) = self.tpl.clone() else { return };
+            self.r.paint(&tpl, &self.texts, &HashSet::new());
+        }
+        let kind = if self.custom { "window" } else { "dialog" };
+        let path = self.dir.join(format!("{kind}-{:02}-{tag}.png", self.shot));
         self.shot += 1;
         if let Ok(file) = std::fs::File::create(&path) {
             let mut enc = png::Encoder::new(std::io::BufWriter::new(file), self.r.w as u32, self.r.h as u32);
@@ -303,7 +380,31 @@ impl Gui for OffscreenGui {
         self.tpl = Some(tpl.clone());
         self.clicked = false;
         self.open = true;
+        self.custom = false;
         self.snapshot("open");
+    }
+
+    fn open_window(&mut self, _title: &str, w: u32, h: u32) {
+        let (w, h) = ((w as usize).clamp(120, 1600), (h as usize).clamp(80, 1000));
+        self.r = Renderer::new(w, h);
+        self.r.apply(&exemu_core::DrawOp::Clear(0x00C0_C0C0));
+        self.custom = true;
+        self.open = true;
+        self.clicked = false;
+    }
+
+    fn draw(&mut self, op: &exemu_core::DrawOp) {
+        self.r.apply(op);
+    }
+
+    fn present(&mut self) {
+        if self.custom {
+            self.snapshot("paint");
+        }
+    }
+
+    fn client_size(&self) -> Option<(u32, u32)> {
+        self.custom.then_some((self.r.w as u32, self.r.h as u32))
     }
 
     fn set_text(&mut self, id: u32, text: &str) {
@@ -322,6 +423,10 @@ impl Gui for OffscreenGui {
 
     fn pump(&mut self, block: bool) -> Option<GuiEvent> {
         if !self.open {
+            return Some(GuiEvent::Close);
+        }
+        // Custom windows: they've painted; end the loop.
+        if self.custom {
             return Some(GuiEvent::Close);
         }
         if block {
