@@ -138,7 +138,8 @@ impl Renderer {
                         let inner = Rect { x: r.x + 1, y: r.y + 1, w: r.w.saturating_sub(2), h: r.h.saturating_sub(2) };
                         self.frame(&inner, C_DKBORDER);
                     }
-                    self.text_centered(&text, &r, C_TEXT);
+                    // Drop the '&' accelerator marker for display.
+                    self.text_centered(&text.replace('&', ""), &r, C_TEXT);
                     self.hits.push((ctl.id, r));
                 }
                 ControlKind::Check => {
