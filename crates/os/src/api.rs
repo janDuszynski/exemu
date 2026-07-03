@@ -213,6 +213,10 @@ pub enum Api {
     /// so a program that reports status or an error keeps running instead of
     /// getting a bogus 0 (not a valid dialog result).
     MessageBoxApi { wide: bool },
+    /// GetUserObjectInformation(A/W): report the process window station as a
+    /// visible, interactive session (UOI_FLAGS → WSF_VISIBLE) so a GUI program
+    /// that gates on an interactive desktop proceeds instead of erroring out.
+    GetUserObjectInfoApi,
     /// LoadLibrary(Ex)(A/W): load a DLL, return a module handle. `argc` is 1
     /// for the plain form and 3 for the Ex form (32-bit stack cleanup).
     LoadLibraryApi { wide: bool, argc: u32 },
@@ -358,7 +362,12 @@ impl Api {
             // fake handle so GUI setup "succeeds" and the program proceeds.
             // BOOL-returning functions that must report success (non-zero)
             // so callers don't treat setup as failed and bail/throw.
-            "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "SetConsoleTitleA"
+            // HeapCreate must yield a non-null heap handle: the older MSVC CRT
+            // creates its own heap here and calls _amsg_exit ("Runtime Error!")
+            // if it fails. Our HeapAlloc ignores the handle and bump-allocates,
+            // so any non-null handle works.
+            "HeapCreate"
+            | "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "SetConsoleTitleA"
             | "FlushConsoleInputBuffer"
             | "SetHandleCount" | "SetThreadPriority"
             | "GetDC" | "GetWindowDC" | "LoadCursorW" | "LoadCursorA" | "LoadIconW" | "LoadIconA"
@@ -408,9 +417,26 @@ impl Api {
                 Api::WinStub { r, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
+            // Heap-management no-ops that must report success (the single bump
+            // arena is never actually destroyed or reconfigured).
+            "HeapDestroy" | "HeapValidate" | "HeapSetInformation" | "HeapCompact" => {
+                Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+
+            // Critical sections / interlocked list heads: we run single-threaded,
+            // so these are no-ops — but the BOOL-returning ones must report
+            // success (the CRT aborts with "Runtime Error!" if lock init fails).
+            "InitializeCriticalSection" | "InitializeCriticalSectionEx"
+            | "InitializeCriticalSectionAndSpinCount" | "EnterCriticalSection"
+            | "LeaveCriticalSection" | "DeleteCriticalSection" | "TryEnterCriticalSection"
+            | "SetCriticalSectionSpinCount" | "InitializeSListHead" => {
+                Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+
             // wsprintf: real (subset) formatting — installers rely on it.
             "wsprintfW" | "wsprintfA" => Api::WsprintfApi { wide: name.ends_with('W') },
             "MessageBoxW" | "MessageBoxA" => Api::MessageBoxApi { wide: name.ends_with('W') },
+            "GetUserObjectInformationW" | "GetUserObjectInformationA" => Api::GetUserObjectInfoApi,
 
             // Registry: report every key/value as absent, so an installer's
             // "already installed?" probes cleanly take the not-found path
@@ -522,6 +548,7 @@ impl Api {
             // Variadic cdecl — caller cleans up.
             Api::WsprintfApi { .. } => 0,
             Api::MessageBoxApi { .. } => 4,
+            Api::GetUserObjectInfoApi => 5,
             // Fake-handle, stub and unimplemented carry their looked-up
             // stdcall footprint so the stack stays balanced.
             Api::WinStub { argc, .. }
@@ -555,7 +582,7 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         // --- 1 arg ---
         "SetConsoleTitleW" | "FlushConsoleInputBuffer" | "SetHandleCount"
         | "InitializeCriticalSection" | "DeleteCriticalSection" | "EnterCriticalSection"
-        | "LeaveCriticalSection"
+        | "LeaveCriticalSection" | "TryEnterCriticalSection" | "InitializeSListHead"
         | "CloseHandle" | "FindClose" | "FreeLibrary" | "GetFileAttributesW" | "DeleteFileW"
         | "GlobalFree" | "GlobalLock" | "GlobalUnlock" | "RemoveDirectoryW"
         | "SetCurrentDirectoryW" | "GetModuleHandleA" | "GetModuleHandleW" | "Sleep"
@@ -565,13 +592,15 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "GetSystemMetrics" | "TranslateMessage" | "DispatchMessageW" | "MessageBoxIndirectW"
         | "DeleteObject" | "CreateBrushIndirect" | "CreateFontIndirectW" | "RegCloseKey"
         | "SHBrowseForFolderW" | "SHFileOperationW" | "OleInitialize" | "CoTaskMemFree"
-        | "ImageList_Destroy" | "GetThreadDesktop" | "LoadCursorA" | "LoadIconA" => 1,
+        | "ImageList_Destroy" | "GetThreadDesktop" | "LoadCursorA" | "LoadIconA"
+        | "HeapDestroy" => 1,
 
         // --- 2 args ---
         "SetConsoleCtrlHandler" | "SetThreadPriority"
         | "CompareFileTime" | "CreateDirectoryW" | "GetFileSize" | "GlobalAlloc" | "MoveFileW"
         | "SetEnvironmentVariableW" | "SetFileAttributesW" | "WaitForSingleObject"
         | "GetExitCodeProcess" | "GetTempPathW" | "GetSystemDirectoryW" | "GetWindowsDirectoryW"
+        | "HeapCompact" | "InitializeCriticalSectionAndSpinCount" | "SetCriticalSectionSpinCount"
         | "EnableWindow" | "EndDialog" | "EndPaint" | "ExitWindowsEx" | "GetClientRect"
         | "GetDlgItem" | "GetSystemMenu" | "GetWindowLongW" | "GetWindowRect" | "LoadBitmapW"
         | "LoadCursorW" | "ReleaseDC" | "ScreenToClient" | "SetClipboardData" | "SetWindowTextW"
@@ -587,14 +616,15 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "InvalidateRect" | "SetClassLongW" | "SetDlgItemTextW" | "SetWindowLongW"
         | "GetClassInfoW" | "OpenProcessToken" | "LookupPrivilegeValueW"
         | "SHGetSpecialFolderLocation" | "ImageList_AddMasked" | "MulDiv" | "lstrcpynW"
-        | "OpenInputDesktopW" => 3,
+        | "OpenInputDesktopW" | "HeapCreate" | "HeapValidate"
+        | "InitializeCriticalSectionEx" => 3,
 
         // --- 4 args ---
         "GetModuleFileNameW" | "GetFullPathNameW" | "SetFilePointer" | "SetFileTime"
         | "GetTempFileNameW" | "WritePrivateProfileStringW" | "AppendMenuW" | "DefWindowProcW"
         | "FindWindowExW" | "GetDlgItemTextW" | "MessageBoxW" | "SendMessageW" | "GetMessageW"
         | "SetTimer" | "SystemParametersInfoW" | "DrawTextW" | "FillRect" | "RegEnumKeyW"
-        | "OpenDesktopW" => 4,
+        | "OpenDesktopW" | "HeapSetInformation" => 4,
 
         // --- 5 args ---
         "ReadFile" | "WriteFile" | "GetDiskFreeSpaceW" | "CallWindowProcW" | "CreateDialogParamW"
@@ -1459,6 +1489,29 @@ impl WinOs {
                 let caption = if caption.is_empty() { "Message".to_string() } else { caption };
                 self.emit(true, format!("[MessageBox] {caption}: {text}\n").as_bytes());
                 ret(IDOK as u64)
+            }
+            Api::GetUserObjectInfoApi => {
+                // GetUserObjectInformation(hObj, nIndex, pvInfo, nLength, lpnNeeded).
+                const UOI_FLAGS: u64 = 1;
+                const WSF_VISIBLE: u32 = 0x0001;
+                let nindex = self.arg(cpu, mem, 1)?;
+                let pv = self.arg(cpu, mem, 2)?;
+                let nlen = self.arg(cpu, mem, 3)?;
+                let needed = self.arg(cpu, mem, 4)?;
+                if nindex == UOI_FLAGS {
+                    // USEROBJECTFLAGS { BOOL fInherit; BOOL fReserved; DWORD dwFlags; }
+                    if pv != 0 && nlen >= 12 {
+                        mem.write_u32(pv, 0)?;
+                        mem.write_u32(pv + 4, 0)?;
+                        mem.write_u32(pv + 8, WSF_VISIBLE)?;
+                    }
+                    if needed != 0 {
+                        mem.write_u32(needed, 12)?;
+                    }
+                } else if needed != 0 {
+                    mem.write_u32(needed, 0)?;
+                }
+                ret(TRUE)
             }
 
             Api::SendMessageApi => {
