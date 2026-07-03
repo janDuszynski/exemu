@@ -124,7 +124,9 @@ impl Gui for MinifbGui {
     fn open(&mut self, tpl: &DialogTemplate) {
         let (w, h) = Renderer::size_for(tpl);
         let title = if tpl.title.is_empty() { "exemu" } else { &tpl.title };
-        let opts = WindowOptions { resize: false, ..WindowOptions::default() };
+        // `topmost` keeps the window in front of the launching terminal — on
+        // macOS a normal CLI-owned window otherwise opens hidden behind it.
+        let opts = WindowOptions { resize: false, topmost: true, ..WindowOptions::default() };
         self.window = Window::new(title, w, h, opts).ok();
         // Activate AFTER creating the window, so minifb's own NSApplication
         // setup doesn't override the foreground promotion.
