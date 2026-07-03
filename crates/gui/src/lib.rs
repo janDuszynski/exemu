@@ -32,13 +32,17 @@ fn become_foreground_app() {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn TransformProcessType(psn: *const ProcessSerialNumber, state: u32) -> i32;
+        fn SetFrontProcess(psn: *const ProcessSerialNumber) -> i16;
     }
     const K_CURRENT_PROCESS: u32 = 2;
     const K_TO_FOREGROUND: u32 = 1;
     let psn = ProcessSerialNumber { high: 0, low: K_CURRENT_PROCESS };
-    // Safe: a simple, idempotent Carbon call with a stack-local PSN.
+    // Safe: simple, idempotent Carbon calls with a stack-local PSN. Promote
+    // the process to a foreground app and bring it to the front so the window
+    // is visible and can take keyboard/mouse focus.
     unsafe {
         TransformProcessType(&psn, K_TO_FOREGROUND);
+        SetFrontProcess(&psn);
     }
 }
 
@@ -71,6 +75,9 @@ pub struct MinifbGui {
     texts: HashMap<u32, String>,
     default_id: u32,
     prev_down: bool,
+    /// Input is ignored for this many initial pump iterations, so the
+    /// keystroke that launched the program isn't taken as a button press.
+    warmup: u32,
 }
 
 impl Default for MinifbGui {
@@ -88,6 +95,7 @@ impl MinifbGui {
             texts: HashMap::new(),
             default_id: 1,
             prev_down: false,
+            warmup: 0,
         }
     }
 
@@ -104,17 +112,19 @@ impl MinifbGui {
 
 impl Gui for MinifbGui {
     fn open(&mut self, tpl: &DialogTemplate) {
-        // Must happen before the window is created so it appears + focuses.
-        become_foreground_app();
         let (w, h) = Renderer::size_for(tpl);
         let title = if tpl.title.is_empty() { "exemu" } else { &tpl.title };
         let opts = WindowOptions { resize: false, ..WindowOptions::default() };
         self.window = Window::new(title, w, h, opts).ok();
+        // Activate AFTER creating the window, so minifb's own NSApplication
+        // setup doesn't override the foreground promotion.
+        become_foreground_app();
         self.r = Renderer::new(w, h);
         self.texts = seed_texts(tpl);
         self.default_id = default_button(tpl);
         self.tpl = Some(tpl.clone());
         self.prev_down = false;
+        self.warmup = 40; // ~0.3s of ignored input
         self.repaint();
         let is_open = self.window.as_ref().map(|w| w.is_open()).unwrap_or(false);
         let label = tpl
@@ -140,54 +150,55 @@ impl Gui for MinifbGui {
     }
 
     fn pump(&mut self, block: bool) -> Option<GuiEvent> {
-        let debug = std::env::var_os("EXEMU_GUI_DEBUG").is_some();
-        let mut ticks = 0u32;
+        let mut iter = 0u32;
         loop {
-            if !self.window.as_ref().map(|w| w.is_open()).unwrap_or(false) {
+            let win_open = self.window.as_ref().map(|w| w.is_open()).unwrap_or(false);
+            if !win_open {
+                eprintln!("[exemu-gui] window was closed");
                 return Some(GuiEvent::Close);
             }
             self.repaint();
 
-            // Every ~0.5s, report focus + mouse so we can see if the window is
-            // even receiving events on this machine.
-            if debug {
-                ticks += 1;
-                if ticks % 60 == 1 {
-                    if let Some(w) = self.window.as_mut() {
-                        let active = w.is_active();
-                        let mp = w.get_mouse_pos(MouseMode::Pass);
-                        eprintln!("[exemu-gui] focus(active)={active} mouse={mp:?} — click the window, then press Enter");
-                    }
-                }
-            }
-
-            if let Some(w) = self.window.as_ref() {
-                if w.is_key_pressed(Key::Enter, KeyRepeat::No) || w.is_key_pressed(Key::NumPadEnter, KeyRepeat::No) {
-                    if debug {
-                        eprintln!("[exemu-gui] Enter -> default button id={}", self.default_id);
-                    }
-                    return Some(GuiEvent::Command(self.default_id));
-                }
-                if w.is_key_pressed(Key::Escape, KeyRepeat::No) {
-                    return Some(GuiEvent::Command(2));
-                }
-            }
-
-            let (down, pos) = self
+            // Read input state.
+            let (active, enter, esc, down, pos) = self
                 .window
-                .as_ref()
-                .map(|w| (w.get_mouse_down(MouseButton::Left), w.get_mouse_pos(MouseMode::Clamp).unwrap_or((0.0, 0.0))))
-                .unwrap_or((false, (0.0, 0.0)));
+                .as_mut()
+                .map(|w| {
+                    (
+                        w.is_active(),
+                        w.is_key_pressed(Key::Enter, KeyRepeat::No) || w.is_key_pressed(Key::NumPadEnter, KeyRepeat::No),
+                        w.is_key_pressed(Key::Escape, KeyRepeat::No),
+                        w.get_mouse_down(MouseButton::Left),
+                        w.get_mouse_pos(MouseMode::Clamp).unwrap_or((0.0, 0.0)),
+                    )
+                })
+                .unwrap_or((false, false, false, false, (0.0, 0.0)));
+
+            // Report the first couple of iterations and any input, always, so
+            // the behavior is visible without needing an env var.
+            iter += 1;
             let pressed = down && !self.prev_down;
             self.prev_down = down;
-            if pressed {
-                let (mx, my) = (pos.0 as usize, pos.1 as usize);
-                let hit = self.r.hit_test(mx, my);
-                if debug {
-                    eprintln!("[exemu-gui] click ({mx},{my}) win {}x{} -> {hit:?}", self.r.w, self.r.h);
+            if iter <= 2 || enter || esc || pressed {
+                eprintln!(
+                    "[exemu-gui] pump: active={active} enter={enter} esc={esc} click={pressed}@({},{}) warmup={}",
+                    pos.0 as i32, pos.1 as i32, self.warmup
+                );
+            }
+
+            if self.warmup > 0 {
+                self.warmup -= 1;
+            } else {
+                if enter {
+                    return Some(GuiEvent::Command(self.default_id));
                 }
-                if let Some(id) = hit {
-                    return Some(GuiEvent::Command(id));
+                if esc {
+                    return Some(GuiEvent::Command(2));
+                }
+                if pressed {
+                    if let Some(id) = self.r.hit_test(pos.0 as usize, pos.1 as usize) {
+                        return Some(GuiEvent::Command(id));
+                    }
                 }
             }
 
