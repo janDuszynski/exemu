@@ -86,7 +86,6 @@ pub enum Api {
     GetStartupInfoW,
     GetEnvironmentStringsW,
     FreeEnvironmentStringsW,
-    LoadLibraryA,
     FreeLibrary,
     GetProcAddress,
 
@@ -197,6 +196,9 @@ pub enum Api {
     WinStub { r: u64, argc: u32 },
     /// wsprintf(A/W): format into a caller buffer (subset of format specs).
     WsprintfApi { wide: bool },
+    /// LoadLibrary(Ex)(A/W): load a DLL, return a module handle. `argc` is 1
+    /// for the plain form and 3 for the Ex form (32-bit stack cleanup).
+    LoadLibraryApi { wide: bool, argc: u32 },
 
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
@@ -246,7 +248,10 @@ impl Api {
             "GetStartupInfoW" => Api::GetStartupInfoW,
             "GetEnvironmentStringsW" => Api::GetEnvironmentStringsW,
             "FreeEnvironmentStringsW" => Api::FreeEnvironmentStringsW,
-            "LoadLibraryA" => Api::LoadLibraryA,
+            "LoadLibraryW" => Api::LoadLibraryApi { wide: true, argc: 1 },
+            "LoadLibraryExW" => Api::LoadLibraryApi { wide: true, argc: 3 },
+            "LoadLibraryA" => Api::LoadLibraryApi { wide: false, argc: 1 },
+            "LoadLibraryExA" => Api::LoadLibraryApi { wide: false, argc: 3 },
             "FreeLibrary" => Api::FreeLibrary,
             "GetProcAddress" => Api::GetProcAddress,
 
@@ -434,7 +439,7 @@ impl Api {
             Api::GetStartupInfoA | Api::GetStartupInfoW => 1,
             Api::GetEnvironmentStringsW => 0,
             Api::FreeEnvironmentStringsW => 1,
-            Api::LoadLibraryA => 1,
+            Api::LoadLibraryApi { argc, .. } => *argc,
             Api::FreeLibrary => 1,
             Api::GetProcAddress => 2,
             // cdecl C runtime and internal thunks: caller cleans up.
@@ -787,8 +792,30 @@ impl WinOs {
             Api::GetCommandLineW => ret(self.cfg.cmdline_ptr_w),
 
             Api::GetModuleHandleA | Api::GetModuleHandleW => {
-                // Only the "this module" (NULL name) case is supported.
-                ret(self.cfg.image_base)
+                let name_ptr = self.arg(cpu, mem, 0)?;
+                if name_ptr == 0 {
+                    return ret(self.cfg.image_base); // this module
+                }
+                let name = if matches!(api, Api::GetModuleHandleW) {
+                    read_wstr(mem, name_ptr)?
+                } else {
+                    read_astr(mem, name_ptr)?
+                };
+                ret(self.module_handle(&name))
+            }
+
+            Api::LoadLibraryApi { wide, argc } => {
+                let name_ptr = self.arg(cpu, mem, 0)?;
+                let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
+                let argc = *argc;
+                let handle = self.load_library(mem, &name)?;
+                // Run a freshly loaded plugin's DllMain(base, ATTACH, 0) before
+                // returning the handle to the caller.
+                if let Some((entry, base)) = self.dll.pending_dllmain.take() {
+                    let calls = vec![(entry, vec![base, 1 /* DLL_PROCESS_ATTACH */, 0])];
+                    return self.invoke_callbacks(cpu, mem, calls, handle, argc, false);
+                }
+                ret(handle)
             }
 
             Api::GetProcessHeap => ret(HANDLE_PROCESS_HEAP),
@@ -885,9 +912,12 @@ impl WinOs {
             }
             Api::FreeEnvironmentStringsW => ret(TRUE),
 
-            Api::LoadLibraryA => ret(0), // pretend the DLL could not be loaded
             Api::FreeLibrary => ret(TRUE),
-            Api::GetProcAddress => ret(0),
+            Api::GetProcAddress => {
+                let hmodule = self.arg(cpu, mem, 0)?;
+                let name_ptr = self.arg(cpu, mem, 1)?;
+                ret(self.get_proc_address(mem, hmodule, name_ptr)?)
+            }
 
             // --- msvcrt C runtime --------------------------------------------
             Api::Malloc => {

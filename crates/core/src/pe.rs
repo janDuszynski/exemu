@@ -44,6 +44,25 @@ pub struct Import {
     pub iat_rva: u32,
 }
 
+/// A single exported symbol from a module's export directory.
+#[derive(Debug, Clone)]
+pub struct Export {
+    /// The export name, if the symbol is exported by name.
+    pub name: Option<String>,
+    /// The export ordinal (biased by the directory's ordinal base).
+    pub ordinal: u16,
+    /// RVA of the exported function/variable within the module.
+    pub rva: u32,
+}
+
+/// A base-relocation fixup: apply the load delta to the value at `rva`.
+#[derive(Debug, Clone, Copy)]
+pub struct Reloc {
+    pub rva: u32,
+    /// IMAGE_REL_BASED_* type (3 = HIGHLOW/32-bit, 10 = DIR64/64-bit).
+    pub kind: u8,
+}
+
 /// A fully parsed PE image, ready to be mapped and run.
 #[derive(Debug, Clone)]
 pub struct PeImage {
@@ -63,6 +82,12 @@ pub struct PeImage {
     pub stack_reserve: u64,
     pub sections: Vec<Section>,
     pub imports: Vec<Import>,
+    /// Exported symbols (populated for DLLs; usually empty for exes).
+    pub exports: Vec<Export>,
+    /// Base relocations, used to load a DLL away from its preferred base.
+    pub relocations: Vec<Reloc>,
+    /// The module's own name from the export directory, if present.
+    pub dll_name: Option<String>,
     /// The raw header bytes, mapped read-only at the image base so guests
     /// that walk their own headers (via the PEB) see something sane.
     pub headers: Vec<u8>,

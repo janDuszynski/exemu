@@ -42,7 +42,7 @@ impl WinOs {
     /// A drive prefix (`C:`) becomes a directory named after the letter, and
     /// backslashes become path separators; `..` components are dropped so a
     /// guest cannot escape the sandbox.
-    fn host_path(&self, guest: &str) -> Option<PathBuf> {
+    pub(crate) fn host_path(&self, guest: &str) -> Option<PathBuf> {
         if self.cfg.sandbox.is_empty() {
             return None;
         }
