@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use exemu_core::gui::{Control, ControlKind, DialogTemplate, Gui, GuiEvent};
 use font8x8::UnicodeFonts;
-use minifb::{MouseButton, MouseMode, Window, WindowOptions};
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 // Dialog-unit → pixel scale (approximate MS Shell Dlg base units).
 const SX: f32 = 1.75;
@@ -51,6 +51,8 @@ pub struct MinifbGui {
     /// Clickable control hit rectangles in pixels.
     hits: Vec<(u32, Rect)>,
     prev_down: bool,
+    /// The default (IDOK) button id, activated by Enter.
+    default_id: u32,
 }
 
 impl Default for MinifbGui {
@@ -70,6 +72,7 @@ impl MinifbGui {
             texts: HashMap::new(),
             hits: Vec::new(),
             prev_down: false,
+            default_id: 1,
         }
     }
 
@@ -219,8 +222,25 @@ impl Gui for MinifbGui {
                 self.texts.insert(c.id, c.text.clone());
             }
         }
+        self.default_id = tpl
+            .controls
+            .iter()
+            .find(|c| matches!(c.kind, ControlKind::Button { default: true }))
+            .map(|c| c.id)
+            .unwrap_or(1);
         self.tpl = Some(tpl.clone());
         self.prev_down = false;
+        if self.window.is_some() {
+            eprintln!(
+                "[exemu-gui] window \"{}\" — click a button, or press Enter to {} / Esc to cancel",
+                tpl.title,
+                tpl.controls
+                    .iter()
+                    .find(|c| c.id == self.default_id)
+                    .map(|c| c.text.replace('&', ""))
+                    .unwrap_or_else(|| "OK".into()),
+            );
+        }
         self.refresh();
     }
 
@@ -234,12 +254,30 @@ impl Gui for MinifbGui {
     }
 
     fn pump(&mut self, block: bool) -> Option<GuiEvent> {
+        let debug = std::env::var_os("EXEMU_GUI_DEBUG").is_some();
         loop {
             let open = self.window.as_ref().map(|w| w.is_open()).unwrap_or(false);
             if !open {
                 return Some(GuiEvent::Close);
             }
+            // Process OS events + redraw first, THEN read the fresh input.
             self.refresh();
+
+            // Keyboard: Enter activates the default button, Esc cancels — a
+            // reliable path that avoids any mouse-coordinate quirks.
+            if let Some(w) = self.window.as_ref() {
+                if w.is_key_pressed(Key::Enter, KeyRepeat::No)
+                    || w.is_key_pressed(Key::NumPadEnter, KeyRepeat::No)
+                {
+                    if debug {
+                        eprintln!("[exemu-gui] Enter -> default button id={}", self.default_id);
+                    }
+                    return Some(GuiEvent::Command(self.default_id));
+                }
+                if w.is_key_pressed(Key::Escape, KeyRepeat::No) {
+                    return Some(GuiEvent::Command(2)); // IDCANCEL
+                }
+            }
 
             let (down, pos) = self
                 .window
@@ -252,22 +290,40 @@ impl Gui for MinifbGui {
                 })
                 .unwrap_or((false, (0.0, 0.0)));
 
-            // A click is a release after a press.
-            let released = self.prev_down && !down;
+            // Fire on the press edge — a physical press is held long enough
+            // across polls to be caught, unlike a fast release.
+            let pressed = down && !self.prev_down;
             self.prev_down = down;
-            if released {
+            if pressed {
                 let (mx, my) = (pos.0 as usize, pos.1 as usize);
-                for (id, r) in &self.hits {
-                    if r.contains(mx, my) {
-                        return Some(GuiEvent::Command(*id));
-                    }
+                let hit = self.hits.iter().find(|(_, r)| r.contains(mx, my)).map(|(id, _)| *id);
+                if debug {
+                    eprintln!(
+                        "[exemu-gui] click at ({mx},{my}) win {}x{} -> {}",
+                        self.w,
+                        self.h,
+                        match hit {
+                            Some(id) => format!("control id={id}"),
+                            None => {
+                                let rects: Vec<_> = self
+                                    .hits
+                                    .iter()
+                                    .map(|(id, r)| format!("{id}:[{},{} {}x{}]", r.x, r.y, r.w, r.h))
+                                    .collect();
+                                format!("no control (buttons: {})", rects.join(" "))
+                            }
+                        }
+                    );
+                }
+                if let Some(id) = hit {
+                    return Some(GuiEvent::Command(id));
                 }
             }
 
             if !block {
                 return None;
             }
-            std::thread::sleep(std::time::Duration::from_millis(16));
+            std::thread::sleep(std::time::Duration::from_millis(8));
         }
     }
 
