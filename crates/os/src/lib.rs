@@ -139,6 +139,20 @@ pub struct WinOs {
     /// etc.), one per distinct name, allocated lazily from the heap arena.
     crt_globals: std::collections::HashMap<String, u64>,
 
+    /// Process environment (ordered `name=value` pairs), seeded with a
+    /// plausible Windows environment. Backs the `GetEnvironmentStrings*`,
+    /// `GetEnvironmentVariable*`, `SetEnvironmentVariable*` and
+    /// `ExpandEnvironmentStrings*` families. Kept ordered so successive
+    /// `GetEnvironmentStrings` calls are stable and match `Set` insertions.
+    env: Vec<(String, String)>,
+
+    /// Thread-Local Storage slots (`TlsAlloc` family). `Some(v)` = allocated,
+    /// holding value `v`; `None` = free. Single-threaded, so one global vector.
+    tls_slots: Vec<Option<u64>>,
+    /// Fiber-Local Storage slots (`FlsAlloc` family) — the same model, in a
+    /// separate namespace. The MSVC CRT keeps its per-thread data pointer here.
+    fls_slots: Vec<Option<u64>>,
+
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
@@ -179,6 +193,9 @@ impl WinOs {
             next_handle: 0x0000_1000,
             temp_counter: 0,
             crt_globals: std::collections::HashMap::new(),
+            env: default_environment(),
+            tls_slots: Vec::new(),
+            fls_slots: Vec::new(),
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
         };
@@ -384,6 +401,181 @@ impl WinOs {
         self.crt_globals.insert(name.to_string(), cell);
         Ok(cell)
     }
+
+    // ---- Thread/Fiber Local Storage --------------------------------------
+    // Fiber slots share this implementation (we run single-threaded); the
+    // `fiber` flag only selects which of the two independent slot vectors is
+    // used, matching Windows' separate TLS and FLS index namespaces.
+
+    fn tls_store(&mut self, fiber: bool) -> &mut Vec<Option<u64>> {
+        if fiber {
+            &mut self.fls_slots
+        } else {
+            &mut self.tls_slots
+        }
+    }
+
+    /// Reserve a slot and return its index (never the out-of-indexes sentinel,
+    /// since the vector grows on demand). A fresh slot reads back as NULL.
+    fn tls_alloc(&mut self, fiber: bool) -> u64 {
+        let slots = self.tls_store(fiber);
+        let idx = match slots.iter().position(Option::is_none) {
+            Some(i) => i,
+            None => {
+                slots.push(None);
+                slots.len() - 1
+            }
+        };
+        slots[idx] = Some(0);
+        idx as u64
+    }
+
+    /// Store a value in a slot. Returns whether it succeeded (always true for a
+    /// valid index; the vector is grown so an in-range index never fails).
+    fn tls_set(&mut self, fiber: bool, index: u64, value: u64) -> bool {
+        let i = index as usize;
+        let slots = self.tls_store(fiber);
+        if i >= slots.len() {
+            slots.resize(i + 1, None);
+        }
+        slots[i] = Some(value);
+        true
+    }
+
+    /// Read a slot's value (NULL for an unset or out-of-range index).
+    fn tls_get(&self, fiber: bool, index: u64) -> u64 {
+        let slots = if fiber { &self.fls_slots } else { &self.tls_slots };
+        slots.get(index as usize).copied().flatten().unwrap_or(0)
+    }
+
+    /// Release a slot. Always reports success.
+    fn tls_free(&mut self, fiber: bool, index: u64) -> bool {
+        let slots = self.tls_store(fiber);
+        if let Some(slot) = slots.get_mut(index as usize) {
+            *slot = None;
+        }
+        true
+    }
+
+    // ---- environment -----------------------------------------------------
+
+    /// Look up an environment variable (case-insensitive, as on Windows).
+    pub(crate) fn env_get(&self, name: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Set (or, with `None`, remove) an environment variable, case-insensitively.
+    pub(crate) fn env_set(&mut self, name: &str, value: Option<&str>) {
+        let pos = self.env.iter().position(|(k, _)| k.eq_ignore_ascii_case(name));
+        match (pos, value) {
+            (Some(i), Some(v)) => self.env[i].1 = v.to_string(),
+            (Some(i), None) => {
+                self.env.remove(i);
+            }
+            (None, Some(v)) => self.env.push((name.to_string(), v.to_string())),
+            (None, None) => {}
+        }
+    }
+
+    /// The environment block as `name=value\0…\0\0` code units (UTF-16).
+    pub(crate) fn env_block_utf16(&self) -> Vec<u16> {
+        let mut out = Vec::new();
+        for (k, v) in &self.env {
+            out.extend(k.encode_utf16());
+            out.push(b'=' as u16);
+            out.extend(v.encode_utf16());
+            out.push(0);
+        }
+        out.push(0); // the block's final terminator
+        out
+    }
+
+    /// Expand `%VAR%` references in `src`. Unknown variables are left verbatim
+    /// (including the surrounding `%`), matching Windows' behavior. A lone `%`
+    /// with no closing `%` is emitted as-is.
+    pub(crate) fn expand_env(&self, src: &str) -> String {
+        let mut out = String::new();
+        let mut rest = src;
+        while let Some(open) = rest.find('%') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            match after.find('%') {
+                Some(close) => {
+                    let name = &after[..close];
+                    match self.env_get(name) {
+                        Some(v) => out.push_str(v),
+                        None => {
+                            // Leave the token untouched: %NAME%.
+                            out.push('%');
+                            out.push_str(name);
+                            out.push('%');
+                        }
+                    }
+                    rest = &after[close + 1..];
+                }
+                None => {
+                    // No closing '%': emit the remainder literally.
+                    out.push('%');
+                    out.push_str(after);
+                    rest = "";
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The environment block as `name=value\0…\0\0` bytes (ANSI).
+    pub(crate) fn env_block_ansi(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (k, v) in &self.env {
+            out.extend_from_slice(k.as_bytes());
+            out.push(b'=');
+            out.extend_from_slice(v.as_bytes());
+            out.push(0);
+        }
+        out.push(0);
+        out
+    }
+}
+
+/// A plausible Windows environment so the C runtime's environment setup
+/// succeeds and programs that read `PATH`/`TEMP`/`USERPROFILE`/etc. behave.
+/// `C:` maps into the sandbox, so these are consistent with the guest
+/// filesystem the emulator presents.
+fn default_environment() -> Vec<(String, String)> {
+    [
+        ("ALLUSERSPROFILE", "C:\\ProgramData"),
+        ("APPDATA", "C:\\Users\\exemu\\AppData\\Roaming"),
+        ("CommonProgramFiles", "C:\\Program Files\\Common Files"),
+        ("COMPUTERNAME", "EXEMU"),
+        ("ComSpec", "C:\\Windows\\system32\\cmd.exe"),
+        ("HOMEDRIVE", "C:"),
+        ("HOMEPATH", "\\Users\\exemu"),
+        ("LOCALAPPDATA", "C:\\Users\\exemu\\AppData\\Local"),
+        ("NUMBER_OF_PROCESSORS", "8"),
+        ("OS", "Windows_NT"),
+        ("Path", "C:\\Windows;C:\\Windows\\system32;C:\\Windows\\System32\\Wbem"),
+        ("PATHEXT", ".COM;.EXE;.BAT;.CMD;.VBS;.JS"),
+        ("PROCESSOR_ARCHITECTURE", "AMD64"),
+        ("ProgramData", "C:\\ProgramData"),
+        ("ProgramFiles", "C:\\Program Files"),
+        ("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+        ("SystemDrive", "C:"),
+        ("SystemRoot", "C:\\Windows"),
+        ("TEMP", "C:\\Temp"),
+        ("TMP", "C:\\Temp"),
+        ("USERDOMAIN", "EXEMU"),
+        ("USERNAME", "exemu"),
+        ("USERPROFILE", "C:\\Users\\exemu"),
+        ("windir", "C:\\Windows"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
 }
 
 impl Hooks for WinOs {
