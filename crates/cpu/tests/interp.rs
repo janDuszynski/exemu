@@ -336,3 +336,60 @@ fn bsf_without_f3_still_works() {
     ];
     assert_eq!(rbx(&run(&code)), 4);
 }
+
+fn rcx(cpu: &Interpreter) -> u64 {
+    cpu.state().reg(exemu_core::Reg::Rcx)
+}
+fn rdx(cpu: &Interpreter) -> u64 {
+    cpu.state().reg(exemu_core::Reg::Rdx)
+}
+
+#[test]
+fn cpuid_vendor_string_is_intel() {
+    // xor eax,eax ; cpuid ; hlt  → EBX="Genu" ECX="ntel" EDX="ineI"
+    let code = [
+        0x31, 0xC0, // xor eax, eax
+        0x0F, 0xA2, // cpuid
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rbx(&cpu) as u32, 0x756e_6547); // "Genu"
+    assert_eq!(rcx(&cpu) as u32, 0x6c65_746e); // "ntel"
+    assert_eq!(rdx(&cpu) as u32, 0x4965_6e69); // "ineI"
+    assert_eq!(rax(&cpu) as u32, 7); // max standard leaf
+}
+
+#[test]
+fn cpuid_advertises_sse2_but_not_avx() {
+    // mov eax,1 ; cpuid ; hlt
+    let code = [
+        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+        0x0F, 0xA2, // cpuid
+        0xF4,
+    ];
+    let cpu = run(&code);
+    let edx = rdx(&cpu) as u32;
+    let ecx = rcx(&cpu) as u32;
+    assert!(edx & (1 << 26) != 0, "SSE2 (EDX.26) must be set");
+    assert!(edx & (1 << 25) != 0, "SSE (EDX.25) must be set");
+    assert!(ecx & (1 << 23) != 0, "POPCNT (ECX.23) must be set");
+    assert!(ecx & (1 << 28) == 0, "AVX (ECX.28) must NOT be advertised");
+    assert!(ecx & (1 << 26) == 0, "XSAVE (ECX.26) must NOT be advertised");
+    // Three-byte SSSE3/SSE4 escapes are not decoded, so those bits stay off.
+    assert!(ecx & (1 << 9) == 0, "SSSE3 (ECX.9) must NOT be advertised");
+    assert!(ecx & (1 << 20) == 0, "SSE4.2 (ECX.20) must NOT be advertised");
+}
+
+#[test]
+fn rdtsc_is_monotonic() {
+    // rdtsc ; mov ecx,eax ; rdtsc ; sub eax,ecx ; hlt  → second read > first
+    let code = [
+        0x0F, 0x31, // rdtsc
+        0x89, 0xC1, // mov ecx, eax
+        0x0F, 0x31, // rdtsc
+        0x29, 0xC8, // sub eax, ecx
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert!(rax(&cpu) as u32 > 0, "TSC must advance between reads");
+}

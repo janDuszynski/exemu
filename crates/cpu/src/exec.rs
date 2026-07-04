@@ -838,6 +838,62 @@ impl Interpreter {
         c == 0 || (rep == 0xF3 && !zf) || (rep == 0xF2 && zf)
     }
 
+    /// `CPUID`: report only the features the interpreter actually implements.
+    ///
+    /// Honesty matters: MSVC/GCC CRTs branch on these bits to pick a `memcpy`/
+    /// `memset`/`strlen` variant. Advertising AVX we cannot execute makes the
+    /// CRT jump straight into a VEX-encoded loop and fault; advertising the
+    /// SSE-family baseline we *do* support steers it onto code we can run.
+    fn cpuid(&mut self) {
+        let leaf = self.state.gpr_read(0, 4) as u32;
+        // Brand string returned by extended leaves 0x8000_0002..=0x8000_0004.
+        const BRAND: &[u8; 48] = b"exemu virtual x86-64 CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let brand_word = |i: usize| -> u32 {
+            u32::from_le_bytes([BRAND[i], BRAND[i + 1], BRAND[i + 2], BRAND[i + 3]])
+        };
+        let (eax, ebx, ecx, edx) = match leaf {
+            // Standard: max leaf + "GenuineIntel" so feature detection that
+            // keys off the vendor takes its Intel path (all we implement is
+            // Intel-compatible).
+            0x0 => (0x7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+            // Family/model/stepping + feature flags. ECX/EDX enumerate ONLY
+            // implemented features. The interpreter covers the one-byte SSE/
+            // SSE2 map plus POPCNT; the three-byte 0F 38 / 0F 3A escapes that
+            // carry SSSE3/SSE4.1/SSE4.2 are NOT decoded, so those bits are
+            // withheld (advertising them would steer the CRT into pshufb /
+            // pcmpistri / crc32 we cannot execute). AVX/XSAVE/MMX/AES: absent.
+            0x1 => {
+                // POPCNT (ECX.23) is a discrete feature bit, valid to report
+                // without SSE4.2 (ECX.20), which we do not implement.
+                let ecx: u32 = 1 << 23; // POPCNT
+                let edx: u32 = 1        // FPU (bit 0; guaranteed in long mode)
+                    | (1 << 4)          // TSC
+                    | (1 << 15)         // CMOV
+                    | (1 << 24)         // FXSR
+                    | (1 << 25)         // SSE
+                    | (1 << 26); // SSE2
+                (0x0003_06c3, 0x0001_0800, ecx, edx)
+            }
+            // Structured extended features. All zero: no BMI1/BMI2/AVX2/AVX-512
+            // (we have TZCNT/LZCNT but not the rest of BMI1, so we do not claim
+            // the BMI1 bit).
+            0x7 => (0, 0, 0, 0),
+            // Extended: max extended leaf.
+            0x8000_0000 => (0x8000_0004, 0, 0, 0),
+            // Extended features: LZCNT/ABM (ECX bit 5), SYSCALL (EDX bit 11)
+            // and Long Mode (EDX bit 29) — all implemented.
+            0x8000_0001 => (0u32, 0, 1 << 5, (1 << 11) | (1 << 29)),
+            0x8000_0002 => (brand_word(0), brand_word(4), brand_word(8), brand_word(12)),
+            0x8000_0003 => (brand_word(16), brand_word(20), brand_word(24), brand_word(28)),
+            0x8000_0004 => (brand_word(32), brand_word(36), brand_word(40), brand_word(44)),
+            _ => (0, 0, 0, 0),
+        };
+        self.state.gpr_write(0, 4, eax as u64);
+        self.state.gpr_write(3, 4, ebx as u64);
+        self.state.gpr_write(1, 4, ecx as u64);
+        self.state.gpr_write(2, 4, edx as u64);
+    }
+
     /// Two-byte (0x0F) opcode group. Returns `Some(exit)` only for the rare
     /// arms that divert control flow; otherwise `None` and the caller's tail
     /// advances `rip`.
@@ -868,15 +924,14 @@ impl Interpreter {
                 self.read_modrm(ctx, mem)?;
             }
 
-            // CPUID / RDTSC: minimal stubs (report nothing).
-            0xA2 => {
-                for r in [0usize, 1, 2, 3] {
-                    self.state.gpr_write(r as u8, 4, 0);
-                }
-            }
+            // CPUID: report an honest feature set (only what we execute).
+            0xA2 => self.cpuid(),
+            // RDTSC: return the monotonic counter in EDX:EAX and advance it.
             0x31 => {
-                self.state.gpr_write(0, 4, 0);
-                self.state.gpr_write(2, 4, 0);
+                let t = self.tsc;
+                self.tsc = self.tsc.wrapping_add(64);
+                self.state.gpr_write(0, 4, t & 0xffff_ffff);
+                self.state.gpr_write(2, 4, t >> 32);
             }
 
             // CMOVcc r, r/m

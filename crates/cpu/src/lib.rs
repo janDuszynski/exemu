@@ -36,6 +36,9 @@ pub enum Bits {
 pub struct Interpreter {
     state: CpuState,
     bits: Bits,
+    /// Monotonic time-stamp counter backing `RDTSC`. Advanced on each read so
+    /// spin loops that wait for the TSC to change make progress.
+    tsc: u64,
 }
 
 impl Default for Interpreter {
@@ -47,16 +50,16 @@ impl Default for Interpreter {
 impl Interpreter {
     /// A fresh 64-bit interpreter.
     pub fn new() -> Self {
-        Interpreter { state: CpuState::new(), bits: Bits::B64 }
+        Interpreter { state: CpuState::new(), bits: Bits::B64, tsc: 0 }
     }
 
     /// A fresh interpreter in the given mode.
     pub fn with_bits(bits: Bits) -> Self {
-        Interpreter { state: CpuState::new(), bits }
+        Interpreter { state: CpuState::new(), bits, tsc: 0 }
     }
 
     pub fn with_state(state: CpuState) -> Self {
-        Interpreter { state, bits: Bits::B64 }
+        Interpreter { state, bits: Bits::B64, tsc: 0 }
     }
 
     pub fn bits(&self) -> Bits {
