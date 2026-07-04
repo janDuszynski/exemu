@@ -120,12 +120,15 @@ exemu sample <out.exe>
   a 32-bit and a 64-bit mode (REX-vs-inc/dec, RIP-relative-vs-absolute
   addressing, 4-vs-8-byte stack, `fs:`-vs-`gs:` TEB).
 * A broad instruction subset: the ALU family, `MOV`/`LEA`/`MOVZX`/`MOVSX`,
-  stack ops, `CALL`/`RET`, the full `Jcc`/`SETcc`/`CMOVcc` condition set,
-  shifts/rotates, `SHLD`/`SHRD`, `MUL`/`IMUL`/`DIV`/`IDIV`, the `BT` bit-test
-  family, `BSF`/`BSR`/`BSWAP`, `XADD`/`CMPXCHG`, `LOOP`/`JECXZ`, the string
-  ops (`MOVS`/`STOS`/`CMPS`/`LODS`/`SCAS` with `REP`/`REPE`/`REPNE`), and
+  `MOVBE`, stack ops, `CALL`/`RET`, the full `Jcc`/`SETcc`/`CMOVcc` condition
+  set, shifts/rotates, `SHLD`/`SHRD`, `MUL`/`IMUL`/`DIV`/`IDIV`, the `BT`
+  bit-test family, `BSF`/`BSR`/`BSWAP`, the bit-count instructions
+  `POPCNT`/`TZCNT`/`LZCNT`, `XADD`/`CMPXCHG`, `LOOP`/`JECXZ`, the string ops
+  (`MOVS`/`STOS`/`CMPS`/`LODS`/`SCAS` with `REP`/`REPE`/`REPNE`), and
   **SSE/SSE2** (moves, logical, scalar+packed float arithmetic, compares and
-  conversions) — all with faithful EFLAGS.
+  conversions) — all with faithful EFLAGS. `CPUID` reports an honest feature
+  set (only the instructions actually implemented), so CRTs dispatch onto code
+  paths the interpreter can execute rather than into AVX it cannot.
 * **~200 Win32 functions** across `kernel32`/`user32`/`gdi32`/`advapi32`/
   `shell32`/`ole32`/`comctl32`: console I/O, the `Heap*`/`Global*`/`Virtual*`
   allocators, the `lstr*` string family, `CharNext`/`CharPrev`, command
