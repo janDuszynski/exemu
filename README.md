@@ -85,15 +85,22 @@ Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
 ### CLI
 
 ```
-exemu run <file.exe> [--trace] [--no-echo] [-- <args>...]
+exemu run <file.exe> [--trace] [--no-echo] [--telemetry <path>] [-- <args>...]
 exemu info <file.exe>
+exemu opcodes [--telemetry <path>] [--clear]
 exemu sample <out.exe>
 ```
 
 * `run` maps the image, resolves imports, and interprets it to completion,
   exiting with the guest's exit code. `--trace` logs calls to unimplemented
   Windows APIs; `--no-echo` suppresses mirroring guest output to the host.
+  If a run stops on an instruction the decoder doesn't implement, the opcode
+  is appended to a telemetry log (`--telemetry <path>`, else the
+  `EXEMU_TELEMETRY` env var, else `$TMPDIR/exemu-telemetry.log`).
 * `info` dumps headers, sections and imports.
+* `opcodes` reads that telemetry log and prints a **most-wanted ranking** of
+  the unimplemented opcodes that blocked past runs — so the highest-leverage
+  instruction to add next is obvious. `--clear` resets the log.
 * `sample` writes the built-in Hello-World PE to disk.
 
 ## How it runs a `.exe`
