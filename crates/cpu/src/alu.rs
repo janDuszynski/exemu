@@ -263,3 +263,231 @@ pub fn shift(s: &mut CpuState, kind: Shift, val: u64, count: u64, size: u8) -> u
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Flag-accuracy matrix (roadmap P0.3).
+    //!
+    //! Each ALU helper is checked against an *independent* derivation of every
+    //! status flag, so a bug in the helper is not masked by a test that merely
+    //! restates the helper's own formula:
+    //!
+    //! * CF — 128-bit wide add/sub, inspect the bit above the operand width.
+    //! * OF — width-clamped *signed* range check (sign-extend, compute in i128,
+    //!   test whether the true result fits the signed width).
+    //! * AF — low-nibble arithmetic (`(a&0xf)+(b&0xf)+c > 0xf`), never the
+    //!   `a^b^res` trick the implementation uses.
+    //! * SF/ZF/PF — from the masked result directly.
+
+    use super::*;
+
+    const SIZES: [u8; 4] = [1, 2, 4, 8];
+
+    /// A spread of operands per width that exercises the flag edges: zero, one,
+    /// the sign bit, max unsigned, low-nibble carry boundaries, and a couple of
+    /// arbitrary middles.
+    fn operands(size: u8) -> Vec<u64> {
+        let m = mask(size);
+        let sb = sign_bit(size);
+        let mut v = vec![
+            0,
+            1,
+            0xf,
+            0x10,
+            0x7f,
+            0x80,
+            sb - 1,
+            sb,
+            sb + 1,
+            m - 1,
+            m,
+            m & 0x5555_5555_5555_5555,
+            m & 0xaaaa_aaaa_aaaa_aaaa,
+        ];
+        v.retain(|&x| x <= m);
+        v.dedup();
+        v
+    }
+
+    fn fresh() -> CpuState {
+        CpuState::new()
+    }
+
+    // ---- independent reference flag derivations --------------------------
+
+    fn ref_add(a: u64, b: u64, cin: u64, size: u8) -> (u64, bool, bool, bool) {
+        let m = mask(size);
+        let (a, b) = (a & m, b & m);
+        let full = a as u128 + b as u128 + cin as u128;
+        let res = (full as u64) & m;
+        let cf = (full >> (size as u32 * 8)) & 1 != 0;
+        let af = (a & 0xf) + (b & 0xf) + cin > 0xf;
+        // OF via signed range clamp. Cast through i64 so the u64 from `sext`
+        // sign-extends into i128 rather than zero-extending.
+        let sa = sext(a, size) as i64 as i128;
+        let sb = sext(b, size) as i64 as i128;
+        let sres = sa + sb + cin as i128;
+        let lim = 1i128 << (size as u32 * 8 - 1);
+        let of = sres < -lim || sres >= lim;
+        (res, cf, af, of)
+    }
+
+    fn ref_sub(a: u64, b: u64, bin: u64, size: u8) -> (u64, bool, bool, bool) {
+        let m = mask(size);
+        let (a, b) = (a & m, b & m);
+        let rhs = b as u128 + bin as u128;
+        let cf = (a as u128) < rhs;
+        let res = a.wrapping_sub(b).wrapping_sub(bin) & m;
+        let af = (a & 0xf) < (b & 0xf) + bin;
+        let sa = sext(a, size) as i64 as i128;
+        let sb = sext(b, size) as i64 as i128;
+        let sres = sa - sb - bin as i128;
+        let lim = 1i128 << (size as u32 * 8 - 1);
+        let of = sres < -lim || sres >= lim;
+        (res, cf, af, of)
+    }
+
+    fn assert_szp(st: &CpuState, res: u64, size: u8, ctx: &str) {
+        let r = res & mask(size);
+        assert_eq!(st.flag(flags::ZF), r == 0, "ZF {ctx}");
+        assert_eq!(st.flag(flags::SF), r & sign_bit(size) != 0, "SF {ctx}");
+        assert_eq!(st.flag(flags::PF), (r as u8).count_ones() % 2 == 0, "PF {ctx}");
+    }
+
+    #[test]
+    fn add_flag_matrix() {
+        for &size in &SIZES {
+            for &a in &operands(size) {
+                for &b in &operands(size) {
+                    for cin in [0u64, 1] {
+                        let mut st = fresh();
+                        let got = add(&mut st, a, b, cin, size);
+                        let (res, cf, af, of) = ref_add(a, b, cin, size);
+                        let ctx = format!("add a={a:#x} b={b:#x} c={cin} sz={size}");
+                        assert_eq!(got, res, "result {ctx}");
+                        assert_eq!(st.flag(flags::CF), cf, "CF {ctx}");
+                        assert_eq!(st.flag(flags::AF), af, "AF {ctx}");
+                        assert_eq!(st.flag(flags::OF), of, "OF {ctx}");
+                        assert_szp(&st, res, size, &ctx);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sub_flag_matrix() {
+        for &size in &SIZES {
+            for &a in &operands(size) {
+                for &b in &operands(size) {
+                    for bin in [0u64, 1] {
+                        let mut st = fresh();
+                        let got = sub(&mut st, a, b, bin, size);
+                        let (res, cf, af, of) = ref_sub(a, b, bin, size);
+                        let ctx = format!("sub a={a:#x} b={b:#x} bin={bin} sz={size}");
+                        assert_eq!(got, res, "result {ctx}");
+                        assert_eq!(st.flag(flags::CF), cf, "CF {ctx}");
+                        assert_eq!(st.flag(flags::AF), af, "AF {ctx}");
+                        assert_eq!(st.flag(flags::OF), of, "OF {ctx}");
+                        assert_szp(&st, res, size, &ctx);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn logic_clears_cf_of_af() {
+        for &size in &SIZES {
+            for &a in &operands(size) {
+                for &b in &operands(size) {
+                    let mut st = fresh();
+                    // Seed CF/OF/AF set, to prove `logic` clears them.
+                    st.set_flag(flags::CF, true);
+                    st.set_flag(flags::OF, true);
+                    st.set_flag(flags::AF, true);
+                    let res = logic(&mut st, a & b, size);
+                    let ctx = format!("and a={a:#x} b={b:#x} sz={size}");
+                    assert!(!st.flag(flags::CF), "CF cleared {ctx}");
+                    assert!(!st.flag(flags::OF), "OF cleared {ctx}");
+                    assert!(!st.flag(flags::AF), "AF cleared {ctx}");
+                    assert_szp(&st, res, size, &ctx);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inc_dec_preserve_cf() {
+        for &size in &SIZES {
+            for &a in &operands(size) {
+                for cf_seed in [false, true] {
+                    let mut st = fresh();
+                    st.set_flag(flags::CF, cf_seed);
+                    let r = inc(&mut st, a, size);
+                    assert_eq!(st.flag(flags::CF), cf_seed, "INC keeps CF sz={size} a={a:#x}");
+                    let (_, _, af, of) = ref_add(a, 1, 0, size);
+                    assert_eq!(st.flag(flags::AF), af, "INC AF sz={size} a={a:#x}");
+                    assert_eq!(st.flag(flags::OF), of, "INC OF sz={size} a={a:#x}");
+                    assert_szp(&st, r, size, "inc");
+
+                    let mut st = fresh();
+                    st.set_flag(flags::CF, cf_seed);
+                    let r = dec(&mut st, a, size);
+                    assert_eq!(st.flag(flags::CF), cf_seed, "DEC keeps CF sz={size} a={a:#x}");
+                    let (_, _, af, of) = ref_sub(a, 1, 0, size);
+                    assert_eq!(st.flag(flags::AF), af, "DEC AF sz={size} a={a:#x}");
+                    assert_eq!(st.flag(flags::OF), of, "DEC OF sz={size} a={a:#x}");
+                    assert_szp(&st, r, size, "dec");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shl_shr_sar_cf_and_result() {
+        for &size in &SIZES {
+            let m = mask(size);
+            let bits = size as u32 * 8;
+            for &v in &operands(size) {
+                for count in 1..=bits.min(31) as u64 {
+                    // SHL
+                    let mut st = fresh();
+                    let r = shift(&mut st, Shift::Shl, v, count, size);
+                    assert_eq!(r, (v << count) & m, "SHL res v={v:#x} n={count} sz={size}");
+                    let exp_cf = count <= bits as u64 && ((v & m) >> (bits as u64 - count)) & 1 != 0;
+                    assert_eq!(st.flag(flags::CF), exp_cf, "SHL CF v={v:#x} n={count} sz={size}");
+
+                    // SHR
+                    let mut st = fresh();
+                    let r = shift(&mut st, Shift::Shr, v, count, size);
+                    assert_eq!(r, (v & m) >> count, "SHR res v={v:#x} n={count} sz={size}");
+                    let exp_cf = ((v & m) >> (count - 1)) & 1 != 0;
+                    assert_eq!(st.flag(flags::CF), exp_cf, "SHR CF v={v:#x} n={count} sz={size}");
+
+                    // SAR
+                    let mut st = fresh();
+                    let r = shift(&mut st, Shift::Sar, v, count, size);
+                    let signed = sext(v, size);
+                    assert_eq!(r, (((signed as i64) >> count) as u64) & m, "SAR res v={v:#x} n={count} sz={size}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_count_shift_is_identity_and_preserves_flags() {
+        for &size in &SIZES {
+            for &v in &operands(size) {
+                for kind in [Shift::Shl, Shift::Shr, Shift::Sar, Shift::Rol, Shift::Ror] {
+                    let mut st = fresh();
+                    st.rflags = flags::RESERVED_ONE | flags::CF | flags::OF;
+                    let before = st.rflags;
+                    let r = shift(&mut st, kind, v, 0, size);
+                    assert_eq!(r, v & mask(size), "zero-count identity sz={size}");
+                    assert_eq!(st.rflags, before, "zero-count preserves flags sz={size}");
+                }
+            }
+        }
+    }
+}
