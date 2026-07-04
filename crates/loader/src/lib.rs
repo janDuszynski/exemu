@@ -13,6 +13,7 @@
 
 mod reader;
 mod resources;
+mod unwind;
 
 pub use resources::parse_dialogs;
 
@@ -39,6 +40,7 @@ const OPT_SUBSYSTEM: usize = 68;
 // Data-directory indices.
 const DIR_EXPORT: usize = 0;
 const DIR_IMPORT: usize = 1;
+const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
 
 // Section characteristics bits.
@@ -108,6 +110,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     };
     let (import_dir_rva, import_dir_size) = dir(DIR_IMPORT)?;
     let (export_dir_rva, export_dir_size) = dir(DIR_EXPORT)?;
+    let (exc_dir_rva, exc_dir_size) = dir(DIR_EXCEPTION)?;
     let (reloc_dir_rva, reloc_dir_size) = dir(DIR_BASERELOC)?;
 
     // ---- Section table ---------------------------------------------------
@@ -166,6 +169,15 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         Vec::new()
     };
 
+    // ---- x64 exception function table (.pdata/.xdata) ---------------------
+    // 32-bit x86 uses the fs:[0] SEH chain instead; its directory 3 (when
+    // present at all) holds a different format, so parse only for PE32+.
+    let function_table = if is_64bit && exc_dir_rva != 0 && exc_dir_size != 0 {
+        unwind::parse_function_table(&sections, exc_dir_rva, exc_dir_size)
+    } else {
+        Vec::new()
+    };
+
     let headers = r.bytes(0, (size_of_headers as usize).min(r.len()))?;
 
     Ok(PeImage {
@@ -182,6 +194,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         relocations,
         dll_name,
         headers,
+        function_table,
     })
 }
 
@@ -260,7 +273,16 @@ fn read_at_rva(sections: &[Section], rva: u32) -> Option<(&Section, usize)> {
     None
 }
 
-fn slice_u16(sections: &[Section], rva: u32) -> Result<u16> {
+pub(crate) fn slice_u8(sections: &[Section], rva: u32) -> Result<u8> {
+    let (s, off) = read_at_rva(sections, rva)
+        .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} not in any section")))?;
+    s.data
+        .get(off)
+        .copied()
+        .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} past section data")))
+}
+
+pub(crate) fn slice_u16(sections: &[Section], rva: u32) -> Result<u16> {
     let (s, off) = read_at_rva(sections, rva)
         .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} not in any section")))?;
     let b = s
@@ -270,7 +292,7 @@ fn slice_u16(sections: &[Section], rva: u32) -> Result<u16> {
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
 
-fn slice_u32(sections: &[Section], rva: u32) -> Result<u32> {
+pub(crate) fn slice_u32(sections: &[Section], rva: u32) -> Result<u32> {
     let (s, off) = read_at_rva(sections, rva)
         .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} not in any section")))?;
     let b = s
