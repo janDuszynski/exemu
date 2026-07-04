@@ -97,6 +97,9 @@ exemu sample <out.exe>
   If a run stops on an instruction the decoder doesn't implement, the opcode
   is appended to a telemetry log (`--telemetry <path>`, else the
   `EXEMU_TELEMETRY` env var, else `$TMPDIR/exemu-telemetry.log`).
+  On a fault the report includes a register dump, the recent rip trail and —
+  for 64-bit images with unwind data — a **call stack** recovered by virtually
+  unwinding the guest's frames.
 * `info` dumps headers, sections, imports and the x64 unwind data
   (`.pdata` runtime-function count).
 * `opcodes` reads that telemetry log and prints a **most-wanted ranking** of
@@ -202,10 +205,11 @@ Complex apps will hit unimplemented calls.
 AVX and x87 floating point; native-themed / GDI+ / DirectX rendering (the
 GDI is a solid-fill/text subset); TLS callbacks and base relocations (images
 load at their preferred base); table-based structured exception handling
-(the `.pdata`/`.xdata` unwind tables are now *parsed* at load, but dispatch/
-unwinding is still a no-op — fine unless an exception is actually thrown);
-real threads; **COM** object creation; and the registry (Reg* calls are
-stubbed).
+(the `.pdata`/`.xdata` unwind tables are parsed and virtually unwound for
+fault-report call stacks, but exception *dispatch* — actually running C++
+catch/SEH handlers — is still a no-op, fine unless an exception is actually
+thrown); real threads; **COM** object creation; and the registry (Reg* calls
+are stubbed).
 
 ### What real installers do today
 
