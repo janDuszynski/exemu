@@ -18,6 +18,7 @@ pub mod hooks;
 pub mod memory;
 pub mod pe;
 pub mod telemetry;
+pub mod unwind;
 
 pub use cpu::{Cpu, CpuState, Exit, Reg, flags};
 pub use error::{EmuError, Result};
@@ -26,3 +27,4 @@ pub use hooks::Hooks;
 pub use memory::{Memory, Perm, Region};
 pub use pe::{Export, Import, ImportSymbol, PeImage, Reloc, Section};
 pub use telemetry::{rank as rank_opcode_misses, MissRecord, OpcodeRank};
+pub use unwind::{UnwindCode, UnwindEntry, UnwindInfo, UnwindOp};

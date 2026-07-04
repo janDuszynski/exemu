@@ -279,6 +279,16 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
         );
     }
 
+    if !image.function_table.is_empty() {
+        let with_handler =
+            image.function_table.iter().filter(|e| e.info.handler_rva.is_some()).count();
+        println!(
+            "\n  x64 unwind data: {} runtime functions ({} with a language handler)",
+            image.function_table.len(),
+            with_handler
+        );
+    }
+
     println!("\n  imports ({}):", image.imports.len());
     let mut current = String::new();
     for imp in &image.imports {

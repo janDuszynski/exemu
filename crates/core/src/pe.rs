@@ -91,6 +91,10 @@ pub struct PeImage {
     /// The raw header bytes, mapped read-only at the image base so guests
     /// that walk their own headers (via the PEB) see something sane.
     pub headers: Vec<u8>,
+    /// The x64 exception function table (`.pdata`/`.xdata`), sorted by
+    /// `begin_rva`. Empty for 32-bit images (x86 uses the `fs:[0]` SEH chain)
+    /// and for images without an exception directory.
+    pub function_table: Vec<crate::unwind::UnwindEntry>,
 }
 
 impl PeImage {
@@ -98,5 +102,11 @@ impl PeImage {
     #[inline]
     pub fn entry_va(&self) -> u64 {
         self.image_base + self.entry_rva as u64
+    }
+
+    /// The unwind entry covering the given RVA, if any — the emulator-side
+    /// equivalent of `RtlLookupFunctionEntry`.
+    pub fn find_unwind(&self, rva: u32) -> Option<&crate::unwind::UnwindEntry> {
+        crate::unwind::lookup(&self.function_table, rva)
     }
 }
