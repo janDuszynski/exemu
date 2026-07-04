@@ -73,7 +73,7 @@ fn parse_runtime_function(
         )));
     }
     let info = parse_unwind_info(sections, unwind_rva, depth)?;
-    Ok(Some(UnwindEntry { begin_rva, end_rva, info }))
+    Ok(Some(UnwindEntry { begin_rva, end_rva, record_rva: rec_rva, info }))
 }
 
 fn parse_unwind_info(sections: &[Section], rva: u32, depth: u8) -> Result<UnwindInfo> {
@@ -151,6 +151,7 @@ fn parse_unwind_info(sections: &[Section], rva: u32, depth: u8) -> Result<Unwind
     let after_codes = slots_base + 2 * ((count as u32 + 1) & !1);
 
     let mut handler_rva = None;
+    let mut handler_data_rva = None;
     let mut chained = None;
     if flags & UNW_FLAG_CHAININFO != 0 {
         if depth >= MAX_CHAIN_DEPTH {
@@ -162,6 +163,7 @@ fn parse_unwind_info(sections: &[Section], rva: u32, depth: u8) -> Result<Unwind
         }
     } else if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
         handler_rva = Some(slice_u32(sections, after_codes)?);
+        handler_data_rva = Some(after_codes + 4);
     }
 
     Ok(UnwindInfo {
@@ -173,6 +175,7 @@ fn parse_unwind_info(sections: &[Section], rva: u32, depth: u8) -> Result<Unwind
         frame_offset,
         codes,
         handler_rva,
+        handler_data_rva,
         chained,
     })
 }
@@ -293,6 +296,10 @@ mod tests {
         assert!(info.has_exception_handler);
         assert!(!info.has_termination_handler);
         assert_eq!(info.handler_rva, Some(0x5199));
+        // Language-specific data follows the handler RVA in the xdata blob:
+        // 0x1010 (info) + 4 (header) + 2×2 (padded codes) + 4 (handler rva).
+        assert_eq!(info.handler_data_rva, Some(0x101c));
+        assert_eq!(table[0].record_rva, 0x1000); // the .pdata record itself
     }
 
     #[test]
