@@ -966,17 +966,52 @@ impl Interpreter {
                 self.bit_op(ctx, mem, sub, size, idx)?;
             }
 
-            // ---- BSF / BSR ----------------------------------------------
+            // ---- BSF / BSR, or (with F3) TZCNT / LZCNT ------------------
+            //
+            // BMI1's TZCNT/LZCNT reuse the BSF/BSR opcodes under a mandatory
+            // F3 prefix. On a CPU without BMI1 the F3 is ignored and these
+            // decode as BSF/BSR — but modern compilers emit them unconditionally
+            // and rely on the distinct zero-input result (operand width, not
+            // "undefined") and on CF, so we honour the prefix.
             0xBC | 0xBD => {
                 self.read_modrm(ctx, mem)?;
                 let size = Self::opsize(ctx);
+                let bits = size as u32 * 8;
                 let v = self.read_rm(ctx, &*mem, size)? & alu::mask(size);
-                if v == 0 {
+                if ctx.pfx.rep == 0xF3 {
+                    // TZCNT (BC) / LZCNT (BD).
+                    let cnt = if v == 0 {
+                        bits
+                    } else if op2 == 0xBC {
+                        v.trailing_zeros()
+                    } else {
+                        v.leading_zeros() - (64 - bits)
+                    };
+                    self.write_reg_field(ctx, size, cnt as u64);
+                    self.state.set_flag(flags::CF, v == 0);
+                    self.state.set_flag(flags::ZF, cnt == 0);
+                    for f in [flags::OF, flags::SF, flags::AF, flags::PF] {
+                        self.state.set_flag(f, false);
+                    }
+                } else if v == 0 {
+                    // BSF/BSR of 0: ZF set, destination undefined (left as-is).
                     self.state.set_flag(flags::ZF, true);
                 } else {
                     self.state.set_flag(flags::ZF, false);
                     let idx = if op2 == 0xBC { v.trailing_zeros() } else { 63 - v.leading_zeros() };
                     self.write_reg_field(ctx, size, idx as u64);
+                }
+            }
+
+            // ---- POPCNT (F3 0F B8) --------------------------------------
+            0xB8 if ctx.pfx.rep == 0xF3 => {
+                self.read_modrm(ctx, mem)?;
+                let size = Self::opsize(ctx);
+                let v = self.read_rm(ctx, &*mem, size)? & alu::mask(size);
+                self.write_reg_field(ctx, size, v.count_ones() as u64);
+                self.state.set_flag(flags::ZF, v == 0);
+                for f in [flags::CF, flags::OF, flags::SF, flags::AF, flags::PF] {
+                    self.state.set_flag(f, false);
                 }
             }
 
