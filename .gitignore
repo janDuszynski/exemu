@@ -18,3 +18,5 @@ Cargo.lock.orig
 # See knowledge/index.know
 *.know
 
+# Local exe files to test the knowledge base — never committed.
+example_exe/
