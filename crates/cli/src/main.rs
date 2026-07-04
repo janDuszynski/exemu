@@ -12,8 +12,10 @@
 
 use std::process::ExitCode;
 
+use std::path::PathBuf;
+
 use exemu_app::{gui_sample, sample, Process, RunConfig};
-use exemu_core::ImportSymbol;
+use exemu_core::{rank_opcode_misses, EmuError, ImportSymbol, MissRecord};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,6 +34,7 @@ fn run(args: Vec<String>) -> Result<u8, String> {
     match cmd {
         Some("run") => cmd_run(it.as_slice()),
         Some("info") => cmd_info(it.as_slice()),
+        Some("opcodes") => cmd_opcodes(it.as_slice()),
         Some("sample") => cmd_sample(it.as_slice()),
         Some("gui-sample") => cmd_gui_sample(it.as_slice()),
         Some("-h") | Some("--help") | Some("help") | None => {
@@ -53,21 +56,29 @@ fn print_help() {
 USAGE:\n\
     exemu run <file.exe> [--trace] [--no-echo] [-- <args>...]\n\
     exemu info <file.exe>\n\
+    exemu opcodes [--telemetry <path>] [--clear]\n\
     exemu sample <out.exe>\n\
     exemu gui-sample <out.exe>\n\
 \n\
 COMMANDS:\n\
     run        Load and execute a PE64 executable\n\
     info       Print headers, sections and imports of a PE64 file\n\
+    opcodes    Rank unimplemented opcodes that blocked past runs (most-wanted)\n\
     sample     Generate a console demo .exe (Hello World via kernel32)\n\
     gui-sample Generate a GUI demo .exe (a real window; run with --gui)\n\
 \n\
 RUN OPTIONS:\n\
-    --trace       Log calls to unimplemented Windows APIs\n\
-    --no-echo     Do not mirror guest console output to the host\n\
-    --gui         Render dialogs in a real window (drive them yourself)\n\
-    --max-steps N Instruction budget (0 = unlimited; default 2e9)\n\
-    -- <args>     Pass the remaining arguments to the guest program\n\
+    --trace         Log calls to unimplemented Windows APIs\n\
+    --no-echo       Do not mirror guest console output to the host\n\
+    --gui           Render dialogs in a real window (drive them yourself)\n\
+    --max-steps N   Instruction budget (0 = unlimited; default 2e9)\n\
+    --telemetry P   Opcode-miss log file (default $TMPDIR/exemu-telemetry.log,\n\
+                    or the EXEMU_TELEMETRY env var)\n\
+    -- <args>       Pass the remaining arguments to the guest program\n\
+\n\
+When a run stops on an instruction the decoder does not implement, the opcode\n\
+is appended to the telemetry log; `exemu opcodes` ranks the log so the most\n\
+impactful missing instruction to add next is obvious.\n\
 \n\
 Files a program writes (e.g. an installer's extracted files) go to a host\n\
 sandbox under $TMPDIR/exemu-sandbox. For real installers, build with\n\
@@ -82,6 +93,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut echo = true;
     let mut gui = false;
     let mut max_steps: Option<u64> = None;
+    let mut telemetry: Option<String> = None;
     let mut guest_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -94,6 +106,10 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
                 i += 1;
                 let v = rest.get(i).ok_or("--max-steps needs a value (0 = unlimited)")?;
                 max_steps = Some(v.replace('_', "").parse().map_err(|_| "bad --max-steps value")?);
+            }
+            "--telemetry" => {
+                i += 1;
+                telemetry = Some(rest.get(i).ok_or("--telemetry needs a <path>")?.clone());
             }
             "--" => {
                 guest_args.extend(rest[i + 1..].iter().cloned());
@@ -131,12 +147,64 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
 
     report_sandbox(&sandbox);
 
-    let result = run.map_err(|e| e.to_string())?;
-    eprintln!(
-        "\n[exemu] process exited with code {} after {} instructions",
-        result.exit_code, result.steps
-    );
-    Ok(result.exit_code as u8)
+    match run {
+        Ok(result) => {
+            eprintln!(
+                "\n[exemu] process exited with code {} after {} instructions",
+                result.exit_code, result.steps
+            );
+            Ok(result.exit_code as u8)
+        }
+        Err(e) => {
+            // A run that dies on an instruction the decoder doesn't implement
+            // is a data point for prioritizing the ISA (roadmap P0.5): record
+            // it, then still surface the error. The run layer wraps faults in a
+            // diagnostic `EmuError::Fault`, so reach the structured cause.
+            if let EmuError::Decode { rip, opcode } = e.cause() {
+                record_decode_miss(telemetry.as_deref(), path, *rip, opcode);
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Resolve the opcode-miss telemetry log path: explicit `--telemetry` flag,
+/// else the `EXEMU_TELEMETRY` env var, else a stable file under the temp dir.
+fn telemetry_log_path(explicit: Option<&str>) -> PathBuf {
+    if let Some(p) = explicit {
+        return PathBuf::from(p);
+    }
+    match std::env::var("EXEMU_TELEMETRY") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => std::env::temp_dir().join("exemu-telemetry.log"),
+    }
+}
+
+/// Append one decode miss to the telemetry log (best-effort — a logging
+/// failure must never mask the real run error) and tell the user about it.
+fn record_decode_miss(explicit: Option<&str>, exe_path: &str, rip: u64, opcode: &str) {
+    let exe = std::path::Path::new(exe_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(exe_path)
+        .to_string();
+    let log = telemetry_log_path(explicit);
+    let rec = MissRecord { opcode: opcode.to_string(), rip, exe };
+
+    eprintln!("\n[exemu] unimplemented opcode: {opcode} at {rip:#x}");
+    use std::io::Write;
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .and_then(|mut f| writeln!(f, "{}", rec.to_line()));
+    match appended {
+        Ok(()) => eprintln!(
+            "[exemu] recorded to {} — rank blockers with `exemu opcodes`",
+            log.display()
+        ),
+        Err(e) => eprintln!("[exemu] (could not write telemetry log {}: {e})", log.display()),
+    }
 }
 
 /// List what the guest wrote into the sandbox filesystem, so the user knows
@@ -238,6 +306,65 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
         }
     }
 
+    Ok(0)
+}
+
+/// `opcodes [--telemetry <path>] [--clear]` — read the decode-miss log and
+/// print the most-wanted ranking of unimplemented opcodes, so the highest-
+/// leverage instruction to implement next is obvious (roadmap P0.5).
+fn cmd_opcodes(rest: &[String]) -> Result<u8, String> {
+    let mut explicit: Option<&str> = None;
+    let mut clear = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--telemetry" => {
+                i += 1;
+                explicit = Some(rest.get(i).ok_or("--telemetry needs a <path>")?.as_str());
+            }
+            "--clear" => clear = true,
+            other => return Err(format!("opcodes: unexpected argument '{other}'")),
+        }
+        i += 1;
+    }
+
+    let log = telemetry_log_path(explicit);
+    if clear {
+        match std::fs::remove_file(&log) {
+            Ok(()) => println!("cleared {}", log.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("already empty ({})", log.display())
+            }
+            Err(e) => return Err(format!("cannot clear {}: {e}", log.display())),
+        }
+        return Ok(0);
+    }
+
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let ranked = rank_opcode_misses(text.lines().filter_map(MissRecord::parse));
+    if ranked.is_empty() {
+        println!("no decode misses recorded yet ({})", log.display());
+        println!("run some executables; blockers are logged automatically.");
+        return Ok(0);
+    }
+
+    let total: usize = ranked.iter().map(|r| r.count).sum();
+    println!(
+        "most-wanted unimplemented opcodes — {} miss(es), {} distinct ({})",
+        total,
+        ranked.len(),
+        log.display()
+    );
+    println!("  {:>4}  {:<14}  {:<18}  exes", "hits", "opcode", "example rip");
+    for r in &ranked {
+        println!(
+            "  {:>4}  {:<14}  {:#018x}  {}",
+            r.count,
+            r.opcode,
+            r.example_rip,
+            r.exes.join(", ")
+        );
+    }
     Ok(0)
 }
 

@@ -425,7 +425,10 @@ impl Process {
                 let _ = write!(o, " {r:#x}");
             }
         }
-        EmuError::Os(o)
+        // Keep the structured `err` as the cause so callers can still classify
+        // the fault (e.g. decode-miss telemetry, roadmap P0.5) — the report is
+        // only the human-facing rendering.
+        EmuError::Fault { report: o, cause: Box::new(err) }
     }
 }
 

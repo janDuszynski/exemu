@@ -29,6 +29,25 @@ pub enum EmuError {
     Os(String),
     /// Host-side I/O failure while reading the executable etc.
     Io(String),
+    /// A runtime fault wrapped with a full human-readable diagnostic `report`
+    /// (register dump, faulting bytes, rip trail) while **preserving** the
+    /// structured `cause`. Keeping the cause is what lets callers still tell
+    /// *what* faulted after the report is attached — e.g. the opcode-miss
+    /// telemetry keys off an [`EmuError::Decode`] inside it (roadmap P0.5).
+    Fault { report: String, cause: Box<EmuError> },
+}
+
+impl EmuError {
+    /// The underlying structured error, unwrapping any [`EmuError::Fault`]
+    /// diagnostic wrapper (recursively). Returns `self` for non-fault errors.
+    /// Match on this instead of the raw error when you care about the *kind* of
+    /// failure rather than its rendered report.
+    pub fn cause(&self) -> &EmuError {
+        match self {
+            EmuError::Fault { cause, .. } => cause.cause(),
+            other => other,
+        }
+    }
 }
 
 impl fmt::Display for EmuError {
@@ -50,8 +69,39 @@ impl fmt::Display for EmuError {
             EmuError::InvalidPe(why) => write!(f, "invalid PE image: {why}"),
             EmuError::Os(why) => write!(f, "emulated OS error: {why}"),
             EmuError::Io(why) => write!(f, "io error: {why}"),
+            // The report already opens with the cause's own message, so render
+            // it verbatim — the structured cause is for programmatic callers.
+            EmuError::Fault { report, .. } => write!(f, "{report}"),
         }
     }
 }
 
 impl std::error::Error for EmuError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cause_unwraps_nested_faults() {
+        let decode = EmuError::Decode { rip: 0x1400, opcode: "0xd9".into() };
+        // A fault wrapping the decode error still reports the structured cause.
+        let faulted = EmuError::Fault { report: "big diagnostic".into(), cause: Box::new(decode.clone()) };
+        assert_eq!(faulted.cause(), &decode);
+        // Nested wrappers unwrap all the way down.
+        let double = EmuError::Fault { report: "outer".into(), cause: Box::new(faulted) };
+        assert_eq!(double.cause(), &decode);
+        // A non-fault error is its own cause.
+        assert_eq!(decode.cause(), &decode);
+    }
+
+    #[test]
+    fn fault_display_is_just_the_report() {
+        let e = EmuError::Fault {
+            report: "cannot decode instruction at 0x1400: 0xd9\n  faulted after 0 instructions".into(),
+            cause: Box::new(EmuError::Decode { rip: 0x1400, opcode: "0xd9".into() }),
+        };
+        assert!(e.to_string().starts_with("cannot decode instruction"));
+        assert!(!e.to_string().contains("emulated OS error"));
+    }
+}

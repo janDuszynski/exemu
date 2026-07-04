@@ -96,3 +96,31 @@ fn rejects_garbage() {
     let err = load_and_run(b"this is not an exe", silent_cfg());
     assert!(err.is_err());
 }
+
+#[test]
+fn decode_miss_surfaces_structured_cause() {
+    // A run that stops on an instruction the decoder can't handle must surface
+    // a structured `EmuError::Decode` *through* the diagnostic fault wrapper, so
+    // the opcode-miss telemetry (roadmap P0.5) can key off it. Regression guard:
+    // the fault reporter used to collapse every error into `EmuError::Os`, which
+    // silently disabled the telemetry recording.
+    let mut bytes = sample::build();
+    // Overwrite the entry prologue's first byte with 0xD9 (x87 ESC, not yet
+    // implemented — roadmap P1.1) to force a decode miss at the entry point.
+    // Locating the prologue by pattern keeps this robust to layout changes.
+    let entry_prologue = [0x48u8, 0x83, 0xEC, 0x38]; // sub rsp, 0x38
+    let at = bytes
+        .windows(entry_prologue.len())
+        .position(|w| w == entry_prologue)
+        .expect("sample entry prologue present");
+    bytes[at] = 0xD9;
+
+    let err = match load_and_run(&bytes, silent_cfg()) {
+        Err(e) => e,
+        Ok(_) => panic!("decode miss must fault, but the run succeeded"),
+    };
+    match err.cause() {
+        exemu_core::EmuError::Decode { opcode, .. } => assert_eq!(opcode, "0xd9"),
+        other => panic!("expected a structured Decode cause, got {other:?}"),
+    }
+}
