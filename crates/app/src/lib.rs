@@ -26,7 +26,12 @@ use exemu_os::{WinConfig, WinOs};
 // ---- Address-space layout policy -------------------------------------------
 
 const PAGE: u64 = 0x1000;
-const TEB_SIZE: u64 = 0x1000;
+// The x64 TEB is ~0x1838 bytes; its inline `TlsSlots[64]` array sits at offset
+// 0x1480 and `TlsExpansionSlots` at 0x1780. Compilers inline TLS access as a
+// direct `gs:[0x1480 + i*8]` load/store, so the region must span past those —
+// 0x1000 is not enough. 0x2000 covers the whole struct and abuts the PEB
+// (placed at `teb_base + 0x2000`) without overlapping it.
+const TEB_SIZE: u64 = 0x2000;
 const ENV_SIZE: u64 = 0x1000;
 const API_SIZE: u64 = 0x0010_0000; // 1 MiB → 128k import slots
 

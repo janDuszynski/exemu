@@ -93,10 +93,30 @@ pub enum Api {
     SetConsoleMode,
     GetStartupInfoA,
     GetStartupInfoW,
-    GetEnvironmentStringsW,
-    FreeEnvironmentStringsW,
+    GetEnvironmentStrings { wide: bool },
+    FreeEnvironmentStrings,
+    GetEnvironmentVariable { wide: bool },
+    SetEnvironmentVariable { wide: bool },
+    ExpandEnvironmentStrings { wide: bool },
+    /// The codepage-conversion pair. We present the ANSI codepage as UTF-8
+    /// (`GetACP` → 65001), so both directions are UTF-16 ⇄ UTF-8. Returning 0
+    /// (the old stub) breaks the CRT's environment/argv setup, which converts
+    /// its wide strings to narrow with these.
+    WideCharToMultiByte,
+    MultiByteToWideChar,
     FreeLibrary,
     GetProcAddress,
+
+    /// Thread/Fiber Local Storage (`Tls*`/`Fls*`). We run single-threaded, so
+    /// a fiber slot behaves exactly like a thread slot; `fiber` only selects
+    /// which slot namespace is used. These must actually round-trip: the MSVC
+    /// CRT stores its per-thread-data pointer via `FlsSetValue` and reads it
+    /// back with `FlsGetValue`; if the set is stubbed to fail (BOOL 0) the CRT
+    /// aborts at startup with "R6016 - not enough space for thread data".
+    TlsAlloc { fiber: bool },
+    TlsSetValue { fiber: bool },
+    TlsGetValue { fiber: bool },
+    TlsFree { fiber: bool },
 
     // --- msvcrt C runtime -------------------------------------------------
     Malloc,
@@ -156,6 +176,7 @@ pub enum Api {
     DeleteFileW,
     GetModuleFileNameW,
     GlobalAlloc,
+    GlobalReAlloc,
     GlobalLock,
     GlobalFreeUnlock,
     GetVersion,
@@ -272,14 +293,36 @@ impl Api {
             "SetConsoleMode" => Api::SetConsoleMode,
             "GetStartupInfoA" => Api::GetStartupInfoA,
             "GetStartupInfoW" => Api::GetStartupInfoW,
-            "GetEnvironmentStringsW" => Api::GetEnvironmentStringsW,
-            "FreeEnvironmentStringsW" => Api::FreeEnvironmentStringsW,
+            "GetEnvironmentStringsW" => Api::GetEnvironmentStrings { wide: true },
+            "GetEnvironmentStrings" | "GetEnvironmentStringsA" => {
+                Api::GetEnvironmentStrings { wide: false }
+            }
+            "FreeEnvironmentStringsW" | "FreeEnvironmentStringsA" => Api::FreeEnvironmentStrings,
+            "GetEnvironmentVariableW" => Api::GetEnvironmentVariable { wide: true },
+            "GetEnvironmentVariableA" => Api::GetEnvironmentVariable { wide: false },
+            "SetEnvironmentVariableW" => Api::SetEnvironmentVariable { wide: true },
+            "SetEnvironmentVariableA" => Api::SetEnvironmentVariable { wide: false },
+            "ExpandEnvironmentStringsW" => Api::ExpandEnvironmentStrings { wide: true },
+            "ExpandEnvironmentStringsA" => Api::ExpandEnvironmentStrings { wide: false },
+            "WideCharToMultiByte" => Api::WideCharToMultiByte,
+            "MultiByteToWideChar" => Api::MultiByteToWideChar,
             "LoadLibraryW" => Api::LoadLibraryApi { wide: true, argc: 1 },
             "LoadLibraryExW" => Api::LoadLibraryApi { wide: true, argc: 3 },
             "LoadLibraryA" => Api::LoadLibraryApi { wide: false, argc: 1 },
             "LoadLibraryExA" => Api::LoadLibraryApi { wide: false, argc: 3 },
             "FreeLibrary" => Api::FreeLibrary,
             "GetProcAddress" => Api::GetProcAddress,
+
+            // Thread/Fiber Local Storage. FLS shares the TLS implementation
+            // (single-threaded); only the slot namespace differs.
+            "TlsAlloc" => Api::TlsAlloc { fiber: false },
+            "TlsSetValue" => Api::TlsSetValue { fiber: false },
+            "TlsGetValue" => Api::TlsGetValue { fiber: false },
+            "TlsFree" => Api::TlsFree { fiber: false },
+            "FlsAlloc" => Api::TlsAlloc { fiber: true },
+            "FlsSetValue" => Api::TlsSetValue { fiber: true },
+            "FlsGetValue" => Api::TlsGetValue { fiber: true },
+            "FlsFree" => Api::TlsFree { fiber: true },
 
             // msvcrt / UCRT C runtime.
             "malloc" => Api::Malloc,
@@ -344,6 +387,7 @@ impl Api {
             "PostQuitMessage" => Api::PostQuitMessageApi,
             "EndDialog" => Api::EndDialogApi,
             "GlobalAlloc" | "LocalAlloc" => Api::GlobalAlloc,
+            "GlobalReAlloc" | "LocalReAlloc" => Api::GlobalReAlloc,
             "GlobalLock" | "LocalLock" | "GlobalHandle" => Api::GlobalLock,
             "GlobalFree" | "GlobalUnlock" | "LocalFree" | "LocalUnlock" => Api::GlobalFreeUnlock,
             "__set_app_type" | "_set_fmode" | "_get_fmode" | "__setusermatherr"
@@ -502,11 +546,19 @@ impl Api {
             Api::GetConsoleMode => 2,
             Api::SetConsoleMode => 2,
             Api::GetStartupInfoA | Api::GetStartupInfoW => 1,
-            Api::GetEnvironmentStringsW => 0,
-            Api::FreeEnvironmentStringsW => 1,
+            Api::GetEnvironmentStrings { .. } => 0,
+            Api::FreeEnvironmentStrings => 1,
+            Api::SetEnvironmentVariable { .. } => 2,
+            Api::GetEnvironmentVariable { .. } | Api::ExpandEnvironmentStrings { .. } => 3,
+            Api::MultiByteToWideChar => 6,
+            Api::WideCharToMultiByte => 8,
             Api::LoadLibraryApi { argc, .. } => *argc,
             Api::FreeLibrary => 1,
             Api::GetProcAddress => 2,
+            // TlsAlloc() takes no args; FlsAlloc(callback) takes one.
+            Api::TlsAlloc { fiber } => *fiber as u32,
+            Api::TlsGetValue { .. } | Api::TlsFree { .. } => 1,
+            Api::TlsSetValue { .. } => 2,
             // cdecl C runtime and internal thunks: caller cleans up.
             Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
             | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
@@ -532,6 +584,7 @@ impl Api {
             Api::CreateDialogParam { .. } | Api::CoCreateInstanceApi => 5,
             Api::CreateDirectoryW | Api::GetTempPathW | Api::GetFileSizeApi | Api::GlobalAlloc
             | Api::GetSystemDirectoryW | Api::GetWindowsDirectoryW => 2,
+            Api::GlobalReAlloc => 3,
             Api::GetModuleFileNameW => 3,
             Api::SetFilePointerApi | Api::GetTempFileNameW => 4,
             Api::ReadFileApi => 5,
@@ -997,12 +1050,178 @@ impl WinOs {
                 }
                 Ok(Outcome::Return(0))
             }
-            Api::GetEnvironmentStringsW => {
-                // Return an empty environment block (double NUL).
-                let ptr = self.heap_alloc(8);
-                ret(ptr)
+            Api::GetEnvironmentStrings { wide } => {
+                // Materialize the environment block into the heap and hand back
+                // a pointer. The CRT walks this to build `environ`/`_wenviron`;
+                // an empty or null block makes it abort ("R6009 - not enough
+                // space for environment"), so we always return a real block.
+                if *wide {
+                    let units = self.env_block_utf16();
+                    let ptr = self.heap_alloc(units.len() as u64 * 2);
+                    if ptr != 0 {
+                        for (i, u) in units.iter().enumerate() {
+                            mem.write_u16(ptr + i as u64 * 2, *u)?;
+                        }
+                    }
+                    ret(ptr)
+                } else {
+                    let bytes = self.env_block_ansi();
+                    let ptr = self.heap_alloc(bytes.len() as u64);
+                    if ptr != 0 {
+                        mem.write(ptr, &bytes)?;
+                    }
+                    ret(ptr)
+                }
             }
-            Api::FreeEnvironmentStringsW => ret(TRUE),
+            Api::FreeEnvironmentStrings => ret(TRUE),
+            Api::GetEnvironmentVariable { wide } => {
+                // GetEnvironmentVariable(name, buf, size). Returns chars copied
+                // (excl. NUL) on success, the required size (incl. NUL) if the
+                // buffer is too small, or 0 (ERROR_ENVVAR_NOT_FOUND) if absent.
+                let name_ptr = self.arg(cpu, mem, 0)?;
+                let buf = self.arg(cpu, mem, 1)?;
+                let size = self.arg(cpu, mem, 2)? as usize;
+                let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
+                match self.env_get(&name).map(str::to_owned) {
+                    None => {
+                        self.last_error = 203; // ERROR_ENVVAR_NOT_FOUND
+                        ret(0)
+                    }
+                    Some(value) => {
+                        if *wide {
+                            let units: Vec<u16> = value.encode_utf16().collect();
+                            if units.len() + 1 > size {
+                                ret(units.len() as u64 + 1)
+                            } else {
+                                write_wstr_units(mem, buf, &units, size)?;
+                                ret(units.len() as u64)
+                            }
+                        } else {
+                            let bytes = value.as_bytes();
+                            if bytes.len() + 1 > size {
+                                ret(bytes.len() as u64 + 1)
+                            } else {
+                                mem.write(buf, bytes)?;
+                                mem.write_u8(buf + bytes.len() as u64, 0)?;
+                                ret(bytes.len() as u64)
+                            }
+                        }
+                    }
+                }
+            }
+            Api::SetEnvironmentVariable { wide } => {
+                // SetEnvironmentVariable(name, value): value NULL removes it.
+                let name_ptr = self.arg(cpu, mem, 0)?;
+                let value_ptr = self.arg(cpu, mem, 1)?;
+                let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
+                if name.is_empty() {
+                    return ret(FALSE);
+                }
+                let value = if value_ptr == 0 {
+                    None
+                } else if *wide {
+                    Some(read_wstr(mem, value_ptr)?)
+                } else {
+                    Some(read_astr(mem, value_ptr)?)
+                };
+                self.env_set(&name, value.as_deref());
+                ret(TRUE)
+            }
+            Api::ExpandEnvironmentStrings { wide } => {
+                // ExpandEnvironmentStrings(src, dst, size): replace %VAR% tokens
+                // (unknown ones are left verbatim, as Windows does). Returns the
+                // number of TCHARs stored including the NUL, or the size needed.
+                let src_ptr = self.arg(cpu, mem, 0)?;
+                let dst = self.arg(cpu, mem, 1)?;
+                let size = self.arg(cpu, mem, 2)? as usize;
+                let src = if *wide { read_wstr(mem, src_ptr)? } else { read_astr(mem, src_ptr)? };
+                let expanded = self.expand_env(&src);
+                if *wide {
+                    let units: Vec<u16> = expanded.encode_utf16().collect();
+                    let needed = units.len() + 1;
+                    if needed <= size {
+                        write_wstr_units(mem, dst, &units, size)?;
+                    }
+                    ret(needed as u64)
+                } else {
+                    let bytes = expanded.as_bytes();
+                    let needed = bytes.len() + 1;
+                    if needed <= size && dst != 0 {
+                        mem.write(dst, bytes)?;
+                        mem.write_u8(dst + bytes.len() as u64, 0)?;
+                    }
+                    ret(needed as u64)
+                }
+            }
+            Api::WideCharToMultiByte => {
+                // WideCharToMultiByte(cp, flags, wstr, cch, mbstr, cb, defChar,
+                //                     usedDefault). We treat the codepage as
+                //  UTF-8. cch<0 ⇒ NUL-terminated input, terminator included in
+                //  the output and count. cb==0 ⇒ return required byte count.
+                let wstr = self.arg(cpu, mem, 2)?;
+                let cch = self.arg(cpu, mem, 3)? as i32;
+                let mbstr = self.arg(cpu, mem, 4)?;
+                let cb = self.arg(cpu, mem, 5)? as i32;
+                let used_default = self.arg(cpu, mem, 7)?;
+
+                let units: Vec<u16> = if cch < 0 {
+                    read_wstr_units(mem, wstr)?
+                } else {
+                    let mut v = Vec::with_capacity(cch as usize);
+                    for i in 0..cch as u64 {
+                        v.push(mem.read_u16(wstr + i * 2)?);
+                    }
+                    v
+                };
+                let mut bytes = String::from_utf16_lossy(&units).into_bytes();
+                if cch < 0 {
+                    bytes.push(0); // include the NUL terminator in the output
+                }
+                if used_default != 0 {
+                    mem.write_u8(used_default, 0)?; // no lossy substitution under UTF-8
+                }
+                if cb == 0 {
+                    return ret(bytes.len() as u64); // size query
+                }
+                if bytes.len() > cb as usize {
+                    self.last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                    return ret(0);
+                }
+                mem.write(mbstr, &bytes)?;
+                ret(bytes.len() as u64)
+            }
+            Api::MultiByteToWideChar => {
+                // MultiByteToWideChar(cp, flags, mbstr, cb, wstr, cch). cb<0 ⇒
+                // NUL-terminated input (terminator included); cch==0 ⇒ return
+                // the required count in wide chars.
+                let mbstr = self.arg(cpu, mem, 2)?;
+                let cb = self.arg(cpu, mem, 3)? as i32;
+                let wstr = self.arg(cpu, mem, 4)?;
+                let cch = self.arg(cpu, mem, 5)? as i32;
+
+                let bytes: Vec<u8> = if cb < 0 {
+                    mem.read_cstr(mbstr, 1 << 20)?
+                } else {
+                    let mut v = vec![0u8; cb as usize];
+                    mem.read(mbstr, &mut v)?;
+                    v
+                };
+                let mut units: Vec<u16> = String::from_utf8_lossy(&bytes).encode_utf16().collect();
+                if cb < 0 {
+                    units.push(0); // include the NUL terminator
+                }
+                if cch == 0 {
+                    return ret(units.len() as u64); // size query
+                }
+                if units.len() > cch as usize {
+                    self.last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                    return ret(0);
+                }
+                for (i, u) in units.iter().enumerate() {
+                    mem.write_u16(wstr + i as u64 * 2, *u)?;
+                }
+                ret(units.len() as u64)
+            }
 
             Api::FreeLibrary => ret(TRUE),
             Api::GetProcAddress => {
@@ -1018,6 +1237,26 @@ impl WinOs {
                     eprintln!("[exemu]   GetProcAddress({hmodule:#x}, \"{what}\") -> {addr:#x}");
                 }
                 ret(addr)
+            }
+
+            // Thread/Fiber Local Storage. FlsAlloc's callback argument is
+            // ignored (single-threaded: no thread/fiber ever exits to run it).
+            Api::TlsAlloc { fiber } => ret(self.tls_alloc(*fiber)),
+            Api::TlsSetValue { fiber } => {
+                let index = self.arg(cpu, mem, 0)?;
+                let value = self.arg(cpu, mem, 1)?;
+                ret(self.tls_set(*fiber, index, value) as u64)
+            }
+            Api::TlsGetValue { fiber } => {
+                let index = self.arg(cpu, mem, 0)?;
+                // On success TlsGetValue clears the last error, so a caller that
+                // reads a legitimately-NULL slot doesn't see a stale failure.
+                self.last_error = 0;
+                ret(self.tls_get(*fiber, index))
+            }
+            Api::TlsFree { fiber } => {
+                let index = self.arg(cpu, mem, 0)?;
+                ret(self.tls_free(*fiber, index) as u64)
             }
 
             // --- msvcrt C runtime --------------------------------------------
@@ -1763,6 +2002,20 @@ impl WinOs {
             Api::GlobalAlloc => {
                 let size = self.arg(cpu, mem, 1)?;
                 ret(self.heap_alloc(size))
+            }
+            Api::GlobalReAlloc => {
+                // GlobalReAlloc(hMem, dwBytes, uFlags). GMEM_FIXED semantics:
+                // allocate a fresh block and copy. Returning 0 (the old stub)
+                // reads as an allocation failure and makes C++ callers throw.
+                let old = self.arg(cpu, mem, 0)?;
+                let size = self.arg(cpu, mem, 1)?;
+                let new = self.heap_alloc(size);
+                if new != 0 && old != 0 {
+                    let mut tmp = vec![0u8; size as usize];
+                    mem.read(old, &mut tmp)?;
+                    mem.write(new, &tmp)?;
+                }
+                ret(new)
             }
             Api::GlobalLock => {
                 let h = self.arg(cpu, mem, 0)?;

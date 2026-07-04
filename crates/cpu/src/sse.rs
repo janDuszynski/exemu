@@ -32,10 +32,18 @@ const LOW64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
 const LOW32: u128 = 0xFFFF_FFFF;
 
 /// Whether a two-byte (`0F xx`) opcode should be routed to the SSE unit.
+///
+/// The `0x60..=0x76`, `0xC6` and `0xD0..=0xFE` ranges are the MMX/SSE2 integer
+/// opcodes (pack/unpack, compares, shifts, packed add/sub, shuffles). They do
+/// not overlap the two-byte opcodes handled directly in `exec.rs` (`0F A2`
+/// CPUID, `0F C7` CMPXCHG8B, `0F C8..CF` BSWAP, the `Jcc`/`SETcc`/`CMOVcc`
+/// blocks, etc.), so routing whole ranges here is safe; anything we do not yet
+/// implement falls through to a clear "unsupported" error.
 pub(crate) fn is_sse(op2: u8) -> bool {
     matches!(op2,
         0x10..=0x17 | 0x28..=0x2F | 0x51..=0x5F |
-        0x6E | 0x6F | 0x7E | 0x7F | 0xD6 | 0xDB | 0xDF | 0xEB | 0xEF)
+        0x60..=0x76 | 0x7E | 0x7F |
+        0xC6 | 0xD0..=0xFE)
 }
 
 impl Interpreter {
@@ -294,6 +302,140 @@ impl Interpreter {
             0xEB => self.sse_logic(ctx, mem, |a, b| a | b)?,
             0xEF => self.sse_logic(ctx, mem, |a, b| a ^ b)?,
 
+            // ---- MOVNTPS / MOVNTDQ store (non-temporal → plain store) ---
+            0x2B | 0xE7 => {
+                let v = self.xmm(reg);
+                self.sse_store_full(ctx, mem, v)?;
+            }
+
+            // ---- PUNPCKL{BW,WD,DQ,QDQ} / PUNPCKH… (interleave) ----------
+            // The CRT's SSE2 memset broadcasts a byte across a register with
+            // these, so they are on the hot path into `main`.
+            0x60 | 0x61 | 0x62 | 0x6C => {
+                let esz = [1usize, 2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8][(op2 - 0x60) as usize];
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, punpck(a, b, esz, false));
+            }
+            0x68 | 0x69 | 0x6A | 0x6D => {
+                let esz = [1usize, 2, 4, 0, 0, 8][(op2 - 0x68) as usize];
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, punpck(a, b, esz, true));
+            }
+
+            // ---- PCMPEQ{B,W,D} / PCMPGT{B,W,D} --------------------------
+            0x74..=0x76 => {
+                let esz = 1usize << (op2 - 0x74);
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, pcmp(a, b, esz, false));
+            }
+            0x64..=0x66 => {
+                let esz = 1usize << (op2 - 0x64);
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, pcmp(a, b, esz, true));
+            }
+
+            // ---- PADD{B,W,D} / PADDQ / PSUB{B,W,D} / PSUBQ --------------
+            0xFC..=0xFE => {
+                let esz = 1usize << (op2 - 0xFC);
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, add_sub(a, b, esz, true));
+            }
+            0xD4 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, add_sub(a, b, 8, true));
+            }
+            0xF8..=0xFB => {
+                let esz = 1usize << (op2 - 0xF8);
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, add_sub(a, b, esz, false));
+            }
+
+            // ---- PMINUB / PMAXUB (unsigned byte min/max) ----------------
+            0xDA => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, byte_minmax(a, b, false));
+            }
+            0xDE => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, byte_minmax(a, b, true));
+            }
+
+            // ---- PMOVMSKB: gather the 16 byte sign bits into a GP reg ---
+            // The workhorse of SSE2 strlen/memchr/strcmp (pcmpeqb + pmovmskb).
+            0xD7 => {
+                let v = self.sse_rm(ctx, mem, 16)?;
+                let mask = pmovmskb(v) as u64;
+                let size = if ctx.pfx.w() { 8 } else { 4 };
+                self.write_reg_field(ctx, size, mask);
+            }
+
+            // ---- PSHUFD / PSHUFLW / PSHUFHW (66/F2/F3 0F 70 ib) ---------
+            0x70 => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let imm = ctx.u8(mem)?;
+                let out = match kind {
+                    Sse::Pd => pshufd(src, imm),
+                    Sse::Sd => pshuflw(src, imm),
+                    Sse::Ss => pshufhw(src, imm),
+                    Sse::Ps => return unsupported(op2, ctx, "pshufw(mm)"),
+                };
+                self.set_xmm(reg, out);
+            }
+
+            // ---- SHUFPS / SHUFPD (0F C6 ib) -----------------------------
+            0xC6 => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let dst = self.xmm(reg);
+                let imm = ctx.u8(mem)?;
+                let out = if kind == Sse::Pd { shufpd(dst, src, imm) } else { shufps(dst, src, imm) };
+                self.set_xmm(reg, out);
+            }
+
+            // ---- Shift by imm8 (groups 71/72/73) ------------------------
+            // reg field is the /digit; r/m is the xmm register operand.
+            0x71..=0x73 => {
+                let digit = ctx.reg & 7;
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let imm = ctx.u8(mem)? as u64;
+                let esz = match op2 {
+                    0x71 => 2,
+                    0x72 => 4,
+                    _ => 8,
+                };
+                let out = match (op2, digit) {
+                    (_, 2) => shift_r(src, esz, imm, false),  // PSRLW/D/Q
+                    (0x71 | 0x72, 4) => shift_r(src, esz, imm, true), // PSRAW/D
+                    (_, 6) => shift_l(src, esz, imm),         // PSLLW/D/Q
+                    (0x73, 3) => src >> (imm.min(16) * 8),    // PSRLDQ (bytes)
+                    (0x73, 7) => {
+                        if imm >= 16 {
+                            0
+                        } else {
+                            src << (imm * 8)
+                        }
+                    } // PSLLDQ (bytes)
+                    _ => return unsupported(op2, ctx, "psh-group"),
+                };
+                self.sse_store_full(ctx, mem, out)?;
+            }
+
+            // ---- Shift by xmm/m128 count (variable) ---------------------
+            0xD1 | 0xD2 | 0xD3 | 0xE1 | 0xE2 | 0xF1 | 0xF2 | 0xF3 => {
+                let count = (self.sse_rm(ctx, mem, 16)? & LOW64) as u64;
+                let dst = self.xmm(reg);
+                let out = match op2 {
+                    0xD1 => shift_r(dst, 2, count, false),
+                    0xD2 => shift_r(dst, 4, count, false),
+                    0xD3 => shift_r(dst, 8, count, false),
+                    0xE1 => shift_r(dst, 2, count, true),
+                    0xE2 => shift_r(dst, 4, count, true),
+                    0xF1 => shift_l(dst, 2, count),
+                    0xF2 => shift_l(dst, 4, count),
+                    _ => shift_l(dst, 8, count),
+                };
+                self.set_xmm(reg, out);
+            }
+
             other => return unsupported(other, ctx, "sse"),
         }
         Ok(())
@@ -440,6 +582,186 @@ fn f64_lane(v: u128, lane: u32) -> f64 {
 
 fn f32_lane(v: u128, lane: u32) -> f32 {
     f32::from_bits((v >> (lane * 32)) as u32)
+}
+
+// ---- packed-integer element helpers ----------------------------------------
+
+/// Element mask for an `esz`-byte lane (`esz` ∈ {1,2,4,8}).
+fn emask(esz: usize) -> u128 {
+    let bits = esz * 8;
+    if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
+}
+
+/// Interleave `esz`-byte elements of `a` (dst) and `b` (src), taking the low
+/// or high half — PUNPCKL*/PUNPCKH*.
+fn punpck(a: u128, b: u128, esz: usize, high: bool) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let half = (16 / esz) / 2;
+    let base = if high { half } else { 0 };
+    let mut out = 0u128;
+    for i in 0..half {
+        let d = (a >> ((base + i) * bits)) & mask;
+        let s = (b >> ((base + i) * bits)) & mask;
+        out |= d << ((2 * i) * bits);
+        out |= s << ((2 * i + 1) * bits);
+    }
+    out
+}
+
+/// Per-element compare: equality, or signed greater-than. Matching lanes become
+/// all-ones, others zero (PCMPEQ*/PCMPGT*).
+fn pcmp(a: u128, b: u128, esz: usize, gt: bool) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let sign = 1u128 << (bits - 1);
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let x = (a >> (i * bits)) & mask;
+        let y = (b >> (i * bits)) & mask;
+        let hit = if gt {
+            // Signed compare: flip the sign bit so an unsigned compare orders
+            // the two's-complement values correctly.
+            (x ^ sign) > (y ^ sign)
+        } else {
+            x == y
+        };
+        if hit {
+            out |= mask << (i * bits);
+        }
+    }
+    out
+}
+
+/// Per-element wrapping add (`sub=false`) or subtract (PADD*/PSUB*).
+fn add_sub(a: u128, b: u128, esz: usize, add: bool) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let x = ((a >> (i * bits)) & mask) as u64;
+        let y = ((b >> (i * bits)) & mask) as u64;
+        let r = if add { x.wrapping_add(y) } else { x.wrapping_sub(y) } as u128;
+        out |= (r & mask) << (i * bits);
+    }
+    out
+}
+
+/// Per-byte unsigned min (`max=false`) or max — PMINUB/PMAXUB.
+fn byte_minmax(a: u128, b: u128, max: bool) -> u128 {
+    let mut out = 0u128;
+    for i in 0..16 {
+        let x = ((a >> (i * 8)) & 0xFF) as u8;
+        let y = ((b >> (i * 8)) & 0xFF) as u8;
+        let r = if max { x.max(y) } else { x.min(y) } as u128;
+        out |= r << (i * 8);
+    }
+    out
+}
+
+/// The top bit of each of the 16 bytes, packed into a 16-bit mask — PMOVMSKB.
+fn pmovmskb(v: u128) -> u32 {
+    let mut m = 0u32;
+    for i in 0..16 {
+        if (v >> (i * 8 + 7)) & 1 == 1 {
+            m |= 1 << i;
+        }
+    }
+    m
+}
+
+/// Per-element right shift, logical (`arith=false`) or arithmetic — PSRL*/PSRA*.
+fn shift_r(v: u128, esz: usize, count: u64, arith: bool) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let sign = 1u128 << (bits - 1);
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let e = (v >> (i * bits)) & mask;
+        let r = if arith {
+            // Sign-extend the lane to i128, arithmetic-shift, remask.
+            let se = ((e ^ sign).wrapping_sub(sign)) as i128;
+            let r = if count >= bits as u64 { se >> 127 } else { se >> count };
+            (r as u128) & mask
+        } else if count >= bits as u64 {
+            0
+        } else {
+            e >> count
+        };
+        out |= r << (i * bits);
+    }
+    out
+}
+
+/// Per-element logical left shift — PSLL*.
+fn shift_l(v: u128, esz: usize, count: u64) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    if count >= bits as u64 {
+        return 0;
+    }
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let e = (v >> (i * bits)) & mask;
+        out |= ((e << count) & mask) << (i * bits);
+    }
+    out
+}
+
+/// Select four dwords per `imm` from a single source — PSHUFD.
+fn pshufd(src: u128, imm: u8) -> u128 {
+    let mut out = 0u128;
+    for i in 0..4 {
+        let sel = (imm >> (i * 2)) & 3;
+        let dw = (src >> (sel as u32 * 32)) & LOW32;
+        out |= dw << (i * 32);
+    }
+    out
+}
+
+/// Shuffle the low four words per `imm`, copying the high qword — PSHUFLW.
+fn pshuflw(src: u128, imm: u8) -> u128 {
+    let mut low = 0u128;
+    for i in 0..4 {
+        let sel = (imm >> (i * 2)) & 3;
+        let w = (src >> (sel as u32 * 16)) & 0xFFFF;
+        low |= w << (i * 16);
+    }
+    (src & !LOW64) | (low & LOW64)
+}
+
+/// Shuffle the high four words per `imm`, copying the low qword — PSHUFHW.
+fn pshufhw(src: u128, imm: u8) -> u128 {
+    let hi = src >> 64;
+    let mut out = 0u128;
+    for i in 0..4 {
+        let sel = (imm >> (i * 2)) & 3;
+        let w = (hi >> (sel as u32 * 16)) & 0xFFFF;
+        out |= w << (i * 16);
+    }
+    (src & LOW64) | (out << 64)
+}
+
+/// SHUFPS: low two dwords from `dst`, high two from `src`, per `imm`.
+fn shufps(dst: u128, src: u128, imm: u8) -> u128 {
+    let dw = |v: u128, i: u8| (v >> (i as u32 * 32)) & LOW32;
+    let mut out = 0u128;
+    out |= dw(dst, imm & 3);
+    out |= dw(dst, (imm >> 2) & 3) << 32;
+    out |= dw(src, (imm >> 4) & 3) << 64;
+    out |= dw(src, (imm >> 6) & 3) << 96;
+    out
+}
+
+/// SHUFPD: low qword from `dst`, high qword from `src`, each per one `imm` bit.
+fn shufpd(dst: u128, src: u128, imm: u8) -> u128 {
+    let lo = if imm & 1 == 0 { dst & LOW64 } else { (dst >> 64) & LOW64 };
+    let hi = if imm & 2 == 0 { src & LOW64 } else { (src >> 64) & LOW64 };
+    lo | (hi << 64)
 }
 
 fn unsupported(op2: u8, ctx: &Ctx, group: &str) -> Result<()> {

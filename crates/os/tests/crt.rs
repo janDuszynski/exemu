@@ -88,6 +88,78 @@ fn malloc_returns_heap_pointer() {
 }
 
 #[test]
+fn tls_alloc_set_get_roundtrip() {
+    // The MSVC CRT stores its per-thread data pointer in a TLS/FLS slot; if the
+    // set/get do not round-trip it aborts at startup (R6016). TlsAlloc → an
+    // index, TlsSetValue stores, TlsGetValue reads the same value back.
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+    let idx = call(&mut os, &mut mem, &mut cpu, "TlsAlloc");
+
+    cpu.set_reg(Reg::Rcx, idx);
+    cpu.set_reg(Reg::Rdx, 0xCAFE_D00D);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "TlsSetValue"), 1, "TlsSetValue must succeed");
+
+    cpu.set_reg(Reg::Rcx, idx);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "TlsGetValue"), 0xCAFE_D00D);
+}
+
+#[test]
+fn fls_alloc_set_get_roundtrip() {
+    // Fiber-local storage shares the implementation; the classic MSVC CRT uses
+    // FlsAlloc/FlsSetValue/FlsGetValue for the same per-thread data pointer.
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+    let idx = call(&mut os, &mut mem, &mut cpu, "FlsAlloc");
+
+    cpu.set_reg(Reg::Rcx, idx);
+    cpu.set_reg(Reg::Rdx, 0x1234_5678);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "FlsSetValue"), 1);
+
+    cpu.set_reg(Reg::Rcx, idx);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "FlsGetValue"), 0x1234_5678);
+}
+
+#[test]
+fn get_environment_strings_is_populated() {
+    // An empty environment block makes the CRT abort (R6009); ours is seeded, so
+    // the block's first wide character is non-NUL.
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+    let ptr = call(&mut os, &mut mem, &mut cpu, "GetEnvironmentStringsW");
+    assert_ne!(ptr, 0);
+    assert_ne!(mem.read_u16(ptr).unwrap(), 0, "environment block must not be empty");
+}
+
+#[test]
+fn environment_variable_set_then_get() {
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+    // "EXEMU_TEST" (name) and "yes" (value) as UTF-16 in guest memory.
+    let name = DATA;
+    let value = DATA + 0x100;
+    let out = DATA + 0x200;
+    for (i, u) in "EXEMU_TEST".encode_utf16().chain([0]).enumerate() {
+        mem.write_u16(name + i as u64 * 2, u).unwrap();
+    }
+    for (i, u) in "yes".encode_utf16().chain([0]).enumerate() {
+        mem.write_u16(value + i as u64 * 2, u).unwrap();
+    }
+
+    cpu.set_reg(Reg::Rcx, name);
+    cpu.set_reg(Reg::Rdx, value);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetEnvironmentVariableW"), 1);
+
+    cpu.set_reg(Reg::Rcx, name);
+    cpu.set_reg(Reg::Rdx, out);
+    cpu.set_reg(Reg::R8, 260); // buffer size in wide chars
+    let n = call(&mut os, &mut mem, &mut cpu, "GetEnvironmentVariableW");
+    assert_eq!(n, 3, "GetEnvironmentVariableW returns the length in chars");
+    let read: Vec<u16> = (0..n).map(|i| mem.read_u16(out + i * 2).unwrap()).collect();
+    assert_eq!(String::from_utf16(&read).unwrap(), "yes");
+}
+
+#[test]
 fn exit_terminates_process() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::new();
