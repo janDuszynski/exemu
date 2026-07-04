@@ -20,6 +20,11 @@ pub struct UnwindEntry {
     pub begin_rva: u32,
     /// RVA one past the last byte of the range (exclusive).
     pub end_rva: u32,
+    /// RVA of this entry's on-disk 12-byte `RUNTIME_FUNCTION` record.
+    /// Exception dispatch hands `image_base + record_rva` to guest language
+    /// handlers as `DISPATCHER_CONTEXT.FunctionEntry` — they re-read the
+    /// mapped `.pdata`/`.xdata` bytes themselves.
+    pub record_rva: u32,
     pub info: UnwindInfo,
 }
 
@@ -45,6 +50,10 @@ pub struct UnwindInfo {
     /// RVA of the language-specific handler (`__C_specific_handler`,
     /// `__CxxFrameHandler3/4`, …) when either handler flag is set.
     pub handler_rva: Option<u32>,
+    /// RVA of the language-specific data that follows the handler RVA in the
+    /// `.xdata` blob (the C-scope table / C++ `FuncInfo` pointer). Handed to
+    /// guest handlers as `DISPATCHER_CONTEXT.HandlerData`.
+    pub handler_data_rva: Option<u32>,
     /// `UNW_FLAG_CHAININFO` — the primary entry this fragment continues
     /// (its codes apply after ours when unwinding).
     pub chained: Option<Box<UnwindEntry>>,
@@ -372,6 +381,7 @@ mod tests {
         UnwindEntry {
             begin_rva: begin,
             end_rva: end,
+            record_rva: 0,
             info: UnwindInfo {
                 version: 1,
                 has_exception_handler: false,
@@ -381,6 +391,7 @@ mod tests {
                 frame_offset: 0,
                 codes: Vec::new(),
                 handler_rva: None,
+                handler_data_rva: None,
                 chained: None,
             },
         }
