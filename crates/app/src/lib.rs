@@ -141,6 +141,10 @@ pub struct Process {
     sandbox: String,
     entry: u64,
     max_steps: u64,
+    /// The image's x64 unwind function table + base, kept for virtual
+    /// unwinding (fault-report call stacks now; exception dispatch later).
+    function_table: Vec<exemu_core::UnwindEntry>,
+    image_base: u64,
 }
 
 impl Process {
@@ -304,6 +308,8 @@ impl Process {
             sandbox: sandbox.to_string_lossy().into_owned(),
             entry: image.entry_va(),
             max_steps: cfg.max_steps,
+            function_table: image.function_table,
+            image_base: base,
         })
     }
 
@@ -423,6 +429,23 @@ impl Process {
             let _ = write!(o, "\n  recent rip trail (oldest→newest):");
             for r in recent {
                 let _ = write!(o, " {r:#x}");
+            }
+        }
+        // Call stack via the x64 unwind tables (roadmap P4.2) — turns the
+        // faulting rip into the chain of callers that led there.
+        if !self.function_table.is_empty() {
+            let frames = exemu_core::unwind::backtrace(
+                &self.function_table,
+                self.image_base,
+                s,
+                &self.mem,
+                24,
+            );
+            if !frames.is_empty() {
+                let _ = write!(o, "\n  call stack (virtual unwind, innermost first): {:#x}", s.rip);
+                for f in &frames {
+                    let _ = write!(o, " ← {f:#x}");
+                }
             }
         }
         // Keep the structured `err` as the cause so callers can still classify
