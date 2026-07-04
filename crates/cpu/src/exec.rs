@@ -1104,6 +1104,41 @@ impl Interpreter {
                 }
             }
 
+            // ---- Three-byte 0F 38 escape --------------------------------
+            // Only MOVBE is decoded here for now; this arm is also the future
+            // home of the SSSE3 / SSE4 instructions (pshufb, pcmpistri, …),
+            // which is why CPUID withholds those feature bits until they land.
+            0x38 => {
+                let op3 = ctx.u8(mem)?;
+                match op3 {
+                    // MOVBE — load (F0) / store (F1) with byte reversal. Under
+                    // an F2 prefix these encode CRC32, which we do not
+                    // implement, so exclude that case.
+                    0xF0 | 0xF1 if ctx.pfx.rep != 0xF2 => {
+                        self.read_modrm(ctx, mem)?;
+                        let size = Self::opsize(ctx);
+                        let bswap = |v: u64| match size {
+                            2 => (v as u16).swap_bytes() as u64,
+                            4 => (v as u32).swap_bytes() as u64,
+                            _ => v.swap_bytes(),
+                        };
+                        if op3 == 0xF0 {
+                            let v = self.read_rm(ctx, &*mem, size)?;
+                            self.write_reg_field(ctx, size, bswap(v));
+                        } else {
+                            let v = self.read_reg_field(ctx, size);
+                            self.write_rm(ctx, mem, size, bswap(v))?;
+                        }
+                    }
+                    other => {
+                        return Err(EmuError::Decode {
+                            rip: start,
+                            opcode: format!("0f 38 {other:#04x}"),
+                        });
+                    }
+                }
+            }
+
             other => {
                 return Err(EmuError::Decode {
                     rip: start,

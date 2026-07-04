@@ -393,3 +393,27 @@ fn rdtsc_is_monotonic() {
     let cpu = run(&code);
     assert!(rax(&cpu) as u32 > 0, "TSC must advance between reads");
 }
+
+#[test]
+fn movbe_load_byteswaps_from_memory() {
+    // mov dword [rsp-8], 0x11223344 ; movbe eax, [rsp-8] ; hlt → 0x44332211
+    let code = [
+        0xC7, 0x44, 0x24, 0xF8, 0x44, 0x33, 0x22, 0x11, // mov dword [rsp-8], 0x11223344
+        0x0F, 0x38, 0xF0, 0x44, 0x24, 0xF8, // movbe eax, [rsp-8]
+        0xF4,
+    ];
+    assert_eq!(rax(&run(&code)) & 0xffff_ffff, 0x4433_2211);
+}
+
+#[test]
+fn movbe_store_byteswaps_to_memory() {
+    // mov eax, 0xAABBCCDD ; movbe [rsp-8], eax ; mov ebx, [rsp-8] ; hlt
+    // stored bytes are reversed → reloaded value is 0xDDCCBBAA
+    let code = [
+        0xB8, 0xDD, 0xCC, 0xBB, 0xAA, // mov eax, 0xAABBCCDD
+        0x0F, 0x38, 0xF1, 0x44, 0x24, 0xF8, // movbe [rsp-8], eax
+        0x8B, 0x5C, 0x24, 0xF8, // mov ebx, [rsp-8]
+        0xF4,
+    ];
+    assert_eq!(rbx(&run(&code)) & 0xffff_ffff, 0xDDCC_BBAA);
+}
