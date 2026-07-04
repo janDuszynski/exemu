@@ -259,3 +259,80 @@ fn overflow_flag_on_signed_add() {
     assert!(cpu.state().flag(flags::OF), "overflow flag should be set");
     assert!(cpu.state().flag(flags::SF), "sign flag should be set");
 }
+
+#[test]
+fn popcnt_counts_set_bits() {
+    // mov eax, 0xF0F ; popcnt ebx, eax ; hlt  → 8 set bits, ZF clear
+    let code = [
+        0xB8, 0x0F, 0x0F, 0x00, 0x00, // mov eax, 0x0F0F
+        0xF3, 0x0F, 0xB8, 0xD8, // popcnt ebx, eax
+        0xF4, // hlt
+    ];
+    let cpu = run(&code);
+    assert_eq!(rbx(&cpu), 8);
+    assert!(!cpu.state().flag(flags::ZF));
+}
+
+#[test]
+fn popcnt_zero_sets_zf() {
+    // mov eax, 0 ; popcnt ebx, eax ; hlt  → 0, ZF set
+    let code = [
+        0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+        0xF3, 0x0F, 0xB8, 0xD8, // popcnt ebx, eax
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rbx(&cpu), 0);
+    assert!(cpu.state().flag(flags::ZF));
+}
+
+#[test]
+fn tzcnt_trailing_zeros() {
+    // mov eax, 0x10 ; tzcnt ebx, eax ; hlt  → 4, CF clear
+    let code = [
+        0xB8, 0x10, 0x00, 0x00, 0x00, // mov eax, 0x10
+        0xF3, 0x0F, 0xBC, 0xD8, // tzcnt ebx, eax
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rbx(&cpu), 4);
+    assert!(!cpu.state().flag(flags::CF));
+    assert!(!cpu.state().flag(flags::ZF));
+}
+
+#[test]
+fn tzcnt_zero_is_width_and_sets_cf() {
+    // mov eax, 0 ; tzcnt ebx, eax ; hlt  → 32 (operand width), CF set
+    let code = [
+        0xB8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+        0xF3, 0x0F, 0xBC, 0xD8, // tzcnt ebx, eax
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rbx(&cpu), 32);
+    assert!(cpu.state().flag(flags::CF));
+}
+
+#[test]
+fn lzcnt_leading_zeros() {
+    // mov eax, 0xFF ; lzcnt ebx, eax ; hlt  → 24 (32-bit operand), CF clear
+    let code = [
+        0xB8, 0xFF, 0x00, 0x00, 0x00, // mov eax, 0xFF
+        0xF3, 0x0F, 0xBD, 0xD8, // lzcnt ebx, eax
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rbx(&cpu), 24);
+    assert!(!cpu.state().flag(flags::CF));
+}
+
+#[test]
+fn bsf_without_f3_still_works() {
+    // mov eax, 0x10 ; bsf ebx, eax ; hlt  → index 4
+    let code = [
+        0xB8, 0x10, 0x00, 0x00, 0x00, // mov eax, 0x10
+        0x0F, 0xBC, 0xD8, // bsf ebx, eax
+        0xF4,
+    ];
+    assert_eq!(rbx(&run(&code)), 4);
+}
