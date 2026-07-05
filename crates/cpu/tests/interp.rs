@@ -417,3 +417,106 @@ fn movbe_store_byteswaps_to_memory() {
     ];
     assert_eq!(rbx(&run(&code)) & 0xffff_ffff, 0xDDCC_BBAA);
 }
+
+// ---- Differential-oracle regression tests (roadmap P0.4) -------------------
+//
+// Each of these encodes a case the P0.1 Unicorn oracle flagged as an exemu vs
+// real-x86 divergence, so the fixes cannot silently regress under CI (which
+// does not build the Unicorn-gated oracle itself).
+
+fn flag(cpu: &Interpreter, mask: u64) -> bool {
+    cpu.state().flag(mask)
+}
+
+#[test]
+fn imul_two_op_negative_no_overflow_clears_cf_of() {
+    // mov eax, -1 ; imul eax, eax ; hlt  →  (-1)*(-1) = 1, fits → CF=OF=0.
+    // The sign-vs-zero-extension bug set CF/OF here (0xffffffff read as +4e9).
+    let code = [
+        0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov eax, 0xFFFFFFFF (-1)
+        0x0F, 0xAF, 0xC0, // imul eax, eax
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rax(&cpu) & 0xffff_ffff, 1);
+    assert!(!flag(&cpu, flags::CF), "CF must be clear (no overflow)");
+    assert!(!flag(&cpu, flags::OF), "OF must be clear (no overflow)");
+}
+
+#[test]
+fn imul_one_op_signed_high_half() {
+    // mov eax, -2 ; mov ecx, 3 ; imul ecx ; hlt  →  edx:eax = -6.
+    // The zero-extension bug corrupted the high half (edx) for negatives.
+    let code = [
+        0xB8, 0xFE, 0xFF, 0xFF, 0xFF, // mov eax, -2
+        0xB9, 0x03, 0x00, 0x00, 0x00, // mov ecx, 3
+        0xF7, 0xE9, // imul ecx  (F7 /5)
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rax(&cpu) & 0xffff_ffff, 0xFFFF_FFFA); // -6 low
+    assert_eq!(rdx(&cpu) & 0xffff_ffff, 0xFFFF_FFFF); // -6 high (sign)
+    assert!(!flag(&cpu, flags::CF));
+    assert!(!flag(&cpu, flags::OF));
+}
+
+#[test]
+fn idiv_negative_divisor() {
+    // mov eax,-6 ; cdq ; mov ecx,-3 ; idiv ecx ; hlt  →  q=2, r=0.
+    // The divisor sign-extension bug made -3 read as a huge positive.
+    let code = [
+        0xB8, 0xFA, 0xFF, 0xFF, 0xFF, // mov eax, -6
+        0x99, // cdq (edx = sign of eax)
+        0xB9, 0xFD, 0xFF, 0xFF, 0xFF, // mov ecx, -3
+        0xF7, 0xF9, // idiv ecx  (F7 /7)
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rax(&cpu) & 0xffff_ffff, 2); // quotient
+    assert_eq!(rdx(&cpu) & 0xffff_ffff, 0); // remainder
+}
+
+#[test]
+fn rcl_by_one_sets_overflow() {
+    // mov eax, 0x80000000 ; rcl eax,1 ; hlt.  CF starts 0.
+    // MSB(1) rotates into CF; result 0, CF=1, OF = MSB(res) XOR CF = 1.
+    // Previously OF was left untouched (the RCL/RCR arm never set it).
+    let code = [
+        0xB8, 0x00, 0x00, 0x00, 0x80, // mov eax, 0x80000000
+        0xD1, 0xD0, // rcl eax, 1  (D1 /2)
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rax(&cpu) & 0xffff_ffff, 0);
+    assert!(flag(&cpu, flags::CF), "CF = old MSB = 1");
+    assert!(flag(&cpu, flags::OF), "OF = MSB(result) XOR CF = 1");
+}
+
+#[test]
+fn cmov_not_taken_zero_extends() {
+    // mov rax,-1 ; cmovb eax, ecx (CF=0 → not taken) ; hlt.
+    // A 32-bit CMOV zero-extends the destination even when not taken.
+    let code = [
+        0x48, 0xC7, 0xC0, 0xFF, 0xFF, 0xFF, 0xFF, // mov rax, -1 (all ones)
+        0x0F, 0x42, 0xC1, // cmovb eax, ecx
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rax(&cpu), 0x0000_0000_FFFF_FFFF, "upper 32 bits must be cleared");
+}
+
+#[test]
+fn cmpxchg_equal_zero_extends_accumulator() {
+    // mov rax, 0x1_00000000 ; mov ecx,0 ; mov edx,5 ; cmpxchg ecx, edx ; hlt.
+    // eax(low32)=0 == ecx=0 → equal → ecx=edx=5, and eax zero-extends to 0.
+    let code = [
+        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // mov rax, 0x100000000
+        0xB9, 0x00, 0x00, 0x00, 0x00, // mov ecx, 0
+        0xBA, 0x05, 0x00, 0x00, 0x00, // mov edx, 5
+        0x0F, 0xB1, 0xD1, // cmpxchg ecx, edx
+        0xF4,
+    ];
+    let cpu = run(&code);
+    assert_eq!(rax(&cpu), 0, "accumulator upper 32 bits must be cleared");
+    assert_eq!(rcx(&cpu) & 0xffff_ffff, 5, "destination updated on equal");
+}
