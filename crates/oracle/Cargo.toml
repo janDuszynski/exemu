@@ -1,0 +1,29 @@
+# exemu-oracle — a dev-only differential CPU oracle (roadmap P0.1/P0.2).
+#
+# Lockstep-steps the exemu interpreter against Unicorn (QEMU TCG) on generated
+# instructions and reports the first divergence. The `unicorn` feature is OFF
+# by default, so a plain `cargo build/test --workspace` (the CI gate) never
+# needs Unicorn's native toolchain; build the real thing with
+# `cargo run -p exemu-oracle --features unicorn --release -- fuzz`.
+[package]
+name = "exemu-oracle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "exemu-oracle"
+path = "src/main.rs"
+
+[dependencies]
+exemu-core = { workspace = true }
+exemu-cpu = { workspace = true }
+exemu-memory = { workspace = true }
+unicorn-engine = { version = "2.1", optional = true }
+
+[features]
+default = []
+# Pull in Unicorn (builds the bundled C library via cmake) and the harness.
+unicorn = ["dep:unicorn-engine"]

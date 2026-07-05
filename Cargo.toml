@@ -21,6 +21,7 @@ members = [
     "crates/gui",
     "crates/app",
     "crates/cli",
+    "crates/oracle",
 ]
 
 [workspace.package]
