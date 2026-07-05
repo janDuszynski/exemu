@@ -199,3 +199,62 @@ fn movd_gpr_to_xmm_and_back() {
     assert_eq!(cpu.state().reg(exemu_core::Reg::Rdx), 0xCAFE_BABE);
     assert_eq!(cpu.state().xmm[0], 0xCAFE_BABE);
 }
+
+// ---- Differential-oracle SSE regression tests (roadmap P0.4 / P1.3) --------
+//
+// Each encodes an exemu-vs-real-x86 divergence the P0.1 Unicorn oracle flagged.
+
+fn eax(cpu: &Interpreter) -> u64 {
+    cpu.state().reg(exemu_core::Reg::Rax) & 0xffff_ffff
+}
+
+#[test]
+fn cvttsd2si_out_of_range_is_integer_indefinite() {
+    // cvttsd2si eax, xmm0 with xmm0 = 1e30 → out of i32 range → 0x80000000
+    // (x86 "integer indefinite"), NOT a saturated 0x7fffffff.
+    let code = [0xF2, 0x0F, 0x2C, 0xC0, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| cpu.state_mut().xmm[0] = 1e30f64.to_bits() as u128);
+    assert_eq!(eax(&cpu), 0x8000_0000);
+}
+
+#[test]
+fn cvtsd2si_rounds_to_nearest_even() {
+    // cvtsd2si eax, xmm0 with xmm0 = 2.5 → 2 (banker's rounding), not 3.
+    let code = [0xF2, 0x0F, 0x2D, 0xC0, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| cpu.state_mut().xmm[0] = 2.5f64.to_bits() as u128);
+    assert_eq!(eax(&cpu), 2);
+}
+
+#[test]
+fn minps_returns_source_on_nan() {
+    // minps xmm0, xmm1 with xmm0 lane0 = 1.0, xmm1 lane0 = NaN.
+    // x86 min is (a<b)?a:b, so the NaN source is returned (not dropped).
+    let code = [0x0F, 0x5D, 0xC1, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = 1.0f32.to_bits() as u128;
+        cpu.state_mut().xmm[1] = f32::NAN.to_bits() as u128;
+    });
+    let lane0 = cpu.state().xmm[0] as u32;
+    assert!(f32::from_bits(lane0).is_nan(), "min(1.0, NaN) must yield the NaN source");
+}
+
+#[test]
+fn minsd_returns_source_on_signed_zero() {
+    // minsd xmm0, xmm1 with xmm0 = +0.0, xmm1 = -0.0 → -0.0 (the source),
+    // since +0.0 < -0.0 is false.
+    let code = [0xF2, 0x0F, 0x5D, 0xC1, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = 0.0f64.to_bits() as u128;
+        cpu.state_mut().xmm[1] = (-0.0f64).to_bits() as u128;
+    });
+    assert_eq!(cpu.state().xmm[0] as u64, 0x8000_0000_0000_0000, "min(+0,-0) = src = -0.0");
+}
+
+#[test]
+fn psrldq_by_16_or_more_clears() {
+    // psrldq xmm0, 17 → 0 (all 16 bytes shifted out). The buggy `>> 128`
+    // wrapped to `>> 0` and left the register unchanged.
+    let code = [0x66, 0x0F, 0x73, 0xD8, 0x11, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| cpu.state_mut().xmm[0] = u128::MAX);
+    assert_eq!(cpu.state().xmm[0], 0);
+}

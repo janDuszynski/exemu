@@ -202,8 +202,7 @@ impl Interpreter {
                 } else {
                     f32::from_bits((val & LOW32) as u32) as f64
                 };
-                let f = if truncate { f.trunc() } else { f.round() };
-                let out = if size == 8 { f as i64 as u64 } else { f as i32 as u32 as u64 };
+                let out = cvt_f_to_int(f, truncate, size);
                 self.write_reg_field(ctx, size, out);
             }
             // ---- UCOMISS/UCOMISD (2E) and COMISS/COMISD (2F) -----------
@@ -235,9 +234,12 @@ impl Interpreter {
             0x58 => self.sse_arith(ctx, mem, kind, |a, b| a + b)?,
             0x59 => self.sse_arith(ctx, mem, kind, |a, b| a * b)?,
             0x5C => self.sse_arith(ctx, mem, kind, |a, b| a - b)?,
-            0x5D => self.sse_arith(ctx, mem, kind, |a, b| a.min(b))?,
+            // MIN/MAX are `(a<b)?a:b` / `(a>b)?a:b`, NOT IEEE minNum/maxNum:
+            // if either operand is NaN, or they are equal (incl. ±0), the
+            // *source* (b) is returned. Rust's f64::min/max instead drop NaNs.
+            0x5D => self.sse_arith(ctx, mem, kind, |a, b| if a < b { a } else { b })?,
             0x5E => self.sse_arith(ctx, mem, kind, |a, b| a / b)?,
-            0x5F => self.sse_arith(ctx, mem, kind, |a, b| a.max(b))?,
+            0x5F => self.sse_arith(ctx, mem, kind, |a, b| if a > b { a } else { b })?,
 
             // ---- CVTSD2SS / CVTSS2SD (5A) -------------------------------
             0x5A => match kind {
@@ -406,7 +408,15 @@ impl Interpreter {
                     (_, 2) => shift_r(src, esz, imm, false),  // PSRLW/D/Q
                     (0x71 | 0x72, 4) => shift_r(src, esz, imm, true), // PSRAW/D
                     (_, 6) => shift_l(src, esz, imm),         // PSLLW/D/Q
-                    (0x73, 3) => src >> (imm.min(16) * 8),    // PSRLDQ (bytes)
+                    // PSRLDQ (whole-register byte shift): >=16 clears it. Guard
+                    // the count so we never `>> 128` (which Rust masks to `>> 0`).
+                    (0x73, 3) => {
+                        if imm >= 16 {
+                            0
+                        } else {
+                            src >> (imm * 8)
+                        }
+                    } // PSRLDQ (bytes)
                     (0x73, 7) => {
                         if imm >= 16 {
                             0
@@ -573,6 +583,27 @@ fn low_mask(n: usize) -> u128 {
         u128::MAX
     } else {
         (1u128 << (n * 8)) - 1
+    }
+}
+
+/// Convert a float to a signed integer of `size` bytes with x86 CVT(T)*2SI
+/// semantics: round per mode (truncate → toward zero, else round-to-nearest-
+/// even, matching the default MXCSR mode), and yield the "integer indefinite"
+/// value (0x8000…0) when the rounded result is out of range or the input is
+/// NaN — where Rust's saturating `as` cast would instead clamp or return 0.
+fn cvt_f_to_int(f: f64, truncate: bool, size: u8) -> u64 {
+    let r = if truncate { f.trunc() } else { f.round_ties_even() };
+    if size == 8 {
+        // Valid i64 targets satisfy -2^63 <= r < 2^63 (both bounds exact f64).
+        if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r) {
+            r as i64 as u64
+        } else {
+            0x8000_0000_0000_0000
+        }
+    } else if (-2_147_483_648.0..2_147_483_648.0).contains(&r) {
+        (r as i32 as u32) as u64
+    } else {
+        0x8000_0000
     }
 }
 
