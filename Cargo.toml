@@ -32,7 +32,7 @@ members = [
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 authors = ["exemu contributors"]
 repository = "https://github.com/janDuszynski/exe-emulator"
 
