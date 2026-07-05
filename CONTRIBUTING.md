@@ -69,4 +69,5 @@ register dump + rip trail it prints), and what you expected to happen.
 
 By contributing, you agree that your contributions are provided under the terms
 of the [CLA](CLA.md) and may be distributed as part of exemu under the project's
-license (MIT today, at the owner's discretion going forward).
+license — the [PolyForm Noncommercial License 1.0.0](LICENSE.md) today, and any
+other terms at the owner's discretion going forward.
