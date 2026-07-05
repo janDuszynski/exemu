@@ -22,11 +22,22 @@ const LOGIC: u64 = CF | PF | ZF | SF | OF; // AND/OR/XOR leave AF undefined
 const INCDEC: u64 = PF | AF | ZF | SF | OF; // INC/DEC preserve CF
 const MULF: u64 = CF | OF; // MUL/IMUL define only CF/OF
 
+/// A guest data region both engines map identically, so instructions with a
+/// memory operand (and the REP string ops) can be diffed on their memory
+/// effects — the "touched pages" half of the P0.1 oracle spec.
+pub const DATA_BASE: u64 = 0x0001_0000;
+pub const DATA_LEN: usize = 0x1000;
+/// The middle of the data region; memory operands are based here so a small
+/// displacement always lands inside the mapping.
+const DATA_MID: u64 = DATA_BASE + (DATA_LEN as u64) / 2;
+
 /// A seeded architectural state shared by both engines for one trial.
 #[derive(Clone)]
 pub struct Seed {
     pub gpr: [u64; 16],
     pub rflags: u64,
+    /// Initial contents of the shared data region at [`DATA_BASE`].
+    pub data: Vec<u8>,
 }
 
 /// One generated instruction plus the policy for comparing its result.
@@ -116,10 +127,19 @@ fn alu_defined(op: u8) -> u64 {
 
 const ALU_MNEM: [&str; 8] = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"];
 
-/// Build one trial, possibly adjusting `seed` (only the DIV/IDIV family does,
-/// to keep the quotient in range so the trial tests division math rather than
-/// the #DE-on-overflow fault path).
+/// Build one trial, possibly adjusting `seed`. Roughly half the trials use a
+/// memory operand or a REP string op (exercising the ModRM/SIB/disp decoder and
+/// the "touched pages" half of the oracle); the rest are register/immediate.
 pub fn build(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    if rng.boolean() {
+        build_mem(rng, bits, seed)
+    } else {
+        build_reg(rng, bits, seed)
+    }
+}
+
+/// Register/immediate-form instructions (no memory operand).
+fn build_reg(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     match rng.below(26) {
         0 => alu_rr(rng, bits),
         1 => alu_imm(rng, bits),
@@ -553,6 +573,224 @@ fn cdq_cwde(rng: &mut Rng, bits: Bits) -> Trial {
     Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} w{width}", if cdq { "cdq/cqo" } else { "cwde/cdqe" }) }
 }
 
+// ---- memory-operand and string families ------------------------------------
+
+/// Base registers safe to use at ModRM mod=01 without SIB (rm=4) or the
+/// disp32 special case (rm=5): ecx, ebx, esi, edi.
+const MEM_BASES: [u8; 4] = [1, 3, 6, 7];
+
+/// Point base register `base` at the middle of the data region and return a
+/// small displacement so `[base+disp]` stays inside the mapping for operands
+/// up to 8 bytes.
+fn point_data(seed: &mut Seed, base: u8, rng: &mut Rng) -> i8 {
+    seed.gpr[base as usize] = DATA_MID;
+    (rng.below(0xF0) as i32 - 0x78) as i8 // ~[-120, 119]
+}
+
+fn push_mem(b: &mut Vec<u8>, reg: u8, base: u8, disp: i8) {
+    b.push(0x40 | ((reg & 7) << 3) | (base & 7)); // mod=01, r/m=base
+    b.push(disp as u8);
+}
+
+fn build_mem(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    match rng.below(10) {
+        0 => mem_alu(rng, bits, seed),
+        1 => mem_mov(rng, bits, seed),
+        2 => mem_movzx_movsx(rng, bits, seed),
+        3 => mem_incdec(rng, bits, seed),
+        4 => mem_neg_not(rng, bits, seed),
+        5 => mem_shift(rng, bits, seed),
+        6 => mem_xadd(rng, bits, seed),
+        7 => mem_cmpxchg(rng, bits, seed),
+        8 => mem_test(rng, bits, seed),
+        _ => string_op(rng, bits, seed),
+    }
+}
+
+fn mem_alu(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let op = rng.below(8) as u8;
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { w24(rng, bits) };
+    let dir = rng.boolean(); // false: [m],r   true: r,[m]
+    let reg = rng.below(8) as u8;
+    let base = *rng.pick(&MEM_BASES);
+    let disp = point_data(seed, base, rng);
+    let mut b = Vec::new();
+    prefixes(&mut b, width, false);
+    b.push((op << 3) | ((dir as u8) << 1) | (!byte as u8));
+    push_mem(&mut b, reg, base, disp);
+    Trial { bytes: b, defined_flags: alu_defined(op), skip_reg: 0, label: format!("{} w{} {}", ALU_MNEM[op as usize], width, if dir { "r,[m]" } else { "[m],r" }) }
+}
+
+fn mem_mov(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    let reg = rng.below(8) as u8;
+    let disp = point_data(seed, base, rng);
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { w24(rng, bits) };
+    let mut b = Vec::new();
+    prefixes(&mut b, width, false);
+    let label = match rng.below(3) {
+        0 => {
+            b.push(if byte { 0x88 } else { 0x89 });
+            push_mem(&mut b, reg, base, disp);
+            format!("mov [m],r w{width}")
+        }
+        1 => {
+            b.push(if byte { 0x8A } else { 0x8B });
+            push_mem(&mut b, reg, base, disp);
+            format!("mov r,[m] w{width}")
+        }
+        _ => {
+            b.push(if byte { 0xC6 } else { 0xC7 });
+            push_mem(&mut b, 0, base, disp);
+            emit_imm(&mut b, rng.operand(), if byte { 1 } else if width == 2 { 2 } else { 4 });
+            format!("mov [m],imm w{width}")
+        }
+    };
+    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label }
+}
+
+fn mem_movzx_movsx(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    let reg = rng.below(8) as u8;
+    let disp = point_data(seed, base, rng);
+    let src = if rng.boolean() { 1 } else { 2 };
+    let dst = if src == 1 { *rng.pick(if bits == Bits::B64 { &[2u8, 4, 8][..] } else { &[2u8, 4][..] }) } else if bits == Bits::B64 { *rng.pick(&[4u8, 8]) } else { 4 };
+    let signed = rng.boolean();
+    let op2 = match (src, signed) {
+        (1, false) => 0xB6,
+        (2, false) => 0xB7,
+        (1, true) => 0xBE,
+        _ => 0xBF,
+    };
+    let mut b = Vec::new();
+    prefixes(&mut b, dst, false);
+    b.push(0x0F);
+    b.push(op2);
+    push_mem(&mut b, reg, base, disp);
+    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} dst{dst}<-[m]{src}", if signed { "movsx" } else { "movzx" }) }
+}
+
+fn mem_incdec(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    let disp = point_data(seed, base, rng);
+    let dec = rng.boolean();
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { w24(rng, bits) };
+    let mut b = Vec::new();
+    prefixes(&mut b, width, false);
+    b.push(if byte { 0xFE } else { 0xFF });
+    push_mem(&mut b, if dec { 1 } else { 0 }, base, disp);
+    Trial { bytes: b, defined_flags: INCDEC, skip_reg: 0, label: format!("{} [m] w{width}", if dec { "dec" } else { "inc" }) }
+}
+
+fn mem_neg_not(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    let disp = point_data(seed, base, rng);
+    let is_neg = rng.boolean();
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { w24(rng, bits) };
+    let mut b = Vec::new();
+    prefixes(&mut b, width, false);
+    b.push(if byte { 0xF6 } else { 0xF7 });
+    push_mem(&mut b, if is_neg { 3 } else { 2 }, base, disp);
+    Trial { bytes: b, defined_flags: if is_neg { ARITH } else { 0 }, skip_reg: 0, label: format!("{} [m] w{width}", if is_neg { "neg" } else { "not" }) }
+}
+
+fn mem_shift(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    let disp = point_data(seed, base, rng);
+    let regf = rng.below(8) as u8;
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { w24(rng, bits) };
+    let wb = (width as u32) * 8;
+    let count = rng.below(wb + 1);
+    let masked = count & if width == 8 { 0x3f } else { 0x1f };
+    let mut b = Vec::new();
+    prefixes(&mut b, width, false);
+    b.push(if byte { 0xC0 } else { 0xC1 });
+    push_mem(&mut b, regf, base, disp);
+    emit_imm(&mut b, count as u64, 1);
+    Trial { bytes: b, defined_flags: shift_defined(regf, masked), skip_reg: 0, label: format!("{} [m] w{width} imm={count}", SH_MNEM[(regf & 7) as usize]) }
+}
+
+fn mem_xadd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    let reg = rng.below(8) as u8;
+    let disp = point_data(seed, base, rng);
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { w24(rng, bits) };
+    let mut b = Vec::new();
+    prefixes(&mut b, width, false);
+    b.push(0x0F);
+    b.push(if byte { 0xC0 } else { 0xC1 });
+    push_mem(&mut b, reg, base, disp);
+    Trial { bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("xadd [m],r w{width}") }
+}
+
+fn mem_cmpxchg(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    let reg = rng.below(8) as u8;
+    let disp = point_data(seed, base, rng);
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { w24(rng, bits) };
+    let mut b = Vec::new();
+    prefixes(&mut b, width, false);
+    b.push(0x0F);
+    b.push(if byte { 0xB0 } else { 0xB1 });
+    push_mem(&mut b, reg, base, disp);
+    Trial { bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("cmpxchg [m],r w{width}") }
+}
+
+fn mem_test(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    let reg = rng.below(8) as u8;
+    let disp = point_data(seed, base, rng);
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { w24(rng, bits) };
+    let mut b = Vec::new();
+    prefixes(&mut b, width, false);
+    b.push(if byte { 0x84 } else { 0x85 });
+    push_mem(&mut b, reg, base, disp);
+    Trial { bytes: b, defined_flags: LOGIC, skip_reg: 0, label: format!("test [m],r w{width}") }
+}
+
+/// REP-able string ops (MOVS/STOS/CMPS/SCAS/LODS). Pointers are placed with a
+/// 32-byte headroom in the seeded DF direction so every access stays inside the
+/// data region.
+fn string_op(rng: &mut Rng, _bits: Bits, seed: &mut Seed) -> Trial {
+    let which = rng.below(5);
+    let byte = rng.boolean();
+    let width = if byte { 1 } else { *rng.pick(&[2u8, 4]) };
+    let rep = rng.boolean();
+    let df = seed.rflags & DF != 0;
+    let count = if rep { 1 + rng.below(8) as u64 } else { 1 };
+    let (sp, dp) = if df { (DATA_BASE + 0xE00, DATA_BASE + 0xA00) } else { (DATA_BASE + 0x100, DATA_BASE + 0x500) };
+    seed.gpr[6] = sp; // rsi
+    seed.gpr[7] = dp; // rdi
+    if rep {
+        seed.gpr[1] = count; // rcx
+    }
+    let mut b = Vec::new();
+    if rep {
+        b.push(0xF3);
+    }
+    if width == 2 {
+        b.push(0x66);
+    }
+    let (opc, mnem, defined) = match which {
+        0 => (if byte { 0xA4 } else { 0xA5 }, "movs", 0),
+        1 => (if byte { 0xAA } else { 0xAB }, "stos", 0),
+        2 => (if byte { 0xA6 } else { 0xA7 }, "cmps", ARITH),
+        3 => (if byte { 0xAE } else { 0xAF }, "scas", ARITH),
+        _ => (if byte { 0xAC } else { 0xAD }, "lods", 0),
+    };
+    b.push(opc);
+    let sz = if byte { "b" } else if width == 2 { "w" } else { "d" };
+    Trial { bytes: b, defined_flags: defined, skip_reg: 0, label: format!("{}{}{} n={}{}", if rep { "rep " } else { "" }, mnem, sz, count, if df { " df" } else { "" }) }
+}
+
 /// Build a fully random seed: interesting GPR values and random status flags.
 pub fn seed(rng: &mut Rng) -> Seed {
     let mut gpr = [0u64; 16];
@@ -565,5 +803,9 @@ pub fn seed(rng: &mut Rng) -> Seed {
             rflags |= f;
         }
     }
-    Seed { gpr, rflags }
+    let mut data = vec![0u8; DATA_LEN];
+    for b in data.iter_mut() {
+        *b = rng.next_u32() as u8;
+    }
+    Seed { gpr, rflags, data }
 }

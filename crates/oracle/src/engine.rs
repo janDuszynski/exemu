@@ -48,6 +48,7 @@ struct Post {
     gpr: [u64; 16],
     rflags: u64,
     ip: u64,
+    data: Vec<u8>,
 }
 
 enum Outcome {
@@ -65,10 +66,11 @@ fn width_mask(bits: Bits) -> u64 {
 
 fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
     let mut mem = VirtualMemory::new();
-    if mem.map(Region::new("code", CODE_BASE, 0x1000, Perm::RWX)).is_err() {
-        return Outcome::Fault;
-    }
-    if mem.write(CODE_BASE, code).is_err() {
+    if mem.map(Region::new("code", CODE_BASE, 0x1000, Perm::RWX)).is_err()
+        || mem.map(Region::new("data", gen::DATA_BASE, gen::DATA_LEN as u64, Perm::RW)).is_err()
+        || mem.write(CODE_BASE, code).is_err()
+        || mem.write(gen::DATA_BASE, &seed.data).is_err()
+    {
         return Outcome::Fault;
     }
     let mut cpu = Interpreter::with_bits(bits);
@@ -81,8 +83,15 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
     let mut hooks = NoHooks;
     match cpu.step(&mut mem, &mut hooks) {
         Ok(Exit::Continue) => {
-            let s = cpu.state();
-            Outcome::Ok(Post { gpr: s.gpr, rflags: s.rflags, ip: s.rip })
+            let (gpr, rflags, ip) = {
+                let s = cpu.state();
+                (s.gpr, s.rflags, s.rip)
+            };
+            let mut data = vec![0u8; gen::DATA_LEN];
+            if mem.read(gen::DATA_BASE, &mut data).is_err() {
+                return Outcome::Fault;
+            }
+            Outcome::Ok(Post { gpr, rflags, ip, data })
         }
         // #DE (Interrupt(0)), Halted, ProcessExit, or a memory/decode error.
         _ => Outcome::Fault,
@@ -101,7 +110,11 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         Err(_) => return Outcome::Fault,
     };
     let mask = width_mask(bits);
-    if uc.mem_map(CODE_BASE, 0x1000, Prot::ALL).is_err() || uc.mem_write(CODE_BASE, code).is_err() {
+    if uc.mem_map(CODE_BASE, 0x1000, Prot::ALL).is_err()
+        || uc.mem_map(gen::DATA_BASE, gen::DATA_LEN as u64, Prot::ALL).is_err()
+        || uc.mem_write(CODE_BASE, code).is_err()
+        || uc.mem_write(gen::DATA_BASE, &seed.data).is_err()
+    {
         return Outcome::Fault;
     }
     for (i, r) in regs.iter().enumerate() {
@@ -111,7 +124,11 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
     }
     let _ = uc.reg_write(RegisterX86::EFLAGS, seed.rflags & 0xffff_ffff);
     let _ = uc.reg_write(ip_reg, CODE_BASE);
-    match uc.emu_start(CODE_BASE, CODE_BASE + code.len() as u64, 0, 1) {
+    // Run until rip reaches the end of the instruction (count=0 = no limit), so
+    // a REP string op completes all its iterations in one go — exemu executes
+    // the whole REP in a single step(), and count=1 would stop Unicorn after
+    // just the first iteration.
+    match uc.emu_start(CODE_BASE, CODE_BASE + code.len() as u64, 0, 0) {
         Ok(()) => {
             let mut gpr = [0u64; 16];
             for (i, r) in regs.iter().enumerate() {
@@ -119,7 +136,11 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             }
             let rflags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
             let ip = uc.reg_read(ip_reg).unwrap_or(0);
-            Outcome::Ok(Post { gpr, rflags, ip })
+            let mut data = vec![0u8; gen::DATA_LEN];
+            if uc.mem_read(gen::DATA_BASE, &mut data).is_err() {
+                return Outcome::Fault;
+            }
+            Outcome::Ok(Post { gpr, rflags, ip, data })
         }
         Err(_) => Outcome::Fault,
     }
@@ -164,6 +185,11 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
     let fb = b.rflags & trial.defined_flags;
     if fa != fb {
         return Some(format!("flags(defined={:#x}) exemu={:#x} unicorn={:#x} Δ={:#x}", trial.defined_flags, fa, fb, fa ^ fb));
+    }
+    for (i, (x, y)) in a.data.iter().zip(b.data.iter()).enumerate() {
+        if x != y {
+            return Some(format!("mem[{:#x}] exemu={:#04x} unicorn={:#04x}", gen::DATA_BASE + i as u64, x, y));
+        }
     }
     if a.ip != b.ip {
         return Some(format!("ip exemu={:#x} unicorn={:#x}", a.ip, b.ip));
