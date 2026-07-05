@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "exemu-app"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exemu-core",
  "exemu-cpu",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "exemu-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exemu-app",
  "exemu-core",
@@ -105,11 +105,11 @@ dependencies = [
 
 [[package]]
 name = "exemu-core"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "exemu-cpu"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exemu-core",
  "exemu-memory",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "exemu-gui"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exemu-core",
  "font8x8",
@@ -127,21 +127,21 @@ dependencies = [
 
 [[package]]
 name = "exemu-loader"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exemu-core",
 ]
 
 [[package]]
 name = "exemu-memory"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exemu-core",
 ]
 
 [[package]]
 name = "exemu-os"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "exemu-core",
  "exemu-loader",

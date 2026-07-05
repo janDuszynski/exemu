@@ -24,7 +24,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+# Capability-tracked version (pre-1.0). v0.0.1 = foundation / bring-up: console
+# apps + headless installer auto-drive + x64 exceptions. v0.1.0 is reserved for
+# the first real interactive native window. See the release plan in the local
+# knowledge base for the gate that triggers each version.
+version = "0.0.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"

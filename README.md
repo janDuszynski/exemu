@@ -1,5 +1,9 @@
 # exemu — a Windows `.exe` emulator for Apple Silicon
 
+**Version 0.0.1** (foundation / bring-up) — see [CHANGELOG.md](CHANGELOG.md).
+Versions before 1.0 track capability, not API stability: `0.1.0` will be the
+first real interactive native window, `1.0.0` the notarized product.
+
 `exemu` loads a Windows **PE** (Portable Executable) `.exe` — either 32-bit
 (`x86`) or 64-bit (`x86-64`) — and runs it on an Apple **M-series** (ARM64)
 Mac, with no Windows, no Rosetta, and no virtual machine. It parses the
