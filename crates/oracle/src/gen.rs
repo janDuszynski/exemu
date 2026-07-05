@@ -36,6 +36,8 @@ const DATA_MID: u64 = DATA_BASE + (DATA_LEN as u64) / 2;
 pub struct Seed {
     pub gpr: [u64; 16],
     pub rflags: u64,
+    /// Initial XMM register file (xmm0..xmm15).
+    pub xmm: [u128; 16],
     /// Initial contents of the shared data region at [`DATA_BASE`].
     pub data: Vec<u8>,
 }
@@ -48,6 +50,10 @@ pub struct Trial {
     /// Bitmask of GPR indices whose post-value is architecturally undefined
     /// (e.g. BSF/BSR destination when the source is zero).
     pub skip_reg: u16,
+    /// XMM comparison policy: 0 = bit-exact; 4 = f32 lanes NaN-aware; 8 = f64
+    /// lanes NaN-aware (a lane that is NaN in both engines counts as equal,
+    /// since x86 and the host FPU may pick different NaN payloads).
+    pub xmm_nan: u8,
     pub label: String,
 }
 
@@ -131,10 +137,10 @@ const ALU_MNEM: [&str; 8] = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cm
 /// memory operand or a REP string op (exercising the ModRM/SIB/disp decoder and
 /// the "touched pages" half of the oracle); the rest are register/immediate.
 pub fn build(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
-    if rng.boolean() {
-        build_mem(rng, bits, seed)
-    } else {
-        build_reg(rng, bits, seed)
+    match rng.below(3) {
+        0 => build_sse(rng, bits, seed),
+        1 => build_mem(rng, bits, seed),
+        _ => build_reg(rng, bits, seed),
     }
 }
 
@@ -182,6 +188,7 @@ fn alu_rr(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(opcode);
     b.push(modrm_reg(reg, rm));
     Trial {
+        xmm_nan: 0,
         bytes: b,
         defined_flags: alu_defined(op),
         skip_reg: 0,
@@ -211,7 +218,7 @@ fn alu_imm(rng: &mut Rng, bits: Bits) -> Trial {
         b.push(modrm_reg(op, rm));
         emit_imm(&mut b, imm, if width == 2 { 2 } else { 4 });
     }
-    Trial { bytes: b, defined_flags: alu_defined(op), skip_reg: 0, label: format!("{} w{} rm,imm", ALU_MNEM[op as usize], width) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: alu_defined(op), skip_reg: 0, label: format!("{} w{} rm,imm", ALU_MNEM[op as usize], width) }
 }
 
 const SH_MNEM: [&str; 8] = ["rol", "ror", "rcl", "rcr", "shl", "shr", "sal", "sar"];
@@ -242,7 +249,7 @@ fn shift_imm(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
     b.push(if width == 1 { 0xC0 } else { 0xC1 });
     b.push(modrm_reg(reg, rm));
     emit_imm(&mut b, count as u64, 1);
-    Trial { bytes: b, defined_flags: shift_defined(reg, masked), skip_reg: 0, label: format!("{} w{} imm={}", SH_MNEM[(reg & 7) as usize], width, count) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: shift_defined(reg, masked), skip_reg: 0, label: format!("{} w{} imm={}", SH_MNEM[(reg & 7) as usize], width, count) }
 }
 
 fn shift_cl(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -257,7 +264,7 @@ fn shift_cl(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(0xD3);
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: shift_defined(reg, masked), skip_reg: 0, label: format!("{} w{} cl(={})", SH_MNEM[(reg & 7) as usize], width, cl & 0xff) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: shift_defined(reg, masked), skip_reg: 0, label: format!("{} w{} cl(={})", SH_MNEM[(reg & 7) as usize], width, cl & 0xff) }
 }
 
 fn shld_shrd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -283,7 +290,7 @@ fn shld_shrd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
         emit_imm(&mut b, count as u64, 1);
     }
     let defined = if count == 0 { 0 } else { CF | SF | ZF | PF };
-    Trial { bytes: b, defined_flags: defined, skip_reg: 0, label: format!("{} w{} {}", if is_shrd { "shrd" } else { "shld" }, width, count_label) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: defined, skip_reg: 0, label: format!("{} w{} {}", if is_shrd { "shrd" } else { "shld" }, width, count_label) }
 }
 
 fn mul_one(rng: &mut Rng, bits: Bits) -> Trial {
@@ -294,7 +301,7 @@ fn mul_one(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if width == 1 { 0xF6 } else { 0xF7 });
     b.push(modrm_reg(if signed { 5 } else { 4 }, rm));
-    Trial { bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("{} w{} (one-op)", if signed { "imul" } else { "mul" }, width) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("{} w{} (one-op)", if signed { "imul" } else { "mul" }, width) }
 }
 
 fn imul2(rng: &mut Rng, bits: Bits) -> Trial {
@@ -305,7 +312,7 @@ fn imul2(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(0xAF);
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("imul2 w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("imul2 w{width}") }
 }
 
 fn imul3(rng: &mut Rng, bits: Bits) -> Trial {
@@ -318,7 +325,7 @@ fn imul3(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(if imm8 { 0x6B } else { 0x69 });
     b.push(modrm_reg(reg, rm));
     emit_imm(&mut b, imm, if imm8 { 1 } else if width == 2 { 2 } else { 4 });
-    Trial { bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("imul3 w{width} {}", if imm8 { "imm8" } else { "immZ" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("imul3 w{width} {}", if imm8 { "imm8" } else { "immZ" }) }
 }
 
 fn div_op(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -350,7 +357,7 @@ fn div_op(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(0xF7);
     b.push(modrm_reg(if signed { 7 } else { 6 }, rm));
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} w{width}", if signed { "idiv" } else { "div" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} w{width}", if signed { "idiv" } else { "div" }) }
 }
 
 fn incdec(rng: &mut Rng, bits: Bits) -> Trial {
@@ -366,7 +373,7 @@ fn incdec(rng: &mut Rng, bits: Bits) -> Trial {
         b.push(if width == 1 { 0xFE } else { 0xFF });
         b.push(modrm_reg(if dec { 1 } else { 0 }, rm));
     }
-    Trial { bytes: b, defined_flags: INCDEC, skip_reg: 0, label: format!("{} w{width}", if dec { "dec" } else { "inc" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: INCDEC, skip_reg: 0, label: format!("{} w{width}", if dec { "dec" } else { "inc" }) }
 }
 
 fn neg(rng: &mut Rng, bits: Bits) -> Trial {
@@ -376,7 +383,7 @@ fn neg(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if width == 1 { 0xF6 } else { 0xF7 });
     b.push(modrm_reg(3, rm));
-    Trial { bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("neg w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("neg w{width}") }
 }
 
 fn not(rng: &mut Rng, bits: Bits) -> Trial {
@@ -386,7 +393,7 @@ fn not(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if width == 1 { 0xF6 } else { 0xF7 });
     b.push(modrm_reg(2, rm));
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("not w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("not w{width}") }
 }
 
 fn test_rr(rng: &mut Rng, bits: Bits) -> Trial {
@@ -397,7 +404,7 @@ fn test_rr(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0x84 } else { 0x85 });
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: LOGIC, skip_reg: 0, label: format!("test w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: LOGIC, skip_reg: 0, label: format!("test w{width}") }
 }
 
 const BT_MNEM: [(&str, u8); 4] = [("bt", 0xA3), ("bts", 0xAB), ("btr", 0xB3), ("btc", 0xBB)];
@@ -411,7 +418,7 @@ fn bt_reg(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
     b.push(0x0F);
     b.push(op2);
     b.push(modrm_reg(reg, rm)); // reg = bit index, rm = bit base register
-    Trial { bytes: b, defined_flags: CF, skip_reg: 0, label: format!("{name} w{width} (reg)") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: CF, skip_reg: 0, label: format!("{name} w{width} (reg)") }
 }
 
 fn bt_imm(rng: &mut Rng, bits: Bits) -> Trial {
@@ -425,7 +432,7 @@ fn bt_imm(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0xBA);
     b.push(modrm_reg(4 + sub, rm));
     emit_imm(&mut b, idx as u64, 1);
-    Trial { bytes: b, defined_flags: CF, skip_reg: 0, label: format!("{} w{width} imm={idx}", ["bt", "bts", "btr", "btc"][sub as usize]) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: CF, skip_reg: 0, label: format!("{} w{width} imm={idx}", ["bt", "bts", "btr", "btc"][sub as usize]) }
 }
 
 fn bsf_bsr(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -440,7 +447,7 @@ fn bsf_bsr(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(modrm_reg(reg, rm));
     // When the source is zero the destination is architecturally undefined.
     let skip = if src_zero { 1u16 << (reg & 7) } else { 0 };
-    Trial { bytes: b, defined_flags: ZF, skip_reg: skip, label: format!("{} w{width}{}", if bsr { "bsr" } else { "bsf" }, if src_zero { " (src=0)" } else { "" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: ZF, skip_reg: skip, label: format!("{} w{width}{}", if bsr { "bsr" } else { "bsf" }, if src_zero { " (src=0)" } else { "" }) }
 }
 
 fn tzcnt_lzcnt(rng: &mut Rng, bits: Bits) -> Trial {
@@ -452,7 +459,7 @@ fn tzcnt_lzcnt(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(if lz { 0xBD } else { 0xBC });
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: CF | ZF, skip_reg: 0, label: format!("{} w{width}", if lz { "lzcnt" } else { "tzcnt" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: CF | ZF, skip_reg: 0, label: format!("{} w{width}", if lz { "lzcnt" } else { "tzcnt" }) }
 }
 
 fn popcnt(rng: &mut Rng, bits: Bits) -> Trial {
@@ -463,7 +470,7 @@ fn popcnt(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(0xB8);
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: CF | OF | SF | ZF | AF | PF, skip_reg: 0, label: format!("popcnt w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: CF | OF | SF | ZF | AF | PF, skip_reg: 0, label: format!("popcnt w{width}") }
 }
 
 fn movzx_movsx(rng: &mut Rng, bits: Bits) -> Trial {
@@ -471,7 +478,7 @@ fn movzx_movsx(rng: &mut Rng, bits: Bits) -> Trial {
     if bits == Bits::B64 && rng.below(4) == 0 {
         let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8);
         let b = vec![0x48, 0x63, modrm_reg(reg, rm)];
-        return Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: "movsxd r64,rm32".into() };
+        return Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "movsxd r64,rm32".into() };
     }
     let src = if rng.boolean() { 1 } else { 2 };
     // Destination wider than source.
@@ -489,7 +496,7 @@ fn movzx_movsx(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(op2);
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} dst{dst}<-src{src}", if signed { "movsx" } else { "movzx" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} dst{dst}<-src{src}", if signed { "movsx" } else { "movzx" }) }
 }
 
 const CC: [&str; 16] = ["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"];
@@ -498,7 +505,7 @@ fn setcc(rng: &mut Rng) -> Trial {
     let cc = rng.below(16) as u8;
     let rm = rng.below(8) as u8;
     let b = vec![0x0F, 0x90 + cc, modrm_reg(0, rm)];
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("set{}", CC[cc as usize]) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("set{}", CC[cc as usize]) }
 }
 
 fn cmovcc(rng: &mut Rng, bits: Bits) -> Trial {
@@ -510,7 +517,7 @@ fn cmovcc(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(0x40 + cc);
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("cmov{} w{width}", CC[cc as usize]) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("cmov{} w{width}", CC[cc as usize]) }
 }
 
 fn bswap(rng: &mut Rng, bits: Bits) -> Trial {
@@ -522,7 +529,7 @@ fn bswap(rng: &mut Rng, bits: Bits) -> Trial {
     }
     b.push(0x0F);
     b.push(0xC8 + reg);
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("bswap w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("bswap w{width}") }
 }
 
 fn xadd(rng: &mut Rng, bits: Bits) -> Trial {
@@ -534,7 +541,7 @@ fn xadd(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(if byte { 0xC0 } else { 0xC1 });
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("xadd w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("xadd w{width}") }
 }
 
 fn cmpxchg(rng: &mut Rng, bits: Bits) -> Trial {
@@ -546,7 +553,7 @@ fn cmpxchg(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(if byte { 0xB0 } else { 0xB1 });
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("cmpxchg w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("cmpxchg w{width}") }
 }
 
 fn xchg(rng: &mut Rng, bits: Bits) -> Trial {
@@ -557,7 +564,7 @@ fn xchg(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0x86 } else { 0x87 });
     b.push(modrm_reg(reg, rm));
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("xchg w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("xchg w{width}") }
 }
 
 fn cdq_cwde(rng: &mut Rng, bits: Bits) -> Trial {
@@ -570,7 +577,7 @@ fn cdq_cwde(rng: &mut Rng, bits: Bits) -> Trial {
         b.push(0x66);
     }
     b.push(if cdq { 0x99 } else { 0x98 });
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} w{width}", if cdq { "cdq/cqo" } else { "cwde/cdqe" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} w{width}", if cdq { "cdq/cqo" } else { "cwde/cdqe" }) }
 }
 
 // ---- memory-operand and string families ------------------------------------
@@ -619,7 +626,7 @@ fn mem_alu(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push((op << 3) | ((dir as u8) << 1) | (!byte as u8));
     push_mem(&mut b, reg, base, disp);
-    Trial { bytes: b, defined_flags: alu_defined(op), skip_reg: 0, label: format!("{} w{} {}", ALU_MNEM[op as usize], width, if dir { "r,[m]" } else { "[m],r" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: alu_defined(op), skip_reg: 0, label: format!("{} w{} {}", ALU_MNEM[op as usize], width, if dir { "r,[m]" } else { "[m],r" }) }
 }
 
 fn mem_mov(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -648,7 +655,7 @@ fn mem_mov(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
             format!("mov [m],imm w{width}")
         }
     };
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label }
 }
 
 fn mem_movzx_movsx(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -669,7 +676,7 @@ fn mem_movzx_movsx(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(0x0F);
     b.push(op2);
     push_mem(&mut b, reg, base, disp);
-    Trial { bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} dst{dst}<-[m]{src}", if signed { "movsx" } else { "movzx" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} dst{dst}<-[m]{src}", if signed { "movsx" } else { "movzx" }) }
 }
 
 fn mem_incdec(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -682,7 +689,7 @@ fn mem_incdec(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0xFE } else { 0xFF });
     push_mem(&mut b, if dec { 1 } else { 0 }, base, disp);
-    Trial { bytes: b, defined_flags: INCDEC, skip_reg: 0, label: format!("{} [m] w{width}", if dec { "dec" } else { "inc" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: INCDEC, skip_reg: 0, label: format!("{} [m] w{width}", if dec { "dec" } else { "inc" }) }
 }
 
 fn mem_neg_not(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -695,7 +702,7 @@ fn mem_neg_not(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0xF6 } else { 0xF7 });
     push_mem(&mut b, if is_neg { 3 } else { 2 }, base, disp);
-    Trial { bytes: b, defined_flags: if is_neg { ARITH } else { 0 }, skip_reg: 0, label: format!("{} [m] w{width}", if is_neg { "neg" } else { "not" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: if is_neg { ARITH } else { 0 }, skip_reg: 0, label: format!("{} [m] w{width}", if is_neg { "neg" } else { "not" }) }
 }
 
 fn mem_shift(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -712,7 +719,7 @@ fn mem_shift(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(if byte { 0xC0 } else { 0xC1 });
     push_mem(&mut b, regf, base, disp);
     emit_imm(&mut b, count as u64, 1);
-    Trial { bytes: b, defined_flags: shift_defined(regf, masked), skip_reg: 0, label: format!("{} [m] w{width} imm={count}", SH_MNEM[(regf & 7) as usize]) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: shift_defined(regf, masked), skip_reg: 0, label: format!("{} [m] w{width} imm={count}", SH_MNEM[(regf & 7) as usize]) }
 }
 
 fn mem_xadd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -726,7 +733,7 @@ fn mem_xadd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(0x0F);
     b.push(if byte { 0xC0 } else { 0xC1 });
     push_mem(&mut b, reg, base, disp);
-    Trial { bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("xadd [m],r w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("xadd [m],r w{width}") }
 }
 
 fn mem_cmpxchg(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -740,7 +747,7 @@ fn mem_cmpxchg(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(0x0F);
     b.push(if byte { 0xB0 } else { 0xB1 });
     push_mem(&mut b, reg, base, disp);
-    Trial { bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("cmpxchg [m],r w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("cmpxchg [m],r w{width}") }
 }
 
 fn mem_test(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -753,7 +760,7 @@ fn mem_test(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0x84 } else { 0x85 });
     push_mem(&mut b, reg, base, disp);
-    Trial { bytes: b, defined_flags: LOGIC, skip_reg: 0, label: format!("test [m],r w{width}") }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: LOGIC, skip_reg: 0, label: format!("test [m],r w{width}") }
 }
 
 /// REP-able string ops (MOVS/STOS/CMPS/SCAS/LODS). Pointers are placed with a
@@ -788,7 +795,245 @@ fn string_op(rng: &mut Rng, _bits: Bits, seed: &mut Seed) -> Trial {
     };
     b.push(opc);
     let sz = if byte { "b" } else if width == 2 { "w" } else { "d" };
-    Trial { bytes: b, defined_flags: defined, skip_reg: 0, label: format!("{}{}{} n={}{}", if rep { "rep " } else { "" }, mnem, sz, count, if df { " df" } else { "" }) }
+    Trial { xmm_nan: 0, bytes: b, defined_flags: defined, skip_reg: 0, label: format!("{}{}{} n={}{}", if rep { "rep " } else { "" }, mnem, sz, count, if df { " df" } else { "" }) }
+}
+
+// ---- SSE / SSE2 families (register form) ------------------------------------
+
+/// Emit the mandatory SSE prefix: 0 = none (`...ps`), 1 = `66` (`...pd`/int),
+/// 2 = `F3` (`...ss`), 3 = `F2` (`...sd`); plus optional REX.W.
+fn sse_prefix(b: &mut Vec<u8>, mp: u8, rexw: bool) {
+    match mp {
+        1 => b.push(0x66),
+        2 => b.push(0xF3),
+        3 => b.push(0xF2),
+        _ => {}
+    }
+    if rexw {
+        b.push(0x48);
+    }
+}
+
+const KIND: [&str; 4] = ["ps", "pd", "ss", "sd"];
+
+/// f32 lanes for `...ps`/`...ss`, f64 lanes for `...pd`/`...sd`.
+fn nan_lane(mp: u8) -> u8 {
+    if mp == 0 || mp == 2 {
+        4
+    } else {
+        8
+    }
+}
+
+fn build_sse(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
+    match rng.below(12) {
+        0 => sse_arith(rng),
+        1 => sse_sqrt(rng),
+        2 => sse_logic(rng),
+        3 => sse_comis(rng),
+        4 => sse_cvt_i2f(rng, bits),
+        5 => sse_cvt_f2i(rng, bits),
+        6 => sse_cvt_f2f(rng),
+        7 => sse_move(rng, bits),
+        8 => sse_int(rng),
+        9 => sse_shift_imm(rng),
+        10 => sse_shift_var(rng),
+        _ => {
+            if rng.boolean() {
+                sse_shuffle(rng)
+            } else {
+                sse_pmovmskb(rng, bits)
+            }
+        }
+    }
+}
+
+fn sse_arith(rng: &mut Rng) -> Trial {
+    let (op2, name) = *rng.pick(&[(0x58u8, "add"), (0x59, "mul"), (0x5C, "sub"), (0x5D, "min"), (0x5E, "div"), (0x5F, "max")]);
+    let mp = rng.below(4) as u8;
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let mut b = Vec::new();
+    sse_prefix(&mut b, mp, false);
+    b.extend([0x0F, op2, modrm_reg(d, s)]);
+    Trial { xmm_nan: nan_lane(mp), bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{name}{}", KIND[mp as usize]) }
+}
+
+fn sse_sqrt(rng: &mut Rng) -> Trial {
+    let mp = rng.below(4) as u8;
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let mut b = Vec::new();
+    sse_prefix(&mut b, mp, false);
+    b.extend([0x0F, 0x51, modrm_reg(d, s)]);
+    Trial { xmm_nan: nan_lane(mp), bytes: b, defined_flags: 0, skip_reg: 0, label: format!("sqrt{}", KIND[mp as usize]) }
+}
+
+fn sse_logic(rng: &mut Rng) -> Trial {
+    let (op2, name, mp) = if rng.boolean() {
+        let (o, n) = *rng.pick(&[(0xDBu8, "pand"), (0xDF, "pandn"), (0xEB, "por"), (0xEF, "pxor")]);
+        (o, n, 1u8)
+    } else {
+        let (o, n) = *rng.pick(&[(0x54u8, "andps"), (0x55, "andnps"), (0x56, "orps"), (0x57, "xorps")]);
+        (o, n, rng.below(2) as u8)
+    };
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let mut b = Vec::new();
+    sse_prefix(&mut b, mp, false);
+    b.extend([0x0F, op2, modrm_reg(d, s)]);
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: name.into() }
+}
+
+fn sse_comis(rng: &mut Rng) -> Trial {
+    let op2 = if rng.boolean() { 0x2E } else { 0x2F };
+    let dbl = rng.boolean();
+    let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8);
+    let mut b = Vec::new();
+    sse_prefix(&mut b, if dbl { 1 } else { 0 }, false);
+    b.extend([0x0F, op2, modrm_reg(reg, rm)]);
+    Trial { xmm_nan: 0, bytes: b, defined_flags: CF | PF | AF | ZF | SF | OF, skip_reg: 0, label: format!("{}comis{}", if op2 == 0x2E { "u" } else { "" }, if dbl { "d" } else { "s" }) }
+}
+
+fn sse_cvt_i2f(rng: &mut Rng, bits: Bits) -> Trial {
+    let sd = rng.boolean();
+    let rexw = bits == Bits::B64 && rng.boolean();
+    let (d, rm) = (rng.below(8) as u8, rng.below(8) as u8); // rm = GP source
+    let mut b = Vec::new();
+    sse_prefix(&mut b, if sd { 3 } else { 2 }, rexw);
+    b.extend([0x0F, 0x2A, modrm_reg(d, rm)]);
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("cvtsi2s{}{}", if sd { "d" } else { "s" }, if rexw { " r64" } else { "" }) }
+}
+
+fn sse_cvt_f2i(rng: &mut Rng, bits: Bits) -> Trial {
+    let op2 = if rng.boolean() { 0x2C } else { 0x2D }; // trunc / round
+    let sd = rng.boolean();
+    let rexw = bits == Bits::B64 && rng.boolean();
+    let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8); // reg = GP dst, rm = xmm src
+    let mut b = Vec::new();
+    sse_prefix(&mut b, if sd { 3 } else { 2 }, rexw);
+    b.extend([0x0F, op2, modrm_reg(reg, rm)]);
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("cvt{}s{}2si{}", if op2 == 0x2C { "t" } else { "" }, if sd { "d" } else { "s" }, if rexw { " r64" } else { "" }) }
+}
+
+fn sse_cvt_f2f(rng: &mut Rng) -> Trial {
+    let sd2ss = rng.boolean();
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let mut b = Vec::new();
+    sse_prefix(&mut b, if sd2ss { 3 } else { 2 }, false); // F2 = cvtsd2ss, F3 = cvtss2sd
+    b.extend([0x0F, 0x5A, modrm_reg(d, s)]);
+    Trial { xmm_nan: if sd2ss { 4 } else { 8 }, bytes: b, defined_flags: 0, skip_reg: 0, label: if sd2ss { "cvtsd2ss".into() } else { "cvtss2sd".into() } }
+}
+
+fn sse_move(rng: &mut Rng, bits: Bits) -> Trial {
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    match rng.below(6) {
+        0 => Trial { xmm_nan: 0, bytes: vec![0x0F, 0x28, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: "movaps".into() },
+        1 => Trial { xmm_nan: 0, bytes: vec![0x66, 0x0F, 0x6F, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: "movdqa".into() },
+        2 => {
+            let sd = rng.boolean();
+            Trial { xmm_nan: 0, bytes: vec![if sd { 0xF2 } else { 0xF3 }, 0x0F, 0x10, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: if sd { "movsd".into() } else { "movss".into() } }
+        }
+        3 => {
+            let rexw = bits == Bits::B64 && rng.boolean();
+            let mut b = vec![0x66];
+            if rexw {
+                b.push(0x48);
+            }
+            b.extend([0x0F, 0x6E, modrm_reg(d, s)]);
+            Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "movd xmm,r".into() }
+        }
+        4 => {
+            let rexw = bits == Bits::B64 && rng.boolean();
+            let mut b = vec![0x66];
+            if rexw {
+                b.push(0x48);
+            }
+            b.extend([0x0F, 0x7E, modrm_reg(d, s)]); // reg=xmm src, rm=GP dst
+            Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "movd r,xmm".into() }
+        }
+        _ => Trial { xmm_nan: 0, bytes: vec![0xF3, 0x0F, 0x7E, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: "movq xmm".into() },
+    }
+}
+
+fn sse_int(rng: &mut Rng) -> Trial {
+    let (op2, name) = *rng.pick(&[
+        (0xFCu8, "paddb"),
+        (0xFD, "paddw"),
+        (0xFE, "paddd"),
+        (0xD4, "paddq"),
+        (0xF8, "psubb"),
+        (0xF9, "psubw"),
+        (0xFA, "psubd"),
+        (0xFB, "psubq"),
+        (0x74, "pcmpeqb"),
+        (0x75, "pcmpeqw"),
+        (0x76, "pcmpeqd"),
+        (0x64, "pcmpgtb"),
+        (0x65, "pcmpgtw"),
+        (0x66, "pcmpgtd"),
+        (0x60, "punpcklbw"),
+        (0x61, "punpcklwd"),
+        (0x62, "punpckldq"),
+        (0x6C, "punpcklqdq"),
+        (0x68, "punpckhbw"),
+        (0x69, "punpckhwd"),
+        (0x6A, "punpckhdq"),
+        (0x6D, "punpckhqdq"),
+        (0xDA, "pminub"),
+        (0xDE, "pmaxub"),
+    ]);
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    Trial { xmm_nan: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: name.into() }
+}
+
+fn sse_pmovmskb(rng: &mut Rng, bits: Bits) -> Trial {
+    let rexw = bits == Bits::B64 && rng.boolean();
+    let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8); // reg = GP dst, rm = xmm src
+    let mut b = vec![0x66];
+    if rexw {
+        b.push(0x48);
+    }
+    b.extend([0x0F, 0xD7, modrm_reg(reg, rm)]);
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "pmovmskb".into() }
+}
+
+fn sse_shift_imm(rng: &mut Rng) -> Trial {
+    let op2 = *rng.pick(&[0x71u8, 0x72, 0x73]);
+    let digit = if op2 == 0x73 { *rng.pick(&[2u8, 3, 6, 7]) } else { *rng.pick(&[2u8, 4, 6]) };
+    let rm = rng.below(8) as u8; // xmm operand (shifted in place)
+    let imm = rng.below(20) as u8;
+    Trial { xmm_nan: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(digit, rm), imm], defined_flags: 0, skip_reg: 0, label: format!("psh-imm {op2:#x}/{digit} imm={imm}") }
+}
+
+fn sse_shift_var(rng: &mut Rng) -> Trial {
+    let (op2, name) = *rng.pick(&[
+        (0xD1u8, "psrlw"),
+        (0xD2, "psrld"),
+        (0xD3, "psrlq"),
+        (0xE1, "psraw"),
+        (0xE2, "psrad"),
+        (0xF1, "psllw"),
+        (0xF2, "pslld"),
+        (0xF3, "psllq"),
+    ]);
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    Trial { xmm_nan: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: name.into() }
+}
+
+fn sse_shuffle(rng: &mut Rng) -> Trial {
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let imm = rng.next_u32() as u8;
+    if rng.boolean() {
+        let mp = *rng.pick(&[1u8, 2, 3]); // pshufd(66) / pshufhw(F3) / pshuflw(F2)
+        let mut b = Vec::new();
+        sse_prefix(&mut b, mp, false);
+        b.extend([0x0F, 0x70, modrm_reg(d, s), imm]);
+        Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "pshuf".into() }
+    } else {
+        let mp = rng.below(2) as u8; // shufps(none) / shufpd(66)
+        let mut b = Vec::new();
+        sse_prefix(&mut b, mp, false);
+        b.extend([0x0F, 0xC6, modrm_reg(d, s), imm]);
+        Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "shufp".into() }
+    }
 }
 
 /// Build a fully random seed: interesting GPR values and random status flags.
@@ -807,5 +1052,74 @@ pub fn seed(rng: &mut Rng) -> Seed {
     for b in data.iter_mut() {
         *b = rng.next_u32() as u8;
     }
-    Seed { gpr, rflags, data }
+    let mut xmm = [0u128; 16];
+    for x in xmm.iter_mut() {
+        *x = xmm_seed(rng);
+    }
+    Seed { gpr, rflags, xmm, data }
+}
+
+/// Interesting f64 lane bit patterns (±0, ±1, halves, ±inf, quiet/signaling
+/// NaN, max, min-normal, denormal, pi, large magnitudes).
+const F64_EDGES: [u64; 16] = [
+    0x0000_0000_0000_0000, // +0.0
+    0x8000_0000_0000_0000, // -0.0
+    0x3FF0_0000_0000_0000, // 1.0
+    0xBFF0_0000_0000_0000, // -1.0
+    0x3FE0_0000_0000_0000, // 0.5
+    0x4000_0000_0000_0000, // 2.0
+    0x7FF0_0000_0000_0000, // +inf
+    0xFFF0_0000_0000_0000, // -inf
+    0x7FF8_0000_0000_0000, // qNaN
+    0x7FF0_0000_0000_0001, // sNaN
+    0x7FEF_FFFF_FFFF_FFFF, // f64::MAX
+    0x0010_0000_0000_0000, // min normal
+    0x0000_0000_0000_0001, // denormal
+    0x4009_21FB_5444_2D18, // pi
+    0x7E37_E43C_8800_759C, // 1e300
+    0xC1E0_0000_0000_0000, // -2^31
+];
+
+/// Interesting f32 lane bit patterns.
+const F32_EDGES: [u32; 15] = [
+    0x0000_0000, // +0.0
+    0x8000_0000, // -0.0
+    0x3F80_0000, // 1.0
+    0xBF80_0000, // -1.0
+    0x3F00_0000, // 0.5
+    0x4000_0000, // 2.0
+    0x7F80_0000, // +inf
+    0xFF80_0000, // -inf
+    0x7FC0_0000, // qNaN
+    0x7F80_0001, // sNaN
+    0x7F7F_FFFF, // f32::MAX
+    0x0000_0001, // denormal
+    0x4049_0FDB, // pi
+    0x7149_F2CA, // ~1e30
+    0xF149_F2CA, // ~-1e30
+];
+
+/// A 128-bit XMM seed: a mix of fully-random bits and float-edge lanes so the
+/// float ops hit NaN/inf/denormal/±0 boundaries and the integer ops see
+/// arbitrary bytes.
+fn xmm_seed(rng: &mut Rng) -> u128 {
+    match rng.below(4) {
+        0 => (rng.next_u64() as u128) | ((rng.next_u64() as u128) << 64),
+        1 => {
+            let lo = *rng.pick(&F64_EDGES) as u128;
+            let hi = *rng.pick(&F64_EDGES) as u128;
+            lo | (hi << 64)
+        }
+        2 => {
+            let mut v = 0u128;
+            for i in 0..4 {
+                v |= (*rng.pick(&F32_EDGES) as u128) << (i * 32);
+            }
+            v
+        }
+        _ => {
+            let lo = *rng.pick(&F64_EDGES) as u128;
+            lo | ((rng.next_u64() as u128) << 64)
+        }
+    }
 }

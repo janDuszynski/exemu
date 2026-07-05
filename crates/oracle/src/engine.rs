@@ -43,14 +43,49 @@ const REGS64: [RegisterX86; 16] = [
     RegisterX86::R15,
 ];
 
+/// The eight low XMM registers (all the generator uses; XMM8-15 need REX).
+const XMMS: [RegisterX86; 8] = [
+    RegisterX86::XMM0,
+    RegisterX86::XMM1,
+    RegisterX86::XMM2,
+    RegisterX86::XMM3,
+    RegisterX86::XMM4,
+    RegisterX86::XMM5,
+    RegisterX86::XMM6,
+    RegisterX86::XMM7,
+];
+
 /// The observable result of one step.
 struct Post {
     gpr: [u64; 16],
     rflags: u64,
     ip: u64,
+    xmm: [u128; 16],
     data: Vec<u8>,
 }
 
+/// Per-lane XMM equality under a NaN-aware policy (`nan` = 0 bit-exact, 4 f32
+/// lanes, 8 f64 lanes; a lane NaN in both engines counts as equal).
+fn xmm_eq(a: u128, b: u128, nan: u8) -> bool {
+    if a == b {
+        return true;
+    }
+    match nan {
+        4 => (0..4).all(|l| {
+            let (x, y) = ((a >> (l * 32)) as u32, (b >> (l * 32)) as u32);
+            x == y || (f32::from_bits(x).is_nan() && f32::from_bits(y).is_nan())
+        }),
+        8 => (0..2).all(|l| {
+            let (x, y) = ((a >> (l * 64)) as u64, (b >> (l * 64)) as u64);
+            x == y || (f64::from_bits(x).is_nan() && f64::from_bits(y).is_nan())
+        }),
+        _ => false,
+    }
+}
+
+// `Post` is deliberately large (full register + XMM snapshot); it lives only
+// for the span of one trial's comparison, so boxing it would just add churn.
+#[allow(clippy::large_enum_variant)]
 enum Outcome {
     Ok(Post),
     Fault,
@@ -78,20 +113,21 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         let s = cpu.state_mut();
         s.gpr = seed.gpr;
         s.rflags = seed.rflags;
+        s.xmm = seed.xmm;
         s.rip = CODE_BASE;
     }
     let mut hooks = NoHooks;
     match cpu.step(&mut mem, &mut hooks) {
         Ok(Exit::Continue) => {
-            let (gpr, rflags, ip) = {
+            let (gpr, rflags, ip, xmm) = {
                 let s = cpu.state();
-                (s.gpr, s.rflags, s.rip)
+                (s.gpr, s.rflags, s.rip, s.xmm)
             };
             let mut data = vec![0u8; gen::DATA_LEN];
             if mem.read(gen::DATA_BASE, &mut data).is_err() {
                 return Outcome::Fault;
             }
-            Outcome::Ok(Post { gpr, rflags, ip, data })
+            Outcome::Ok(Post { gpr, rflags, ip, xmm, data })
         }
         // #DE (Interrupt(0)), Halted, ProcessExit, or a memory/decode error.
         _ => Outcome::Fault,
@@ -122,6 +158,11 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             return Outcome::Fault;
         }
     }
+    for (i, x) in XMMS.iter().enumerate() {
+        if uc.reg_write_long(*x, &seed.xmm[i].to_le_bytes()).is_err() {
+            return Outcome::Fault;
+        }
+    }
     let _ = uc.reg_write(RegisterX86::EFLAGS, seed.rflags & 0xffff_ffff);
     let _ = uc.reg_write(ip_reg, CODE_BASE);
     // Run until rip reaches the end of the instruction (count=0 = no limit), so
@@ -136,11 +177,21 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             }
             let rflags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
             let ip = uc.reg_read(ip_reg).unwrap_or(0);
+            let mut xmm = [0u128; 16];
+            for (i, x) in XMMS.iter().enumerate() {
+                if let Ok(bytes) = uc.reg_read_long(*x) {
+                    if bytes.len() >= 16 {
+                        let mut a = [0u8; 16];
+                        a.copy_from_slice(&bytes[..16]);
+                        xmm[i] = u128::from_le_bytes(a);
+                    }
+                }
+            }
             let mut data = vec![0u8; gen::DATA_LEN];
             if uc.mem_read(gen::DATA_BASE, &mut data).is_err() {
                 return Outcome::Fault;
             }
-            Outcome::Ok(Post { gpr, rflags, ip, data })
+            Outcome::Ok(Post { gpr, rflags, ip, xmm, data })
         }
         Err(_) => Outcome::Fault,
     }
@@ -185,6 +236,11 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
     let fb = b.rflags & trial.defined_flags;
     if fa != fb {
         return Some(format!("flags(defined={:#x}) exemu={:#x} unicorn={:#x} Δ={:#x}", trial.defined_flags, fa, fb, fa ^ fb));
+    }
+    for i in 0..8 {
+        if !xmm_eq(a.xmm[i], b.xmm[i], trial.xmm_nan) {
+            return Some(format!("xmm{i} exemu={:#034x} unicorn={:#034x}", a.xmm[i], b.xmm[i]));
+        }
     }
     for (i, (x, y)) in a.data.iter().zip(b.data.iter()).enumerate() {
         if x != y {
