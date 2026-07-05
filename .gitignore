@@ -20,3 +20,6 @@ Cargo.lock.orig
 
 # Local exe files to test the knowledge base — never committed.
 example_exe/
+
+# Local Claude Code config / skills (do not commit)
+.claude/
