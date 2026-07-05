@@ -248,6 +248,28 @@ The interpreter has hand-assembled unit tests (arithmetic, loops, calls,
 signed compares, division, `rep stos`, flags), and the app crate runs the
 generated `.exe` through the entire pipeline and asserts on its output.
 
+### Differential CPU oracle
+
+The software CPU is validated against a reference x86 (Unicorn / QEMU TCG) by
+the dev-only `exemu-oracle` crate. It seeds identical state into exemu and
+Unicorn, single-steps one generated instruction in each, and diffs the
+registers, defined status flags, and touched memory — across the integer ALU,
+shift/rotate, multiply/divide, bit, and REP string families in both 32- and
+64-bit mode. It runs millions of trials to `ZERO DIVERGENCE`:
+
+```sh
+# The `unicorn` feature builds a bundled C library (needs cmake); off by
+# default, so the normal workspace build and CI never require it.
+cargo run -p exemu-oracle --features unicorn --release -- fuzz --bits both --count 2M
+```
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). All
+contributors sign the [Contributor License Agreement](CLA.md) (a one-comment
+step handled automatically by a bot on your first pull request).
+
 ## License
 
 MIT
+
