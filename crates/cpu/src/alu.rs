@@ -259,6 +259,18 @@ pub fn shift(s: &mut CpuState, kind: Shift, val: u64, count: u64, size: u8) -> u
                 }
             }
             s.set_flag(flags::CF, cf);
+            // OF is defined only for the single-bit rotates. For RCL it is
+            // MSB(result) XOR CF(result); for RCR it is the XOR of the two most
+            // significant bits of the result. (Undefined for multi-bit — left
+            // untouched, matching real CPUs.)
+            if count == 1 {
+                let msb = res & sb != 0;
+                let of = match kind {
+                    Shift::Rcl => msb ^ cf,
+                    _ => msb ^ (res & (sb >> 1) != 0),
+                };
+                s.set_flag(flags::OF, of);
+            }
             res & m
         }
     }

@@ -607,9 +607,9 @@ impl Interpreter {
     /// Two-operand signed multiply truncated to `size`, setting CF/OF on
     /// overflow.
     fn imul_trunc(&mut self, a: u64, b: u64, size: u8) -> u64 {
-        let prod = (alu::sext(a, size) as i128) * (alu::sext(b, size) as i128);
+        let prod = (alu::sext(a, size) as i64 as i128) * (alu::sext(b, size) as i64 as i128);
         let res = (prod as u64) & alu::mask(size);
-        let overflow = (alu::sext(res, size) as i128) != prod;
+        let overflow = (alu::sext(res, size) as i64 as i128) != prod;
         self.state.set_flag(flags::CF, overflow);
         self.state.set_flag(flags::OF, overflow);
         res
@@ -621,10 +621,10 @@ impl Interpreter {
         let src = self.read_rm(ctx, &*mem, size)?;
         let a = self.state.gpr_read(0, size);
         let (lo, hi, flag) = if signed {
-            let prod = (alu::sext(a, size) as i128) * (alu::sext(src, size) as i128);
+            let prod = (alu::sext(a, size) as i64 as i128) * (alu::sext(src, size) as i64 as i128);
             let lo = (prod as u64) & alu::mask(size);
             let hi = ((prod >> (size * 8)) as u64) & alu::mask(size);
-            (lo, hi, (alu::sext(lo, size) as i128) != prod)
+            (lo, hi, (alu::sext(lo, size) as i64 as i128) != prod)
         } else {
             let prod = (a as u128) * (src as u128);
             let lo = (prod as u64) & alu::mask(size);
@@ -681,7 +681,7 @@ impl Interpreter {
             let num = ((hi as i128) << bits) | (lo as i128 & (alu::mask(size) as i128));
             // sign-extend the assembled two's-complement value
             let num = (num << (128 - 2 * bits)) >> (128 - 2 * bits);
-            let d = alu::sext(divisor, size) as i128;
+            let d = alu::sext(divisor, size) as i64 as i128;
             let q = num / d;
             let r = num % d;
             self.state.gpr_write(0, size, q as u64);
@@ -939,9 +939,13 @@ impl Interpreter {
                 self.read_modrm(ctx, mem)?;
                 let size = Self::opsize(ctx);
                 let v = self.read_rm(ctx, &*mem, size)?;
-                if self.cond(op2 & 0xF) {
-                    self.write_reg_field(ctx, size, v);
-                }
+                // The destination is written unconditionally: on a taken move
+                // with the source, otherwise with its own current value. That
+                // matters in 64-bit mode, where a 32-bit write zero-extends the
+                // upper half even when the condition is *not* met.
+                let keep = self.read_reg_field(ctx, size);
+                let val = if self.cond(op2 & 0xF) { v } else { keep };
+                self.write_reg_field(ctx, size, val);
             }
 
             // Jcc rel32
@@ -1096,12 +1100,15 @@ impl Interpreter {
                 let dst = self.read_rm(ctx, &*mem, size)?;
                 let acc = self.state.gpr_read(0, size);
                 alu::sub(&mut self.state, acc, dst, 0, size); // sets ZF on equality
-                if self.state.flag(flags::ZF) {
-                    let src = self.read_reg_field(ctx, size);
-                    self.write_rm(ctx, mem, size, src)?;
-                } else {
-                    self.state.gpr_write(0, size, dst); // acc = dst
-                }
+                let equal = self.state.flag(flags::ZF);
+                // Read the source before touching the accumulator (they may
+                // alias). x86 CMPXCHG always writes *both* the accumulator (with
+                // the old destination) and the destination (with the source when
+                // equal, else with itself) — so 32-bit forms zero-extend the
+                // upper half of each register regardless of the branch taken.
+                let store = if equal { self.read_reg_field(ctx, size) } else { dst };
+                self.state.gpr_write(0, size, dst);
+                self.write_rm(ctx, mem, size, store)?;
             }
 
             // ---- Three-byte 0F 38 escape --------------------------------
