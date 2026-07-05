@@ -20,6 +20,7 @@
 
 mod api;
 mod dll;
+mod exc;
 mod fs;
 mod gdi;
 
@@ -156,6 +157,11 @@ pub struct WinOs {
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
+
+    /// The image's x64 unwind function table (sorted by begin RVA), used by
+    /// `RtlLookupFunctionEntry`/`RtlVirtualUnwind`/exception dispatch. Empty
+    /// for 32-bit images. See [`crate::exc`].
+    function_table: Vec<exemu_core::UnwindEntry>,
 }
 
 // Sentinel handle values returned by GetStdHandle and understood by WriteFile.
@@ -198,11 +204,24 @@ impl WinOs {
             fls_slots: Vec::new(),
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
+            function_table: Vec::new(),
         };
         // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
         os.cb_driver = os.alloc_thunk(Api::CallbackDriver);
         os
+    }
+
+    /// Hand the emulated OS the image's parsed x64 unwind table so the native
+    /// `Rtl*` exception APIs and exception dispatch can walk guest frames
+    /// (roadmap P4.3). No-op for 32-bit images (the table is empty).
+    pub fn set_unwind_table(&mut self, table: Vec<exemu_core::UnwindEntry>) {
+        self.function_table = table;
+    }
+
+    /// The image's unwind function table (for the app's fault-report backtrace).
+    pub fn unwind_table(&self) -> &[exemu_core::UnwindEntry] {
+        &self.function_table
     }
 
     /// Install a windowing backend and the image's dialog templates. With a
