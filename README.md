@@ -277,7 +277,7 @@ exemu is licensed under the **PolyForm Noncommercial License 1.0.0** — see
 - **Noncommercial use is free** — personal, research, hobby, education, and other
   noncommercial purposes.
 - **Commercial/production use requires a separate license** from the owner.
-  Enquiries: jasiek.duszynski@gmail.com
+  Enquiries: jan@janduszynski.pl
 
 Contributions are accepted under the [Contributor License Agreement](CLA.md),
 which keeps the owner as the sole rights-holder able to license, relicense, and

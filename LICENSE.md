@@ -8,7 +8,7 @@ license from the owner.
 
 Required Notice: Copyright (c) 2026 Jan Duszyński (https://github.com/janDuszynski/exe-emulator)
 
-Commercial licensing enquiries: jasiek.duszynski@gmail.com
+Commercial licensing enquiries: jan@janduszynski.pl
 
 --------------------------------------------------------------------------------
 
