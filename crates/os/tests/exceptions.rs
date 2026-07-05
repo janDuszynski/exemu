@@ -159,6 +159,130 @@ fn virtual_unwind_pops_frame_and_reports_handler() {
     assert_eq!(mem.read_u64(CTX + CTX_RBX).unwrap(), 0xBBBB_0003);
 }
 
+/// Handler-bearing function A, with the raise happening inside it. Lays out
+/// A's frame on the stack (saved rbx, then a return address that leaves the
+/// image so the walk terminates) and invokes RaiseException. Returns the CPU
+/// after dispatch has set up (or declined) the handler call.
+fn raise_inside_a(os: &mut WinOs, mem: &mut VirtualMemory, with_handler: bool) -> (CpuState, Option<Exit>) {
+    let mut a = entry(
+        0x1000,
+        0x1080,
+        0x9000,
+        vec![UnwindCode { prolog_offset: 1, op: UnwindOp::PushNonvolatile { reg: 3 } }],
+    );
+    a.info.has_exception_handler = with_handler;
+    a.info.handler_rva = with_handler.then_some(0x2000);
+    a.info.handler_data_rva = with_handler.then_some(0x2100);
+    os.set_unwind_table(vec![a]);
+
+    let mut cpu = CpuState::new();
+    let raise_from = IMAGE_BASE + 0x1040;
+    cpu.set_rsp(STACK);
+    mem.write_u64(STACK, raise_from).unwrap(); // RaiseException's return addr = raise site in A
+    mem.write_u64(STACK + 8, 0xBBBB_0003).unwrap(); // A's saved rbx
+    mem.write_u64(STACK + 0x10, 0x0000_7EFF_0000_0500).unwrap(); // return into OS region → walk ends
+    cpu.set_reg(Reg::Rcx, 0xE06D_7363); // ExceptionCode (C++ throw)
+    cpu.set_reg(Reg::Rdx, 1); // ExceptionFlags
+    cpu.set_reg(Reg::R8, 0); // NumberParameters
+    cpu.set_reg(Reg::R9, 0); // lpArguments
+    let thunk = os.resolve_import("kernel32.dll", &ImportSymbol::Named("RaiseException".into()));
+    cpu.rip = thunk;
+    let exit = os.intercept(thunk, &mut cpu, mem).unwrap();
+    (cpu, exit)
+}
+
+#[test]
+fn raise_exception_invokes_frame_handler() {
+    let (mut os, mut mem) = setup(vec![]);
+    let (cpu, exit) = raise_inside_a(&mut os, &mut mem, true);
+    assert_eq!(exit, Some(Exit::Continue));
+    // Dispatch set up a call into the language handler with the x64 ABI.
+    assert_eq!(cpu.rip, IMAGE_BASE + 0x2000, "handler invoked");
+    assert_eq!(cpu.reg(Reg::Rdx), STACK + 8, "establisher frame");
+    let record = cpu.reg(Reg::Rcx);
+    assert_eq!(mem.read_u32(record).unwrap(), 0xE06D_7363, "record ExceptionCode");
+    // DISPATCHER_CONTEXT (r9): LanguageHandler at +0x30, HandlerData at +0x38.
+    let disp = cpu.reg(Reg::R9);
+    assert_eq!(mem.read_u64(disp + 0x30).unwrap(), IMAGE_BASE + 0x2000);
+    assert_eq!(mem.read_u64(disp + 0x38).unwrap(), IMAGE_BASE + 0x2100);
+}
+
+#[test]
+fn unhandled_exception_terminates_with_code() {
+    let (mut os, mut mem) = setup(vec![]);
+    let (_cpu, exit) = raise_inside_a(&mut os, &mut mem, false);
+    // No frame caught it → std::terminate: exit with the exception code.
+    assert_eq!(exit, Some(Exit::ProcessExit(0xE06D_7363u32 as i32)));
+}
+
+#[test]
+fn continue_search_advances_then_terminates() {
+    // A handler that returns ExceptionContinueSearch (RAX=1) must move the
+    // walk on; with no further frame it terminates.
+    let (mut os, mut mem) = setup(vec![]);
+    let (cpu_after_call, _) = raise_inside_a(&mut os, &mut mem, true);
+    assert_eq!(cpu_after_call.rip, IMAGE_BASE + 0x2000);
+
+    // Simulate the handler returning ContinueSearch to the driver thunk.
+    let driver_ret = mem.read_u64(cpu_after_call.rsp()).unwrap(); // = exc_driver thunk
+    let mut cpu = cpu_after_call;
+    cpu.set_reg(Reg::Rax, 1); // EXCEPTION_CONTINUE_SEARCH
+    cpu.rip = driver_ret;
+    let exit = os.intercept(driver_ret, &mut cpu, &mut mem).unwrap();
+    // The only handler declined and the next frame leaves the image → terminate.
+    assert_eq!(exit, Some(Exit::ProcessExit(0xE06D_7363u32 as i32)));
+}
+
+#[test]
+fn rtl_unwind_ex_transfers_to_target() {
+    // A language handler decides to catch: it calls RtlUnwindEx targeting its
+    // own establisher frame, and control must resume at the catch IP.
+    let a = entry(
+        0x1000,
+        0x1080,
+        0x9000,
+        vec![UnwindCode { prolog_offset: 1, op: UnwindOp::PushNonvolatile { reg: 3 } }],
+    );
+    let (mut os, mut mem) = setup(vec![a]);
+
+    // Build the ContextRecord RtlUnwindEx unwinds from: positioned in A.
+    let ctx_in = 0x6800u64;
+    mem.write_u64(ctx_in + 0xf8, IMAGE_BASE + 0x1040).unwrap(); // RIP in A
+    mem.write_u64(ctx_in + 0x98, STACK + 8).unwrap(); // RSP = A's frame base
+
+    let catch_ip = IMAGE_BASE + 0x1055;
+    let mut cpu = CpuState::new();
+    cpu.set_rsp(STACK);
+    mem.write_u64(STACK, RET_ADDR).unwrap();
+    cpu.set_reg(Reg::Rcx, STACK + 8); // TargetFrame = A's establisher
+    cpu.set_reg(Reg::Rdx, catch_ip); // TargetIp
+    cpu.set_reg(Reg::R8, 0); // ExceptionRecord
+    cpu.set_reg(Reg::R9, 0xCAFE); // ReturnValue → RAX at the catch
+    set_stack_arg(&mut mem, 4, ctx_in); // ContextRecord
+    set_stack_arg(&mut mem, 5, 0); // HistoryTable
+    let thunk = os.resolve_import("ntdll.dll", &ImportSymbol::Named("RtlUnwindEx".into()));
+    cpu.rip = thunk;
+    let exit = os.intercept(thunk, &mut cpu, &mut mem).unwrap();
+
+    assert_eq!(exit, Some(Exit::Continue));
+    assert_eq!(cpu.rip, catch_ip, "resumed at the catch funclet");
+    assert_eq!(cpu.reg(Reg::Rax), 0xCAFE, "return value delivered in RAX");
+    assert_eq!(cpu.rsp(), STACK + 8, "stack unwound to the target frame");
+}
+
+#[test]
+fn set_unhandled_exception_filter_round_trips() {
+    let (mut os, mut mem) = setup(vec![]);
+    let mut cpu = CpuState::new();
+    cpu.set_reg(Reg::Rcx, 0xF00D);
+    let r = call(&mut os, &mut mem, &mut cpu, "SetUnhandledExceptionFilter");
+    assert_eq!(r, 0, "no previous filter");
+    let mut cpu = CpuState::new();
+    cpu.set_reg(Reg::Rcx, 0xBEEF);
+    let r = call(&mut os, &mut mem, &mut cpu, "SetUnhandledExceptionFilter");
+    assert_eq!(r, 0xF00D, "returns the previously installed filter");
+}
+
 #[test]
 fn pc_to_file_header_classifies_image() {
     let table = vec![entry(0x1000, 0x1080, 0x9000, vec![])];

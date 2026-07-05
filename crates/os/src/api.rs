@@ -256,6 +256,20 @@ pub enum Api {
     /// `RtlPcToFileHeader(pc, *base)` — return the image base if `pc` is inside
     /// the image (write it out too), else 0.
     RtlPcToFileHeader,
+    /// `RaiseException(code, flags, nargs, args)` / `RtlRaiseException` — start
+    /// dispatch: build the record, capture context, walk frames offering the
+    /// exception to each guest language handler (roadmap P4.3c).
+    RaiseException,
+    /// `RtlUnwindEx(target, ip, record, retval, ctx, hist)` — unwind to the
+    /// target frame (running termination handlers) and transfer control there.
+    RtlUnwindEx,
+    /// `SetUnhandledExceptionFilter(filter)` — install the last-chance filter.
+    SetUnhandledExceptionFilter,
+    /// `UnhandledExceptionFilter(info)` — the default last-chance filter; we
+    /// report "execute the handler" so the CRT terminates cleanly.
+    UnhandledExceptionFilter,
+    /// Not an import: drives re-entrant exception-handler calls.
+    ExceptionDriver,
 
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
@@ -297,6 +311,10 @@ impl Api {
             "RtlLookupFunctionEntry" => Api::RtlLookupFunctionEntry,
             "RtlVirtualUnwind" => Api::RtlVirtualUnwind,
             "RtlPcToFileHeader" => Api::RtlPcToFileHeader,
+            "RaiseException" | "RtlRaiseException" => Api::RaiseException,
+            "RtlUnwindEx" | "RtlUnwind" => Api::RtlUnwindEx,
+            "SetUnhandledExceptionFilter" => Api::SetUnhandledExceptionFilter,
+            "UnhandledExceptionFilter" => Api::UnhandledExceptionFilter,
             "GetLastError" => Api::GetLastError,
             "SetLastError" => Api::SetLastError,
             "GetCurrentProcessId" => Api::GetCurrentProcessId,
@@ -626,7 +644,11 @@ impl Api {
             Api::GetUserObjectInfoApi => 5,
             // x64-only ntdll exception APIs: no 32-bit stdcall footprint.
             Api::RtlCaptureContext | Api::RtlLookupFunctionEntry | Api::RtlVirtualUnwind
-            | Api::RtlPcToFileHeader => 0,
+            | Api::RtlPcToFileHeader | Api::RaiseException | Api::RtlUnwindEx
+            | Api::ExceptionDriver => 0,
+            // SetUnhandledExceptionFilter is stdcall(1) on 32-bit; the filter
+            // itself (UnhandledExceptionFilter) takes one pointer arg too.
+            Api::SetUnhandledExceptionFilter | Api::UnhandledExceptionFilter => 1,
             // Fake-handle, stub and unimplemented carry their looked-up
             // stdcall footprint so the stack stays balanced.
             Api::WinStub { argc, .. }
@@ -1103,6 +1125,19 @@ impl WinOs {
                 }
                 ret(base)
             }
+
+            Api::RaiseException => self.raise_exception(cpu, mem),
+            Api::RtlUnwindEx => self.rtl_unwind_ex(cpu, mem),
+            Api::ExceptionDriver => self.exc_advance(cpu, mem),
+            Api::SetUnhandledExceptionFilter => {
+                let old = self.unhandled_filter;
+                self.unhandled_filter = self.arg(cpu, mem, 0)?;
+                ret(old)
+            }
+            // The default last-chance filter: report EXCEPTION_EXECUTE_HANDLER
+            // (1) so the CRT's __scrt path terminates the process cleanly
+            // rather than looping or continuing into undefined state.
+            Api::UnhandledExceptionFilter => ret(1),
 
             Api::GetLastError => ret(self.last_error as u64),
             Api::SetLastError => {
@@ -2406,7 +2441,7 @@ impl WinOs {
     /// Set up a guest call to `func` with `args`, returning to `ret_thunk`.
     /// 64-bit: first four args in RCX/RDX/R8/R9 over a 32-byte shadow.
     /// 32-bit: args pushed right-to-left (stdcall; the callee cleans them).
-    fn setup_call_args(
+    pub(crate) fn setup_call_args(
         &self,
         cpu: &mut CpuState,
         mem: &mut dyn Memory,

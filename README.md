@@ -204,12 +204,15 @@ Complex apps will hit unimplemented calls.
 
 AVX and x87 floating point; native-themed / GDI+ / DirectX rendering (the
 GDI is a solid-fill/text subset); TLS callbacks and base relocations (images
-load at their preferred base); table-based structured exception handling
-(the `.pdata`/`.xdata` unwind tables are parsed and virtually unwound for
-fault-report call stacks, but exception *dispatch* — actually running C++
-catch/SEH handlers — is still a no-op, fine unless an exception is actually
-thrown); real threads; **COM** object creation; and the registry (Reg* calls
-are stubbed).
+load at their preferred base); real threads; **COM** object creation; and the
+registry (Reg* calls are stubbed).
+
+**x64 exceptions work:** the `.pdata`/`.xdata` unwind tables are parsed,
+`RtlCaptureContext`/`RtlLookupFunctionEntry`/`RtlVirtualUnwind`/`RtlUnwindEx`
+are native, and `RaiseException` drives a real search-then-unwind dispatch that
+walks the guest's frames and calls its own C++/SEH language handlers; a matching
+catch resumes execution, an unmatched throw terminates like `std::terminate`.
+(Still to come: 32-bit `fs:[0]` SEH and vectored exception handlers.)
 
 ### What real installers do today
 
