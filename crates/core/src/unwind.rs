@@ -131,21 +131,94 @@ pub fn virtual_unwind<M: Memory + ?Sized>(
     ctx: &mut CpuState,
     mem: &M,
 ) -> Result<()> {
+    virtual_unwind_frame(table, image_base, ctx, mem).map(|_| ())
+}
+
+/// What a single-frame virtual unwind established about the frame it left —
+/// the `RtlVirtualUnwind` out-parameters. Returned by [`virtual_unwind_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameUnwind {
+    /// The establisher frame: RSP at the end of the frame's prolog (the base
+    /// of its fixed stack allocation), which language handlers key off.
+    pub establisher_frame: u64,
+    /// RVA of the frame's language handler, if it has one (and, for a search
+    /// via [`HandlerType`], if the frame opts into that phase).
+    pub handler_rva: Option<u32>,
+    /// RVA of the handler's language-specific data.
+    pub handler_data_rva: Option<u32>,
+    /// The frame was a leaf / outside the image, or was mid-epilog — in both
+    /// cases no unwind codes ran and there is no language handler.
+    pub is_leaf_or_epilog: bool,
+}
+
+/// Which handler phase a virtual unwind is serving — mirrors `RtlVirtualUnwind`'s
+/// `HandlerType` mask. Only handlers opting into the requested phase are
+/// reported; passing [`HandlerType::NONE`] unwinds without surfacing a handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandlerType(pub u32);
+
+impl HandlerType {
+    /// `UNW_FLAG_NHANDLER` — unwind only, surface no handler.
+    pub const NONE: HandlerType = HandlerType(0);
+    /// `UNW_FLAG_EHANDLER` — the exception-search phase.
+    pub const EXCEPTION: HandlerType = HandlerType(1);
+    /// `UNW_FLAG_UHANDLER` — the unwind (termination) phase.
+    pub const UNWIND: HandlerType = HandlerType(2);
+}
+
+/// Unwind exactly one frame and report what it established. Like
+/// [`virtual_unwind`] but surfaces the establisher frame and the frame's
+/// language handler (filtered by `handler_type`), which exception dispatch
+/// and `RtlVirtualUnwind` need. Defaults to the exception-search phase via
+/// [`virtual_unwind`]'s wrapper (which discards the detail).
+pub fn virtual_unwind_frame<M: Memory + ?Sized>(
+    table: &[UnwindEntry],
+    image_base: u64,
+    ctx: &mut CpuState,
+    mem: &M,
+) -> Result<FrameUnwind> {
+    virtual_unwind_typed(table, image_base, ctx, mem, HandlerType::EXCEPTION)
+}
+
+/// The full form: `handler_type` selects which frames' handlers are reported
+/// (search vs unwind vs neither).
+pub fn virtual_unwind_typed<M: Memory + ?Sized>(
+    table: &[UnwindEntry],
+    image_base: u64,
+    ctx: &mut CpuState,
+    mem: &M,
+    handler_type: HandlerType,
+) -> Result<FrameUnwind> {
     let rva = match ctx.rip.checked_sub(image_base) {
         Some(off) if u32::try_from(off).is_ok() => off as u32,
-        _ => return pop_return_address(ctx, mem), // outside the image → leaf rules
+        _ => {
+            pop_return_address(ctx, mem)?; // outside the image → leaf rules
+            return Ok(FrameUnwind { establisher_frame: ctx.rsp(), is_leaf_or_epilog: true, ..Default::default() });
+        }
     };
     let Some(entry) = lookup(table, rva) else {
-        return pop_return_address(ctx, mem); // leaf function: no frame to undo
+        pop_return_address(ctx, mem)?; // leaf function: no frame to undo
+        return Ok(FrameUnwind { establisher_frame: ctx.rsp(), is_leaf_or_epilog: true, ..Default::default() });
     };
 
     // Unwinding from within an epilog: part of the frame is already torn
-    // down, so simulate the remaining epilog instructions instead.
+    // down, so simulate the remaining epilog instructions instead. A frame in
+    // its epilog exposes no handler (the try scope has already been left).
     if try_simulate_epilog(entry, image_base, ctx, mem)? {
-        return Ok(());
+        return Ok(FrameUnwind { establisher_frame: ctx.rsp(), is_leaf_or_epilog: true, ..Default::default() });
     }
 
     let offset_in_func = rva - entry.begin_rva;
+    // The primary frame's handler (search/unwind-filtered) and establisher.
+    let opts_in = match handler_type {
+        HandlerType::EXCEPTION => entry.info.has_exception_handler,
+        HandlerType::UNWIND => entry.info.has_termination_handler,
+        _ => false,
+    };
+    let handler_rva = opts_in.then_some(entry.info.handler_rva).flatten();
+    let handler_data_rva = opts_in.then_some(entry.info.handler_data_rva).flatten();
+    let mut establisher_frame = ctx.rsp();
+
     let mut machine_frame = false;
     let mut cur = entry;
     let mut first = true;
@@ -158,6 +231,9 @@ pub fn virtual_unwind<M: Memory + ?Sized>(
             Some(fr) => ctx.gpr[fr as usize & 0xf].wrapping_sub(info.frame_offset as u64),
             None => ctx.rsp(),
         };
+        if first {
+            establisher_frame = frame;
+        }
         for code in &info.codes {
             // Prolog codes that haven't executed yet at this rip are skipped —
             // only for the entry actually containing rip; a chained (primary)
@@ -205,11 +281,10 @@ pub fn virtual_unwind<M: Memory + ?Sized>(
         }
     }
 
-    if machine_frame {
-        Ok(()) // the machine frame already supplied RIP and RSP
-    } else {
-        pop_return_address(ctx, mem)
+    if !machine_frame {
+        pop_return_address(ctx, mem)?;
     }
+    Ok(FrameUnwind { establisher_frame, handler_rva, handler_data_rva, is_leaf_or_epilog: false })
 }
 
 fn pop_return_address<M: Memory + ?Sized>(ctx: &mut CpuState, mem: &M) -> Result<()> {
@@ -693,6 +768,66 @@ mod tests {
         assert_eq!(ctx.gpr[3], 0xBBBB_0003);
         assert_eq!(ctx.rip, BASE + 0x2000);
         assert_eq!(ctx.rsp(), stack + 16);
+    }
+
+    #[test]
+    fn unwind_frame_reports_handler_and_establisher() {
+        // A frame with an exception handler; rip mid-body.
+        let mut e = entry_with(
+            0x1000,
+            0x1080,
+            5,
+            vec![
+                code(5, UnwindOp::Alloc { size: 0x28 }),
+                code(1, UnwindOp::PushNonvolatile { reg: 5 }),
+            ],
+        );
+        e.info.has_exception_handler = true;
+        e.info.handler_rva = Some(0x9000);
+        e.info.handler_data_rva = Some(0x9100);
+        let table = vec![e];
+        let mut mem = FlatMem::new(0x8000, 0x100);
+        mem.put64(0x8028, 0xBBBB_0005);
+        mem.put64(0x8030, BASE + 0x2000);
+        let mut ctx = CpuState::new();
+        ctx.rip = BASE + 0x1040;
+        ctx.set_rsp(0x8000);
+        // Search phase surfaces the handler; establisher = rsp at prolog end.
+        let fu = virtual_unwind_frame(&table, BASE, &mut ctx, &mem).unwrap();
+        assert_eq!(fu.handler_rva, Some(0x9000));
+        assert_eq!(fu.handler_data_rva, Some(0x9100));
+        assert_eq!(fu.establisher_frame, 0x8000);
+        assert!(!fu.is_leaf_or_epilog);
+        assert_eq!(ctx.rip, BASE + 0x2000);
+    }
+
+    #[test]
+    fn unwind_frame_hides_handler_for_wrong_phase() {
+        let mut e = entry_with(0x1000, 0x1080, 2, vec![code(2, UnwindOp::PushNonvolatile { reg: 3 })]);
+        e.info.has_exception_handler = true; // EHANDLER only, not UHANDLER
+        e.info.handler_rva = Some(0x9000);
+        let table = vec![e];
+        let mut mem = FlatMem::new(0x8000, 0x100);
+        mem.put64(0x8000, 0xBBBB_0003);
+        mem.put64(0x8008, BASE + 0x2000);
+        let mut ctx = CpuState::new();
+        ctx.rip = BASE + 0x1040;
+        ctx.set_rsp(0x8000);
+        // Asking for the UNWIND phase must not surface an EHANDLER-only handler.
+        let fu = virtual_unwind_typed(&table, BASE, &mut ctx, &mem, HandlerType::UNWIND).unwrap();
+        assert_eq!(fu.handler_rva, None);
+    }
+
+    #[test]
+    fn unwind_frame_leaf_flagged() {
+        let mut mem = FlatMem::new(0x8000, 0x100);
+        mem.put64(0x8000, BASE + 0x2000);
+        let mut ctx = CpuState::new();
+        ctx.rip = BASE + 0x5000; // no entry covers it
+        ctx.set_rsp(0x8000);
+        let fu = virtual_unwind_frame(&[], BASE, &mut ctx, &mem).unwrap();
+        assert!(fu.is_leaf_or_epilog);
+        assert_eq!(fu.handler_rva, None);
     }
 
     #[test]

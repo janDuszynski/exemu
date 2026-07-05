@@ -141,9 +141,8 @@ pub struct Process {
     sandbox: String,
     entry: u64,
     max_steps: u64,
-    /// The image's x64 unwind function table + base, kept for virtual
-    /// unwinding (fault-report call stacks now; exception dispatch later).
-    function_table: Vec<exemu_core::UnwindEntry>,
+    /// Image base, kept for virtual unwinding in the fault reporter (the
+    /// unwind table itself is owned by the OS layer — see `os.unwind_table`).
     image_base: u64,
 }
 
@@ -258,6 +257,10 @@ impl Process {
         // memory, and land here instead of faulting. Known CRT data globals
         // are seeded below; the rest default to zero (their normal initial
         // value).
+        // Hand the OS layer the unwind table so its native Rtl* exception
+        // APIs and dispatch can walk guest frames (roadmap P4.3).
+        os.set_unwind_table(image.function_table.clone());
+
         mem.map(Region::new("imports", lay.api_base, API_SIZE, Perm::RW))?;
 
         for imp in &image.imports {
@@ -308,7 +311,6 @@ impl Process {
             sandbox: sandbox.to_string_lossy().into_owned(),
             entry: image.entry_va(),
             max_steps: cfg.max_steps,
-            function_table: image.function_table,
             image_base: base,
         })
     }
@@ -433,9 +435,10 @@ impl Process {
         }
         // Call stack via the x64 unwind tables (roadmap P4.2) — turns the
         // faulting rip into the chain of callers that led there.
-        if !self.function_table.is_empty() {
+        let function_table = self.os.unwind_table();
+        if !function_table.is_empty() {
             let frames = exemu_core::unwind::backtrace(
-                &self.function_table,
+                function_table,
                 self.image_base,
                 s,
                 &self.mem,

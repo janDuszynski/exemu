@@ -27,4 +27,4 @@ pub use hooks::Hooks;
 pub use memory::{Memory, Perm, Region};
 pub use pe::{Export, Import, ImportSymbol, PeImage, Reloc, Section};
 pub use telemetry::{rank as rank_opcode_misses, MissRecord, OpcodeRank};
-pub use unwind::{UnwindCode, UnwindEntry, UnwindInfo, UnwindOp};
+pub use unwind::{FrameUnwind, HandlerType, UnwindCode, UnwindEntry, UnwindInfo, UnwindOp};

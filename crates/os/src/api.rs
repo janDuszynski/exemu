@@ -242,6 +242,21 @@ pub enum Api {
     /// for the plain form and 3 for the Ex form (32-bit stack cleanup).
     LoadLibraryApi { wide: bool, argc: u32 },
 
+    // --- x64 exception machinery (roadmap P4.3) ---------------------------
+    /// `RtlCaptureContext(ctx)` — fill the guest CONTEXT with the caller's
+    /// register state (RIP = return address, RSP = post-return stack).
+    RtlCaptureContext,
+    /// `RtlLookupFunctionEntry(pc, *base, *hist)` — return the guest VA of the
+    /// RUNTIME_FUNCTION covering `pc`, or 0; write the image base out.
+    RtlLookupFunctionEntry,
+    /// `RtlVirtualUnwind(type, base, pc, fn, ctx, *data, *frame, ptrs)` — unwind
+    /// `ctx` one frame; return the frame's language handler (or 0), writing the
+    /// establisher frame and handler-data pointers out.
+    RtlVirtualUnwind,
+    /// `RtlPcToFileHeader(pc, *base)` — return the image base if `pc` is inside
+    /// the image (write it out too), else 0.
+    RtlPcToFileHeader,
+
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
@@ -275,6 +290,13 @@ impl Api {
             | "DecodeSystemPointer" | "RtlEncodePointer" | "RtlDecodePointer" => {
                 Api::EncodeDecodePointer
             }
+
+            // x64 exception machinery (ntdll), called by the guest CRT's
+            // language handlers to walk and unwind frames (roadmap P4.3).
+            "RtlCaptureContext" => Api::RtlCaptureContext,
+            "RtlLookupFunctionEntry" => Api::RtlLookupFunctionEntry,
+            "RtlVirtualUnwind" => Api::RtlVirtualUnwind,
+            "RtlPcToFileHeader" => Api::RtlPcToFileHeader,
             "GetLastError" => Api::GetLastError,
             "SetLastError" => Api::SetLastError,
             "GetCurrentProcessId" => Api::GetCurrentProcessId,
@@ -602,6 +624,9 @@ impl Api {
             Api::WsprintfApi { .. } => 0,
             Api::MessageBoxApi { .. } => 4,
             Api::GetUserObjectInfoApi => 5,
+            // x64-only ntdll exception APIs: no 32-bit stdcall footprint.
+            Api::RtlCaptureContext | Api::RtlLookupFunctionEntry | Api::RtlVirtualUnwind
+            | Api::RtlPcToFileHeader => 0,
             // Fake-handle, stub and unimplemented carry their looked-up
             // stdcall footprint so the stack stays balanced.
             Api::WinStub { argc, .. }
@@ -990,6 +1015,93 @@ impl WinOs {
                 // later guarded call through it lands on real code, not null.
                 let p = self.arg(cpu, mem, 0)?;
                 ret(p)
+            }
+
+            // --- x64 exception machinery (roadmap P4.3) -------------------
+            Api::RtlCaptureContext => {
+                // Fill *ctx with the caller's state: RIP is the return address,
+                // RSP is the stack *after* this call returns (the ABI-visible
+                // caller frame), all other regs as-is.
+                let ctx_ptr = self.arg(cpu, mem, 0)?;
+                let ret_addr = mem.read_u64(cpu.rsp())?;
+                let mut snap = cpu.clone();
+                snap.rip = ret_addr;
+                snap.set_rsp(cpu.rsp() + 8);
+                crate::exc::write_context(mem, ctx_ptr, &snap)?;
+                ret(0)
+            }
+            Api::RtlLookupFunctionEntry => {
+                // (ControlPc, *ImageBase, *HistoryTable) → RUNTIME_FUNCTION* | 0
+                let pc = self.arg(cpu, mem, 0)?;
+                let base_out = self.arg(cpu, mem, 1)?;
+                let image_base = self.cfg.image_base;
+                let entry = pc
+                    .checked_sub(image_base)
+                    .and_then(|off| u32::try_from(off).ok())
+                    .and_then(|rva| exemu_core::unwind::lookup(&self.function_table, rva));
+                match entry {
+                    Some(e) => {
+                        if base_out != 0 {
+                            mem.write_u64(base_out, image_base)?;
+                        }
+                        ret(image_base + e.record_rva as u64)
+                    }
+                    None => {
+                        if base_out != 0 {
+                            mem.write_u64(base_out, 0)?;
+                        }
+                        ret(0)
+                    }
+                }
+            }
+            Api::RtlVirtualUnwind => {
+                // (HandlerType, ImageBase, ControlPc, FunctionEntry, ContextRecord,
+                //  *HandlerData, *EstablisherFrame, ContextPointers)
+                let handler_type = self.arg(cpu, mem, 0)? as u32;
+                let control_pc = self.arg(cpu, mem, 2)?;
+                let ctx_ptr = self.arg(cpu, mem, 4)?;
+                let handler_data_out = self.arg(cpu, mem, 5)?;
+                let frame_out = self.arg(cpu, mem, 6)?;
+                let image_base = self.cfg.image_base;
+
+                let mut state = crate::exc::read_context(mem, ctx_ptr)?;
+                // Honour the passed ControlPc (handlers may unwind a PC other
+                // than the context's current RIP on the first hop).
+                state.rip = control_pc;
+                let fu = exemu_core::unwind::virtual_unwind_typed(
+                    &self.function_table,
+                    image_base,
+                    &mut state,
+                    mem,
+                    exemu_core::HandlerType(handler_type),
+                )?;
+                crate::exc::write_context(mem, ctx_ptr, &state)?;
+                if frame_out != 0 {
+                    mem.write_u64(frame_out, fu.establisher_frame)?;
+                }
+                if handler_data_out != 0 {
+                    let hd = fu
+                        .handler_data_rva
+                        .map(|rva| image_base + rva as u64)
+                        .unwrap_or(0);
+                    mem.write_u64(handler_data_out, hd)?;
+                }
+                ret(fu.handler_rva.map(|rva| image_base + rva as u64).unwrap_or(0))
+            }
+            Api::RtlPcToFileHeader => {
+                // (PcValue, *BaseOfImage) → image base if pc is in the image.
+                let pc = self.arg(cpu, mem, 0)?;
+                let base_out = self.arg(cpu, mem, 1)?;
+                let image_base = self.cfg.image_base;
+                let in_image = pc
+                    .checked_sub(image_base)
+                    .and_then(|off| u32::try_from(off).ok())
+                    .is_some_and(|rva| exemu_core::unwind::lookup(&self.function_table, rva).is_some());
+                let base = if in_image { image_base } else { 0 };
+                if base_out != 0 {
+                    mem.write_u64(base_out, base)?;
+                }
+                ret(base)
             }
 
             Api::GetLastError => ret(self.last_error as u64),
