@@ -162,6 +162,12 @@ pub struct WinOs {
     /// `RtlLookupFunctionEntry`/`RtlVirtualUnwind`/exception dispatch. Empty
     /// for 32-bit images. See [`crate::exc`].
     function_table: Vec<exemu_core::UnwindEntry>,
+    /// Thunk that drives re-entrant exception-handler calls (roadmap P4.3c).
+    exc_driver: u64,
+    /// Active exception dispatches (a stack: a handler can raise again).
+    exc_stack: Vec<exc::DispatchFrame>,
+    /// The filter installed by `SetUnhandledExceptionFilter`, or 0.
+    unhandled_filter: u64,
 }
 
 // Sentinel handle values returned by GetStdHandle and understood by WriteFile.
@@ -205,10 +211,14 @@ impl WinOs {
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
             function_table: Vec::new(),
+            exc_driver: 0,
+            exc_stack: Vec::new(),
+            unhandled_filter: 0,
         };
         // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
         os.cb_driver = os.alloc_thunk(Api::CallbackDriver);
+        os.exc_driver = os.alloc_thunk(Api::ExceptionDriver);
         os
     }
 
