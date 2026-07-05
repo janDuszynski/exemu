@@ -708,7 +708,9 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "SetBkMode" | "SetTextColor" | "RegDeleteKeyW" | "RegDeleteValueW"
         | "SHGetPathFromIDListW" | "lstrcatW" | "lstrcmpW" | "lstrcmpiA" | "lstrcmpiW"
         | "lstrcpyA" | "lstrcpyW" | "FindFirstFileW" | "FindFirstFileA" | "FindNextFileW"
-        | "FindNextFileA" | "RegNotifyChangeKeyValue" => 2,
+        | "FindNextFileA" | "RegNotifyChangeKeyValue"
+        // Window property list (nsDialogs attaches state to the dialog HWND).
+        | "GetPropW" | "GetPropA" | "RemovePropW" | "RemovePropA" => 2,
 
         // --- 3 args ---
         "ExpandEnvironmentStringsW" | "CopyFileW" | "SetFileSecurityW" | "LoadLibraryExW"
@@ -717,14 +719,14 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "GetClassInfoW" | "OpenProcessToken" | "LookupPrivilegeValueW"
         | "SHGetSpecialFolderLocation" | "ImageList_AddMasked" | "MulDiv" | "lstrcpynW"
         | "OpenInputDesktopW" | "HeapCreate" | "HeapValidate"
-        | "InitializeCriticalSectionEx" => 3,
+        | "InitializeCriticalSectionEx" | "SetPropW" | "SetPropA" => 3,
 
         // --- 4 args ---
         "GetModuleFileNameW" | "GetFullPathNameW" | "SetFilePointer" | "SetFileTime"
         | "GetTempFileNameW" | "WritePrivateProfileStringW" | "AppendMenuW" | "DefWindowProcW"
         | "FindWindowExW" | "GetDlgItemTextW" | "MessageBoxW" | "SendMessageW" | "GetMessageW"
         | "SetTimer" | "SystemParametersInfoW" | "DrawTextW" | "FillRect" | "RegEnumKeyW"
-        | "OpenDesktopW" | "HeapSetInformation" => 4,
+        | "OpenDesktopW" | "HeapSetInformation" | "MapWindowPoints" => 4,
 
         // --- 5 args ---
         "ReadFile" | "WriteFile" | "GetDiskFreeSpaceW" | "CallWindowProcW" | "CreateDialogParamW"
