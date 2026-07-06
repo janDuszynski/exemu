@@ -196,7 +196,9 @@ impl Interpreter {
                     self.state.gpr_write(0, size, b);
                     self.state.gpr_write(r, size, a);
                 }
-                // r == 0 → plain NOP (also PAUSE when preceded by F3).
+                // r == 0 → plain NOP.  F3 90 (PAUSE) intentionally takes this
+                // same path: PAUSE is a no-op hint with no architectural side
+                // effects, so no separate handling is needed or desirable.
             }
 
             // ---- CWDE/CDQE and CDQ/CQO ----------------------------------
@@ -932,6 +934,32 @@ impl Interpreter {
                 self.tsc = self.tsc.wrapping_add(64);
                 self.state.gpr_write(0, 4, t & 0xffff_ffff);
                 self.state.gpr_write(2, 4, t >> 32);
+            }
+
+            // 0F 01 /sub — RDTSCP (sub-byte 0xF9) and system instructions.
+            // Only RDTSCP is implemented; all other sub-encodings (SGDT, SIDT,
+            // LGDT, LIDT, SMSW, LMSW, INVLPG, SWAPGS, …) are rejected cleanly
+            // rather than silently no-op'd.
+            0x01 => {
+                let sub = ctx.u8(mem)?;
+                match sub {
+                    // RDTSCP (0F 01 F9): EDX:EAX = TSC (identical to RDTSC
+                    // semantics — monotonic, wrapping_add(64) each call), and
+                    // ECX = IA32_TSC_AUX = 0 (processor id; 0 is correct for
+                    // the single-vCPU model).  No flags are touched.
+                    0xF9 => {
+                        let t = self.tsc;
+                        self.tsc = self.tsc.wrapping_add(64);
+                        self.state.gpr_write(0, 4, t & 0xffff_ffff); // EAX = TSC[31:0]
+                        self.state.gpr_write(2, 4, t >> 32); // EDX = TSC[63:32]
+                        self.state.gpr_write(1, 4, 0); // ECX = IA32_TSC_AUX (processor 0)
+                    }
+                    other => {
+                        return Err(EmuError::Unsupported(format!(
+                            "0f 01 {other:#04x} at {start:#x}"
+                        )));
+                    }
+                }
             }
 
             // CMOVcc r, r/m

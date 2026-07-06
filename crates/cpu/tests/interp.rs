@@ -520,3 +520,63 @@ fn cmpxchg_equal_zero_extends_accumulator() {
     assert_eq!(rax(&cpu), 0, "accumulator upper 32 bits must be cleared");
     assert_eq!(rcx(&cpu) & 0xffff_ffff, 5, "destination updated on equal");
 }
+
+#[test]
+fn rdtscp_ecx_zero_and_tsc_monotonic() {
+    // RDTSCP (0F 01 F9): EDX:EAX = TSC, ECX = IA32_TSC_AUX (processor id = 0).
+    // Two back-to-back calls must return a strictly increasing TSC, confirming
+    // that the counter advances and that all 3 encoding bytes are consumed.
+    //
+    // Byte layout (total 9 bytes before hlt):
+    //   0F 01 F9          rdtscp          (3 bytes — low32→EAX, high32→EDX, ECX=0)
+    //   89 C3             mov ebx, eax    (2 bytes — save first TSC low-32)
+    //   0F 01 F9          rdtscp          (3 bytes — second read, overwrites EAX/EDX/ECX)
+    //   F4                hlt             (1 byte)
+    let code = [
+        0x0F, 0x01, 0xF9, // rdtscp  (first read)
+        0x89, 0xC3, // mov ebx, eax  (stash first low-32 in EBX)
+        0x0F, 0x01, 0xF9, // rdtscp  (second read)
+        0xF4, // hlt
+    ];
+    let cpu = run(&code);
+    // ECX must be IA32_TSC_AUX = 0 (single-vCPU emulator reports processor 0).
+    assert_eq!(rcx(&cpu) as u32, 0, "ECX (IA32_TSC_AUX) must be 0");
+    // Second TSC low-32 must be strictly greater than the first.
+    let first_low = rbx(&cpu) as u32;
+    let second_low = rax(&cpu) as u32;
+    assert!(
+        second_low > first_low,
+        "TSC must be monotonically increasing: first={first_low} second={second_low}"
+    );
+    // RIP must point at the hlt byte, proving all three bytes of each RDTSCP
+    // were consumed.  HLT surfaces as Exit::Halted without advancing rip, so
+    // rip stops at CODE_BASE + 8 (3 + 2 + 3 bytes consumed before the hlt).
+    assert_eq!(cpu.state().rip, CODE_BASE + 8, "rip must advance past all 3 RDTSCP bytes");
+}
+
+#[test]
+fn pause_is_nop() {
+    // F3 90 = PAUSE.  PAUSE is a no-op hint with no architectural side effects;
+    // it takes the r==0 NOP path in the 0x90..=0x97 arm intentionally.
+    // After PAUSE + HLT the GPRs must be unchanged and rip advanced by exactly
+    // 2 bytes (F3 prefix + 90 opcode) for PAUSE, plus 1 for HLT.
+    //
+    //   F3 90   pause   (2 bytes — rep prefix consumed, r=0 → NOP)
+    //   F4      hlt     (1 byte)
+    let code = [
+        0xF3, 0x90, // pause
+        0xF4, // hlt
+    ];
+    let cpu = run(&code);
+    assert_eq!(rax(&cpu), 0, "RAX must be unchanged by PAUSE");
+    assert_eq!(rbx(&cpu), 0, "RBX must be unchanged by PAUSE");
+    assert_eq!(rcx(&cpu), 0, "RCX must be unchanged by PAUSE");
+    assert_eq!(rdx(&cpu), 0, "RDX must be unchanged by PAUSE");
+    // RIP must be CODE_BASE + 2: PAUSE consumed 2 bytes (F3 prefix + 90
+    // opcode), then HLT at offset 2 fires without advancing rip further.
+    assert_eq!(
+        cpu.state().rip,
+        CODE_BASE + 2,
+        "rip must advance past PAUSE (2 bytes); HLT stops without advancing rip"
+    );
+}
