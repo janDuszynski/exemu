@@ -18,6 +18,27 @@ pub struct OpenFile {
     pub file: std::fs::File,
 }
 
+/// One entry collected during a directory enumeration.
+#[derive(Clone)]
+pub struct FindEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    /// Creation time as FILETIME (100-ns intervals since 1601-01-01 UTC).
+    pub ctime: u64,
+    /// Last access time as FILETIME.
+    pub atime: u64,
+    /// Last write/modification time as FILETIME.
+    pub mtime: u64,
+}
+
+/// State associated with an open directory-enumeration handle
+/// (FindFirstFileW / FindNextFileW / FindClose).
+pub struct FindState {
+    pub entries: Vec<FindEntry>,
+    pub pos: usize,
+}
+
 // Windows constants.
 pub const INVALID_HANDLE_VALUE: u64 = 0xFFFF_FFFF; // (HANDLE)-1 as seen by 32-bit callers
 const INVALID_FILE_ATTRIBUTES: u64 = 0xFFFF_FFFF;
@@ -199,5 +220,234 @@ impl WinOs {
 
     fn set_last_error(&mut self, code: u32) {
         self.last_error = code;
+    }
+
+    // ---- directory enumeration (FindFirstFileW / FindNextFileW) ----------
+
+    /// FindFirstFileW / FindFirstFileExW: enumerate sandbox entries whose names
+    /// match the wildcard `leaf` inside `dir`, write the first match into
+    /// the guest `WIN32_FIND_DATAW` buffer at `data_ptr`, and return a find
+    /// handle. Returns `INVALID_HANDLE_VALUE` (and sets last-error 2) when
+    /// there are no matches or the directory does not exist.
+    pub(crate) fn find_first_file(
+        &mut self,
+        mem: &mut dyn Memory,
+        pattern: &str,
+        data_ptr: u64,
+    ) -> Result<u64> {
+        // Split the guest path into a directory part and the wildcard leaf.
+        let (dir, leaf) = match pattern.rfind('\\') {
+            Some(pos) => (&pattern[..pos], &pattern[pos + 1..]),
+            None => ("", pattern),
+        };
+
+        let Some(host_dir) = self.host_path(dir) else {
+            self.set_last_error(2); // ERROR_FILE_NOT_FOUND
+            return Ok(INVALID_HANDLE_VALUE);
+        };
+
+        let mut entries: Vec<FindEntry> = Vec::new();
+
+        // Virtual "." entry — the directory itself.
+        if glob_matches(leaf, ".") {
+            let (ctime, atime, mtime) = std::fs::metadata(&host_dir)
+                .as_ref()
+                .map(metadata_times)
+                .unwrap_or((0, 0, 0));
+            entries.push(FindEntry {
+                name: ".".to_string(),
+                is_dir: true,
+                size: 0,
+                ctime,
+                atime,
+                mtime,
+            });
+        }
+
+        // Virtual ".." entry — the parent directory.
+        if glob_matches(leaf, "..") {
+            let (ctime, atime, mtime) = host_dir
+                .parent()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .as_ref()
+                .map(metadata_times)
+                .unwrap_or((0, 0, 0));
+            entries.push(FindEntry {
+                name: "..".to_string(),
+                is_dir: true,
+                size: 0,
+                ctime,
+                atime,
+                mtime,
+            });
+        }
+
+        // Real entries from the host directory.
+        if let Ok(iter) = std::fs::read_dir(&host_dir) {
+            for de in iter.flatten() {
+                let file_name = de.file_name();
+                let name = file_name.to_string_lossy().into_owned();
+                if glob_matches(leaf, &name) {
+                    let meta = de.metadata().ok();
+                    let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let (ctime, atime, mtime) =
+                        meta.as_ref().map(metadata_times).unwrap_or((0, 0, 0));
+                    entries.push(FindEntry { name, is_dir, size, ctime, atime, mtime });
+                }
+            }
+        }
+
+        // Sort case-insensitively for determinism.  "." and ".." sort before
+        // alphabetic names (ASCII 0x2E < 0x61) so they naturally come first.
+        entries.sort_by(|a, b| {
+            a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
+        });
+
+        if entries.is_empty() {
+            self.set_last_error(2); // ERROR_FILE_NOT_FOUND
+            return Ok(INVALID_HANDLE_VALUE);
+        }
+
+        // Marshal the first entry into the guest buffer.
+        write_find_data(mem, data_ptr, &entries[0])?;
+
+        // Allocate a find handle from the same monotonic counter as file
+        // handles (but we do NOT add it to `self.files`, so is_file_handle
+        // correctly returns false for find handles).
+        let h = self.next_handle;
+        self.next_handle += 4;
+        self.find_handles.insert(h, FindState { entries, pos: 1 });
+
+        Ok(h)
+    }
+
+    /// FindNextFileW: advance to the next matching entry and marshal it.
+    /// Returns TRUE (1) on success; sets last-error ERROR_NO_MORE_FILES (18)
+    /// and returns FALSE (0) when the list is exhausted or the handle is unknown.
+    pub(crate) fn find_next_file(
+        &mut self,
+        mem: &mut dyn Memory,
+        handle: u64,
+        data_ptr: u64,
+    ) -> Result<u64> {
+        let Some(state) = self.find_handles.get_mut(&handle) else {
+            self.set_last_error(18); // ERROR_NO_MORE_FILES
+            return Ok(0);
+        };
+        if state.pos < state.entries.len() {
+            let entry = state.entries[state.pos].clone();
+            state.pos += 1;
+            write_find_data(mem, data_ptr, &entry)?;
+            Ok(1)
+        } else {
+            self.set_last_error(18); // ERROR_NO_MORE_FILES
+            Ok(0)
+        }
+    }
+
+    /// FindClose: release a find handle. Always returns TRUE; lenient for
+    /// unknown handles (a close after exhaustion is harmless).
+    pub(crate) fn find_close(&mut self, handle: u64) -> u64 {
+        self.find_handles.remove(&handle);
+        1 // TRUE
+    }
+}
+
+// ---- free helpers -----------------------------------------------------------
+
+/// Write a `WIN32_FIND_DATAW` (592 bytes, little-endian) into guest memory.
+///
+/// Byte layout:
+/// ```text
+///   0  dwFileAttributes  DWORD
+///   4  ftCreationTime    FILETIME (low @ 4, high @ 8)
+///  12  ftLastAccessTime  FILETIME (low @12, high @16)
+///  20  ftLastWriteTime   FILETIME (low @20, high @24)
+///  28  nFileSizeHigh     DWORD   (high BEFORE low)
+///  32  nFileSizeLow      DWORD
+///  36  dwReserved0       DWORD
+///  40  dwReserved1       DWORD
+///  44  cFileName[260]    WCHAR[260] = 520 bytes
+/// 564  cAlternateFileName[14] WCHAR[14] = 28 bytes  (written as a single NUL)
+/// ```
+fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry) -> Result<()> {
+    // Zero the entire 592-byte structure first.
+    mem.write(ptr, &[0u8; 592])?;
+
+    // dwFileAttributes
+    let attrs: u32 = if entry.is_dir {
+        FILE_ATTRIBUTE_DIRECTORY as u32 // 0x10
+    } else {
+        FILE_ATTRIBUTE_NORMAL as u32 // 0x80
+    };
+    mem.write_u32(ptr, attrs)?;
+
+    // ftCreationTime (low DWORD @ 4, high DWORD @ 8)
+    mem.write_u32(ptr + 4, entry.ctime as u32)?;
+    mem.write_u32(ptr + 8, (entry.ctime >> 32) as u32)?;
+
+    // ftLastAccessTime (low @ 12, high @ 16)
+    mem.write_u32(ptr + 12, entry.atime as u32)?;
+    mem.write_u32(ptr + 16, (entry.atime >> 32) as u32)?;
+
+    // ftLastWriteTime (low @ 20, high @ 24)
+    mem.write_u32(ptr + 20, entry.mtime as u32)?;
+    mem.write_u32(ptr + 24, (entry.mtime >> 32) as u32)?;
+
+    // nFileSizeHigh @ 28 (HIGH comes BEFORE low)
+    mem.write_u32(ptr + 28, (entry.size >> 32) as u32)?;
+    // nFileSizeLow @ 32
+    mem.write_u32(ptr + 32, entry.size as u32)?;
+
+    // cFileName[260] starting at offset 44 (520 bytes).
+    WinOs::write_wstr(mem, ptr + 44, &entry.name, 260)?;
+
+    // cAlternateFileName[14] at offset 564 is already zeroed (NUL = no 8.3 name).
+
+    Ok(())
+}
+
+/// Convert `std::fs::Metadata` timestamps to FILETIME values
+/// (100-nanosecond intervals since 1601-01-01 00:00:00 UTC).
+/// Returns `(ctime, atime, mtime)`. Any unavailable time becomes 0.
+fn metadata_times(meta: &std::fs::Metadata) -> (u64, u64, u64) {
+    /// Difference in 100-ns units between the Windows epoch (1601-01-01) and
+    /// the UNIX epoch (1970-01-01): 11644473600 seconds × 10_000_000.
+    const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
+    let to_ft = |res: std::io::Result<std::time::SystemTime>| -> u64 {
+        res.ok()
+            .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| {
+                d.as_secs() * 10_000_000
+                    + d.subsec_nanos() as u64 / 100
+                    + EPOCH_DIFF
+            })
+            .unwrap_or(0)
+    };
+    (to_ft(meta.created()), to_ft(meta.accessed()), to_ft(meta.modified()))
+}
+
+/// Case-insensitive wildcard glob: `*` matches any run of characters (including
+/// empty), `?` matches exactly one character. `*.*` is treated as `*`
+/// (matches everything, including names with no dot) per Windows convention.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let effective_pat: &str = if pattern == "*.*" { "*" } else { pattern };
+    let p: Vec<char> = effective_pat.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let n: Vec<char> = name.chars().map(|c| c.to_ascii_lowercase()).collect();
+    glob_ci(&p, &n)
+}
+
+/// Recursive case-insensitive glob core (operates on char slices that have
+/// already been lower-cased).
+fn glob_ci(p: &[char], n: &[char]) -> bool {
+    match p.first() {
+        None => n.is_empty(),
+        Some('*') => {
+            // '*' matches 0 or more characters from `n`.
+            (0..=n.len()).any(|i| glob_ci(&p[1..], &n[i..]))
+        }
+        Some('?') => !n.is_empty() && glob_ci(&p[1..], &n[1..]),
+        Some(pc) => matches!(n.first(), Some(nc) if *nc == *pc) && glob_ci(&p[1..], &n[1..]),
     }
 }

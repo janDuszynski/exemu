@@ -175,6 +175,12 @@ pub enum Api {
     GetFileAttributesW,
     DeleteFileW,
     GetModuleFileNameW,
+    /// FindFirstFileW / FindFirstFileExW — begin a sandbox directory scan;
+    /// `ex` selects which register holds the find-data buffer pointer (arg1 for
+    /// the plain form, arg2 for the Ex form whose arg1 is fInfoLevelId).
+    FindFirstFileW { ex: bool },
+    FindNextFileW,
+    FindClose,
     GlobalAlloc,
     GlobalReAlloc,
     GlobalLock,
@@ -536,14 +542,18 @@ impl Api {
                 Api::WinStub { r: 0, argc: win32_argc(dll, name).unwrap_or(0) } // ERROR_SUCCESS
             }
 
-            // Directory enumeration against nothing: no matches.
-            "FindFirstFileW" | "FindFirstFileA" | "FindFirstFileExW" => {
-                Api::WinStub { r: u64::MAX, argc: win32_argc(dll, name).unwrap_or(0) } // INVALID_HANDLE_VALUE
+            // Directory enumeration against the sandbox.
+            "FindFirstFileW" => Api::FindFirstFileW { ex: false },
+            "FindFirstFileExW" => Api::FindFirstFileW { ex: true },
+            // A-variants: no wide-string handling; stub as "no results".
+            "FindFirstFileA" | "FindFirstFileExA" => {
+                Api::WinStub { r: u64::MAX, argc: win32_argc(dll, name).unwrap_or(0) }
             }
-            "FindNextFileW" | "FindNextFileA" => {
+            "FindNextFileW" => Api::FindNextFileW,
+            "FindNextFileA" => {
                 Api::WinStub { r: FALSE, argc: win32_argc(dll, name).unwrap_or(0) }
             }
-            "FindClose" => Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) },
+            "FindClose" => Api::FindClose,
 
             _ => Api::Unsupported {
                 sym: format!("{dll}!{name}"),
@@ -610,7 +620,9 @@ impl Api {
             Api::LstrcpynW => 3,
             // Filesystem.
             Api::CloseHandle | Api::DeleteFileW | Api::GetFileAttributesW | Api::GlobalLock
-            | Api::GlobalFreeUnlock => 1,
+            | Api::GlobalFreeUnlock | Api::FindClose => 1,
+            Api::FindFirstFileW { ex: false } | Api::FindNextFileW => 2,
+            Api::FindFirstFileW { ex: true } => 6,
             Api::GetVersion => 0,
             Api::GetVersionEx => 1,
             // GUI.
@@ -2136,6 +2148,25 @@ impl WinOs {
             Api::DeleteFileW => {
                 let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
                 ret(self.delete_file(&name) as u64)
+            }
+            Api::FindFirstFileW { ex } => {
+                // FindFirstFileW(lpFileName, lpFindFileData)
+                // FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, ...)
+                // Buffer pointer is arg1 for the plain form, arg2 for the Ex form.
+                let pattern = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+                let buf_arg = if *ex { 2 } else { 1 };
+                let data_ptr = self.arg(cpu, mem, buf_arg)?;
+                ret(self.find_first_file(mem, &pattern, data_ptr)?)
+            }
+            Api::FindNextFileW => {
+                // FindNextFileW(hFind, lpFindFileData)
+                let handle = self.arg(cpu, mem, 0)?;
+                let data_ptr = self.arg(cpu, mem, 1)?;
+                ret(self.find_next_file(mem, handle, data_ptr)?)
+            }
+            Api::FindClose => {
+                let handle = self.arg(cpu, mem, 0)?;
+                ret(self.find_close(handle))
             }
             Api::GetModuleFileNameW => {
                 let buf = self.arg(cpu, mem, 1)?;

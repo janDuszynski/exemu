@@ -133,6 +133,8 @@ pub struct WinOs {
 
     /// Open guest file handles → host file objects.
     files: std::collections::HashMap<u64, fs::OpenFile>,
+    /// Open directory-enumeration handles (FindFirstFileW / FindNextFileW).
+    find_handles: std::collections::HashMap<u64, fs::FindState>,
     next_handle: u64,
     /// Monotonic source of unique temp-file numbers.
     temp_counter: u32,
@@ -202,6 +204,7 @@ impl WinOs {
             gdi: gdi::Gdi::default(),
             dll: dll::Loader::default(),
             files: std::collections::HashMap::new(),
+            find_handles: std::collections::HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,
             crt_globals: std::collections::HashMap::new(),
