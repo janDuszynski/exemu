@@ -154,9 +154,12 @@ exemu sample <out.exe>
   Handle-returning stubs yield a non-null fake handle so setup proceeds.
 * A **host-backed sandbox filesystem**: `CreateFileW`/`ReadFile`/`WriteFile`/
   `CloseHandle`, `CreateDirectoryW`, `GetTempPathW`/`GetTempFileNameW`,
-  `GetFileSize`/`SetFilePointer`/`GetFileAttributesW`/`DeleteFileW`, and
-  `GetModuleFileNameW`. Guest paths map into a sandbox dir; the executable is
-  copied in so a self-extractor can read its own appended archive.
+  `GetFileSize`/`SetFilePointer`/`GetFileAttributesW`/`DeleteFileW`,
+  `GetModuleFileNameW`, and **directory enumeration**
+  (`FindFirstFileW`/`FindNextFileW`/`FindClose`) with case-insensitive glob,
+  `.`/`..` entries, and `WIN32_FIND_DATAW` size/time fields. Guest paths map
+  into a sandbox dir; the executable is copied in so a self-extractor can read
+  its own appended archive.
 * Data imports, `_initterm` static-constructor execution via re-entrant
   guest calls, and a slice of the `msvcrt` C runtime.
 * **Data imports** (a DLL exporting a variable, not a function). The thunk
