@@ -139,8 +139,9 @@ exemu sample <out.exe>
   set, shifts/rotates, `SHLD`/`SHRD`, `MUL`/`IMUL`/`DIV`/`IDIV`, the `BT`
   bit-test family, `BSF`/`BSR`/`BSWAP`, the bit-count instructions
   `POPCNT`/`TZCNT`/`LZCNT`, `XADD`/`CMPXCHG`, `LOOP`/`JECXZ`, the string ops
-  (`MOVS`/`STOS`/`CMPS`/`LODS`/`SCAS` with `REP`/`REPE`/`REPNE`), and
-  **SSE/SSE2** (moves, logical, scalar+packed float arithmetic, compares and
+  (`MOVS`/`STOS`/`CMPS`/`LODS`/`SCAS` with `REP`/`REPE`/`REPNE`),
+  `RDTSC`/`RDTSCP` (monotonic counter; `RDTSCP` reports `TSC_AUX`=0 for the
+  single-vCPU model), `PAUSE`, and **SSE/SSE2** (moves, logical, scalar+packed float arithmetic, compares and
   conversions) — all with faithful EFLAGS. `CPUID` reports an honest feature
   set (only the instructions actually implemented), so CRTs dispatch onto code
   paths the interpreter can execute rather than into AVX it cannot.
