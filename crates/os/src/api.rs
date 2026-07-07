@@ -136,6 +136,14 @@ pub enum Api {
     Initterm,
     /// Not an import: the thunk that sequences `_initterm` callbacks.
     InittermDriver,
+    /// `__EH_prolog` — MSVC 32-bit C++ SEH frame prolog helper. Called with
+    /// `eax` = the function's scopetable/handler pointer and `[esp]` = the
+    /// return address into the caller. It links a fresh EXCEPTION_REGISTRATION
+    /// frame at `fs:[0]`, saves the caller's `ebp`, repoints `ebp` into the
+    /// frame and returns to the caller (esp ends 16 bytes below the pre-`call`
+    /// value). The no-op stub left `ebp`/`esp`/`fs:[0]` wrong, so the caller's
+    /// next `ebp`-relative store faulted. 32-bit only (guarded to `Bits::B32`).
+    EhProlog,
     /// A CRT startup/teardown hook we can safely no-op, returning 0.
     CrtNoop,
     /// A CRT global-accessor (`__p__fmode`, `__p__commode`, `__p___argc`, …):
@@ -399,6 +407,14 @@ impl Api {
             "exit" | "_exit" | "_cexit" | "_c_exit" => Api::CrtExit,
             "__getmainargs" | "__wgetmainargs" => Api::GetMainArgs,
             "_initterm" | "_initterm_e" => Api::Initterm,
+
+            // MSVC 32-bit C++ SEH frame prolog helper. Builds an
+            // EXCEPTION_REGISTRATION frame, links it at fs:[0] and repoints ebp
+            // into it, then returns to the caller. The classic `__EH_prolog`
+            // pairs with an *inline* epilog (no helper call), so only the
+            // prolog needs a native implementation. x64 uses table-based
+            // unwind, so this never fires in 64-bit.
+            "_EH_prolog" | "__EH_prolog" => Api::EhProlog,
             "fputs" => Api::Fputs,
             "fputc" | "putc" | "putchar" => Api::Fputc,
             "fwrite" => Api::Fwrite,
@@ -647,7 +663,7 @@ impl Api {
             Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
             | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
             | Api::CrtNoop | Api::CrtGlobalPtr { .. } | Api::InittermDriver | Api::ReturnExit
-            | Api::Fputs | Api::Fputc | Api::Fwrite | Api::Puts => 0,
+            | Api::Fputs | Api::Fputc | Api::Fwrite | Api::Puts | Api::EhProlog => 0,
             // Win32 string helpers.
             Api::CharNextA | Api::CharNextW | Api::LstrlenA | Api::LstrlenW => 1,
             Api::CharPrevW | Api::LstrcpyW | Api::LstrcatW | Api::LstrcmpW | Api::LstrcmpiW => 2,
@@ -1613,6 +1629,8 @@ impl WinOs {
                     }
                 }
             }
+            Api::EhProlog => self.eh_prolog(cpu, mem),
+
             // A constructor just returned to the driver thunk: run the next
             // one, or return to _initterm's original caller when done.
             Api::InittermDriver => self.initterm_advance(cpu, mem),
@@ -2801,6 +2819,49 @@ impl WinOs {
 
     /// Called when a `_initterm` callback returns to the driver thunk. Runs
     /// the next callback, or unwinds back to `_initterm`'s original caller.
+    /// MSVC 32-bit C++ SEH frame prolog (`__EH_prolog`).
+    ///
+    /// The compiler emits `mov eax, <scopetable>` / `call __EH_prolog` at the
+    /// top of a function that uses structured/`try` exception handling. The
+    /// helper builds an `EXCEPTION_REGISTRATION` frame on the stack, links it
+    /// at `fs:[0]`, saves the caller's `ebp` and repoints `ebp` into the frame,
+    /// then returns to the caller. We compute the end state directly instead of
+    /// replaying its internal `push`/`ret` dance.
+    ///
+    /// Entry: `esp = S`, `mem[S] = retaddr`, `eax = scopetable`,
+    /// `ebp = caller_ebp`, `mem[fs:0] = old_head`.
+    /// Exit: `mem[S-4] = 0xFFFFFFFF` (trylevel −1), `mem[S-8] = scopetable`,
+    /// `mem[S-12] = old_head`, `mem[S] = caller_ebp` (retaddr slot repurposed),
+    /// `fs:[0] = S-12`, `ebp = S`, `esp = S-12`, `rip = retaddr`.
+    /// `eax` is left untouched (the no-op stub wrongly zeroed it).
+    fn eh_prolog(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        // 64-bit uses table-based unwind; this helper is 32-bit only. If it is
+        // ever reached in 64-bit, fall back to a plain return.
+        if self.cfg.is_64bit {
+            return Ok(Outcome::Return(0));
+        }
+        let s = cpu.rsp() & 0xFFFF_FFFF; // S
+        let retaddr = mem.read_u32(s)? as u64;
+        let scopetable = cpu.gpr_read(Reg::Rax as u8, 4) as u32;
+        let caller_ebp = cpu.gpr_read(Reg::Rbp as u8, 4) as u32;
+        let fs0 = exemu_cpu::FS_BASE_32;
+        let old_head = mem.read_u32(fs0)?;
+
+        let m4 = s.wrapping_sub(4) & 0xFFFF_FFFF;
+        let m8 = s.wrapping_sub(8) & 0xFFFF_FFFF;
+        let m12 = s.wrapping_sub(12) & 0xFFFF_FFFF;
+        mem.write_u32(m4, 0xFFFF_FFFF)?; // trylevel = -1
+        mem.write_u32(m8, scopetable)?; // scopetable / handler pointer
+        mem.write_u32(m12, old_head)?; // previous SEH frame head
+        mem.write_u32(s, caller_ebp)?; // retaddr slot now holds saved ebp
+        mem.write_u32(fs0, m12 as u32)?; // fs:[0] = new frame head (S-12)
+
+        cpu.gpr_write(Reg::Rbp as u8, 4, s); // ebp = S
+        cpu.set_rsp(m12); // esp = S-12
+        cpu.rip = retaddr; // return to caller
+        Ok(Outcome::Resume)
+    }
+
     fn initterm_advance(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let next = self
             .initterm_stack

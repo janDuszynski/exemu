@@ -218,6 +218,7 @@ name = "exemu-os"
 version = "0.0.1"
 dependencies = [
  "exemu-core",
+ "exemu-cpu",
  "exemu-loader",
  "exemu-memory",
 ]
