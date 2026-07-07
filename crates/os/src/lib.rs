@@ -160,6 +160,14 @@ pub struct WinOs {
     /// separate namespace. The MSVC CRT keeps its per-thread data pointer here.
     fls_slots: Vec<Option<u64>>,
 
+    /// In-memory registry hive: full canonical key path → value map.
+    /// Value map: value name → (REG_* type, raw bytes). The default value
+    /// for a key uses the empty string as its name.
+    reg_hive: HashMap<String, HashMap<String, (u32, Vec<u8>)>>,
+    /// Open registry handles (HKEY values allocated by RegCreateKeyExW /
+    /// RegOpenKeyExW) → the canonical key path they refer to.
+    reg_handles: HashMap<u64, String>,
+
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
@@ -216,6 +224,8 @@ impl WinOs {
             env: default_environment(),
             tls_slots: Vec::new(),
             fls_slots: Vec::new(),
+            reg_hive: HashMap::new(),
+            reg_handles: HashMap::new(),
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
             function_table: Vec::new(),
@@ -497,6 +507,30 @@ impl WinOs {
             *slot = None;
         }
         true
+    }
+
+    // ---- in-memory registry hive ----------------------------------------
+
+    /// Map a predefined HKEY constant to its canonical root name string.
+    fn reg_hkey_root(hkey: u64) -> Option<&'static str> {
+        match hkey {
+            0x8000_0000 => Some("HKCR"),
+            0x8000_0001 => Some("HKCU"),
+            0x8000_0002 => Some("HKLM"),
+            0x8000_0003 => Some("HKU"),
+            0x8000_0005 => Some("HKCC"),
+            _ => None,
+        }
+    }
+
+    /// Resolve any open HKEY (predefined root or allocated handle) to its
+    /// canonical key-path string. Returns `None` for an unknown handle
+    /// (the caller should return ERROR_INVALID_HANDLE = 6).
+    pub(crate) fn reg_resolve(&self, hkey: u64) -> Option<String> {
+        if let Some(root) = Self::reg_hkey_root(hkey) {
+            return Some(root.to_string());
+        }
+        self.reg_handles.get(&hkey).cloned()
     }
 
     // ---- environment -----------------------------------------------------
