@@ -231,7 +231,7 @@ catch resumes execution, an unmatched throw terminates like `std::terminate`.
 | **7-Zip installer** | 64-bit MSVC GUI | **installs end to end** — drives its dialog, "clicks" Install, decompresses its LZMA archive, writes all 107 files + registry, exits 0 (~496M instructions) |
 | **extracted `7z.exe`** | 64-bit console | **runs and prints its banner/usage** (`7-Zip 26.02 … Igor Pavlov`); `7z i` also runs |
 | generated `hello.exe` | 64-bit console | **runs fully**, prints output incl. an SSE2 computation, exits 0 |
-| Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; inner program runs CRT init + setup + SEH frame build for ~4.7M instructions before a downstream fault |
+| Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; inner program runs CRT init + setup + SEH frame build + sync init for ~4.7M instructions; stops on an unimplemented instruction (`group5 /7`) at 0x40000c |
 | SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for ~45M instructions before a fault deep in unpacked code |
 
 7-Zip is only an example — the same generic path drives any dialog-based
