@@ -41,7 +41,7 @@ const LOW32: u128 = 0xFFFF_FFFF;
 /// implement falls through to a clear "unsupported" error.
 pub(crate) fn is_sse(op2: u8) -> bool {
     matches!(op2,
-        0x10..=0x17 | 0x28..=0x2F | 0x51..=0x5F |
+        0x10..=0x17 | 0x28..=0x2F | 0x50..=0x5F |
         0x60..=0x76 | 0x7E | 0x7F |
         0xC6 | 0xD0..=0xFE)
 }
@@ -222,6 +222,24 @@ impl Interpreter {
             }
 
             // ---- SQRT (51) ----------------------------------------------
+            // ---- MOVMSKPS / MOVMSKPD (NP/66 0F 50 /r) ------------------
+            // Sign bits of the packed floats → low bits of a GP register.
+            0x50 => {
+                let v = self.sse_rm(ctx, mem, 16)?;
+                let mask = match kind {
+                    // 4 f32 lanes: sign bits at 31/63/95/127.
+                    Sse::Ps => {
+                        ((v >> 31) & 1) | ((v >> 62) & 2) | ((v >> 93) & 4) | ((v >> 124) & 8)
+                    }
+                    // 2 f64 lanes: sign bits at 63/127.
+                    Sse::Pd => ((v >> 63) & 1) | ((v >> 126) & 2),
+                    // F3/F2 0F 50 are not defined encodings.
+                    _ => return unsupported(op2, ctx, "movmsk ss/sd"),
+                } as u64;
+                let size = if ctx.pfx.w() { 8 } else { 4 };
+                self.write_reg_field(ctx, size, mask);
+            }
+
             0x51 => self.sse_unary(ctx, mem, kind, f64::sqrt)?,
 
             // ---- Bitwise logic: ANDPS/ANDNPS/ORPS/XORPS (54-57) --------

@@ -168,6 +168,22 @@ fn pcmpeqb_then_pmovmskb_finds_zero_bytes() {
 }
 
 #[test]
+fn movmskps_movmskpd_extract_sign_bits() {
+    // xmm0 sign bits set on f32 lane 0 (bit 31) and lane 3 (bit 127).
+    let v = (1u128 << 127) | (1u128 << 31);
+    // movmskps eax, xmm0 → lanes 0 and 3 → 0b1001 = 9.
+    let (cpu, _) = run_with(&[0x0F, 0x50, 0xC0, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = v;
+    });
+    assert_eq!(cpu.state().reg(exemu_core::Reg::Rax), 0b1001);
+    // movmskpd eax, xmm0 → f64 lanes at bits 63 (clear) and 127 (set) → 0b10.
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0x50, 0xC0, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = v;
+    });
+    assert_eq!(cpu.state().reg(exemu_core::Reg::Rax), 0b10);
+}
+
+#[test]
 fn paddb_adds_per_byte_with_wrap() {
     // paddb xmm0, xmm1: 0xFF + 0x01 wraps to 0x00 in every byte lane.
     let code = [0x66, 0x0F, 0xFC, 0xC1, 0xF4];
