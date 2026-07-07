@@ -530,6 +530,15 @@ impl Api {
                 Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
+            // DLL search-path setters (BOOL): we have a single flat module map,
+            // so these are no-ops — but they MUST report success. A FALSE return
+            // can push callers onto an error path, and (more importantly) the
+            // looked-up argc keeps the 32-bit stdcall stack balanced (each takes
+            // one DWORD/pointer arg; argc 0 leaked esp and crashed Firefox).
+            "SetDefaultDllDirectories" | "SetDllDirectoryW" | "SetDllDirectoryA" => {
+                Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+
             // Critical sections / interlocked list heads: we run single-threaded,
             // so these are no-ops — but the BOOL-returning ones must report
             // success (the CRT aborts with "Runtime Error!" if lock init fails).
@@ -736,7 +745,10 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "DeleteObject" | "CreateBrushIndirect" | "CreateFontIndirectW" | "RegCloseKey"
         | "SHBrowseForFolderW" | "SHFileOperationW" | "OleInitialize" | "CoTaskMemFree"
         | "ImageList_Destroy" | "GetThreadDesktop" | "LoadCursorA" | "LoadIconA"
-        | "HeapDestroy" => 1,
+        | "HeapDestroy"
+        // DLL search-path setters: each takes one DWORD/pointer argument.
+        // BOOL SetDefaultDllDirectories(DWORD); BOOL SetDllDirectory[AW](LPCTSTR).
+        | "SetDefaultDllDirectories" | "SetDllDirectoryW" | "SetDllDirectoryA" => 1,
 
         // --- 2 args ---
         "SetConsoleCtrlHandler" | "SetThreadPriority"
@@ -2812,6 +2824,29 @@ impl WinOs {
                 cpu.set_reg(Reg::Rax, 0);
                 Ok(Outcome::Resume)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the DLL search-path setters are 32-bit stdcall functions
+    /// that each take one DWORD/pointer argument. If their stub reports argc 0
+    /// it fails to pop that argument, leaking 4 bytes of esp per call — the
+    /// corruption that made a later `ret` wild-jump and crashed the Firefox
+    /// installer. They must report argc 1 and return TRUE (BOOL success).
+    #[test]
+    fn dll_directory_setters_pop_one_arg_and_return_true() {
+        for name in ["SetDefaultDllDirectories", "SetDllDirectoryW", "SetDllDirectoryA"] {
+            assert_eq!(win32_argc("kernel32", name), Some(1), "{name} argc");
+            let api = Api::classify("kernel32", name);
+            assert_eq!(api.argc(), 1, "{name} classified argc");
+            assert!(
+                matches!(api, Api::WinStub { r: TRUE, argc: 1 }),
+                "{name} must be a success-returning stub that pops 1 arg, got {api:?}"
+            );
         }
     }
 }
