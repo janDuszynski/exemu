@@ -865,13 +865,11 @@ fn build_sse(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
         8 => sse_int(rng),
         9 => sse_shift_imm(rng),
         10 => sse_shift_var(rng),
-        _ => {
-            if rng.boolean() {
-                sse_shuffle(rng)
-            } else {
-                sse_pmovmskb(rng, bits)
-            }
-        }
+        _ => match rng.below(3) {
+            0 => sse_shuffle(rng),
+            1 => sse_pmovmskb(rng, bits),
+            _ => sse_movmsk(rng, bits),
+        },
     }
 }
 
@@ -1020,6 +1018,29 @@ fn sse_pmovmskb(rng: &mut Rng, bits: Bits) -> Trial {
     }
     b.extend([0x0F, 0xD7, modrm_reg(reg, rm)]);
     Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "pmovmskb".into() }
+}
+
+/// MOVMSKPS (NP) / MOVMSKPD (66) — sign bits of the packed floats into a GP
+/// register. Register form only (the memory form is #UD).
+fn sse_movmsk(rng: &mut Rng, bits: Bits) -> Trial {
+    let pd = rng.boolean();
+    let rexw = bits == Bits::B64 && rng.boolean();
+    let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8); // reg = GP dst, rm = xmm src
+    let mut b = Vec::new();
+    if pd {
+        b.push(0x66);
+    }
+    if rexw {
+        b.push(0x48);
+    }
+    b.extend([0x0F, 0x50, modrm_reg(reg, rm)]);
+    Trial {
+        xmm_nan: 0,
+        bytes: b,
+        defined_flags: 0,
+        skip_reg: 0,
+        label: if pd { "movmskpd" } else { "movmskps" }.into(),
+    }
 }
 
 fn sse_shift_imm(rng: &mut Rng) -> Trial {
