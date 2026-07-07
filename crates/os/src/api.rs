@@ -1016,18 +1016,40 @@ impl WinOs {
             Api::HeapReAlloc => {
                 // HeapReAlloc(hHeap, dwFlags, lpMem, dwBytes)
                 let old = self.arg(cpu, mem, 2)?;
-                let size = self.arg(cpu, mem, 3)?;
-                let new = self.heap_alloc(size);
+                let new_size = self.arg(cpu, mem, 3)?;
+                let new = self.heap_alloc(new_size);
                 if new != 0 && old != 0 {
-                    // Best-effort copy; we do not track the old size.
-                    for i in 0..size {
+                    // Copy exactly min(old_size, new_size) bytes.  If the old
+                    // pointer is untracked (a foreign/pre-bridge allocation) fall
+                    // back to copying new_size bytes — the pre-P3.3 behaviour —
+                    // so callers that never went through heap_alloc still work.
+                    let old_size = self.heap_sizes.get(&old).copied().unwrap_or(new_size);
+                    let copy_len = old_size.min(new_size);
+                    for i in 0..copy_len {
                         let b = mem.read_u8(old + i)?;
                         mem.write_u8(new + i, b)?;
                     }
                 }
                 ret(new)
             }
-            Api::HeapFree => ret(TRUE),
+            Api::HeapFree => {
+                // HeapFree(hHeap, dwFlags, lpMem)
+                // Remove the allocation record.  If this was the last block
+                // bumped onto the arena, roll heap_next back to reclaim it —
+                // simple "last-block free" that reduces arena exhaustion for
+                // programs that alloc/realloc/free in a tight loop.
+                // Always returns TRUE (lenient even for unknown/null pointers).
+                let ptr = self.arg(cpu, mem, 2)?;
+                if ptr != 0 {
+                    if let Some(sz) = self.heap_sizes.remove(&ptr) {
+                        // heap_next was set to ptr + sz by heap_alloc.
+                        if self.heap_next == ptr + sz {
+                            self.heap_next = ptr;
+                        }
+                    }
+                }
+                ret(TRUE)
+            }
 
             Api::VirtualAlloc => {
                 // VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect)

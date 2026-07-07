@@ -171,3 +171,136 @@ fn exit_terminates_process() {
     let exit = os.intercept(thunk, &mut cpu, &mut mem).unwrap();
     assert_eq!(exit, Some(Exit::ProcessExit(7)));
 }
+
+// ── Heap per-allocation size tracking (roadmap P3.3) ─────────────────────────
+
+/// Drive a kernel32 API through intercept and return RAX, using the Windows
+/// x64 calling convention (RCX, RDX, R8, R9).
+fn call_k32(
+    os: &mut WinOs,
+    mem: &mut VirtualMemory,
+    cpu: &mut CpuState,
+    name: &str,
+) -> u64 {
+    let thunk = os.resolve_import("kernel32.dll", &ImportSymbol::Named(name.into()));
+    cpu.set_rsp(STACK);
+    mem.write_u64(STACK, RET_ADDR).unwrap();
+    cpu.rip = thunk;
+    let exit = os.intercept(thunk, cpu, mem).unwrap();
+    assert_eq!(exit, Some(Exit::Continue));
+    assert_eq!(cpu.rip, RET_ADDR, "{name} did not return to caller");
+    assert_eq!(cpu.rsp(), STACK + 8, "{name} did not unwind stack");
+    cpu.reg(Reg::Rax)
+}
+
+const HEAP: u64 = 0x00AB_0000; // HANDLE_PROCESS_HEAP sentinel
+
+#[test]
+fn heap_realloc_grow_preserves_data() {
+    // HeapAlloc 0x20 bytes, fill with a pattern, HeapReAlloc to 0x40,
+    // assert the first 0x20 bytes are preserved (not over-read or zeroed).
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+
+    // HeapAlloc(HEAP, 0, 0x20)
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, 0x20);
+    let ptr = call_k32(&mut os, &mut mem, &mut cpu, "HeapAlloc");
+    assert_ne!(ptr, 0, "HeapAlloc must succeed");
+
+    // Write a known byte pattern into the block.
+    for i in 0..0x20u64 {
+        mem.write_u8(ptr + i, (0xA0 + i) as u8).unwrap();
+    }
+
+    // HeapReAlloc(HEAP, 0, ptr, 0x40) — grow the block
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, ptr);
+    cpu.set_reg(Reg::R9, 0x40);
+    let ptr2 = call_k32(&mut os, &mut mem, &mut cpu, "HeapReAlloc");
+    assert_ne!(ptr2, 0, "HeapReAlloc must succeed");
+
+    // First 0x20 bytes must match the pattern written before.
+    for i in 0..0x20u64 {
+        let b = mem.read_u8(ptr2 + i).unwrap();
+        assert_eq!(b, (0xA0 + i) as u8, "byte {i} mismatch after grow realloc");
+    }
+}
+
+#[test]
+fn heap_realloc_shrink_preserves_prefix() {
+    // HeapAlloc 0x40, fill, HeapReAlloc to 0x10; first 0x10 bytes preserved.
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, 0x40);
+    let ptr = call_k32(&mut os, &mut mem, &mut cpu, "HeapAlloc");
+    assert_ne!(ptr, 0);
+
+    for i in 0..0x40u64 {
+        mem.write_u8(ptr + i, (0xC0 + i) as u8).unwrap();
+    }
+
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, ptr);
+    cpu.set_reg(Reg::R9, 0x10);
+    let ptr2 = call_k32(&mut os, &mut mem, &mut cpu, "HeapReAlloc");
+    assert_ne!(ptr2, 0);
+
+    // Only the first 0x10 bytes should have been copied (shrink).
+    for i in 0..0x10u64 {
+        let b = mem.read_u8(ptr2 + i).unwrap();
+        assert_eq!(b, (0xC0 + i) as u8, "byte {i} mismatch after shrink realloc");
+    }
+}
+
+#[test]
+fn heap_free_returns_true() {
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, 0x10);
+    let ptr = call_k32(&mut os, &mut mem, &mut cpu, "HeapAlloc");
+    assert_ne!(ptr, 0);
+
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, ptr);
+    let r = call_k32(&mut os, &mut mem, &mut cpu, "HeapFree");
+    assert_eq!(r, 1, "HeapFree must return TRUE");
+}
+
+#[test]
+fn heap_free_last_block_reclaim() {
+    // Alloc A, free A, alloc B: B should reuse A's address (last-block reclaim).
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+
+    // Alloc A
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, 0x20);
+    let ptr_a = call_k32(&mut os, &mut mem, &mut cpu, "HeapAlloc");
+    assert_ne!(ptr_a, 0);
+
+    // Free A (last block → reclaim)
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, ptr_a);
+    let r = call_k32(&mut os, &mut mem, &mut cpu, "HeapFree");
+    assert_eq!(r, 1);
+
+    // Alloc B — must land at the same address as A
+    cpu.set_reg(Reg::Rcx, HEAP);
+    cpu.set_reg(Reg::Rdx, 0);
+    cpu.set_reg(Reg::R8, 0x20);
+    let ptr_b = call_k32(&mut os, &mut mem, &mut cpu, "HeapAlloc");
+    assert_eq!(ptr_b, ptr_a, "last-block reclaim: B should reuse A's address");
+}
