@@ -212,8 +212,10 @@ Complex apps will hit unimplemented calls.
 
 AVX and x87 floating point; native-themed / GDI+ / DirectX rendering (the
 GDI is a solid-fill/text subset); TLS callbacks and base relocations (images
-load at their preferred base); real threads; **COM** object creation; and the
-registry (Reg* calls are stubbed).
+load at their preferred base); real threads; **COM** object creation; and full
+registry persistence (the W-family `Reg*` create/open/set/query/close/delete
+calls are backed by an in-memory hive that round-trips correctly, but the hive
+is not yet persisted to disk across runs).
 
 **x64 exceptions work:** the `.pdata`/`.xdata` unwind tables are parsed,
 `RtlCaptureContext`/`RtlLookupFunctionEntry`/`RtlVirtualUnwind`/`RtlUnwindEx`
