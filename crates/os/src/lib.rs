@@ -92,6 +92,10 @@ pub struct WinOs {
     interned: HashMap<(String, String), u64>,
     next_thunk: u64,
     heap_next: u64,
+    /// Per-allocation size map: guest ptr → allocated byte count (size.max(1)).
+    /// Populated by every heap_alloc call; used by HeapReAlloc to copy only the
+    /// min(old_size, new_size) bytes and by HeapFree for last-block reclaim.
+    heap_sizes: HashMap<u64, u64>,
     last_error: u32,
 
     /// Thunk address whose interception drives sequential `_initterm`
@@ -187,6 +191,7 @@ impl WinOs {
             interned: HashMap::new(),
             next_thunk: api_base,
             heap_next: heap_base,
+            heap_sizes: HashMap::new(),
             last_error: 0,
             initterm_driver: 0,
             initterm_stack: Vec::new(),
@@ -389,13 +394,18 @@ impl WinOs {
     /// Bump-allocate `size` bytes from the heap arena (always zero-filled,
     /// since the arena is mapped zeroed and never reused). Returns 0 (and
     /// sets ERROR_NOT_ENOUGH_MEMORY) when the arena is exhausted.
+    ///
+    /// Records the allocation in `heap_sizes` so that `HeapReAlloc` can copy
+    /// only the exact old block size, and `HeapFree` can reclaim the last block.
     fn heap_alloc(&mut self, size: u64) -> u64 {
         let align = 16u64;
         let ptr = (self.heap_next + align - 1) & !(align - 1);
-        let end = ptr.checked_add(size.max(1));
+        let stored = size.max(1);
+        let end = ptr.checked_add(stored);
         match end {
             Some(end) if end <= self.cfg.heap_base + self.cfg.heap_size => {
                 self.heap_next = end;
+                self.heap_sizes.insert(ptr, stored);
                 ptr
             }
             _ => {
