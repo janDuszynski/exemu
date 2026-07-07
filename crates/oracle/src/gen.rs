@@ -77,6 +77,23 @@ fn modrm_reg(reg: u8, rm: u8) -> u8 {
     0xC0 | ((reg & 7) << 3) | (rm & 7)
 }
 
+/// Register-index space: 0..8 in 32-bit, 0..16 in 64-bit (REX.R/B reach the
+/// extended r8..r15). Both engines decode identical bytes, so this only widens
+/// the exercised decode path.
+#[inline]
+fn nregs(bits: Bits) -> u32 {
+    if bits == Bits::B64 { 16 } else { 8 }
+}
+
+/// The REX prefix byte needed to encode `reg`/`rm` (their high bit → REX.R/B)
+/// with optional REX.W, or `None` when a plain (no-REX) encoding suffices.
+/// Callers emit it *after* the 0x66 operand-size prefix and before the opcode.
+#[inline]
+fn rex_rb(reg: u8, rm: u8, w: bool) -> Option<u8> {
+    let byte = 0x40 | ((w as u8) << 3) | (((reg >= 8) as u8) << 2) | ((rm >= 8) as u8);
+    (byte != 0x40).then_some(byte)
+}
+
 /// Emit the legacy/REX prefixes for an operand `width` (and an optional F3).
 fn prefixes(b: &mut Vec<u8>, width: u8, f3: bool) {
     if f3 {
@@ -181,10 +198,15 @@ fn alu_rr(rng: &mut Rng, bits: Bits) -> Trial {
     let byte = rng.boolean();
     let dir = rng.boolean(); // false: rm,r  true: r,rm
     let width = if byte { 1 } else { w24(rng, bits) };
-    let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8);
+    let (reg, rm) = (rng.below(nregs(bits)) as u8, rng.below(nregs(bits)) as u8);
     let opcode = (op << 3) | ((dir as u8) << 1) | (!byte as u8);
     let mut b = Vec::new();
-    prefixes(&mut b, width, false);
+    if width == 2 {
+        b.push(0x66);
+    }
+    if let Some(rex) = rex_rb(reg, rm, width == 8) {
+        b.push(rex);
+    }
     b.push(opcode);
     b.push(modrm_reg(reg, rm));
     Trial {
@@ -399,9 +421,14 @@ fn not(rng: &mut Rng, bits: Bits) -> Trial {
 fn test_rr(rng: &mut Rng, bits: Bits) -> Trial {
     let byte = rng.boolean();
     let width = if byte { 1 } else { w24(rng, bits) };
-    let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8);
+    let (reg, rm) = (rng.below(nregs(bits)) as u8, rng.below(nregs(bits)) as u8);
     let mut b = Vec::new();
-    prefixes(&mut b, width, false);
+    if width == 2 {
+        b.push(0x66);
+    }
+    if let Some(rex) = rex_rb(reg, rm, width == 8) {
+        b.push(rex);
+    }
     b.push(if byte { 0x84 } else { 0x85 });
     b.push(modrm_reg(reg, rm));
     Trial { xmm_nan: 0, bytes: b, defined_flags: LOGIC, skip_reg: 0, label: format!("test w{width}") }
