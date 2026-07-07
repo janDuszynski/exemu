@@ -10,9 +10,11 @@ description = "Emulated Windows environment: API thunks and kernel32 implementat
 
 [dependencies]
 exemu-core = { workspace = true }
+exemu-cpu = { workspace = true }
 exemu-loader = { workspace = true }
 
 [dev-dependencies]
+exemu-cpu = { workspace = true }
 exemu-memory = { workspace = true }
 
 [lints.rust]
