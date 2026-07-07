@@ -490,6 +490,15 @@ impl Api {
             // if it fails. Our HeapAlloc ignores the handle and bump-allocates,
             // so any non-null handle works.
             "HeapCreate"
+            // Event/sync objects (roadmap P3.6): these are stubs, not real
+            // signaling objects — we run single-threaded, so a wait never
+            // blocks. CreateEvent[AW]/CreateMutex[AW]/CreateSemaphore[AW] just
+            // need a NON-NULL handle so the caller doesn't null-deref the
+            // returned handle (the Firefox installer stores it and later writes
+            // through it). The looked-up argc keeps the stdcall stack balanced.
+            | "CreateEventA" | "CreateEventW" | "CreateEventExA" | "CreateEventExW"
+            | "CreateMutexA" | "CreateMutexW" | "CreateMutexExA" | "CreateMutexExW"
+            | "CreateSemaphoreA" | "CreateSemaphoreW"
             | "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "SetConsoleTitleA"
             | "FlushConsoleInputBuffer"
             | "SetHandleCount" | "SetThreadPriority"
@@ -563,6 +572,25 @@ impl Api {
             | "LeaveCriticalSection" | "DeleteCriticalSection" | "TryEnterCriticalSection"
             | "SetCriticalSectionSpinCount" | "InitializeSListHead" => {
                 Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+
+            // Event/mutex/semaphore signaling (roadmap P3.6, stub): the
+            // state-changing calls are BOOL and must report success. We keep no
+            // real signaled state (single-threaded), so these are no-ops that
+            // return TRUE with a balanced stdcall stack.
+            "SetEvent" | "ResetEvent" | "PulseEvent"
+            | "ReleaseMutex" | "ReleaseSemaphore" => {
+                Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+
+            // Waits never block in a single-threaded run: report WAIT_OBJECT_0
+            // (0) immediately so the guest proceeds instead of spinning/hanging.
+            // Both were previously Unsupported (argc 0) — the looked-up argc now
+            // keeps the stdcall stack balanced (WaitForMultipleObjects leaked
+            // 16 bytes of esp otherwise).
+            "WaitForSingleObject" | "WaitForSingleObjectEx"
+            | "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" => {
+                Api::WinStub { r: 0, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
             // wsprintf: real (subset) formatting — installers rely on it.
@@ -751,6 +779,8 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         "SetConsoleTitleW" | "FlushConsoleInputBuffer" | "SetHandleCount"
         | "InitializeCriticalSection" | "DeleteCriticalSection" | "EnterCriticalSection"
         | "LeaveCriticalSection" | "TryEnterCriticalSection" | "InitializeSListHead"
+        // Event/sync state changers: BOOL SetEvent(HANDLE) etc. — one handle.
+        | "SetEvent" | "ResetEvent" | "PulseEvent" | "ReleaseMutex"
         | "CloseHandle" | "FindClose" | "FreeLibrary" | "GetFileAttributesW" | "DeleteFileW"
         | "GlobalFree" | "GlobalLock" | "GlobalUnlock" | "RemoveDirectoryW"
         | "SetCurrentDirectoryW" | "GetModuleHandleA" | "GetModuleHandleW" | "Sleep"
@@ -784,7 +814,11 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "GetPropW" | "GetPropA" | "RemovePropW" | "RemovePropA" => 2,
 
         // --- 3 args ---
-        "ExpandEnvironmentStringsW" | "CopyFileW" | "SetFileSecurityW" | "LoadLibraryExW"
+        // BOOL ReleaseSemaphore(HANDLE, LONG, LPLONG); CreateMutex[AW](attr,
+        // bInitialOwner, name); WaitForSingleObjectEx(handle, ms, alertable).
+        "ReleaseSemaphore" | "CreateMutexA" | "CreateMutexW"
+        | "WaitForSingleObjectEx"
+        | "ExpandEnvironmentStringsW" | "CopyFileW" | "SetFileSecurityW" | "LoadLibraryExW"
         | "GetShortPathNameW" | "MoveFileExW" | "CheckDlgButton" | "EnableMenuItem"
         | "InvalidateRect" | "SetClassLongW" | "SetDlgItemTextW" | "SetWindowLongW"
         | "GetClassInfoW" | "OpenProcessToken" | "LookupPrivilegeValueW"
@@ -793,14 +827,23 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "InitializeCriticalSectionEx" | "SetPropW" | "SetPropA" => 3,
 
         // --- 4 args ---
-        "GetModuleFileNameW" | "GetFullPathNameW" | "SetFilePointer" | "SetFileTime"
+        // HANDLE CreateEvent[AW](attr, bManualReset, bInitialState, name) — 4;
+        // CreateSemaphore[AW](attr, init, max, name) — 4; the *Ex event/mutex
+        // forms (attr, name, flags, access) — 4; WaitForMultipleObjects(count,
+        // handles, waitAll, ms) — 4.
+        "CreateEventA" | "CreateEventW" | "CreateEventExA" | "CreateEventExW"
+        | "CreateMutexExA" | "CreateMutexExW"
+        | "CreateSemaphoreA" | "CreateSemaphoreW"
+        | "WaitForMultipleObjects"
+        | "GetModuleFileNameW" | "GetFullPathNameW" | "SetFilePointer" | "SetFileTime"
         | "GetTempFileNameW" | "WritePrivateProfileStringW" | "AppendMenuW" | "DefWindowProcW"
         | "FindWindowExW" | "GetDlgItemTextW" | "MessageBoxW" | "SendMessageW" | "GetMessageW"
         | "SetTimer" | "SystemParametersInfoW" | "DrawTextW" | "FillRect" | "RegEnumKeyW"
         | "OpenDesktopW" | "HeapSetInformation" | "MapWindowPoints" => 4,
 
         // --- 5 args ---
-        "ReadFile" | "WriteFile" | "GetDiskFreeSpaceW" | "CallWindowProcW" | "CreateDialogParamW"
+        "WaitForMultipleObjectsEx"
+        | "ReadFile" | "WriteFile" | "GetDiskFreeSpaceW" | "CallWindowProcW" | "CreateDialogParamW"
         | "DialogBoxParamW" | "PeekMessageW" | "RegOpenKeyExW" | "SHGetFileInfoW"
         | "CoCreateInstance" | "ImageList_Create" => 5,
 
