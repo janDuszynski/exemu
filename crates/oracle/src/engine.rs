@@ -44,7 +44,7 @@ const REGS64: [RegisterX86; 16] = [
 ];
 
 /// The eight low XMM registers (all the generator uses; XMM8-15 need REX).
-const XMMS: [RegisterX86; 8] = [
+const XMMS: [RegisterX86; 16] = [
     RegisterX86::XMM0,
     RegisterX86::XMM1,
     RegisterX86::XMM2,
@@ -53,6 +53,14 @@ const XMMS: [RegisterX86; 8] = [
     RegisterX86::XMM5,
     RegisterX86::XMM6,
     RegisterX86::XMM7,
+    RegisterX86::XMM8,
+    RegisterX86::XMM9,
+    RegisterX86::XMM10,
+    RegisterX86::XMM11,
+    RegisterX86::XMM12,
+    RegisterX86::XMM13,
+    RegisterX86::XMM14,
+    RegisterX86::XMM15,
 ];
 
 /// The observable result of one step.
@@ -158,7 +166,9 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             return Outcome::Fault;
         }
     }
-    for (i, x) in XMMS.iter().enumerate() {
+    // xmm8..15 exist only in 64-bit mode.
+    let nxmm = if bits == Bits::B64 { 16 } else { 8 };
+    for (i, x) in XMMS[..nxmm].iter().enumerate() {
         if uc.reg_write_long(*x, &seed.xmm[i].to_le_bytes()).is_err() {
             return Outcome::Fault;
         }
@@ -178,7 +188,7 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             let rflags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
             let ip = uc.reg_read(ip_reg).unwrap_or(0);
             let mut xmm = [0u128; 16];
-            for (i, x) in XMMS.iter().enumerate() {
+            for (i, x) in XMMS[..nxmm].iter().enumerate() {
                 if let Ok(bytes) = uc.reg_read_long(*x) {
                     if bytes.len() >= 16 {
                         let mut a = [0u8; 16];
@@ -237,7 +247,10 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
     if fa != fb {
         return Some(format!("flags(defined={:#x}) exemu={:#x} unicorn={:#x} Δ={:#x}", trial.defined_flags, fa, fb, fa ^ fb));
     }
-    for i in 0..8 {
+    // xmm8..15 exist only in 64-bit mode; compare them there too (the
+    // generator now reaches them via REX.R/B).
+    let nxmm = if bits == Bits::B64 { 16 } else { 8 };
+    for i in 0..nxmm {
         if !xmm_eq(a.xmm[i], b.xmm[i], trial.xmm_nan) {
             return Some(format!("xmm{i} exemu={:#034x} unicorn={:#034x}", a.xmm[i], b.xmm[i]));
         }
