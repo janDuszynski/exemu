@@ -102,6 +102,7 @@ pub enum Api {
     QueryPerformanceCounter,
     QueryPerformanceFrequency,
     GetSystemTimeAsFileTime,
+    GetSystemTime,
     GetTickCount,
     GetACP,
     SetConsoleCP,
@@ -382,7 +383,8 @@ impl Api {
             "SwitchToThread" => Api::SwitchToThread,
             "QueryPerformanceCounter" => Api::QueryPerformanceCounter,
             "QueryPerformanceFrequency" => Api::QueryPerformanceFrequency,
-            "GetSystemTimeAsFileTime" => Api::GetSystemTimeAsFileTime,
+            "GetSystemTimeAsFileTime" | "GetSystemTimePreciseAsFileTime" => Api::GetSystemTimeAsFileTime,
+            "GetSystemTime" | "GetLocalTime" => Api::GetSystemTime,
             "GetTickCount" | "GetTickCount64" => Api::GetTickCount,
             "GetACP" => Api::GetACP,
             "SetConsoleCP" => Api::SetConsoleCP,
@@ -713,7 +715,7 @@ impl Api {
             Api::IsDebuggerPresent => 0,
             Api::QueryPerformanceCounter => 1,
             Api::QueryPerformanceFrequency => 1,
-            Api::GetSystemTimeAsFileTime => 1,
+            Api::GetSystemTimeAsFileTime | Api::GetSystemTime => 1,
             Api::GetTickCount => 0,
             Api::GetACP => 0,
             Api::SetConsoleCP | Api::SetConsoleOutputCP => 1,
@@ -1339,28 +1341,12 @@ impl WinOs {
             Api::SwitchToThread => self.switch_to_thread(cpu, mem),
             Api::SleepApi { ex } => self.sleep(cpu, mem, if *ex { 2 } else { 1 }),
 
-            Api::QueryPerformanceCounter => {
-                let ptr = self.arg(cpu, mem, 0)?;
-                if ptr != 0 {
-                    mem.write_u64(ptr, 0)?;
-                }
-                ret(TRUE)
-            }
-            Api::QueryPerformanceFrequency => {
-                let ptr = self.arg(cpu, mem, 0)?;
-                if ptr != 0 {
-                    mem.write_u64(ptr, 1_000_000)?;
-                }
-                ret(TRUE)
-            }
-            Api::GetSystemTimeAsFileTime => {
-                let ptr = self.arg(cpu, mem, 0)?;
-                if ptr != 0 {
-                    mem.write_u64(ptr, 0)?;
-                }
-                Ok(Outcome::Return(0))
-            }
-            Api::GetTickCount => ret(0),
+            // Time/date backed by the host clock (roadmap P3.8), see [`crate::time`].
+            Api::QueryPerformanceCounter => self.query_performance_counter(cpu, mem),
+            Api::QueryPerformanceFrequency => self.query_performance_frequency(cpu, mem),
+            Api::GetSystemTimeAsFileTime => self.get_system_time_as_filetime(cpu, mem),
+            Api::GetSystemTime => self.get_system_time(cpu, mem),
+            Api::GetTickCount => self.get_tick_count(),
             Api::GetACP => ret(65001), // UTF-8 code page
 
             Api::SetConsoleCP | Api::SetConsoleOutputCP => ret(TRUE),
