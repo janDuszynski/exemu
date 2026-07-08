@@ -25,6 +25,7 @@ mod fs;
 mod gdi;
 mod sync;
 mod thread;
+mod time;
 mod vm;
 
 use std::collections::HashMap;
@@ -216,6 +217,10 @@ pub struct WinOs {
     /// Instruction ticks since the last preemptive yield (timeslice counter).
     sched_ticks: u64,
 
+    /// Process start instant, the zero for `GetTickCount`/`QueryPerformance
+    /// Counter` (roadmap P3.8).
+    start_time: std::time::Instant,
+
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
@@ -284,6 +289,7 @@ impl WinOs {
             next_tid: 0x1002,
             thread_exit_thunk: 0,
             sched_ticks: 0,
+            start_time: std::time::Instant::now(),
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
             function_table: Vec::new(),
