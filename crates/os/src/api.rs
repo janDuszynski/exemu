@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 use exemu_core::{CpuState, Memory, Reg, Result};
 
+use crate::sync::{SignalOp, SyncKind};
 use crate::{WinOs, HANDLE_PROCESS_HEAP, HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT};
 
 /// The result of servicing an API call.
@@ -68,6 +69,12 @@ pub enum Api {
     VirtualFree,
     VirtualProtect,
     VirtualQuery,
+    /// Real synchronization objects (roadmap P3.6), see [`crate::sync`].
+    CreateSync { kind: crate::sync::SyncKind, ex: bool, wide: bool },
+    OpenSync { wide: bool },
+    SignalSync { op: crate::sync::SignalOp },
+    WaitSingle { ex: bool },
+    WaitMultiple { ex: bool },
     /// EncodePointer/DecodePointer (and the Rtl*/System variants): the CRT's
     /// pointer-obfuscation pair. The only invariant that matters is that
     /// Decode(Encode(p)) == p, so both are the identity on their argument.
@@ -490,15 +497,6 @@ impl Api {
             // if it fails. Our HeapAlloc ignores the handle and bump-allocates,
             // so any non-null handle works.
             "HeapCreate"
-            // Event/sync objects (roadmap P3.6): these are stubs, not real
-            // signaling objects — we run single-threaded, so a wait never
-            // blocks. CreateEvent[AW]/CreateMutex[AW]/CreateSemaphore[AW] just
-            // need a NON-NULL handle so the caller doesn't null-deref the
-            // returned handle (the Firefox installer stores it and later writes
-            // through it). The looked-up argc keeps the stdcall stack balanced.
-            | "CreateEventA" | "CreateEventW" | "CreateEventExA" | "CreateEventExW"
-            | "CreateMutexA" | "CreateMutexW" | "CreateMutexExA" | "CreateMutexExW"
-            | "CreateSemaphoreA" | "CreateSemaphoreW"
             | "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "SetConsoleTitleA"
             | "FlushConsoleInputBuffer"
             | "SetHandleCount" | "SetThreadPriority"
@@ -574,24 +572,27 @@ impl Api {
                 Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
-            // Event/mutex/semaphore signaling (roadmap P3.6, stub): the
-            // state-changing calls are BOOL and must report success. We keep no
-            // real signaled state (single-threaded), so these are no-ops that
-            // return TRUE with a balanced stdcall stack.
-            "SetEvent" | "ResetEvent" | "PulseEvent"
-            | "ReleaseMutex" | "ReleaseSemaphore" => {
-                Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
-            }
-
-            // Waits never block in a single-threaded run: report WAIT_OBJECT_0
-            // (0) immediately so the guest proceeds instead of spinning/hanging.
-            // Both were previously Unsupported (argc 0) — the looked-up argc now
-            // keeps the stdcall stack balanced (WaitForMultipleObjects leaked
-            // 16 bytes of esp otherwise).
-            "WaitForSingleObject" | "WaitForSingleObjectEx"
-            | "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" => {
-                Api::WinStub { r: 0, argc: win32_argc(dll, name).unwrap_or(0) }
-            }
+            // Event/mutex/semaphore/waitable-timer objects with real signaling
+            // state (roadmap P3.6), see [`crate::sync`].
+            "CreateEventA" | "CreateEventW" => Api::CreateSync { kind: SyncKind::Event, ex: false, wide: name.ends_with('W') },
+            "CreateEventExA" | "CreateEventExW" => Api::CreateSync { kind: SyncKind::Event, ex: true, wide: name.ends_with('W') },
+            "CreateMutexA" | "CreateMutexW" => Api::CreateSync { kind: SyncKind::Mutex, ex: false, wide: name.ends_with('W') },
+            "CreateMutexExA" | "CreateMutexExW" => Api::CreateSync { kind: SyncKind::Mutex, ex: true, wide: name.ends_with('W') },
+            "CreateSemaphoreA" | "CreateSemaphoreW" => Api::CreateSync { kind: SyncKind::Semaphore, ex: false, wide: name.ends_with('W') },
+            "CreateSemaphoreExA" | "CreateSemaphoreExW" => Api::CreateSync { kind: SyncKind::Semaphore, ex: true, wide: name.ends_with('W') },
+            "CreateWaitableTimerA" | "CreateWaitableTimerW" => Api::CreateSync { kind: SyncKind::Timer, ex: false, wide: name.ends_with('W') },
+            "CreateWaitableTimerExA" | "CreateWaitableTimerExW" => Api::CreateSync { kind: SyncKind::Timer, ex: true, wide: name.ends_with('W') },
+            "OpenEventA" | "OpenEventW" | "OpenMutexA" | "OpenMutexW" | "OpenSemaphoreA" | "OpenSemaphoreW"
+            | "OpenWaitableTimerA" | "OpenWaitableTimerW" => Api::OpenSync { wide: name.ends_with('W') },
+            "SetEvent" => Api::SignalSync { op: SignalOp::SetEvent },
+            "ResetEvent" => Api::SignalSync { op: SignalOp::ResetEvent },
+            "PulseEvent" => Api::SignalSync { op: SignalOp::PulseEvent },
+            "ReleaseMutex" => Api::SignalSync { op: SignalOp::ReleaseMutex },
+            "ReleaseSemaphore" => Api::SignalSync { op: SignalOp::ReleaseSemaphore },
+            "WaitForSingleObject" => Api::WaitSingle { ex: false },
+            "WaitForSingleObjectEx" => Api::WaitSingle { ex: true },
+            "WaitForMultipleObjects" => Api::WaitMultiple { ex: false },
+            "WaitForMultipleObjectsEx" => Api::WaitMultiple { ex: true },
 
             // wsprintf: real (subset) formatting — installers rely on it.
             "wsprintfW" | "wsprintfA" => Api::WsprintfApi { wide: name.ends_with('W') },
@@ -660,6 +661,23 @@ impl Api {
             Api::VirtualFree => 3,
             Api::VirtualProtect => 4,
             Api::VirtualQuery => 3,
+            // Synchronization-object argc (stdcall cleanup in 32-bit mode).
+            Api::CreateSync { kind, ex, .. } => match (kind, ex) {
+                (SyncKind::Event, _) => 4,           // Create/CreateEx both 4
+                (SyncKind::Mutex, false) => 3,       // (attr, owner, name)
+                (SyncKind::Mutex, true) => 4,        // (attr, name, flags, access)
+                (SyncKind::Semaphore, false) => 4,   // (attr, init, max, name)
+                (SyncKind::Semaphore, true) => 6,    // + flags, access
+                (SyncKind::Timer, false) => 3,       // (attr, manual, name)
+                (SyncKind::Timer, true) => 4,        // (attr, name, flags, access)
+            },
+            Api::OpenSync { .. } => 3,
+            Api::SignalSync { op } => match op {
+                SignalOp::ReleaseSemaphore => 3,
+                _ => 1,
+            },
+            Api::WaitSingle { ex } => if *ex { 3 } else { 2 },
+            Api::WaitMultiple { ex } => if *ex { 5 } else { 4 },
             Api::EncodeDecodePointer => 1,
             Api::GetLastError => 0,
             Api::SetLastError => 1,
@@ -1159,6 +1177,13 @@ impl WinOs {
             Api::VirtualFree => self.virtual_free(cpu, mem),
             Api::VirtualProtect => self.virtual_protect(cpu, mem),
             Api::VirtualQuery => self.virtual_query(cpu, mem),
+
+            // Synchronization objects (roadmap P3.6), see [`crate::sync`].
+            Api::CreateSync { kind, ex, wide } => self.create_sync(cpu, mem, *kind, *ex, *wide),
+            Api::OpenSync { wide } => self.open_sync(cpu, mem, *wide),
+            Api::SignalSync { op } => self.signal_sync(cpu, mem, *op),
+            Api::WaitSingle { .. } => self.wait_single(cpu, mem),
+            Api::WaitMultiple { .. } => self.wait_multiple(cpu, mem),
             Api::EncodeDecodePointer => {
                 // Identity: Decode(Encode(p)) == p. Preserve the pointer so a
                 // later guarded call through it lands on real code, not null.
@@ -1273,7 +1298,7 @@ impl WinOs {
             }
 
             Api::GetCurrentProcessId => ret(0x1000),
-            Api::GetCurrentThreadId => ret(0x1001),
+            Api::GetCurrentThreadId => ret(self.current_tid as u64),
             Api::GetCurrentProcess => ret(u64::MAX), // pseudo-handle (HANDLE)-1
             Api::IsDebuggerPresent => ret(FALSE),
             Api::Sleep => Ok(Outcome::Return(0)),

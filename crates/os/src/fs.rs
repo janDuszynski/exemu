@@ -139,7 +139,19 @@ impl WinOs {
     }
 
     pub(crate) fn close_handle(&mut self, handle: u64) -> bool {
+        if self.kobjects.remove(&handle).is_some() {
+            self.named_kobjects.retain(|_, &mut h| h != handle);
+            return true;
+        }
         self.files.remove(&handle).is_some()
+    }
+
+    /// Allocate a fresh, unique kernel handle value (shared monotonic space
+    /// with file/find handles, so `CloseHandle` can route by lookup).
+    pub(crate) fn alloc_khandle(&mut self) -> u64 {
+        let h = self.next_handle;
+        self.next_handle += 4;
+        h
     }
 
     pub(crate) fn file_size(&self, handle: u64) -> Option<u64> {
@@ -218,7 +230,7 @@ impl WinOs {
         Ok(units.len() as u64)
     }
 
-    fn set_last_error(&mut self, code: u32) {
+    pub(crate) fn set_last_error(&mut self, code: u32) {
         self.last_error = code;
     }
 
