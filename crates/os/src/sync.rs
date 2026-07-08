@@ -15,6 +15,7 @@
 use exemu_core::{CpuState, Memory, Result};
 
 use crate::api::Outcome;
+use crate::thread::WaitDesc;
 use crate::WinOs;
 
 // Wait return codes.
@@ -46,16 +47,20 @@ pub(crate) enum KObject {
     Mutex { owner: Option<u32>, recursion: u32 },
     Semaphore { count: i32, max: i32 },
     Timer { manual_reset: bool, signaled: bool },
+    /// A thread handle (roadmap P3.4): signaled once the thread has exited, and
+    /// stays signaled (manual, like a terminated-process object).
+    Thread { exited: bool },
 }
 
 impl KObject {
     /// Whether a wait would be satisfied right now (without consuming), for the
     /// thread `tid` (mutexes are signaled to their current owner).
-    fn is_signaled(&self, tid: u32) -> bool {
+    pub(crate) fn is_signaled(&self, tid: u32) -> bool {
         match self {
             KObject::Event { signaled, .. } | KObject::Timer { signaled, .. } => *signaled,
             KObject::Semaphore { count, .. } => *count > 0,
             KObject::Mutex { owner, .. } => owner.is_none() || *owner == Some(tid),
+            KObject::Thread { exited } => *exited,
         }
     }
 
@@ -94,6 +99,9 @@ impl KObject {
                 }
                 Some(_) => false,
             },
+            // A thread object is a latch: waiting on an exited thread always
+            // succeeds and never consumes.
+            KObject::Thread { exited } => *exited,
         }
     }
 }
@@ -283,18 +291,22 @@ impl WinOs {
         let handle = self.arg(cpu, mem, 0)?;
         let timeout = self.arg(cpu, mem, 1)? as u32;
         let tid = self.current_tid;
-        match self.kobjects.get_mut(&handle) {
-            None => Ok(Outcome::Return(WAIT_OBJECT_0)), // pseudo/foreign handle
-            Some(obj) => {
-                if obj.acquire(tid) {
-                    Ok(Outcome::Return(WAIT_OBJECT_0))
-                } else if timeout == 0 {
-                    Ok(Outcome::Return(WAIT_TIMEOUT))
-                } else {
-                    // No other runnable thread yet (P3.4 blocks here instead).
-                    Ok(Outcome::Return(WAIT_OBJECT_0))
-                }
-            }
+        // Acquire immediately if signaled (unknown handles count as signaled).
+        let acquired = self.kobjects.get_mut(&handle).map_or(true, |o| o.acquire(tid));
+        if acquired {
+            return Ok(Outcome::Return(WAIT_OBJECT_0));
+        }
+        if timeout == 0 {
+            return Ok(Outcome::Return(WAIT_TIMEOUT));
+        }
+        // Block: switch to another runnable thread. When we are scheduled again
+        // (once the object is signaled) intercept re-runs this wait and it
+        // acquires. If nobody else can run, fall back to WAIT_OBJECT_0 so a
+        // single-threaded program does not hang.
+        if self.block_and_switch(cpu, WaitDesc { handles: vec![handle], all: true }) {
+            Ok(Outcome::Resume)
+        } else {
+            Ok(Outcome::Return(WAIT_OBJECT_0))
         }
     }
 
@@ -312,30 +324,37 @@ impl WinOs {
             handles.push(self.read_ptr(mem, arr + i * stride)?);
         }
 
-        if wait_all {
-            let all = handles.iter().all(|h| self.kobjects.get(h).map_or(true, |o| o.is_signaled(tid)));
-            if all || timeout != 0 {
+        // Peek satisfiability *before* consuming, so a partial set is not
+        // drained when we are going to block instead.
+        let signaled = |h: &u64| self.kobjects.get(h).map_or(true, |o| o.is_signaled(tid));
+        let satisfiable = if wait_all {
+            handles.iter().all(signaled)
+        } else {
+            handles.iter().any(signaled)
+        };
+        if satisfiable {
+            if wait_all {
                 for h in &handles {
                     if let Some(o) = self.kobjects.get_mut(h) {
                         o.acquire(tid);
                     }
                 }
-                Ok(Outcome::Return(WAIT_OBJECT_0))
-            } else {
-                Ok(Outcome::Return(WAIT_TIMEOUT))
+                return Ok(Outcome::Return(WAIT_OBJECT_0));
             }
-        } else {
             for (i, h) in handles.iter().enumerate() {
                 let acquired = self.kobjects.get_mut(h).map_or(true, |o| o.acquire(tid));
                 if acquired {
                     return Ok(Outcome::Return(WAIT_OBJECT_0 + i as u64));
                 }
             }
-            if timeout == 0 {
-                Ok(Outcome::Return(WAIT_TIMEOUT))
-            } else {
-                Ok(Outcome::Return(WAIT_OBJECT_0)) // fallback: first object
-            }
+        }
+        if timeout == 0 {
+            return Ok(Outcome::Return(WAIT_TIMEOUT));
+        }
+        if self.block_and_switch(cpu, WaitDesc { handles, all: wait_all }) {
+            Ok(Outcome::Resume)
+        } else {
+            Ok(Outcome::Return(WAIT_OBJECT_0))
         }
     }
 }

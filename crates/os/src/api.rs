@@ -75,6 +75,18 @@ pub enum Api {
     SignalSync { op: crate::sync::SignalOp },
     WaitSingle { ex: bool },
     WaitMultiple { ex: bool },
+    /// Threads + cooperative scheduler (roadmap P3.4), see [`crate::thread`].
+    CreateThread,
+    ExitThread,
+    /// A thread start-routine returned to the thread-exit thunk.
+    ThreadExit,
+    ResumeThread,
+    SuspendThread,
+    TerminateThread,
+    GetExitCodeThread,
+    SwitchToThread,
+    /// Sleep (argc 1) / SleepEx (argc 2), both cooperative-scheduler yields.
+    SleepApi { ex: bool },
     /// EncodePointer/DecodePointer (and the Rtl*/System variants): the CRT's
     /// pointer-obfuscation pair. The only invariant that matters is that
     /// Decode(Encode(p)) == p, so both are the identity on their argument.
@@ -87,7 +99,6 @@ pub enum Api {
     GetCurrentThreadId,
     GetCurrentProcess,
     IsDebuggerPresent,
-    Sleep,
     QueryPerformanceCounter,
     QueryPerformanceFrequency,
     GetSystemTimeAsFileTime,
@@ -359,7 +370,16 @@ impl Api {
             "GetCurrentThreadId" => Api::GetCurrentThreadId,
             "GetCurrentProcess" => Api::GetCurrentProcess,
             "IsDebuggerPresent" => Api::IsDebuggerPresent,
-            "Sleep" => Api::Sleep,
+            "Sleep" => Api::SleepApi { ex: false },
+            "SleepEx" => Api::SleepApi { ex: true },
+            // Threads + cooperative scheduler (roadmap P3.4).
+            "CreateThread" | "_beginthreadex" => Api::CreateThread,
+            "ExitThread" | "_endthreadex" => Api::ExitThread,
+            "ResumeThread" => Api::ResumeThread,
+            "SuspendThread" => Api::SuspendThread,
+            "TerminateThread" => Api::TerminateThread,
+            "GetExitCodeThread" => Api::GetExitCodeThread,
+            "SwitchToThread" => Api::SwitchToThread,
             "QueryPerformanceCounter" => Api::QueryPerformanceCounter,
             "QueryPerformanceFrequency" => Api::QueryPerformanceFrequency,
             "GetSystemTimeAsFileTime" => Api::GetSystemTimeAsFileTime,
@@ -678,12 +698,19 @@ impl Api {
             },
             Api::WaitSingle { ex } => if *ex { 3 } else { 2 },
             Api::WaitMultiple { ex } => if *ex { 5 } else { 4 },
+            // Threads (roadmap P3.4).
+            Api::CreateThread => 6,
+            Api::ExitThread => 1,
+            Api::ThreadExit => 0,
+            Api::ResumeThread | Api::SuspendThread => 1,
+            Api::TerminateThread | Api::GetExitCodeThread => 2,
+            Api::SwitchToThread => 0,
+            Api::SleepApi { ex } => if *ex { 2 } else { 1 },
             Api::EncodeDecodePointer => 1,
             Api::GetLastError => 0,
             Api::SetLastError => 1,
             Api::GetCurrentProcessId | Api::GetCurrentThreadId | Api::GetCurrentProcess => 0,
             Api::IsDebuggerPresent => 0,
-            Api::Sleep => 1,
             Api::QueryPerformanceCounter => 1,
             Api::QueryPerformanceFrequency => 1,
             Api::GetSystemTimeAsFileTime => 1,
@@ -1301,7 +1328,16 @@ impl WinOs {
             Api::GetCurrentThreadId => ret(self.current_tid as u64),
             Api::GetCurrentProcess => ret(u64::MAX), // pseudo-handle (HANDLE)-1
             Api::IsDebuggerPresent => ret(FALSE),
-            Api::Sleep => Ok(Outcome::Return(0)),
+            // Threads + cooperative scheduler (roadmap P3.4), see [`crate::thread`].
+            Api::CreateThread => self.create_thread(cpu, mem),
+            Api::ExitThread => self.api_exit_thread(cpu, mem),
+            Api::ThreadExit => self.thread_start_returned(cpu, mem),
+            Api::ResumeThread => self.resume_thread(cpu, mem),
+            Api::SuspendThread => self.suspend_thread(cpu, mem),
+            Api::TerminateThread => self.terminate_thread(cpu, mem),
+            Api::GetExitCodeThread => self.get_exit_code_thread(cpu, mem),
+            Api::SwitchToThread => self.switch_to_thread(cpu, mem),
+            Api::SleepApi { ex } => self.sleep(cpu, mem, if *ex { 2 } else { 1 }),
 
             Api::QueryPerformanceCounter => {
                 let ptr = self.arg(cpu, mem, 0)?;

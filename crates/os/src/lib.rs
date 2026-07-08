@@ -24,6 +24,7 @@ mod exc;
 mod fs;
 mod gdi;
 mod sync;
+mod thread;
 mod vm;
 
 use std::collections::HashMap;
@@ -169,12 +170,15 @@ pub struct WinOs {
     /// `GetEnvironmentStrings` calls are stable and match `Set` insertions.
     env: Vec<(String, String)>,
 
-    /// Thread-Local Storage slots (`TlsAlloc` family). `Some(v)` = allocated,
-    /// holding value `v`; `None` = free. Single-threaded, so one global vector.
-    tls_slots: Vec<Option<u64>>,
-    /// Fiber-Local Storage slots (`FlsAlloc` family) — the same model, in a
-    /// separate namespace. The MSVC CRT keeps its per-thread data pointer here.
-    fls_slots: Vec<Option<u64>>,
+    /// Thread-Local Storage index allocation (`TlsAlloc` family): `true` at an
+    /// index means that slot is in use. The *values* are per-thread, held in
+    /// each [`thread::Thread`] (roadmap P3.4), so two threads see independent
+    /// values for the same index.
+    tls_alloc: Vec<bool>,
+    /// Fiber-Local Storage index allocation (`FlsAlloc` family) — the same
+    /// model in a separate namespace. The MSVC CRT keeps its per-thread data
+    /// pointer here.
+    fls_alloc: Vec<bool>,
 
     /// In-memory registry hive: full canonical key path → value map.
     /// Value map: value name → (REG_* type, raw bytes). The default value
@@ -192,9 +196,25 @@ pub struct WinOs {
     /// `Create*`/`Open*` with the same name shares one object (single-instance
     /// mutexes, shared events).
     named_kobjects: HashMap<String, u64>,
-    /// The thread id `GetCurrentThreadId` reports and mutex ownership uses.
-    /// Fixed until the scheduler (P3.4) updates it on each context switch.
+    /// The thread id `GetCurrentThreadId` reports and mutex ownership uses;
+    /// updated on each context switch to the running thread's id.
     current_tid: u32,
+
+    /// The cooperative-scheduler thread table (roadmap P3.4), see
+    /// [`crate::thread`]. `threads[current]` is the running thread; its saved
+    /// register state is stale (live state is in the interpreter's `CpuState`)
+    /// until it yields. Index 0 is always the main thread.
+    threads: Vec<thread::Thread>,
+    /// Index of the currently-running thread in `threads`.
+    current: usize,
+    /// Monotonic thread-id source (the main thread is `0x1001`).
+    next_tid: u32,
+    /// Thunk a thread's start routine returns to; interception ends the thread
+    /// with the return value as its exit code (the thread analogue of
+    /// `ReturnExit`).
+    thread_exit_thunk: u64,
+    /// Instruction ticks since the last preemptive yield (timeslice counter).
+    sched_ticks: u64,
 
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
@@ -252,13 +272,18 @@ impl WinOs {
             temp_counter: 0,
             crt_globals: std::collections::HashMap::new(),
             env: default_environment(),
-            tls_slots: Vec::new(),
-            fls_slots: Vec::new(),
+            tls_alloc: Vec::new(),
+            fls_alloc: Vec::new(),
             reg_hive: HashMap::new(),
             reg_handles: HashMap::new(),
             kobjects: HashMap::new(),
             named_kobjects: HashMap::new(),
             current_tid: 0x1001,
+            threads: Vec::new(),
+            current: 0,
+            next_tid: 0x1002,
+            thread_exit_thunk: 0,
+            sched_ticks: 0,
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
             function_table: Vec::new(),
@@ -270,6 +295,10 @@ impl WinOs {
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
         os.cb_driver = os.alloc_thunk(Api::CallbackDriver);
         os.exc_driver = os.alloc_thunk(Api::ExceptionDriver);
+        os.thread_exit_thunk = os.alloc_thunk(Api::ThreadExit);
+        // Seat the main thread as thread 0. Its saved register state is a
+        // placeholder (the live state lives in the interpreter) until it yields.
+        os.threads.push(thread::Thread::main(0x1001));
         os
     }
 
@@ -488,56 +517,56 @@ impl WinOs {
     }
 
     // ---- Thread/Fiber Local Storage --------------------------------------
-    // Fiber slots share this implementation (we run single-threaded); the
-    // `fiber` flag only selects which of the two independent slot vectors is
-    // used, matching Windows' separate TLS and FLS index namespaces.
+    // Index allocation is process-wide (a slot index is valid in every thread);
+    // the *values* are per-thread, held in each `Thread`, so two threads see
+    // independent values for the same slot. The `fiber` flag selects the TLS or
+    // FLS namespace (independent, as on Windows).
 
-    fn tls_store(&mut self, fiber: bool) -> &mut Vec<Option<u64>> {
+    fn tls_alloc_map(&mut self, fiber: bool) -> &mut Vec<bool> {
         if fiber {
-            &mut self.fls_slots
+            &mut self.fls_alloc
         } else {
-            &mut self.tls_slots
+            &mut self.tls_alloc
         }
     }
 
-    /// Reserve a slot and return its index (never the out-of-indexes sentinel,
-    /// since the vector grows on demand). A fresh slot reads back as NULL.
+    /// Reserve a slot index (growing on demand). A fresh slot reads back NULL in
+    /// every thread; free any stale per-thread value at that index first.
     fn tls_alloc(&mut self, fiber: bool) -> u64 {
-        let slots = self.tls_store(fiber);
-        let idx = match slots.iter().position(Option::is_none) {
+        let map = self.tls_alloc_map(fiber);
+        let idx = match map.iter().position(|used| !*used) {
             Some(i) => i,
             None => {
-                slots.push(None);
-                slots.len() - 1
+                map.push(false);
+                map.len() - 1
             }
         };
-        slots[idx] = Some(0);
+        map[idx] = true;
+        for t in &mut self.threads {
+            t.tls_values(fiber).remove(&(idx as u64));
+        }
         idx as u64
     }
 
-    /// Store a value in a slot. Returns whether it succeeded (always true for a
-    /// valid index; the vector is grown so an in-range index never fails).
+    /// Store a value in the running thread's copy of a slot.
     fn tls_set(&mut self, fiber: bool, index: u64, value: u64) -> bool {
-        let i = index as usize;
-        let slots = self.tls_store(fiber);
-        if i >= slots.len() {
-            slots.resize(i + 1, None);
-        }
-        slots[i] = Some(value);
+        let cur = self.current;
+        self.threads[cur].tls_values(fiber).insert(index, value);
         true
     }
 
-    /// Read a slot's value (NULL for an unset or out-of-range index).
+    /// Read the running thread's copy of a slot (NULL if unset).
     fn tls_get(&self, fiber: bool, index: u64) -> u64 {
-        let slots = if fiber { &self.fls_slots } else { &self.tls_slots };
-        slots.get(index as usize).copied().flatten().unwrap_or(0)
+        self.threads[self.current].tls_values_ref(fiber).get(&index).copied().unwrap_or(0)
     }
 
-    /// Release a slot. Always reports success.
+    /// Release a slot index and drop its value in every thread.
     fn tls_free(&mut self, fiber: bool, index: u64) -> bool {
-        let slots = self.tls_store(fiber);
-        if let Some(slot) = slots.get_mut(index as usize) {
-            *slot = None;
+        if let Some(used) = self.tls_alloc_map(fiber).get_mut(index as usize) {
+            *used = false;
+        }
+        for t in &mut self.threads {
+            t.tls_values(fiber).remove(&index);
         }
         true
     }
@@ -689,6 +718,12 @@ fn default_environment() -> Vec<(String, String)> {
 
 impl Hooks for WinOs {
     fn intercept(&mut self, rip: u64, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Option<Exit>> {
+        // Timeslice preemption (roadmap P3.4): with more than one thread, force
+        // a yield every `TIMESLICE` instructions so a CPU-bound thread can't
+        // starve the others. Cheap no-op in the single-threaded case.
+        if self.preempt(cpu) {
+            return Ok(Some(Exit::Continue));
+        }
         let Some(api) = self.thunks.get(&rip).cloned() else {
             return Ok(None);
         };
