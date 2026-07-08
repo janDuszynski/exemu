@@ -23,6 +23,7 @@ mod dll;
 mod exc;
 mod fs;
 mod gdi;
+mod vm;
 
 use std::collections::HashMap;
 
@@ -61,6 +62,10 @@ pub struct WinConfig {
     /// `[dll_base, dll_base + dll_size)`.
     pub dll_base: u64,
     pub dll_size: u64,
+    /// Base of the address window from which `VirtualAlloc(NULL, …)` hands out
+    /// fresh reservations (the VM manager bumps upward from here, skipping any
+    /// region already mapped). Must be clear of every other region above.
+    pub valloc_base: u64,
 }
 
 impl Default for WinConfig {
@@ -79,6 +84,7 @@ impl Default for WinConfig {
             module_path_w: "C:\\program.exe".into(),
             dll_base: 0x0000_0006_0000_0000,
             dll_size: 0x0800_0000, // 128 MiB
+            valloc_base: 0x0000_0040_0000_0000, // 256 GiB: between stack and thunks
         }
     }
 }
@@ -97,6 +103,14 @@ pub struct WinOs {
     /// min(old_size, new_size) bytes and by HeapFree for last-block reclaim.
     heap_sizes: HashMap<u64, u64>,
     last_error: u32,
+
+    /// The `VirtualAlloc` family's reservations (sorted by base). Each entry
+    /// tracks the nominal `PAGE_*` protection and commit state so `VirtualQuery`
+    /// and `VirtualProtect` report honest values even though the backing memory
+    /// is mapped permissively (RWX) — see [`crate::vm`].
+    vm_allocs: Vec<vm::VmAlloc>,
+    /// Bump hint for the next `VirtualAlloc(NULL, …)` reservation.
+    valloc_next: u64,
 
     /// Thunk address whose interception drives sequential `_initterm`
     /// callbacks (see [`api::InittermFrame`]).
@@ -192,7 +206,7 @@ const HANDLE_PROCESS_HEAP: u64 = 0x00AB_0000;
 
 impl WinOs {
     pub fn new(cfg: WinConfig) -> Self {
-        let (api_base, heap_base) = (cfg.api_base, cfg.heap_base);
+        let (api_base, heap_base, valloc_base) = (cfg.api_base, cfg.heap_base, cfg.valloc_base);
         let mut os = WinOs {
             cfg,
             thunks: HashMap::new(),
@@ -201,6 +215,8 @@ impl WinOs {
             heap_next: heap_base,
             heap_sizes: HashMap::new(),
             last_error: 0,
+            vm_allocs: Vec::new(),
+            valloc_next: valloc_base,
             initterm_driver: 0,
             initterm_stack: Vec::new(),
             cb_driver: 0,

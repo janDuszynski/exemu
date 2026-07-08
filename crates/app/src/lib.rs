@@ -54,6 +54,8 @@ struct Layout {
     teb_stack_base: u64,
     teb_stack_limit: u64,
     peb_image_base: u64,
+    /// Address window the VirtualAlloc manager grows from (roadmap P3.2).
+    valloc_base: u64,
 }
 
 impl Layout {
@@ -75,6 +77,7 @@ impl Layout {
                 teb_stack_base: 0x08,
                 teb_stack_limit: 0x10,
                 peb_image_base: 0x10,
+                valloc_base: 0x0000_0040_0000_0000, // 256 GiB, between stack and thunks
             }
         } else {
             // Everything below 4 GiB, clear of a typical image at 0x400000+.
@@ -94,6 +97,7 @@ impl Layout {
                 teb_stack_base: 0x04,
                 teb_stack_limit: 0x08,
                 peb_image_base: 0x08,
+                valloc_base: 0x3000_0000, // between the DLL arena and the thunks
             }
         }
     }
@@ -248,6 +252,7 @@ impl Process {
             module_path_w,
             dll_base: lay.dll_base,
             dll_size: lay.dll_size,
+            valloc_base: lay.valloc_base,
         });
 
         // Map the thunk region as real read/write memory. Function imports

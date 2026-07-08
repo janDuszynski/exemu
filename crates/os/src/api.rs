@@ -66,9 +66,8 @@ pub enum Api {
     HeapReAlloc,
     VirtualAlloc,
     VirtualFree,
-    /// VirtualProtect: every page is already RWX, so a protection change is a
-    /// no-op — report success and write a plausible old protection out.
     VirtualProtect,
+    VirtualQuery,
     /// EncodePointer/DecodePointer (and the Rtl*/System variants): the CRT's
     /// pointer-obfuscation pair. The only invariant that matters is that
     /// Decode(Encode(p)) == p, so both are the identity on their argument.
@@ -331,6 +330,7 @@ impl Api {
             "VirtualAlloc" => Api::VirtualAlloc,
             "VirtualFree" => Api::VirtualFree,
             "VirtualProtect" => Api::VirtualProtect,
+            "VirtualQuery" => Api::VirtualQuery,
             "EncodePointer" | "DecodePointer" | "EncodeSystemPointer"
             | "DecodeSystemPointer" | "RtlEncodePointer" | "RtlDecodePointer" => {
                 Api::EncodeDecodePointer
@@ -659,6 +659,7 @@ impl Api {
             Api::VirtualAlloc => 4,
             Api::VirtualFree => 3,
             Api::VirtualProtect => 4,
+            Api::VirtualQuery => 3,
             Api::EncodeDecodePointer => 1,
             Api::GetLastError => 0,
             Api::SetLastError => 1,
@@ -1153,23 +1154,11 @@ impl WinOs {
                 ret(TRUE)
             }
 
-            Api::VirtualAlloc => {
-                // VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect)
-                let size = self.arg(cpu, mem, 1)?;
-                ret(self.heap_alloc(size))
-            }
-            Api::VirtualFree => ret(TRUE),
-            Api::VirtualProtect => {
-                // VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect).
-                // Pages are already mapped RWX, so there is nothing to change;
-                // write back a plausible previous protection and succeed. This
-                // is what UPX-style packers and CRT relocation code depend on.
-                let old_ptr = self.arg(cpu, mem, 3)?;
-                if old_ptr != 0 {
-                    mem.write_u32(old_ptr, 0x40)?; // PAGE_EXECUTE_READWRITE
-                }
-                ret(TRUE)
-            }
+            // Virtual-memory manager (roadmap P3.2), see [`crate::vm`].
+            Api::VirtualAlloc => self.virtual_alloc(cpu, mem),
+            Api::VirtualFree => self.virtual_free(cpu, mem),
+            Api::VirtualProtect => self.virtual_protect(cpu, mem),
+            Api::VirtualQuery => self.virtual_query(cpu, mem),
             Api::EncodeDecodePointer => {
                 // Identity: Decode(Encode(p)) == p. Preserve the pointer so a
                 // later guarded call through it lands on real code, not null.
