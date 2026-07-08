@@ -23,6 +23,7 @@ mod dll;
 mod exc;
 mod fs;
 mod gdi;
+mod reg;
 mod sync;
 mod thread;
 mod time;
@@ -305,6 +306,8 @@ impl WinOs {
         // Seat the main thread as thread 0. Its saved register state is a
         // placeholder (the live state lives in the interpreter) until it yields.
         os.threads.push(thread::Thread::main(0x1001));
+        // Seed HKLM/HKCU with values installers commonly probe (roadmap P3.12).
+        os.reg_seed();
         os
     }
 
