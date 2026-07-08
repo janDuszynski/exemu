@@ -212,6 +212,34 @@ fn saturating_add_sub_clamps_lanes() {
 }
 
 #[test]
+fn packed_multiply_ops() {
+    // pmullw: low 16 of 3*5 = 15.
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xD5, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 3;
+        cpu.state_mut().xmm[1] = 5;
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFFFF, 15);
+    // pmulhw: (-32768)*2 = -65536 = 0xFFFF0000 → high word 0xFFFF (signed).
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xE5, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0x8000;
+        cpu.state_mut().xmm[1] = 0x0002;
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFFFF, 0xFFFF);
+    // pmuludq: 0xFFFFFFFF * 0xFFFFFFFF = 0xFFFFFFFE00000001.
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xF4, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0xFFFF_FFFF;
+        cpu.state_mut().xmm[1] = 0xFFFF_FFFF;
+    });
+    assert_eq!(cpu.state().xmm[0], 0xFFFF_FFFE_0000_0001);
+    // pmaddwd: dword0 = 2*4 + 3*5 = 23.
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xF5, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = (3u128 << 16) | 2;
+        cpu.state_mut().xmm[1] = (5u128 << 16) | 4;
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFFFF_FFFF, 23);
+}
+
+#[test]
 fn paddb_adds_per_byte_with_wrap() {
     // paddb xmm0, xmm1: 0xFF + 0x01 wraps to 0x00 in every byte lane.
     let code = [0x66, 0x0F, 0xFC, 0xC1, 0xF4];
