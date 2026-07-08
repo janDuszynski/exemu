@@ -268,6 +268,36 @@ fn avg_sad_pack_extract_ops() {
 }
 
 #[test]
+fn packed_int_float_conversions() {
+    // cvtdq2ps xmm0, xmm1: int32 5 → f32 5.0.
+    let (cpu, _) = run_with(&[0x0F, 0x5B, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[1] = 5;
+    });
+    assert_eq!(cpu.state().xmm[0] as u32, 5.0f32.to_bits());
+    // cvttps2dq xmm0, xmm1: f32 3.9 truncates to 3.
+    let (cpu, _) = run_with(&[0xF3, 0x0F, 0x5B, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[1] = 3.9f32.to_bits() as u128;
+    });
+    assert_eq!(cpu.state().xmm[0] as u32, 3);
+    // cvtps2dq xmm0, xmm1: f32 2.5 rounds to even → 2.
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0x5B, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[1] = 2.5f32.to_bits() as u128;
+    });
+    assert_eq!(cpu.state().xmm[0] as u32, 2);
+}
+
+#[test]
+fn lddqu_loads_128_from_memory() {
+    // lddqu xmm0, [rax] with rax → the data region.
+    let val = 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210u128;
+    let (cpu, _) = run_with(&[0xF2, 0x0F, 0xF0, 0x00, 0xF4], |cpu, mem| {
+        cpu.state_mut().set_reg(exemu_core::Reg::Rax, DATA);
+        mem.write(DATA, &val.to_le_bytes()).unwrap();
+    });
+    assert_eq!(cpu.state().xmm[0], val);
+}
+
+#[test]
 fn paddb_adds_per_byte_with_wrap() {
     // paddb xmm0, xmm1: 0xFF + 0x01 wraps to 0x00 in every byte lane.
     let code = [0x66, 0x0F, 0xFC, 0xC1, 0xF4];

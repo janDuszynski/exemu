@@ -276,6 +276,27 @@ impl Interpreter {
                 _ => return unsupported(op2, ctx, "cvtps2pd/cvtpd2ps"),
             },
 
+            // ---- CVTDQ2PS / CVTPS2DQ / CVTTPS2DQ (0F 5B) ----------------
+            0x5B => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let out = match kind {
+                    Sse::Ps => cvtdq2ps(src),        // NP: int32 → f32
+                    Sse::Pd => cvtps2dq(src, false), // 66: f32 → int32 (round)
+                    Sse::Ss => cvtps2dq(src, true),  // F3: f32 → int32 (truncate)
+                    Sse::Sd => return unsupported(op2, ctx, "cvt 5b/f2"),
+                };
+                self.set_xmm(reg, out);
+            }
+
+            // ---- LDDQU (F2 0F F0): unaligned 128-bit load (≡ MOVDQU) ----
+            0xF0 => {
+                if kind != Sse::Sd {
+                    return unsupported(op2, ctx, "0f f0");
+                }
+                let v = self.sse_rm(ctx, mem, 16)?;
+                self.set_xmm(reg, v);
+            }
+
             // ---- MOVD/MOVQ xmm, r/m (66 0F 6E) --------------------------
             0x6E => {
                 let size = if ctx.pfx.w() { 8 } else { 4 };
@@ -670,6 +691,28 @@ fn cvt_f_to_int(f: f64, truncate: bool, size: u8) -> u64 {
     } else {
         0x8000_0000
     }
+}
+
+/// CVTDQ2PS — 4 packed int32 → 4 packed f32 (round-to-nearest-even, the
+/// default MXCSR mode, which Rust's `i32 as f32` cast also uses).
+fn cvtdq2ps(v: u128) -> u128 {
+    let mut out = 0u128;
+    for i in 0..4 {
+        let x = ((v >> (i * 32)) & 0xFFFF_FFFF) as u32 as i32;
+        out |= ((x as f32).to_bits() as u128) << (i * 32);
+    }
+    out
+}
+
+/// CVTPS2DQ (`truncate=false`) / CVTTPS2DQ — 4 packed f32 → 4 packed int32,
+/// with x86 rounding and integer-indefinite (0x8000_0000) on overflow/NaN.
+fn cvtps2dq(v: u128, truncate: bool) -> u128 {
+    let mut out = 0u128;
+    for i in 0..4 {
+        let r = cvt_f_to_int(f32_lane(v, i) as f64, truncate, 4) as u32;
+        out |= (r as u128) << (i * 32);
+    }
+    out
 }
 
 fn f64_lane(v: u128, lane: u32) -> f64 {
