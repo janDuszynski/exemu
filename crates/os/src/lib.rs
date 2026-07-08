@@ -23,6 +23,7 @@ mod dll;
 mod exc;
 mod fs;
 mod gdi;
+mod sync;
 mod vm;
 
 use std::collections::HashMap;
@@ -30,6 +31,7 @@ use std::collections::HashMap;
 use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Reg, Result};
 
 pub use api::Api;
+pub use sync::{SignalOp, SyncKind};
 
 /// Addresses and sizes the application hands us so the emulated OS knows
 /// where its thunks, heap and process strings live.
@@ -182,6 +184,18 @@ pub struct WinOs {
     /// RegOpenKeyExW) → the canonical key path they refer to.
     reg_handles: HashMap<u64, String>,
 
+    /// Kernel synchronization objects (events/mutexes/semaphores/waitable
+    /// timers) by handle value, with real signaling state (roadmap P3.6). See
+    /// [`crate::sync`].
+    kobjects: HashMap<u64, sync::KObject>,
+    /// Named-object namespace: object name → handle, so a second
+    /// `Create*`/`Open*` with the same name shares one object (single-instance
+    /// mutexes, shared events).
+    named_kobjects: HashMap<String, u64>,
+    /// The thread id `GetCurrentThreadId` reports and mutex ownership uses.
+    /// Fixed until the scheduler (P3.4) updates it on each context switch.
+    current_tid: u32,
+
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
@@ -242,6 +256,9 @@ impl WinOs {
             fls_slots: Vec::new(),
             reg_hive: HashMap::new(),
             reg_handles: HashMap::new(),
+            kobjects: HashMap::new(),
+            named_kobjects: HashMap::new(),
+            current_tid: 0x1001,
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
             function_table: Vec::new(),
