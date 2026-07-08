@@ -193,20 +193,31 @@ pub enum Api {
     CreateFileW,
     ReadFileApi,
     CloseHandle,
-    CreateDirectoryW,
+    /// `wide` selects LPCWSTR (W) vs LPCSTR (A) marshalling; these file APIs are
+    /// otherwise identical (roadmap P3.9).
+    CreateDirectory { wide: bool },
     GetTempPathW,
     GetTempFileNameW,
     GetFileSizeApi,
     SetFilePointerApi,
-    GetFileAttributesW,
-    DeleteFileW,
+    GetFileAttributes { wide: bool },
+    DeleteFile { wide: bool },
     GetModuleFileNameW,
-    /// FindFirstFileW / FindFirstFileExW — begin a sandbox directory scan;
-    /// `ex` selects which register holds the find-data buffer pointer (arg1 for
-    /// the plain form, arg2 for the Ex form whose arg1 is fInfoLevelId).
-    FindFirstFileW { ex: bool },
-    FindNextFileW,
+    /// FindFirstFile[Ex][AW] — begin a sandbox directory scan; `ex` selects which
+    /// register holds the find-data buffer pointer (arg1 for the plain form,
+    /// arg2 for the Ex form whose arg1 is fInfoLevelId); `wide` selects the
+    /// WIN32_FIND_DATAW vs …A layout.
+    FindFirstFile { ex: bool, wide: bool },
+    FindNextFile { wide: bool },
     FindClose,
+    /// GetFullPathName[AW](lpFileName, nBufferLength, lpBuffer, lpFilePart).
+    GetFullPathName { wide: bool },
+    /// MoveFile[AW] / MoveFileEx[AW] (rename within the sandbox).
+    MoveFile { wide: bool, ex: bool },
+    /// CopyFile[AW](src, dst, bFailIfExists).
+    CopyFile { wide: bool },
+    /// SetFileTime(handle, ct, at, mt) — accepted, no-op on the host file.
+    SetFileTimeApi,
     GlobalAlloc,
     GlobalReAlloc,
     GlobalLock,
@@ -465,13 +476,25 @@ impl Api {
             "CreateFileW" => Api::CreateFileW,
             "ReadFile" => Api::ReadFileApi,
             "CloseHandle" => Api::CloseHandle,
-            "CreateDirectoryW" => Api::CreateDirectoryW,
+            "CreateDirectoryW" => Api::CreateDirectory { wide: true },
+            "CreateDirectoryA" => Api::CreateDirectory { wide: false },
             "GetTempPathW" => Api::GetTempPathW,
             "GetTempFileNameW" => Api::GetTempFileNameW,
             "GetFileSize" => Api::GetFileSizeApi,
             "SetFilePointer" => Api::SetFilePointerApi,
-            "GetFileAttributesW" => Api::GetFileAttributesW,
-            "DeleteFileW" => Api::DeleteFileW,
+            "GetFileAttributesW" => Api::GetFileAttributes { wide: true },
+            "GetFileAttributesA" => Api::GetFileAttributes { wide: false },
+            "DeleteFileW" => Api::DeleteFile { wide: true },
+            "DeleteFileA" => Api::DeleteFile { wide: false },
+            "GetFullPathNameW" => Api::GetFullPathName { wide: true },
+            "GetFullPathNameA" => Api::GetFullPathName { wide: false },
+            "MoveFileW" => Api::MoveFile { wide: true, ex: false },
+            "MoveFileA" => Api::MoveFile { wide: false, ex: false },
+            "MoveFileExW" => Api::MoveFile { wide: true, ex: true },
+            "MoveFileExA" => Api::MoveFile { wide: false, ex: true },
+            "CopyFileW" => Api::CopyFile { wide: true },
+            "CopyFileA" => Api::CopyFile { wide: false },
+            "SetFileTime" => Api::SetFileTimeApi,
             "GetModuleFileNameW" | "GetModuleFileNameA" => Api::GetModuleFileNameW,
             "GetVersion" => Api::GetVersion,
             "GetVersionExW" | "GetVersionExA" => Api::GetVersionEx,
@@ -643,17 +666,13 @@ impl Api {
                 Api::WinStub { r: 0, argc: win32_argc(dll, name).unwrap_or(0) } // ERROR_SUCCESS
             }
 
-            // Directory enumeration against the sandbox.
-            "FindFirstFileW" => Api::FindFirstFileW { ex: false },
-            "FindFirstFileExW" => Api::FindFirstFileW { ex: true },
-            // A-variants: no wide-string handling; stub as "no results".
-            "FindFirstFileA" | "FindFirstFileExA" => {
-                Api::WinStub { r: u64::MAX, argc: win32_argc(dll, name).unwrap_or(0) }
-            }
-            "FindNextFileW" => Api::FindNextFileW,
-            "FindNextFileA" => {
-                Api::WinStub { r: FALSE, argc: win32_argc(dll, name).unwrap_or(0) }
-            }
+            // Directory enumeration against the sandbox (W and A variants).
+            "FindFirstFileW" => Api::FindFirstFile { ex: false, wide: true },
+            "FindFirstFileExW" => Api::FindFirstFile { ex: true, wide: true },
+            "FindFirstFileA" => Api::FindFirstFile { ex: false, wide: false },
+            "FindFirstFileExA" => Api::FindFirstFile { ex: true, wide: false },
+            "FindNextFileW" => Api::FindNextFile { wide: true },
+            "FindNextFileA" => Api::FindNextFile { wide: false },
             "FindClose" => Api::FindClose,
 
             _ => Api::Unsupported {
@@ -745,10 +764,12 @@ impl Api {
             Api::CharPrevW | Api::LstrcpyW | Api::LstrcatW | Api::LstrcmpW | Api::LstrcmpiW => 2,
             Api::LstrcpynW => 3,
             // Filesystem.
-            Api::CloseHandle | Api::DeleteFileW | Api::GetFileAttributesW | Api::GlobalLock
+            Api::CloseHandle | Api::DeleteFile { .. } | Api::GetFileAttributes { .. } | Api::GlobalLock
             | Api::GlobalFreeUnlock | Api::FindClose => 1,
-            Api::FindFirstFileW { ex: false } | Api::FindNextFileW => 2,
-            Api::FindFirstFileW { ex: true } => 6,
+            Api::FindFirstFile { ex: false, .. } | Api::FindNextFile { .. } | Api::MoveFile { ex: false, .. } => 2,
+            Api::FindFirstFile { ex: true, .. } => 6,
+            Api::MoveFile { ex: true, .. } | Api::CopyFile { .. } => 3,
+            Api::GetFullPathName { .. } | Api::SetFileTimeApi => 4,
             Api::GetVersion => 0,
             Api::GetVersionEx => 1,
             // GUI.
@@ -760,7 +781,7 @@ impl Api {
             Api::GetDlgItemTextW | Api::SendMessageApi | Api::GetMessageApi => 4,
             Api::PeekMessageApi => 5,
             Api::CreateDialogParam { .. } | Api::CoCreateInstanceApi => 5,
-            Api::CreateDirectoryW | Api::GetTempPathW | Api::GetFileSizeApi | Api::GlobalAlloc
+            Api::CreateDirectory { .. } | Api::GetTempPathW | Api::GetFileSizeApi | Api::GlobalAlloc
             | Api::GetSystemDirectoryW | Api::GetWindowsDirectoryW => 2,
             Api::GlobalReAlloc => 3,
             Api::GetModuleFileNameW => 3,
@@ -1014,6 +1035,37 @@ pub(crate) fn read_astr(mem: &dyn Memory, addr: u64) -> Result<String> {
         i += 1;
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Read a path argument, wide (LPCWSTR) or ANSI (LPCSTR) per `wide`.
+pub(crate) fn read_path(mem: &dyn Memory, addr: u64, wide: bool) -> Result<String> {
+    if wide {
+        read_wstr(mem, addr)
+    } else {
+        read_astr(mem, addr)
+    }
+}
+
+/// Write a NUL-terminated ANSI string (at most `max` bytes incl. terminator),
+/// returning the character count written (excluding the terminator).
+pub(crate) fn write_astr(mem: &mut dyn Memory, addr: u64, s: &str, max: usize) -> Result<u64> {
+    if addr == 0 || max == 0 {
+        return Ok(0);
+    }
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(max - 1);
+    mem.write(addr, &bytes[..n])?;
+    mem.write_u8(addr + n as u64, 0)?;
+    Ok(n as u64)
+}
+
+/// Write a path result, wide or ANSI per `wide`, returning the char count.
+fn write_path(mem: &mut dyn Memory, addr: u64, s: &str, max: usize, wide: bool) -> Result<u64> {
+    if wide {
+        WinOs::write_wstr(mem, addr, s, max)
+    } else {
+        write_astr(mem, addr, s, max)
+    }
 }
 
 /// Length of a NUL-terminated UTF-16 string in code units.
@@ -2498,8 +2550,8 @@ impl WinOs {
                 self.close_handle(handle);
                 ret(TRUE)
             }
-            Api::CreateDirectoryW => {
-                let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+            Api::CreateDirectory { wide } => {
+                let name = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 ret(self.create_directory(&name) as u64)
             }
             Api::GetTempPathW => {
@@ -2533,25 +2585,24 @@ impl WinOs {
                 let method = self.arg(cpu, mem, 3)?;
                 ret(self.set_file_pointer(handle, dist, method))
             }
-            Api::GetFileAttributesW => {
-                let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+            Api::GetFileAttributes { wide } => {
+                let name = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 ret(self.file_attributes(&name))
             }
-            Api::DeleteFileW => {
-                let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+            Api::DeleteFile { wide } => {
+                let name = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 ret(self.delete_file(&name) as u64)
             }
-            Api::FindFirstFileW { ex } => {
-                // FindFirstFileW(lpFileName, lpFindFileData)
-                // FindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, ...)
+            Api::FindFirstFile { ex, wide } => {
+                // FindFirstFile[A/W](lpFileName, lpFindFileData)
+                // FindFirstFileEx[A/W](lpFileName, fInfoLevelId, lpFindFileData, ...)
                 // Buffer pointer is arg1 for the plain form, arg2 for the Ex form.
-                let pattern = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+                let pattern = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 let buf_arg = if *ex { 2 } else { 1 };
                 let data_ptr = self.arg(cpu, mem, buf_arg)?;
-                ret(self.find_first_file(mem, &pattern, data_ptr)?)
+                ret(self.find_first_file(mem, &pattern, data_ptr, *wide)?)
             }
-            Api::FindNextFileW => {
-                // FindNextFileW(hFind, lpFindFileData)
+            Api::FindNextFile { .. } => {
                 let handle = self.arg(cpu, mem, 0)?;
                 let data_ptr = self.arg(cpu, mem, 1)?;
                 ret(self.find_next_file(mem, handle, data_ptr)?)
@@ -2560,6 +2611,37 @@ impl WinOs {
                 let handle = self.arg(cpu, mem, 0)?;
                 ret(self.find_close(handle))
             }
+            Api::GetFullPathName { wide } => {
+                // GetFullPathName(lpFileName, nBufferLength, lpBuffer, lpFilePart)
+                let name = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
+                let len = self.arg(cpu, mem, 1)? as usize;
+                let buf = self.arg(cpu, mem, 2)?;
+                let part_ptr = self.arg(cpu, mem, 3)?;
+                let full = self.full_path_name(&name);
+                let written = write_path(mem, buf, &full, len, *wide)?;
+                // lpFilePart → the final component within the written buffer.
+                if part_ptr != 0 {
+                    let part = match full.rfind('\\') {
+                        Some(pos) if buf != 0 => buf + (pos as u64 + 1) * if *wide { 2 } else { 1 },
+                        _ => 0,
+                    };
+                    self.write_ptr(mem, part_ptr, part)?;
+                }
+                ret(written)
+            }
+            Api::MoveFile { wide, .. } => {
+                let src = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
+                let dst = read_path(mem, self.arg(cpu, mem, 1)?, *wide)?;
+                ret(self.move_file(&src, &dst) as u64)
+            }
+            Api::CopyFile { wide } => {
+                let src = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
+                let dst = read_path(mem, self.arg(cpu, mem, 1)?, *wide)?;
+                let fail_if_exists = self.arg(cpu, mem, 2)? != 0;
+                ret(self.copy_file(&src, &dst, fail_if_exists) as u64)
+            }
+            // SetFileTime(handle, ct, at, mt): accepted; host mtime is left as-is.
+            Api::SetFileTimeApi => ret(TRUE),
             Api::GetModuleFileNameW => {
                 let buf = self.arg(cpu, mem, 1)?;
                 let size = self.arg(cpu, mem, 2)? as usize;

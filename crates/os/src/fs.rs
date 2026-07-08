@@ -33,10 +33,13 @@ pub struct FindEntry {
 }
 
 /// State associated with an open directory-enumeration handle
-/// (FindFirstFileW / FindNextFileW / FindClose).
+/// (FindFirstFile / FindNextFile / FindClose).
 pub struct FindState {
     pub entries: Vec<FindEntry>,
     pub pos: usize,
+    /// Whether entries marshal as `WIN32_FIND_DATAW` (true) or …A (false); set
+    /// by `FindFirstFile` and honoured by `FindNextFile` for the same handle.
+    pub wide: bool,
 }
 
 // Windows constants.
@@ -208,6 +211,64 @@ impl WinOs {
         }
     }
 
+    /// GetFullPathName: turn a possibly-relative guest path into an absolute
+    /// one. Relative names resolve against `C:\` (the sandbox root); already-
+    /// absolute paths (drive-qualified or UNC) are returned normalised to
+    /// backslashes. `.`/`..` collapsing is not modelled.
+    pub(crate) fn full_path_name(&self, name: &str) -> String {
+        let n = name.replace('/', "\\");
+        let bytes = n.as_bytes();
+        let drive_qualified = bytes.len() >= 2 && bytes[1] == b':';
+        if drive_qualified || n.starts_with("\\\\") {
+            n
+        } else if let Some(rest) = n.strip_prefix('\\') {
+            format!("C:\\{}", rest.trim_start_matches('\\'))
+        } else {
+            format!("C:\\{n}")
+        }
+    }
+
+    /// MoveFile/MoveFileEx: rename within the sandbox, falling back to
+    /// copy+delete across host devices.
+    pub(crate) fn move_file(&mut self, src: &str, dst: &str) -> bool {
+        let (Some(s), Some(d)) = (self.host_path(src), self.host_path(dst)) else {
+            self.set_last_error(2); // ERROR_FILE_NOT_FOUND
+            return false;
+        };
+        if let Some(parent) = d.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::rename(&s, &d).is_ok() {
+            return true;
+        }
+        if std::fs::copy(&s, &d).is_ok() && std::fs::remove_file(&s).is_ok() {
+            return true;
+        }
+        self.set_last_error(2);
+        false
+    }
+
+    /// CopyFile: duplicate a sandbox file; honour `fail_if_exists`.
+    pub(crate) fn copy_file(&mut self, src: &str, dst: &str, fail_if_exists: bool) -> bool {
+        let (Some(s), Some(d)) = (self.host_path(src), self.host_path(dst)) else {
+            self.set_last_error(2);
+            return false;
+        };
+        if fail_if_exists && d.exists() {
+            self.set_last_error(80); // ERROR_FILE_EXISTS
+            return false;
+        }
+        if let Some(parent) = d.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::copy(&s, &d).is_ok() {
+            true
+        } else {
+            self.set_last_error(2);
+            false
+        }
+    }
+
     pub(crate) fn file_attributes(&self, name: &str) -> u64 {
         match self.host_path(name).as_deref().map(Path::metadata) {
             Some(Ok(m)) if m.is_dir() => FILE_ATTRIBUTE_DIRECTORY,
@@ -246,6 +307,7 @@ impl WinOs {
         mem: &mut dyn Memory,
         pattern: &str,
         data_ptr: u64,
+        wide: bool,
     ) -> Result<u64> {
         // Split the guest path into a directory part and the wildcard leaf.
         let (dir, leaf) = match pattern.rfind('\\') {
@@ -322,14 +384,14 @@ impl WinOs {
         }
 
         // Marshal the first entry into the guest buffer.
-        write_find_data(mem, data_ptr, &entries[0])?;
+        write_find_data(mem, data_ptr, &entries[0], wide)?;
 
         // Allocate a find handle from the same monotonic counter as file
         // handles (but we do NOT add it to `self.files`, so is_file_handle
         // correctly returns false for find handles).
         let h = self.next_handle;
         self.next_handle += 4;
-        self.find_handles.insert(h, FindState { entries, pos: 1 });
+        self.find_handles.insert(h, FindState { entries, pos: 1, wide });
 
         Ok(h)
     }
@@ -349,8 +411,9 @@ impl WinOs {
         };
         if state.pos < state.entries.len() {
             let entry = state.entries[state.pos].clone();
+            let wide = state.wide;
             state.pos += 1;
-            write_find_data(mem, data_ptr, &entry)?;
+            write_find_data(mem, data_ptr, &entry, wide)?;
             Ok(1)
         } else {
             self.set_last_error(18); // ERROR_NO_MORE_FILES
@@ -368,9 +431,8 @@ impl WinOs {
 
 // ---- free helpers -----------------------------------------------------------
 
-/// Write a `WIN32_FIND_DATAW` (592 bytes, little-endian) into guest memory.
-///
-/// Byte layout:
+/// Write a `WIN32_FIND_DATAW`/`WIN32_FIND_DATAA` into guest memory. Fields
+/// 0..44 are identical; only the trailing name arrays differ:
 /// ```text
 ///   0  dwFileAttributes  DWORD
 ///   4  ftCreationTime    FILETIME (low @ 4, high @ 8)
@@ -378,16 +440,16 @@ impl WinOs {
 ///  20  ftLastWriteTime   FILETIME (low @20, high @24)
 ///  28  nFileSizeHigh     DWORD   (high BEFORE low)
 ///  32  nFileSizeLow      DWORD
-///  36  dwReserved0       DWORD
-///  40  dwReserved1       DWORD
-///  44  cFileName[260]    WCHAR[260] = 520 bytes
-/// 564  cAlternateFileName[14] WCHAR[14] = 28 bytes  (written as a single NUL)
+///  36  dwReserved0/1     DWORD × 2
+///  44  cFileName          WCHAR[260] (…W, 520B) | CHAR[260] (…A, 260B)
+/// tail cAlternateFileName  WCHAR[14]  (…W)       | CHAR[14]  (…A)
 /// ```
-fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry) -> Result<()> {
-    // Zero the entire 592-byte structure first.
-    mem.write(ptr, &[0u8; 592])?;
+/// Total size: 592 bytes (W) or 318 bytes (A).
+fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry, wide: bool) -> Result<()> {
+    let total = if wide { 592 } else { 318 };
+    // Zero the whole structure first (also clears cAlternateFileName).
+    mem.write(ptr, &vec![0u8; total])?;
 
-    // dwFileAttributes
     let attrs: u32 = if entry.is_dir {
         FILE_ATTRIBUTE_DIRECTORY as u32 // 0x10
     } else {
@@ -395,28 +457,22 @@ fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry) -> Result<
     };
     mem.write_u32(ptr, attrs)?;
 
-    // ftCreationTime (low DWORD @ 4, high DWORD @ 8)
     mem.write_u32(ptr + 4, entry.ctime as u32)?;
     mem.write_u32(ptr + 8, (entry.ctime >> 32) as u32)?;
-
-    // ftLastAccessTime (low @ 12, high @ 16)
     mem.write_u32(ptr + 12, entry.atime as u32)?;
     mem.write_u32(ptr + 16, (entry.atime >> 32) as u32)?;
-
-    // ftLastWriteTime (low @ 20, high @ 24)
     mem.write_u32(ptr + 20, entry.mtime as u32)?;
     mem.write_u32(ptr + 24, (entry.mtime >> 32) as u32)?;
-
-    // nFileSizeHigh @ 28 (HIGH comes BEFORE low)
+    // nFileSizeHigh @ 28 (HIGH comes BEFORE low), nFileSizeLow @ 32.
     mem.write_u32(ptr + 28, (entry.size >> 32) as u32)?;
-    // nFileSizeLow @ 32
     mem.write_u32(ptr + 32, entry.size as u32)?;
 
-    // cFileName[260] starting at offset 44 (520 bytes).
-    WinOs::write_wstr(mem, ptr + 44, &entry.name, 260)?;
-
-    // cAlternateFileName[14] at offset 564 is already zeroed (NUL = no 8.3 name).
-
+    // cFileName at offset 44 (already NUL-terminated by the zero-fill).
+    if wide {
+        WinOs::write_wstr(mem, ptr + 44, &entry.name, 260)?;
+    } else {
+        crate::api::write_astr(mem, ptr + 44, &entry.name, 260)?;
+    }
     Ok(())
 }
 

@@ -294,3 +294,115 @@ fn find_close_on_unknown_handle_is_lenient() {
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+// ─── P3.9 additions: A-variants, GetFullPathName, Copy/MoveFile ─────────────
+
+fn write_ansi(mem: &mut VirtualMemory, addr: u64, s: &str) {
+    for (i, b) in s.bytes().chain(std::iter::once(0)).enumerate() {
+        mem.write_u8(addr + i as u64, b).unwrap();
+    }
+}
+
+fn read_ansi(mem: &VirtualMemory, addr: u64, max: usize) -> String {
+    let mut bytes = Vec::new();
+    for i in 0..max {
+        let b = mem.read_u8(addr + i as u64).unwrap();
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[test]
+fn find_first_next_close_ansi_enumerates() {
+    let sandbox = unique_sandbox();
+    let dir_c = sandbox.join("C").join("dir");
+    std::fs::create_dir_all(&dir_c).unwrap();
+    std::fs::write(dir_c.join("a.txt"), b"hello").unwrap();
+    std::fs::write(dir_c.join("b.txt"), b"world").unwrap();
+
+    let (mut os, mut mem) = make_os(sandbox.to_str().unwrap());
+    let mut cpu = CpuState::new();
+    let pattern_ptr = DATA;
+    let find_data_ptr = DATA + 0x100;
+
+    write_ansi(&mut mem, pattern_ptr, "C:\\dir\\*.txt");
+    cpu.set_reg(Reg::Rcx, pattern_ptr);
+    cpu.set_reg(Reg::Rdx, find_data_ptr);
+    let handle = call_k32(&mut os, &mut mem, &mut cpu, "FindFirstFileA");
+    assert_ne!(handle, INVALID_HANDLE_VALUE, "FindFirstFileA must succeed");
+
+    let mut names = vec![read_ansi(&mem, find_data_ptr + FIND_DATA_CFILENAME_OFFSET, 260)];
+    loop {
+        cpu.set_reg(Reg::Rcx, handle);
+        cpu.set_reg(Reg::Rdx, find_data_ptr);
+        if call_k32(&mut os, &mut mem, &mut cpu, "FindNextFileA") == 0 {
+            break;
+        }
+        names.push(read_ansi(&mem, find_data_ptr + FIND_DATA_CFILENAME_OFFSET, 260));
+    }
+    let set: HashSet<&str> = names.iter().map(String::as_str).collect();
+    assert!(set.contains("a.txt") && set.contains("b.txt"), "got {set:?}");
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn get_full_path_name_makes_absolute() {
+    let sandbox = unique_sandbox();
+    std::fs::create_dir_all(sandbox.join("C")).unwrap();
+    let (mut os, mut mem) = make_os(sandbox.to_str().unwrap());
+    let mut cpu = CpuState::new();
+
+    let name_ptr = DATA;
+    let buf = DATA + 0x100;
+    let part_ptr = DATA + 0x300;
+    write_utf16(&mut mem, name_ptr, "sub\\file.txt");
+    cpu.set_reg(Reg::Rcx, name_ptr);
+    cpu.set_reg(Reg::Rdx, 260); // nBufferLength (chars)
+    cpu.set_reg(Reg::R8, buf);
+    cpu.set_reg(Reg::R9, part_ptr);
+    let n = call_k32(&mut os, &mut mem, &mut cpu, "GetFullPathNameW");
+    assert!(n > 0, "GetFullPathNameW returned 0");
+    assert_eq!(read_utf16(&mem, buf, 260), "C:\\sub\\file.txt");
+    // lpFilePart points at "file.txt" within the buffer.
+    let part = mem.read_u64(part_ptr).unwrap();
+    assert_eq!(read_utf16(&mem, part, 260), "file.txt");
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn copy_then_move_file_roundtrip() {
+    let sandbox = unique_sandbox();
+    let c = sandbox.join("C");
+    std::fs::create_dir_all(&c).unwrap();
+    std::fs::write(c.join("a.txt"), b"payload").unwrap();
+
+    let (mut os, mut mem) = make_os(sandbox.to_str().unwrap());
+    let mut cpu = CpuState::new();
+    let src = DATA;
+    let dst = DATA + 0x80;
+    let dst2 = DATA + 0x100;
+
+    // CopyFileW("C:\a.txt", "C:\b.txt", FALSE)
+    write_utf16(&mut mem, src, "C:\\a.txt");
+    write_utf16(&mut mem, dst, "C:\\b.txt");
+    cpu.set_reg(Reg::Rcx, src);
+    cpu.set_reg(Reg::Rdx, dst);
+    cpu.set_reg(Reg::R8, 0);
+    assert_eq!(call_k32(&mut os, &mut mem, &mut cpu, "CopyFileW"), 1, "CopyFileW must succeed");
+    assert!(c.join("b.txt").exists(), "copy target missing");
+
+    // MoveFileW("C:\b.txt", "C:\c.txt")
+    write_utf16(&mut mem, dst2, "C:\\c.txt");
+    cpu.set_reg(Reg::Rcx, dst);
+    cpu.set_reg(Reg::Rdx, dst2);
+    assert_eq!(call_k32(&mut os, &mut mem, &mut cpu, "MoveFileW"), 1, "MoveFileW must succeed");
+    assert!(c.join("c.txt").exists(), "move target missing");
+    assert!(!c.join("b.txt").exists(), "source should be gone after move");
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
