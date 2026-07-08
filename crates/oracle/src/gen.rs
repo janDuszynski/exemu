@@ -865,11 +865,12 @@ fn build_sse(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
         8 => sse_int(rng),
         9 => sse_shift_imm(rng),
         10 => sse_shift_var(rng),
-        _ => match rng.below(4) {
+        _ => match rng.below(5) {
             0 => sse_shuffle(rng),
             1 => sse_pmovmskb(rng, bits),
             2 => sse_movmsk(rng, bits),
-            _ => sse_pextrw(rng, bits),
+            3 => sse_pextrw(rng, bits),
+            _ => sse_cvt_dq(rng),
         },
     }
 }
@@ -946,6 +947,16 @@ fn sse_cvt_f2f(rng: &mut Rng) -> Trial {
     sse_prefix(&mut b, if sd2ss { 3 } else { 2 }, false); // F2 = cvtsd2ss, F3 = cvtss2sd
     b.extend([0x0F, 0x5A, modrm_reg(d, s)]);
     Trial { xmm_nan: if sd2ss { 4 } else { 8 }, bytes: b, defined_flags: 0, skip_reg: 0, label: if sd2ss { "cvtsd2ss".into() } else { "cvtss2sd".into() } }
+}
+
+/// CVTDQ2PS (NP) / CVTPS2DQ (66) / CVTTPS2DQ (F3) — packed int32 ↔ f32.
+fn sse_cvt_dq(rng: &mut Rng) -> Trial {
+    let (mp, name) = *rng.pick(&[(0u8, "cvtdq2ps"), (1, "cvtps2dq"), (2, "cvttps2dq")]);
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let mut b = Vec::new();
+    sse_prefix(&mut b, mp, false);
+    b.extend([0x0F, 0x5B, modrm_reg(d, s)]);
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: name.into() }
 }
 
 fn sse_move(rng: &mut Rng, bits: Bits) -> Trial {
