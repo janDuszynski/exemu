@@ -39,7 +39,15 @@ pub struct Interpreter {
     /// Monotonic time-stamp counter backing `RDTSC`. Advanced on each read so
     /// spin loops that wait for the TSC to change make progress.
     tsc: u64,
+    /// SSE control/status register (`MXCSR`), round-tripped by `LDMXCSR`/
+    /// `STMXCSR`/`FXSAVE`/`FXRSTOR`. Default 0x1F80 (all exceptions masked,
+    /// round-to-nearest). Only the round-nearest default currently affects
+    /// float→int conversions.
+    mxcsr: u32,
 }
+
+/// The bits of `MXCSR` that are defined (reserved bits 16..31 read as 0).
+const MXCSR_MASK: u32 = 0x0000_FFFF;
 
 impl Default for Interpreter {
     fn default() -> Self {
@@ -50,16 +58,16 @@ impl Default for Interpreter {
 impl Interpreter {
     /// A fresh 64-bit interpreter.
     pub fn new() -> Self {
-        Interpreter { state: CpuState::new(), bits: Bits::B64, tsc: 0 }
+        Interpreter { state: CpuState::new(), bits: Bits::B64, tsc: 0, mxcsr: 0x1F80 }
     }
 
     /// A fresh interpreter in the given mode.
     pub fn with_bits(bits: Bits) -> Self {
-        Interpreter { state: CpuState::new(), bits, tsc: 0 }
+        Interpreter { state: CpuState::new(), bits, tsc: 0, mxcsr: 0x1F80 }
     }
 
     pub fn with_state(state: CpuState) -> Self {
-        Interpreter { state, bits: Bits::B64, tsc: 0 }
+        Interpreter { state, bits: Bits::B64, tsc: 0, mxcsr: 0x1F80 }
     }
 
     pub fn bits(&self) -> Bits {
