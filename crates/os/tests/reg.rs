@@ -377,3 +377,162 @@ fn reg_query_size_query_null_data() {
     cpu.set_reg(Reg::Rcx, hkey);
     call_reg(&mut os, &mut mem, &mut cpu, "advapi32.dll", "RegCloseKey");
 }
+
+// ── P3.12 additions: enumeration, A-variants, seeded roots ──────────────────
+
+fn write_astr(mem: &mut VirtualMemory, addr: u64, s: &str) {
+    for (i, b) in s.bytes().chain([0]).enumerate() {
+        mem.write_u8(addr + i as u64, b).unwrap();
+    }
+}
+
+fn read_wstr_at(mem: &VirtualMemory, addr: u64) -> String {
+    let mut units = Vec::new();
+    for i in 0.. {
+        let u = mem.read_u16(addr + i * 2).unwrap();
+        if u == 0 {
+            break;
+        }
+        units.push(u);
+    }
+    String::from_utf16_lossy(&units)
+}
+
+/// Create HKCU\<path> (helper for the enum test).
+fn create_key(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState, path: &str) {
+    let subkey = DATA + 0x400;
+    let phk = DATA + 0x500;
+    write_wstr(mem, subkey, path);
+    cpu.set_reg(Reg::Rcx, HKCU);
+    cpu.set_reg(Reg::Rdx, subkey);
+    cpu.set_reg(Reg::R8, 0);
+    cpu.set_reg(Reg::R9, 0);
+    seat_stack_arg(mem, 4, 0);
+    seat_stack_arg(mem, 5, 0);
+    seat_stack_arg(mem, 6, 0);
+    seat_stack_arg(mem, 7, phk);
+    seat_stack_arg(mem, 8, 0);
+    assert_eq!(call_reg(os, mem, cpu, "advapi32.dll", "RegCreateKeyExW"), 0);
+}
+
+#[test]
+fn reg_enum_key_lists_subkeys() {
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+    create_key(&mut os, &mut mem, &mut cpu, "Software\\Enum\\Alpha");
+    create_key(&mut os, &mut mem, &mut cpu, "Software\\Enum\\Beta");
+
+    // Open the parent.
+    let subkey = DATA;
+    let phk = DATA + 0x100;
+    write_wstr(&mut mem, subkey, "Software\\Enum");
+    cpu.set_reg(Reg::Rcx, HKCU);
+    cpu.set_reg(Reg::Rdx, subkey);
+    cpu.set_reg(Reg::R8, 0);
+    cpu.set_reg(Reg::R9, 0);
+    seat_stack_arg(&mut mem, 4, phk);
+    assert_eq!(call_reg(&mut os, &mut mem, &mut cpu, "advapi32.dll", "RegOpenKeyExW"), 0);
+    let hkey = mem.read_u64(phk).unwrap();
+
+    let name_buf = DATA + 0x200;
+    let cch = DATA + 0x300;
+    let mut names = Vec::new();
+    for i in 0..3u64 {
+        mem.write_u32(cch, 260).unwrap();
+        cpu.set_reg(Reg::Rcx, hkey);
+        cpu.set_reg(Reg::Rdx, i);
+        cpu.set_reg(Reg::R8, name_buf);
+        cpu.set_reg(Reg::R9, cch);
+        seat_stack_arg(&mut mem, 4, 0);
+        seat_stack_arg(&mut mem, 5, 0);
+        seat_stack_arg(&mut mem, 6, 0);
+        seat_stack_arg(&mut mem, 7, 0);
+        let r = call_reg(&mut os, &mut mem, &mut cpu, "advapi32.dll", "RegEnumKeyExW");
+        if r == 259 {
+            break; // ERROR_NO_MORE_ITEMS
+        }
+        assert_eq!(r, 0);
+        names.push(read_wstr_at(&mem, name_buf));
+    }
+    assert_eq!(names, vec!["Alpha".to_string(), "Beta".to_string()], "sorted subkeys");
+}
+
+#[test]
+fn reg_ansi_roundtrip() {
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+    let subkey = DATA;
+    let val_name = DATA + 0x80;
+    let val_data = DATA + 0x100;
+    let phk = DATA + 0x200;
+    let out_type = DATA + 0x210;
+    let out_buf = DATA + 0x220;
+    let out_cb = DATA + 0x240;
+
+    write_astr(&mut mem, subkey, "Software\\AnsiTest");
+    write_astr(&mut mem, val_name, "AVal");
+    write_astr(&mut mem, val_data, "hi"); // 3 bytes incl NUL
+
+    cpu.set_reg(Reg::Rcx, HKCU);
+    cpu.set_reg(Reg::Rdx, subkey);
+    cpu.set_reg(Reg::R8, 0);
+    cpu.set_reg(Reg::R9, 0);
+    seat_stack_arg(&mut mem, 4, 0);
+    seat_stack_arg(&mut mem, 5, 0);
+    seat_stack_arg(&mut mem, 6, 0);
+    seat_stack_arg(&mut mem, 7, phk);
+    seat_stack_arg(&mut mem, 8, 0);
+    assert_eq!(call_reg(&mut os, &mut mem, &mut cpu, "advapi32.dll", "RegCreateKeyExA"), 0);
+    let hkey = mem.read_u64(phk).unwrap();
+
+    cpu.set_reg(Reg::Rcx, hkey);
+    cpu.set_reg(Reg::Rdx, val_name);
+    cpu.set_reg(Reg::R8, 0);
+    cpu.set_reg(Reg::R9, 1); // REG_SZ
+    seat_stack_arg(&mut mem, 4, val_data);
+    seat_stack_arg(&mut mem, 5, 3);
+    assert_eq!(call_reg(&mut os, &mut mem, &mut cpu, "advapi32.dll", "RegSetValueExA"), 0);
+
+    mem.write_u32(out_cb, 0x100).unwrap();
+    cpu.set_reg(Reg::Rcx, hkey);
+    cpu.set_reg(Reg::Rdx, val_name);
+    cpu.set_reg(Reg::R8, 0);
+    cpu.set_reg(Reg::R9, out_type);
+    seat_stack_arg(&mut mem, 4, out_buf);
+    seat_stack_arg(&mut mem, 5, out_cb);
+    assert_eq!(call_reg(&mut os, &mut mem, &mut cpu, "advapi32.dll", "RegQueryValueExA"), 0);
+    assert_eq!(mem.read_u32(out_cb).unwrap(), 3);
+    assert_eq!(mem.read_u8(out_buf).unwrap(), b'h');
+    assert_eq!(mem.read_u8(out_buf + 1).unwrap(), b'i');
+}
+
+#[test]
+fn reg_seeded_hklm_product_name() {
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::new();
+    let subkey = DATA;
+    let val_name = DATA + 0x100;
+    let phk = DATA + 0x180;
+    let out_buf = DATA + 0x200;
+    let out_cb = DATA + 0x300;
+
+    write_wstr(&mut mem, subkey, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+    write_wstr(&mut mem, val_name, "ProductName");
+    cpu.set_reg(Reg::Rcx, HKLM);
+    cpu.set_reg(Reg::Rdx, subkey);
+    cpu.set_reg(Reg::R8, 0);
+    cpu.set_reg(Reg::R9, 0);
+    seat_stack_arg(&mut mem, 4, phk);
+    assert_eq!(call_reg(&mut os, &mut mem, &mut cpu, "advapi32.dll", "RegOpenKeyExW"), 0, "seeded key must open");
+    let hkey = mem.read_u64(phk).unwrap();
+
+    mem.write_u32(out_cb, 0x200).unwrap();
+    cpu.set_reg(Reg::Rcx, hkey);
+    cpu.set_reg(Reg::Rdx, val_name);
+    cpu.set_reg(Reg::R8, 0);
+    cpu.set_reg(Reg::R9, 0);
+    seat_stack_arg(&mut mem, 4, out_buf);
+    seat_stack_arg(&mut mem, 5, out_cb);
+    assert_eq!(call_reg(&mut os, &mut mem, &mut cpu, "advapi32.dll", "RegQueryValueExW"), 0);
+    assert_eq!(read_wstr_at(&mem, out_buf), "Windows 10 Pro");
+}

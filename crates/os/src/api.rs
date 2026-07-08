@@ -315,21 +315,18 @@ pub enum Api {
     ExceptionDriver,
 
     // --- In-memory registry hive (roadmap P3.12, partial) -----------------
-    /// `RegCreateKeyExW`: create or open a registry key; allocates a handle.
-    RegCreateKeyExW,
-    /// `RegOpenKeyExW`: open an existing key (no auto-create); fails with
-    /// ERROR_FILE_NOT_FOUND if the key was never written.
-    RegOpenKeyExW,
-    /// `RegSetValueExW`: write a named value into an open key's entry.
-    RegSetValueExW,
-    /// `RegQueryValueExW`: read a named value; supports size-query (lpData=0).
-    RegQueryValueExW,
-    /// `RegCloseKey`: release an open HKEY handle (predefined roots no-op).
-    RegCloseKey,
-    /// `RegDeleteValueW`: remove a named value from an open key.
-    RegDeleteValueW,
-    /// `RegDeleteKeyW`: remove a sub-key by name.
-    RegDeleteKeyW,
+    // In-memory registry hive (roadmap P3.12), see [`crate::reg`]. `wide`
+    // selects LPCWSTR (W) vs LPCSTR (A) name marshalling.
+    RegCreate { wide: bool },
+    RegOpen { wide: bool },
+    RegSet { wide: bool },
+    RegQuery { wide: bool },
+    RegClose,
+    RegDeleteValue { wide: bool },
+    RegDeleteKey { wide: bool },
+    RegEnumKey { wide: bool },
+    RegEnumValue { wide: bool },
+    RegQueryInfoKey,
 
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
@@ -644,25 +641,29 @@ impl Api {
             "MessageBoxW" | "MessageBoxA" => Api::MessageBoxApi { wide: name.ends_with('W') },
             "GetUserObjectInformationW" | "GetUserObjectInformationA" => Api::GetUserObjectInfoApi,
 
-            // Registry (W variants): in-memory round-trip (roadmap P3.12).
-            // A-variants and lesser-used stubs keep returning a static code so
-            // installer "already installed?" probes take the not-found path.
-            "RegCreateKeyExW" => Api::RegCreateKeyExW,
-            "RegOpenKeyExW" => Api::RegOpenKeyExW,
-            "RegSetValueExW" => Api::RegSetValueExW,
-            "RegQueryValueExW" => Api::RegQueryValueExW,
-            "RegCloseKey" => Api::RegCloseKey,
-            "RegDeleteValueW" => Api::RegDeleteValueW,
-            "RegDeleteKeyW" => Api::RegDeleteKeyW,
-            // A-variants and read-only probes: still return NOT_FOUND / SUCCESS
-            // stubs (no wide-string handling here).
-            "RegOpenKeyExA" | "RegOpenKeyW" | "RegOpenKeyA" | "RegQueryValueExA"
-            | "RegQueryValueW" | "RegQueryValueA" | "RegEnumKeyExW"
-            | "RegEnumKeyW" | "RegEnumValueW" | "RegQueryInfoKeyW" | "RegGetValueW" => {
-                Api::WinStub { r: 2, argc: win32_argc(dll, name).unwrap_or(0) } // ERROR_FILE_NOT_FOUND
-            }
-            "RegCreateKeyExA" | "RegSetValueExA" | "RegDeleteKeyExW" | "RegFlushKey"
-            | "RegNotifyChangeKeyValue" => {
+            // In-memory registry hive (roadmap P3.12): real round-trip +
+            // enumeration in both W and A variants (see [`crate::reg`]).
+            "RegCreateKeyExW" | "RegCreateKeyW" => Api::RegCreate { wide: true },
+            "RegCreateKeyExA" | "RegCreateKeyA" => Api::RegCreate { wide: false },
+            "RegOpenKeyExW" | "RegOpenKeyW" => Api::RegOpen { wide: true },
+            "RegOpenKeyExA" | "RegOpenKeyA" => Api::RegOpen { wide: false },
+            "RegSetValueExW" => Api::RegSet { wide: true },
+            "RegSetValueExA" => Api::RegSet { wide: false },
+            "RegQueryValueExW" => Api::RegQuery { wide: true },
+            "RegQueryValueExA" => Api::RegQuery { wide: false },
+            "RegCloseKey" => Api::RegClose,
+            "RegDeleteValueW" => Api::RegDeleteValue { wide: true },
+            "RegDeleteValueA" => Api::RegDeleteValue { wide: false },
+            "RegDeleteKeyW" | "RegDeleteKeyExW" => Api::RegDeleteKey { wide: true },
+            "RegDeleteKeyA" | "RegDeleteKeyExA" => Api::RegDeleteKey { wide: false },
+            "RegEnumKeyExW" => Api::RegEnumKey { wide: true },
+            "RegEnumKeyExA" => Api::RegEnumKey { wide: false },
+            "RegEnumValueW" => Api::RegEnumValue { wide: true },
+            "RegEnumValueA" => Api::RegEnumValue { wide: false },
+            "RegQueryInfoKeyW" | "RegQueryInfoKeyA" => Api::RegQueryInfoKey,
+            // Lesser-used probes still stub: flush is a no-op success; change
+            // notification returns success (we never signal a change).
+            "RegFlushKey" | "RegNotifyChangeKeyValue" => {
                 Api::WinStub { r: 0, argc: win32_argc(dll, name).unwrap_or(0) } // ERROR_SUCCESS
             }
 
@@ -809,11 +810,13 @@ impl Api {
             // itself (UnhandledExceptionFilter) takes one pointer arg too.
             Api::SetUnhandledExceptionFilter | Api::UnhandledExceptionFilter => 1,
             // Registry hive (roadmap P3.12).
-            Api::RegCloseKey => 1,
-            Api::RegDeleteValueW | Api::RegDeleteKeyW => 2,
-            Api::RegOpenKeyExW => 5,
-            Api::RegSetValueExW | Api::RegQueryValueExW => 6,
-            Api::RegCreateKeyExW => 9,
+            Api::RegClose => 1,
+            Api::RegDeleteValue { .. } | Api::RegDeleteKey { .. } => 2,
+            Api::RegOpen { .. } => 5,
+            Api::RegSet { .. } | Api::RegQuery { .. } => 6,
+            Api::RegEnumKey { .. } | Api::RegEnumValue { .. } => 8,
+            Api::RegCreate { .. } => 9,
+            Api::RegQueryInfoKey => 12,
             // Fake-handle, stub and unimplemented carry their looked-up
             // stdcall footprint so the stack stays balanced.
             Api::WinStub { argc, .. }
@@ -2084,235 +2087,17 @@ impl WinOs {
                 self.gdi_set_pixel(x, y, c);
                 ret(c as u64)
             }
-            // ── In-memory registry hive (roadmap P3.12) ───────────────────
-            Api::RegCreateKeyExW => {
-                // RegCreateKeyExW(hKey, lpSubKey, Reserved, lpClass, dwOptions,
-                //                 samDesired, lpSecurity, phkResult, lpdwDisposition)
-                let hkey = self.arg(cpu, mem, 0)?;
-                let subkey_ptr = self.arg(cpu, mem, 1)?;
-                // args 2-6 (Reserved/lpClass/dwOptions/samDesired/lpSecurity) ignored
-                let phk_result = self.arg(cpu, mem, 7)?;
-                let lpdw_disp = self.arg(cpu, mem, 8)?;
-
-                let Some(base) = self.reg_resolve(hkey) else {
-                    self.last_error = 6; // ERROR_INVALID_HANDLE
-                    return ret(6);
-                };
-                let subkey = read_wstr(mem, subkey_ptr)?;
-                let path = if subkey.is_empty() {
-                    base
-                } else {
-                    format!("{base}\\{subkey}")
-                };
-
-                let existed = self.reg_hive.contains_key(&path);
-                self.reg_hive.entry(path.clone()).or_default();
-
-                let handle = self.next_handle;
-                self.next_handle += 4;
-                self.reg_handles.insert(handle, path);
-
-                if phk_result != 0 {
-                    mem.write_u64(phk_result, handle)?;
-                }
-                if lpdw_disp != 0 {
-                    // REG_CREATED_NEW_KEY = 1, REG_OPENED_EXISTING_KEY = 2
-                    mem.write_u32(lpdw_disp, if existed { 2 } else { 1 })?;
-                }
-                ret(0) // ERROR_SUCCESS
-            }
-
-            Api::RegOpenKeyExW => {
-                // RegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult)
-                let hkey = self.arg(cpu, mem, 0)?;
-                let subkey_ptr = self.arg(cpu, mem, 1)?;
-                // args 2-3 (ulOptions, samDesired) ignored
-                let phk_result = self.arg(cpu, mem, 4)?;
-
-                let Some(base) = self.reg_resolve(hkey) else {
-                    self.last_error = 6; // ERROR_INVALID_HANDLE
-                    return ret(6);
-                };
-                let subkey = read_wstr(mem, subkey_ptr)?;
-                let path = if subkey.is_empty() {
-                    base
-                } else {
-                    format!("{base}\\{subkey}")
-                };
-
-                if !self.reg_hive.contains_key(&path) {
-                    self.last_error = 2; // ERROR_FILE_NOT_FOUND
-                    return ret(2);
-                }
-
-                let handle = self.next_handle;
-                self.next_handle += 4;
-                self.reg_handles.insert(handle, path);
-
-                if phk_result != 0 {
-                    mem.write_u64(phk_result, handle)?;
-                }
-                ret(0) // ERROR_SUCCESS
-            }
-
-            Api::RegSetValueExW => {
-                // RegSetValueExW(hKey, lpValueName, Reserved, dwType, lpData, cbData)
-                let hkey = self.arg(cpu, mem, 0)?;
-                let name_ptr = self.arg(cpu, mem, 1)?;
-                // arg 2 = Reserved
-                let dw_type = self.arg(cpu, mem, 3)? as u32;
-                let lp_data = self.arg(cpu, mem, 4)?;
-                let cb_data = self.arg(cpu, mem, 5)? as usize;
-
-                let Some(path) = self.reg_resolve(hkey) else {
-                    self.last_error = 6; // ERROR_INVALID_HANDLE
-                    return ret(6);
-                };
-
-                let name = if name_ptr == 0 {
-                    String::new() // default value
-                } else {
-                    read_wstr(mem, name_ptr)?
-                };
-
-                let mut data = vec![0u8; cb_data];
-                if lp_data != 0 && cb_data > 0 {
-                    mem.read(lp_data, &mut data)?;
-                }
-
-                self.reg_hive
-                    .entry(path)
-                    .or_default()
-                    .insert(name, (dw_type, data));
-
-                ret(0) // ERROR_SUCCESS
-            }
-
-            Api::RegQueryValueExW => {
-                // RegQueryValueExW(hKey, lpValueName, lpReserved, lpType,
-                //                  lpData, lpcbData)
-                let hkey = self.arg(cpu, mem, 0)?;
-                let name_ptr = self.arg(cpu, mem, 1)?;
-                // arg 2 = lpReserved
-                let lp_type = self.arg(cpu, mem, 3)?;
-                let lp_data = self.arg(cpu, mem, 4)?;
-                let lpcb_data = self.arg(cpu, mem, 5)?;
-
-                let Some(path) = self.reg_resolve(hkey) else {
-                    self.last_error = 6; // ERROR_INVALID_HANDLE
-                    return ret(6);
-                };
-
-                let name = if name_ptr == 0 {
-                    String::new() // default value
-                } else {
-                    read_wstr(mem, name_ptr)?
-                };
-
-                let found = self
-                    .reg_hive
-                    .get(&path)
-                    .and_then(|m| m.get(&name))
-                    .map(|(ty, data)| (*ty, data.clone()));
-
-                let (ty, data) = match found {
-                    Some(v) => v,
-                    None => {
-                        self.last_error = 2; // ERROR_FILE_NOT_FOUND
-                        return ret(2);
-                    }
-                };
-
-                if lp_type != 0 {
-                    mem.write_u32(lp_type, ty)?;
-                }
-
-                let data_len = data.len() as u32;
-
-                if lpcb_data == 0 {
-                    // Caller provided no size pointer — only valid if lpData is
-                    // also NULL; we just return success (size unknown to caller).
-                    return ret(0);
-                }
-
-                // Read how large the caller's buffer is.
-                let buf_size = mem.read_u32(lpcb_data)?;
-
-                if lp_data == 0 {
-                    // Size query: report required byte count, return SUCCESS.
-                    mem.write_u32(lpcb_data, data_len)?;
-                    return ret(0);
-                }
-
-                // Actual data transfer.
-                if buf_size < data_len {
-                    mem.write_u32(lpcb_data, data_len)?;
-                    return ret(234); // ERROR_MORE_DATA
-                }
-
-                mem.write(lp_data, &data)?;
-                mem.write_u32(lpcb_data, data_len)?;
-                ret(0) // ERROR_SUCCESS
-            }
-
-            Api::RegCloseKey => {
-                // RegCloseKey(hKey): free the handle. Predefined roots succeed
-                // without removing anything (they are not in reg_handles).
-                let hkey = self.arg(cpu, mem, 0)?;
-                self.reg_handles.remove(&hkey); // no-op for predefined roots
-                ret(0) // ERROR_SUCCESS
-            }
-
-            Api::RegDeleteValueW => {
-                // RegDeleteValueW(hKey, lpValueName)
-                let hkey = self.arg(cpu, mem, 0)?;
-                let name_ptr = self.arg(cpu, mem, 1)?;
-
-                let Some(path) = self.reg_resolve(hkey) else {
-                    self.last_error = 6;
-                    return ret(6);
-                };
-
-                let name = if name_ptr == 0 {
-                    String::new()
-                } else {
-                    read_wstr(mem, name_ptr)?
-                };
-
-                let removed = self
-                    .reg_hive
-                    .get_mut(&path)
-                    .and_then(|m| m.remove(&name))
-                    .is_some();
-
-                if removed {
-                    ret(0)
-                } else {
-                    self.last_error = 2; // ERROR_FILE_NOT_FOUND
-                    ret(2)
-                }
-            }
-
-            Api::RegDeleteKeyW => {
-                // RegDeleteKeyW(hKey, lpSubKey)
-                let hkey = self.arg(cpu, mem, 0)?;
-                let subkey_ptr = self.arg(cpu, mem, 1)?;
-
-                let Some(base) = self.reg_resolve(hkey) else {
-                    self.last_error = 6;
-                    return ret(6);
-                };
-
-                let subkey = read_wstr(mem, subkey_ptr)?;
-                let path = if subkey.is_empty() {
-                    base
-                } else {
-                    format!("{base}\\{subkey}")
-                };
-
-                self.reg_hive.remove(&path);
-                ret(0) // ERROR_SUCCESS
-            }
+            // In-memory registry hive (roadmap P3.12), see [`crate::reg`].
+            Api::RegCreate { wide } => self.reg_create(cpu, mem, *wide),
+            Api::RegOpen { wide } => self.reg_open(cpu, mem, *wide),
+            Api::RegSet { wide } => self.reg_set(cpu, mem, *wide),
+            Api::RegQuery { wide } => self.reg_query(cpu, mem, *wide),
+            Api::RegClose => self.reg_close(cpu, mem),
+            Api::RegDeleteValue { wide } => self.reg_delete_value(cpu, mem, *wide),
+            Api::RegDeleteKey { wide } => self.reg_delete_key(cpu, mem, *wide),
+            Api::RegEnumKey { wide } => self.reg_enum_key(cpu, mem, *wide),
+            Api::RegEnumValue { wide } => self.reg_enum_value(cpu, mem, *wide),
+            Api::RegQueryInfoKey => self.reg_query_info(cpu, mem),
 
             Api::WinStub { r, .. } => ret(*r),
             Api::WsprintfApi { wide } => {
