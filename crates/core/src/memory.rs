@@ -152,4 +152,47 @@ pub trait Memory {
         }
         Ok(out)
     }
+
+    // ---- dynamic mapping (VirtualAlloc/Free/Protect/Query support) --------
+    //
+    // The domain exposes just enough of the concrete address space for the OS
+    // layer's virtual-memory manager to reserve, release, re-protect and probe
+    // regions at runtime. Backends that are fixed-size (test doubles) inherit
+    // the defaults below and simply refuse dynamic mapping.
+
+    /// Map a fresh zero-filled region of `size` bytes at the fixed address
+    /// `base` with permission `perm`. Fails on overlap with an existing region
+    /// (which the caller uses to detect a taken address). Default: unsupported.
+    fn map_fixed(&mut self, base: u64, size: u64, perm: Perm, name: &str) -> Result<()> {
+        let _ = (base, size, perm, name);
+        Err(EmuError::Unsupported("dynamic mapping".into()))
+    }
+
+    /// Change the protection of the region containing `base` to `perm`,
+    /// returning that region's previous permission. Page-granular splitting is
+    /// not modelled — the whole covering region is re-protected. Default:
+    /// unsupported.
+    fn protect(&mut self, base: u64, size: u64, perm: Perm) -> Result<Perm> {
+        let _ = (base, size, perm);
+        Err(EmuError::Unsupported("protect".into()))
+    }
+
+    /// Release mapped memory. `size == 0` releases the single region that
+    /// starts exactly at `base` (VirtualFree/MEM_RELEASE); otherwise every
+    /// region fully inside `[base, base+size)` is released. Default:
+    /// unsupported.
+    fn unmap(&mut self, base: u64, size: u64) -> Result<()> {
+        let _ = (base, size);
+        Err(EmuError::Unsupported("unmap".into()))
+    }
+
+    /// The first mapped region whose end is above `addr`, as
+    /// `(base, size, perm)`. If its base is `<= addr`, then `addr` is inside
+    /// that region; otherwise `addr` lies in a free gap that ends at the
+    /// returned base. `None` means everything at/above `addr` is free.
+    /// Default: `None`.
+    fn next_region(&self, addr: u64) -> Option<(u64, u64, Perm)> {
+        let _ = addr;
+        None
+    }
 }

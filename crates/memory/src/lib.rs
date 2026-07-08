@@ -184,6 +184,41 @@ impl Memory for VirtualMemory {
         m.bytes[start..end].copy_from_slice(data);
         Ok(())
     }
+
+    // ---- dynamic mapping (backs the OS layer's VirtualAlloc family) -------
+
+    fn map_fixed(&mut self, base: u64, size: u64, perm: Perm, name: &str) -> Result<()> {
+        self.map(Region::new(name, base, size, perm))
+    }
+
+    fn protect(&mut self, base: u64, size: u64, perm: Perm) -> Result<Perm> {
+        let m = self.find_mut(base).ok_or(EmuError::Unmapped { addr: base, len: size as usize })?;
+        let old = m.region.perm;
+        m.region.perm = perm;
+        Ok(old)
+    }
+
+    fn unmap(&mut self, base: u64, size: u64) -> Result<()> {
+        if size == 0 {
+            if let Some(pos) = self.regions.iter().position(|m| m.region.base == base) {
+                self.regions.remove(pos);
+            }
+        } else {
+            let end = base.saturating_add(size);
+            self.regions.retain(|m| !(m.region.base >= base && m.end() <= end));
+        }
+        Ok(())
+    }
+
+    fn next_region(&self, addr: u64) -> Option<(u64, u64, Perm)> {
+        // Regions are sorted by base and non-overlapping, so the first with an
+        // end above `addr` is either the region containing `addr` or the next
+        // one above a free gap.
+        self.regions
+            .iter()
+            .find(|m| m.end() > addr)
+            .map(|m| (m.region.base, m.region.size, m.region.perm))
+    }
 }
 
 #[cfg(test)]
@@ -236,5 +271,35 @@ mod tests {
         let m = mem();
         // 8-byte read starting 4 bytes before the region end overruns it.
         assert!(m.read_u64(0x1000 + 0x1000 - 4).is_err());
+    }
+
+    #[test]
+    fn dynamic_map_protect_unmap() {
+        let mut m = mem();
+        // Map a fresh region, then probe it via next_region.
+        m.map_fixed(0x5000_0000, 0x2000, Perm::RW, "valloc").unwrap();
+        let (base, size, perm) = m.next_region(0x5000_0000).unwrap();
+        assert_eq!((base, size), (0x5000_0000, 0x2000));
+        assert_eq!(perm, Perm::RW);
+        // A fixed map onto a taken address is rejected (address-in-use signal).
+        assert!(m.map_fixed(0x5000_0000, 0x1000, Perm::RW, "dup").is_err());
+        // Re-protect returns the old permission and takes effect.
+        let old = m.protect(0x5000_0000, 0x2000, Perm::RX).unwrap();
+        assert_eq!(old, Perm::RW);
+        assert_eq!(m.next_region(0x5000_0000).unwrap().2, Perm::RX);
+        // MEM_RELEASE (size 0) removes exactly the region at that base.
+        m.unmap(0x5000_0000, 0).unwrap();
+        assert!(m.read_u8(0x5000_0000).is_err());
+    }
+
+    #[test]
+    fn next_region_reports_free_gap() {
+        let m = mem();
+        // 0x9000 lies in the gap between the stack (ends 0x2000) and code
+        // (starts 0x400000); next_region points at the code region above it.
+        let (base, _, _) = m.next_region(0x9000).unwrap();
+        assert_eq!(base, 0x400000);
+        // Above every region, the space is free.
+        assert!(m.next_region(0x9000_0000).is_none());
     }
 }
