@@ -6,6 +6,36 @@ API stability: `0.0.x` is the pre-GUI foundation, `0.1.0` will be the first real
 interactive native window, and `1.0.0` is the notarized product. A version
 advertises only what is actually implemented.
 
+## v0.0.2 — trust the CPU
+
+The CPU's correctness is now guarded by a **Unicorn differential oracle**: the
+interpreter is lockstep-diffed against QEMU/Unicorn over tens of millions of
+randomized instructions with zero divergence. Every instruction added below
+lands only after the oracle is green for it.
+
+### Oracle
+- Fuzz the extended registers: the generator now exercises **R8–R15** (REX.R/B)
+  and the engine seeds, runs and diffs **xmm8–15** in 64-bit mode (a harness bug
+  left Unicorn's high XMM unseeded — fixed).
+
+### CPU — SSE/SSE2 completion (each oracle-verified)
+- `MOVMSKPS`/`MOVMSKPD` (previously a decode error).
+- Saturating packed add/sub: `PADDS`/`PADDUS`/`PSUBS`/`PSUBUS` (byte + word).
+- Packed multiply: `PMULLW`/`PMULHW`/`PMULHUW`, `PMULUDQ`, `PMADDWD`.
+- `PAVGB`/`PAVGW`, `PSADBW`, `PACKSSWB`/`PACKSSDW`/`PACKUSWB`, `PEXTRW`
+  (and routed `0F C5`, which the oracle flagged as unhandled).
+- Packed int↔float: `CVTDQ2PS`/`CVTPS2DQ`/`CVTTPS2DQ`, and `LDDQU`.
+- `LDMXCSR`/`STMXCSR` and `FXSAVE`/`FXRSTOR` (MXCSR + XMM), closing the CPUID
+  FXSR honesty gap.
+
+### Notes
+- The cache-free interpreter runs self-modifying code correctly (pinned by a
+  regression test).
+- Deferred to later releases: the iced-x86 exhaustive-encoding oracle pass,
+  control-flow oracle trials, the full MXCSR rounding-mode model (only
+  round-nearest affects conversions today), and the approximate/rare
+  `RSQRT`/`RCP`/`MASKMOVDQU`.
+
 ## v0.0.1 — foundation / bring-up
 
 The substrate a Windows program needs before its window can exist: a software
