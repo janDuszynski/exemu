@@ -1004,6 +1004,15 @@ fn sse_int(rng: &mut Rng) -> Trial {
         (0x6D, "punpckhqdq"),
         (0xDA, "pminub"),
         (0xDE, "pmaxub"),
+        // saturating add/sub (signed + unsigned, byte + word)
+        (0xDC, "paddusb"),
+        (0xDD, "paddusw"),
+        (0xD8, "psubusb"),
+        (0xD9, "psubusw"),
+        (0xEC, "paddsb"),
+        (0xED, "paddsw"),
+        (0xE8, "psubsb"),
+        (0xE9, "psubsw"),
     ]);
     let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
     Trial { xmm_nan: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: name.into() }

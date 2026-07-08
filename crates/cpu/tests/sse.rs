@@ -184,6 +184,34 @@ fn movmskps_movmskpd_extract_sign_bits() {
 }
 
 #[test]
+fn saturating_add_sub_clamps_lanes() {
+    // paddusb xmm0, xmm1: 0xF0 + 0x20 clamps to 0xFF (unsigned byte).
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xDC, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0xF0;
+        cpu.state_mut().xmm[1] = 0x20;
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFF, 0xFF);
+    // psubusb xmm0, xmm1: 0x10 - 0x20 clamps to 0 (no unsigned wrap).
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xD8, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0x10;
+        cpu.state_mut().xmm[1] = 0x20;
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFF, 0x00);
+    // paddsw xmm0, xmm1: 0x7000 + 0x2000 clamps to 0x7FFF (signed word max).
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xED, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0x7000;
+        cpu.state_mut().xmm[1] = 0x2000;
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFFFF, 0x7FFF);
+    // psubsb xmm0, xmm1: (-0x70) - 0x40 clamps to -128 = 0x80 (signed byte min).
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xE8, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0x90; // -112
+        cpu.state_mut().xmm[1] = 0x40; // +64
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFF, 0x80);
+}
+
+#[test]
 fn paddb_adds_per_byte_with_wrap() {
     // paddb xmm0, xmm1: 0xFF + 0x01 wraps to 0x00 in every byte lane.
     let code = [0x66, 0x0F, 0xFC, 0xC1, 0xF4];
