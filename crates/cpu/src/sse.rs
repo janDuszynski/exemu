@@ -43,7 +43,7 @@ pub(crate) fn is_sse(op2: u8) -> bool {
     matches!(op2,
         0x10..=0x17 | 0x28..=0x2F | 0x50..=0x5F |
         0x60..=0x76 | 0x7E | 0x7F |
-        0xC6 | 0xD0..=0xFE)
+        0xC5 | 0xC6 | 0xD0..=0xFE)
 }
 
 impl Interpreter {
@@ -392,6 +392,29 @@ impl Interpreter {
                     _ => pmaddwd(a, b),
                 };
                 self.set_xmm(reg, out);
+            }
+
+            // ---- PAVGB/W, PSADBW, PACK{SSWB,SSDW,USWB} -----------------
+            0xE0 | 0xE3 | 0xF6 | 0x63 | 0x6B | 0x67 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                let out = match op2 {
+                    0xE0 => pavg(a, b, 1),
+                    0xE3 => pavg(a, b, 2),
+                    0xF6 => psadbw(a, b),
+                    0x63 => pack(a, b, 2, true),  // packsswb
+                    0x6B => pack(a, b, 4, true),  // packssdw
+                    _ => pack(a, b, 2, false),    // packuswb
+                };
+                self.set_xmm(reg, out);
+            }
+
+            // ---- PEXTRW (0F C5 /r ib): word[imm8&7] of xmm → GP reg -----
+            0xC5 => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let imm = ctx.u8(mem)? as u32;
+                let w = ((src >> ((imm & 7) * 16)) & 0xFFFF) as u64;
+                let size = if ctx.pfx.w() { 8 } else { 4 };
+                self.write_reg_field(ctx, size, w);
             }
 
             // ---- PMINUB / PMAXUB (unsigned byte min/max) ----------------
@@ -799,6 +822,64 @@ fn pmaddwd(a: u128, b: u128) -> u128 {
         let bh = ((b >> (base + 16)) & 0xFFFF) as u16 as i16 as i32;
         let s = (al * bl).wrapping_add(ah * bh);
         out |= (s as u32 as u128) << base;
+    }
+    out
+}
+
+/// PAVGB (esz=1) / PAVGW (esz=2) — unsigned rounded average `(x+y+1)>>1`.
+fn pavg(a: u128, b: u128, esz: usize) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let x = ((a >> (i * bits)) & mask) as u64;
+        let y = ((b >> (i * bits)) & mask) as u64;
+        let r = (x + y + 1) >> 1;
+        out |= (r as u128 & mask) << (i * bits);
+    }
+    out
+}
+
+/// PSADBW — sum of absolute byte differences, per 8-byte half, into the low
+/// word of each qword lane (the rest of the lane zeroed).
+fn psadbw(a: u128, b: u128) -> u128 {
+    let mut halves = [0u128; 2];
+    for (h, acc) in halves.iter_mut().enumerate() {
+        let mut sum = 0u32;
+        for i in 0..8 {
+            let sh = (h * 8 + i) * 8;
+            let x = ((a >> sh) & 0xFF) as i32;
+            let y = ((b >> sh) & 0xFF) as i32;
+            sum += (x - y).unsigned_abs();
+        }
+        *acc = sum as u128;
+    }
+    halves[0] | (halves[1] << 64)
+}
+
+/// Pack with saturation: `a`'s lanes fill the low half, `b`'s the high half.
+/// Input lanes are `esz_in` bytes read as signed; output lanes are half that
+/// width, saturated to the signed range (`signed_out`) or `[0,max]` (PACKUSWB).
+fn pack(a: u128, b: u128, esz_in: usize, signed_out: bool) -> u128 {
+    let bits_in = esz_in * 8;
+    let bits_out = bits_in / 2;
+    let mask_in = emask(esz_in);
+    let mask_out = emask(esz_in / 2);
+    let lanes = 16 / esz_in;
+    let (lo, hi) = if signed_out {
+        (-(1i64 << (bits_out - 1)), (1i64 << (bits_out - 1)) - 1)
+    } else {
+        (0, (1i64 << bits_out) - 1)
+    };
+    let mut out = 0u128;
+    for (half, src) in [a, b].iter().enumerate() {
+        for i in 0..lanes {
+            let raw = ((src >> (i * bits_in)) & mask_in) as u64;
+            let shift = 64 - bits_in;
+            let v = ((raw << shift) as i64) >> shift; // sign-extend input
+            let c = (v.clamp(lo, hi) as u64) & mask_out as u64;
+            out |= (c as u128) << ((half * lanes + i) * bits_out);
+        }
     }
     out
 }

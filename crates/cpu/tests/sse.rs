@@ -240,6 +240,34 @@ fn packed_multiply_ops() {
 }
 
 #[test]
+fn avg_sad_pack_extract_ops() {
+    // pavgb: (0xF0 + 0x0F + 1) >> 1 = 0x80.
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xE0, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0xF0;
+        cpu.state_mut().xmm[1] = 0x0F;
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFF, 0x80);
+    // psadbw: all bytes |0x10-0x08| = 8, ×8 per half = 0x40 at bit 0 and bit 64.
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xF6, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = u128::from_le_bytes([0x10; 16]);
+        cpu.state_mut().xmm[1] = u128::from_le_bytes([0x08; 16]);
+    });
+    assert_eq!(cpu.state().xmm[0], (0x40u128 << 64) | 0x40);
+    // packsswb: dst word 0x7FFF → +127 (byte 0); src word 0x8000 → -128 (byte 8).
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0x63, 0xC1, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0x7FFF;
+        cpu.state_mut().xmm[1] = 0x8000;
+    });
+    assert_eq!(cpu.state().xmm[0] & 0xFF, 0x7F);
+    assert_eq!((cpu.state().xmm[0] >> 64) & 0xFF, 0x80);
+    // pextrw eax, xmm0, 2 → word lane 2.
+    let (cpu, _) = run_with(&[0x66, 0x0F, 0xC5, 0xC0, 0x02, 0xF4], |cpu, _| {
+        cpu.state_mut().xmm[0] = 0xBEEFu128 << 32;
+    });
+    assert_eq!(cpu.state().reg(exemu_core::Reg::Rax), 0xBEEF);
+}
+
+#[test]
 fn paddb_adds_per_byte_with_wrap() {
     // paddb xmm0, xmm1: 0xFF + 0x01 wraps to 0x00 in every byte lane.
     let code = [0x66, 0x0F, 0xFC, 0xC1, 0xF4];

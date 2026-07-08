@@ -865,10 +865,11 @@ fn build_sse(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
         8 => sse_int(rng),
         9 => sse_shift_imm(rng),
         10 => sse_shift_var(rng),
-        _ => match rng.below(3) {
+        _ => match rng.below(4) {
             0 => sse_shuffle(rng),
             1 => sse_pmovmskb(rng, bits),
-            _ => sse_movmsk(rng, bits),
+            2 => sse_movmsk(rng, bits),
+            _ => sse_pextrw(rng, bits),
         },
     }
 }
@@ -1019,6 +1020,13 @@ fn sse_int(rng: &mut Rng) -> Trial {
         (0xE4, "pmulhuw"),
         (0xF4, "pmuludq"),
         (0xF5, "pmaddwd"),
+        // average / SAD / pack-with-saturation
+        (0xE0, "pavgb"),
+        (0xE3, "pavgw"),
+        (0xF6, "psadbw"),
+        (0x63, "packsswb"),
+        (0x6B, "packssdw"),
+        (0x67, "packuswb"),
     ]);
     let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
     Trial { xmm_nan: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: name.into() }
@@ -1033,6 +1041,19 @@ fn sse_pmovmskb(rng: &mut Rng, bits: Bits) -> Trial {
     }
     b.extend([0x0F, 0xD7, modrm_reg(reg, rm)]);
     Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "pmovmskb".into() }
+}
+
+/// PEXTRW (66 0F C5 /r ib) — extract word[imm8&7] of an xmm into a GP reg.
+/// Register form only.
+fn sse_pextrw(rng: &mut Rng, bits: Bits) -> Trial {
+    let rexw = bits == Bits::B64 && rng.boolean();
+    let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8); // reg = GP dst, rm = xmm src
+    let mut b = vec![0x66];
+    if rexw {
+        b.push(0x48);
+    }
+    b.extend([0x0F, 0xC5, modrm_reg(reg, rm), rng.below(8) as u8]);
+    Trial { xmm_nan: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "pextrw".into() }
 }
 
 /// MOVMSKPS (NP) / MOVMSKPD (66) — sign bits of the packed floats into a GP
