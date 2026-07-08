@@ -168,6 +168,14 @@ impl WinOs {
         }
     }
 
+    /// Reserve and back a fresh region of `size` bytes somewhere free in the
+    /// VirtualAlloc arena, returning its base — used for thread stacks (P3.4)
+    /// as well as `VirtualAlloc(NULL, …)`. `None` if the mapping fails.
+    pub(crate) fn map_anywhere(&mut self, mem: &mut dyn Memory, size: u64, perm: exemu_core::Perm, name: &str) -> Option<u64> {
+        let base = self.vm_find_free(mem, size);
+        mem.map_fixed(base, size, perm, name).ok().map(|()| base)
+    }
+
     /// Find a free, 64 KiB-aligned base for at least `size` bytes at/above the
     /// bump hint, then advance the hint past it.
     fn vm_find_free(&mut self, mem: &dyn Memory, size: u64) -> u64 {
