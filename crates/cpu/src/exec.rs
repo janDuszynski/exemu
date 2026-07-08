@@ -962,6 +962,54 @@ impl Interpreter {
                 }
             }
 
+            // 0F AE group 15: FXSAVE/FXRSTOR (/0,/1), LDMXCSR/STMXCSR (/2,/3),
+            // and the memory fences LFENCE/MFENCE/SFENCE + CLFLUSH (/5,/6,/7).
+            0xAE => {
+                self.read_modrm(ctx, mem)?;
+                let digit = ctx.reg & 7;
+                // Fences and CLFLUSH: single-threaded, so no-ops (ModRM consumed).
+                if digit >= 5 {
+                    return Ok(None);
+                }
+                let addr = ctx.rm_addr();
+                match digit {
+                    // FXSAVE: 512-byte area. We model MXCSR (off 24) + MXCSR_MASK
+                    // (off 28) + XMM0..15 (off 160, 16 bytes each); the x87 area
+                    // is zeroed (no x87 state yet).
+                    0 => {
+                        let mut buf = [0u8; 512];
+                        buf[24..28].copy_from_slice(&self.mxcsr.to_le_bytes());
+                        buf[28..32].copy_from_slice(&MXCSR_MASK.to_le_bytes());
+                        for i in 0..16 {
+                            let off = 160 + i * 16;
+                            buf[off..off + 16].copy_from_slice(&self.state.xmm[i].to_le_bytes());
+                        }
+                        mem.write(addr, &buf)?;
+                    }
+                    // FXRSTOR: restore MXCSR + XMM from the 512-byte area.
+                    1 => {
+                        let mut buf = [0u8; 512];
+                        mem.read(addr, &mut buf)?;
+                        self.mxcsr =
+                            u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]) & MXCSR_MASK;
+                        for i in 0..16 {
+                            let off = 160 + i * 16;
+                            let mut b = [0u8; 16];
+                            b.copy_from_slice(&buf[off..off + 16]);
+                            self.state.xmm[i] = u128::from_le_bytes(b);
+                        }
+                    }
+                    // LDMXCSR / STMXCSR: load/store the 32-bit control word.
+                    2 => self.mxcsr = mem.read_u32(addr)? & MXCSR_MASK,
+                    3 => mem.write_u32(addr, self.mxcsr)?,
+                    _ => {
+                        return Err(EmuError::Unsupported(format!(
+                            "0f ae /{digit} (xsave) at {start:#x}"
+                        )))
+                    }
+                }
+            }
+
             // CMOVcc r, r/m
             0x40..=0x4F => {
                 self.read_modrm(ctx, mem)?;

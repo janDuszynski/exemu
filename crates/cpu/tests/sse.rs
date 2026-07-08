@@ -298,6 +298,53 @@ fn lddqu_loads_128_from_memory() {
 }
 
 #[test]
+fn mxcsr_load_store_round_trips() {
+    // ldmxcsr [rax]; stmxcsr [rbx] — the control word must survive intact.
+    let (_, mem) = run_with(&[0x0F, 0xAE, 0x10, 0x0F, 0xAE, 0x1B, 0xF4], |cpu, mem| {
+        cpu.state_mut().set_reg(exemu_core::Reg::Rax, DATA);
+        cpu.state_mut().set_reg(exemu_core::Reg::Rbx, DATA + 16);
+        mem.write_u32(DATA, 0x9F80).unwrap();
+    });
+    assert_eq!(mem.read_u32(DATA + 16).unwrap(), 0x9F80);
+}
+
+#[test]
+fn fxsave_fxrstor_round_trip_xmm_and_mxcsr() {
+    // fxsave [rax]: xmm0 lands at +160, mxcsr at +24.
+    let (_, mem) = run_with(&[0x0F, 0xAE, 0x00, 0xF4], |cpu, mem| {
+        cpu.state_mut().set_reg(exemu_core::Reg::Rax, DATA);
+        cpu.state_mut().xmm[0] = 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00;
+        let _ = mem;
+    });
+    let mut b = [0u8; 16];
+    mem.read(DATA + 160, &mut b).unwrap();
+    assert_eq!(u128::from_le_bytes(b), 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00);
+    assert_eq!(mem.read_u32(DATA + 24).unwrap(), 0x1F80);
+
+    // fxrstor [rax]; stmxcsr [rbx] — reload xmm0 + mxcsr from a save area.
+    let (cpu, mem) = run_with(&[0x0F, 0xAE, 0x08, 0x0F, 0xAE, 0x1B, 0xF4], |cpu, mem| {
+        cpu.state_mut().set_reg(exemu_core::Reg::Rax, DATA);
+        cpu.state_mut().set_reg(exemu_core::Reg::Rbx, DATA + 512);
+        mem.write_u32(DATA + 24, 0x9F80).unwrap();
+        mem.write(DATA + 160, &0xCAFE_u128.to_le_bytes()).unwrap();
+    });
+    assert_eq!(cpu.state().xmm[0], 0xCAFE);
+    assert_eq!(mem.read_u32(DATA + 512).unwrap(), 0x9F80);
+}
+
+#[test]
+fn self_modifying_code_reexecutes_patched_bytes() {
+    // No decode cache (P0.6): patching a later instruction's immediate before
+    // it runs must take effect. mov byte [rax+5], 0x42 patches the 0x00 imm of
+    // the following `mov bl, 0x00`, so bl ends up 0x42.
+    let (cpu, _) = run_with(
+        &[0xC6, 0x40, 0x05, 0x42, 0xB3, 0x00, 0xF4],
+        |cpu, _| cpu.state_mut().set_reg(exemu_core::Reg::Rax, CODE_BASE),
+    );
+    assert_eq!(cpu.state().reg(exemu_core::Reg::Rbx) & 0xFF, 0x42);
+}
+
+#[test]
 fn paddb_adds_per_byte_with_wrap() {
     // paddb xmm0, xmm1: 0xFF + 0x01 wraps to 0x00 in every byte lane.
     let code = [0x66, 0x0F, 0xFC, 0xC1, 0xF4];
