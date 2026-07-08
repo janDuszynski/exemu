@@ -381,6 +381,19 @@ impl Interpreter {
                 self.set_xmm(reg, add_sub_sat(a, b, esz, add, signed));
             }
 
+            // ---- Packed multiply: PMULLW/HW/HUW/UDQ, PMADDWD -----------
+            0xD5 | 0xE4 | 0xE5 | 0xF4 | 0xF5 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                let out = match op2 {
+                    0xD5 => pmullw(a, b),
+                    0xE5 => pmulh(a, b, true),
+                    0xE4 => pmulh(a, b, false),
+                    0xF4 => pmuludq(a, b),
+                    _ => pmaddwd(a, b),
+                };
+                self.set_xmm(reg, out);
+            }
+
             // ---- PMINUB / PMAXUB (unsigned byte min/max) ----------------
             0xDA => {
                 let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
@@ -735,6 +748,57 @@ fn add_sub_sat(a: u128, b: u128, esz: usize, add: bool, signed: bool) -> u128 {
             x.saturating_sub(y)
         };
         out |= (r as u128 & mask) << (i * bits);
+    }
+    out
+}
+
+/// PMULLW — 8 word lanes of 16×16, keeping the low 16 bits.
+fn pmullw(a: u128, b: u128) -> u128 {
+    let mut out = 0u128;
+    for i in 0..8 {
+        let x = ((a >> (i * 16)) & 0xFFFF) as u32;
+        let y = ((b >> (i * 16)) & 0xFFFF) as u32;
+        out |= (((x * y) & 0xFFFF) as u128) << (i * 16);
+    }
+    out
+}
+
+/// PMULHW (`signed`) / PMULHUW — 8 word lanes of 16×16, keeping the high 16.
+fn pmulh(a: u128, b: u128, signed: bool) -> u128 {
+    let mut out = 0u128;
+    for i in 0..8 {
+        let x = ((a >> (i * 16)) & 0xFFFF) as u16;
+        let y = ((b >> (i * 16)) & 0xFFFF) as u16;
+        let p: i64 = if signed {
+            (x as i16 as i64) * (y as i16 as i64)
+        } else {
+            (x as i64) * (y as i64)
+        };
+        out |= (((p >> 16) as u128) & 0xFFFF) << (i * 16);
+    }
+    out
+}
+
+/// PMULUDQ — unsigned 32×32→64 on the two even dword lanes (0 and 2).
+fn pmuludq(a: u128, b: u128) -> u128 {
+    let a0 = (a & 0xFFFF_FFFF) as u64;
+    let b0 = (b & 0xFFFF_FFFF) as u64;
+    let a2 = ((a >> 64) & 0xFFFF_FFFF) as u64;
+    let b2 = ((b >> 64) & 0xFFFF_FFFF) as u64;
+    (a0 as u128 * b0 as u128) | ((a2 as u128 * b2 as u128) << 64)
+}
+
+/// PMADDWD — signed 16×16 products summed in adjacent pairs → 4 dwords.
+fn pmaddwd(a: u128, b: u128) -> u128 {
+    let mut out = 0u128;
+    for i in 0..4 {
+        let base = i * 32;
+        let al = ((a >> base) & 0xFFFF) as u16 as i16 as i32;
+        let ah = ((a >> (base + 16)) & 0xFFFF) as u16 as i16 as i32;
+        let bl = ((b >> base) & 0xFFFF) as u16 as i16 as i32;
+        let bh = ((b >> (base + 16)) & 0xFFFF) as u16 as i16 as i32;
+        let s = (al * bl).wrapping_add(ah * bh);
+        out |= (s as u32 as u128) << base;
     }
     out
 }

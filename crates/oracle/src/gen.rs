@@ -1013,6 +1013,12 @@ fn sse_int(rng: &mut Rng) -> Trial {
         (0xED, "paddsw"),
         (0xE8, "psubsb"),
         (0xE9, "psubsw"),
+        // packed multiply
+        (0xD5, "pmullw"),
+        (0xE5, "pmulhw"),
+        (0xE4, "pmulhuw"),
+        (0xF4, "pmuludq"),
+        (0xF5, "pmaddwd"),
     ]);
     let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
     Trial { xmm_nan: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: name.into() }
