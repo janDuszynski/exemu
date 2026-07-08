@@ -1,6 +1,6 @@
 # exemu — a Windows `.exe` emulator for Apple Silicon
 
-**Version 0.0.1** (foundation / bring-up) — see [CHANGELOG.md](CHANGELOG.md).
+**Version 0.0.2** (trust the CPU) — see [CHANGELOG.md](CHANGELOG.md).
 Versions before 1.0 track capability, not API stability: `0.1.0` will be the
 first real interactive native window, `1.0.0` the notarized product.
 
@@ -141,10 +141,16 @@ exemu sample <out.exe>
   `POPCNT`/`TZCNT`/`LZCNT`, `XADD`/`CMPXCHG`, `LOOP`/`JECXZ`, the string ops
   (`MOVS`/`STOS`/`CMPS`/`LODS`/`SCAS` with `REP`/`REPE`/`REPNE`),
   `RDTSC`/`RDTSCP` (monotonic counter; `RDTSCP` reports `TSC_AUX`=0 for the
-  single-vCPU model), `PAUSE`, and **SSE/SSE2** (moves, logical, scalar+packed float arithmetic, compares and
-  conversions) — all with faithful EFLAGS. `CPUID` reports an honest feature
-  set (only the instructions actually implemented), so CRTs dispatch onto code
-  paths the interpreter can execute rather than into AVX it cannot.
+  single-vCPU model), `PAUSE`, and a broad **SSE/SSE2** surface: moves,
+  logical, scalar+packed float arithmetic, compares and conversions
+  (incl. `CVTDQ2PS`/`CVTPS2DQ`/`CVTTPS2DQ`), the packed-integer family —
+  add/sub (incl. **saturating** `PADD/PSUB S/US`), multiply (`PMULLW`/`HW`/
+  `HUW`, `PMULUDQ`, `PMADDWD`), `PAVGB/W`, `PSADBW`, `PACK*`, `PEXTRW`,
+  `MOVMSKPS/PD`, shifts, shuffles, pack/unpack — plus `LDMXCSR`/`STMXCSR`
+  and `FXSAVE`/`FXRSTOR` — all with faithful EFLAGS and cross-checked against
+  a Unicorn differential oracle. `CPUID` reports an honest feature set (only
+  the instructions actually implemented), so CRTs dispatch onto code paths the
+  interpreter can execute rather than into AVX it cannot.
 * **~200 Win32 functions** across `kernel32`/`user32`/`gdi32`/`advapi32`/
   `shell32`/`ole32`/`comctl32`: console I/O, the `Heap*`/`Global*`/`Virtual*`
   allocators, the `lstr*` string family, `CharNext`/`CharPrev`, command

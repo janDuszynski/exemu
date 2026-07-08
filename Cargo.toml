@@ -29,7 +29,7 @@ members = [
 # apps + headless installer auto-drive + x64 exceptions. v0.1.0 is reserved for
 # the first real interactive native window. See the release plan in the local
 # knowledge base for the gate that triggers each version.
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.80"
 license = "PolyForm-Noncommercial-1.0.0"
