@@ -1,6 +1,6 @@
 # exemu — a Windows `.exe` emulator for Apple Silicon
 
-**Version 0.0.2** (trust the CPU) — see [CHANGELOG.md](CHANGELOG.md).
+**Version 0.0.3** (a real process) — see [CHANGELOG.md](CHANGELOG.md).
 Versions before 1.0 track capability, not API stability: `0.1.0` will be the
 first real interactive native window, `1.0.0` the notarized product.
 
@@ -152,20 +152,37 @@ exemu sample <out.exe>
   the instructions actually implemented), so CRTs dispatch onto code paths the
   interpreter can execute rather than into AVX it cannot.
 * **~200 Win32 functions** across `kernel32`/`user32`/`gdi32`/`advapi32`/
-  `shell32`/`ole32`/`comctl32`: console I/O, the `Heap*`/`Global*`/`Virtual*`
-  allocators, the `lstr*` string family, `CharNext`/`CharPrev`, command
-  line, module handles, and timing/console stubs. Every function — even the
-  unimplemented ones — carries its **stdcall argument count**, so 32-bit
-  callee stack cleanup stays correct and stub calls don't corrupt the stack.
-  Handle-returning stubs yield a non-null fake handle so setup proceeds.
+  `shell32`/`ole32`/`comctl32`: console I/O, the `Heap*`/`Global*` allocators,
+  the `lstr*` string family, `CharNext`/`CharPrev`, command line, module
+  handles, and console stubs. Every function — even the unimplemented ones —
+  carries its **stdcall argument count**, so 32-bit callee stack cleanup stays
+  correct and stub calls don't corrupt the stack. Handle-returning stubs yield
+  a non-null fake handle so setup proceeds.
+* **A real process substrate** (the "a real process" milestone):
+  - **Virtual memory:** `VirtualAlloc`/`VirtualFree`/`VirtualProtect`/
+    `VirtualQuery` map real, distinct, page-aligned regions with reserve/commit
+    tracking; `VirtualQuery` fills a true `MEMORY_BASIC_INFORMATION`.
+  - **Threads + a cooperative scheduler:** `CreateThread`/`_beginthreadex`,
+    `ExitThread`, `Resume`/`Suspend`/`TerminateThread`, `GetExitCodeThread`,
+    per-thread stacks and TLS. Threads yield at blocking points and on a
+    timeslice, so a multithreaded console app runs and joins correctly.
+  - **Real synchronization objects:** events (auto/manual-reset), mutexes
+    (ownership + recursion), semaphores (counts), waitable timers, with
+    named-object sharing; `WaitForSingle/MultipleObjects` truly block and wake.
+  - **Host-clock time:** `GetTickCount(64)`, `QueryPerformanceCounter/
+    Frequency`, `GetSystemTimeAsFileTime`, `GetSystemTime`/`GetLocalTime`.
+  - **Registry:** an in-memory hive with W **and A** variants —
+    create/open/set/query/delete, enumeration (`RegEnumKeyEx`/`RegEnumValue`/
+    `RegQueryInfoKey`), every `REG_*` value type, and seeded HKLM/HKCU keys.
 * A **host-backed sandbox filesystem**: `CreateFileW`/`ReadFile`/`WriteFile`/
-  `CloseHandle`, `CreateDirectoryW`, `GetTempPathW`/`GetTempFileNameW`,
-  `GetFileSize`/`SetFilePointer`/`GetFileAttributesW`/`DeleteFileW`,
+  `CloseHandle`, `CreateDirectory`, `GetTempPathW`/`GetTempFileNameW`,
+  `GetFileSize`/`SetFilePointer`/`GetFileAttributes`/`DeleteFile`,
+  `GetFullPathName`, `MoveFile`/`MoveFileEx`, `CopyFile`, `SetFileTime`,
   `GetModuleFileNameW`, and **directory enumeration**
-  (`FindFirstFileW`/`FindNextFileW`/`FindClose`) with case-insensitive glob,
-  `.`/`..` entries, and `WIN32_FIND_DATAW` size/time fields. Guest paths map
-  into a sandbox dir; the executable is copied in so a self-extractor can read
-  its own appended archive.
+  (`FindFirstFile`/`FindNextFile`/`FindClose`, in both **W and A** variants)
+  with case-insensitive glob, `.`/`..` entries, and `WIN32_FIND_DATA` size/time
+  fields. Guest paths map into a sandbox dir; the executable is copied in so a
+  self-extractor can read its own appended archive.
 * Data imports, `_initterm` static-constructor execution via re-entrant
   guest calls, and a slice of the `msvcrt` C runtime.
 * **Data imports** (a DLL exporting a variable, not a function). The thunk
@@ -218,10 +235,11 @@ Complex apps will hit unimplemented calls.
 
 AVX and x87 floating point; native-themed / GDI+ / DirectX rendering (the
 GDI is a solid-fill/text subset); TLS callbacks and base relocations (images
-load at their preferred base); real threads; **COM** object creation; and full
-registry persistence (the W-family `Reg*` create/open/set/query/close/delete
-calls are backed by an in-memory hive that round-trips correctly, but the hive
-is not yet persisted to disk across runs).
+load at their preferred base); **COM** object creation; **preemptive** threads
+(the scheduler is cooperative — it yields at blocking points and on a timeslice,
+not on true OS preemption); and **registry persistence to disk** (the `Reg*`
+family round-trips through an in-memory hive with enumeration and seeded roots,
+but the hive is not yet saved across runs).
 
 **x64 exceptions work:** the `.pdata`/`.xdata` unwind tables are parsed,
 `RtlCaptureContext`/`RtlLookupFunctionEntry`/`RtlVirtualUnwind`/`RtlUnwindEx`
@@ -237,8 +255,8 @@ catch resumes execution, an unmatched throw terminates like `std::terminate`.
 | **7-Zip installer** | 64-bit MSVC GUI | **installs end to end** — drives its dialog, "clicks" Install, decompresses its LZMA archive, writes all 107 files + registry, exits 0 (~496M instructions) |
 | **extracted `7z.exe`** | 64-bit console | **runs and prints its banner/usage** (`7-Zip 26.02 … Igor Pavlov`); `7z i` also runs |
 | generated `hello.exe` | 64-bit console | **runs fully**, prints output incl. an SSE2 computation, exits 0 |
-| Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; inner program runs CRT init + setup + SEH frame build + sync init for ~4.7M instructions; stops on an unimplemented instruction (`group5 /7`) at 0x40000c |
-| SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for ~45M instructions before a fault deep in unpacked code |
+| Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; the inner program runs CRT init + setup + SEH frame build + thread/sync init for ~4.7M instructions before a fault deep in unpacked code |
+| SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for **~93M instructions** (more than double the pre-0.0.2 reach) before a fault deep in unpacked code |
 
 7-Zip is only an example — the same generic path drives any dialog-based
 installer. With `--gui` you click Install in a real window (progress bar and
