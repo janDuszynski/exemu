@@ -370,6 +370,17 @@ impl Interpreter {
                 self.set_xmm(reg, add_sub(a, b, esz, false));
             }
 
+            // ---- Saturating PADD/PSUB (signed + unsigned, byte + word) --
+            // PADDUSB/W (DC/DD), PSUBUSB/W (D8/D9), PADDSB/W (EC/ED),
+            // PSUBSB/W (E8/E9). Codecs and image code lean on these.
+            0xD8 | 0xD9 | 0xDC | 0xDD | 0xE8 | 0xE9 | 0xEC | 0xED => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                let esz = if op2 & 1 == 0 { 1 } else { 2 }; // even opcode = byte
+                let add = matches!(op2, 0xDC | 0xDD | 0xEC | 0xED);
+                let signed = matches!(op2, 0xE8 | 0xE9 | 0xEC | 0xED);
+                self.set_xmm(reg, add_sub_sat(a, b, esz, add, signed));
+            }
+
             // ---- PMINUB / PMAXUB (unsigned byte min/max) ----------------
             0xDA => {
                 let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
@@ -696,6 +707,34 @@ fn add_sub(a: u128, b: u128, esz: usize, add: bool) -> u128 {
         let y = ((b >> (i * bits)) & mask) as u64;
         let r = if add { x.wrapping_add(y) } else { x.wrapping_sub(y) } as u128;
         out |= (r & mask) << (i * bits);
+    }
+    out
+}
+
+/// Saturating packed add/sub for byte (esz=1) or word (esz=2) lanes.
+/// Signed variants clamp to the element's signed range (PADDSB/W, PSUBSB/W);
+/// unsigned variants clamp to `[0, max]` (PADDUSB/W, PSUBUSB/W).
+fn add_sub_sat(a: u128, b: u128, esz: usize, add: bool, signed: bool) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let x = ((a >> (i * bits)) & mask) as u64;
+        let y = ((b >> (i * bits)) & mask) as u64;
+        let r = if signed {
+            let shift = 64 - bits;
+            let sx = ((x << shift) as i64) >> shift;
+            let sy = ((y << shift) as i64) >> shift;
+            let v = if add { sx + sy } else { sx - sy };
+            let hi = (1i64 << (bits - 1)) - 1;
+            let lo = -(1i64 << (bits - 1));
+            (v.clamp(lo, hi) as u64) & mask as u64
+        } else if add {
+            (x + y).min(mask as u64)
+        } else {
+            x.saturating_sub(y)
+        };
+        out |= (r as u128 & mask) << (i * bits);
     }
     out
 }
