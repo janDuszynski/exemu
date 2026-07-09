@@ -15,11 +15,12 @@
 //! thunk, so resuming it simply re-runs the wait — the single source of truth
 //! for wait semantics stays in [`crate::sync`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use exemu_core::{CpuState, Memory, Perm, Reg, Result};
 
 use crate::api::Outcome;
+use crate::msg::PostedMsg;
 use crate::sync::KObject;
 use crate::WinOs;
 
@@ -62,6 +63,12 @@ pub(crate) struct Thread {
     pub wait: Option<WaitDesc>,
     tls: HashMap<u64, u64>,
     fls: HashMap<u64, u64>,
+    /// This thread's Win32 message queue (roadmap P5a.1). `PostMessage`/
+    /// `PostThreadMessage` enqueue here; `GetMessage`/`PeekMessage` drain it.
+    pub msgs: VecDeque<PostedMsg>,
+    /// A pending `WM_QUIT` exit code set by `PostQuitMessage` (delivered once the
+    /// queue drains).
+    pub quit_code: Option<i32>,
 }
 
 impl Thread {
@@ -79,6 +86,8 @@ impl Thread {
             wait: None,
             tls: HashMap::new(),
             fls: HashMap::new(),
+            msgs: VecDeque::new(),
+            quit_code: None,
         }
     }
 
@@ -247,6 +256,8 @@ impl WinOs {
             wait: None,
             tls: HashMap::new(),
             fls: HashMap::new(),
+            msgs: VecDeque::new(),
+            quit_code: None,
         });
         if tid_out != 0 {
             mem.write_u32(tid_out, tid)?;

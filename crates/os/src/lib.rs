@@ -23,6 +23,7 @@ mod dll;
 mod exc;
 mod fs;
 mod gdi;
+mod msg;
 mod reg;
 mod sync;
 mod thread;
