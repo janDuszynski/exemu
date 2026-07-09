@@ -87,6 +87,10 @@ pub enum Api {
     SwitchToThread,
     /// Sleep (argc 1) / SleepEx (argc 2), both cooperative-scheduler yields.
     SleepApi { ex: bool },
+    /// Win32 message queue (roadmap P5a.1), see [`crate::msg`].
+    PostMessageApi,
+    PostThreadMessageApi,
+    TranslateMessageApi,
     /// EncodePointer/DecodePointer (and the Rtl*/System variants): the CRT's
     /// pointer-obfuscation pair. The only invariant that matters is that
     /// Decode(Encode(p)) == p, so both are the identity on their argument.
@@ -504,11 +508,14 @@ impl Api {
             "SetDlgItemTextW" => Api::SetDlgItemTextW,
             "GetDlgItemTextW" => Api::GetDlgItemTextW,
             "GetDlgItem" => Api::GetDlgItemApi,
-            "SendMessageW" | "PostMessageW" => Api::SendMessageApi,
+            "SendMessageW" | "SendMessageA" => Api::SendMessageApi,
+            "PostMessageW" | "PostMessageA" => Api::PostMessageApi,
+            "PostThreadMessageW" | "PostThreadMessageA" => Api::PostThreadMessageApi,
+            "TranslateMessage" => Api::TranslateMessageApi,
             "SetWindowTextW" => Api::SetWindowTextApi,
             "GetWindowTextW" => Api::GetWindowTextApi,
-            "GetMessageW" => Api::GetMessageApi,
-            "PeekMessageW" => Api::PeekMessageApi,
+            "GetMessageW" | "GetMessageA" => Api::GetMessageApi,
+            "PeekMessageW" | "PeekMessageA" => Api::PeekMessageApi,
             "IsDialogMessageW" | "IsDialogMessage" => Api::IsDialogMessageApi,
             "CoCreateInstance" | "CoGetClassObject" => Api::CoCreateInstanceApi,
             "DestroyWindow" => Api::DestroyWindowApi,
@@ -578,7 +585,7 @@ impl Api {
             "LineTo" => Api::LineToApi,
             "SetPixel" | "SetPixelV" => Api::SetPixelApi,
             // Accepted no-effect window/GDI stubs.
-            "ShowWindow" | "UpdateWindow" | "TranslateMessage" | "DeleteObject" | "InvalidateRect"
+            "ShowWindow" | "UpdateWindow" | "DeleteObject" | "InvalidateRect"
             | "SetBkColor" | "SetBkMode" | "ReleaseDC" | "GetSysColor" | "GetSystemMetrics"
             | "SetWindowPos" | "MoveWindow" | "ValidateRect" => {
                 let r = match name {
@@ -728,6 +735,9 @@ impl Api {
             Api::TerminateThread | Api::GetExitCodeThread => 2,
             Api::SwitchToThread => 0,
             Api::SleepApi { ex } => if *ex { 2 } else { 1 },
+            // Message queue (roadmap P5a.1).
+            Api::PostMessageApi | Api::PostThreadMessageApi => 4,
+            Api::TranslateMessageApi => 1,
             Api::EncodeDecodePointer => 1,
             Api::GetLastError => 0,
             Api::SetLastError => 1,
@@ -1396,6 +1406,11 @@ impl WinOs {
             Api::SwitchToThread => self.switch_to_thread(cpu, mem),
             Api::SleepApi { ex } => self.sleep(cpu, mem, if *ex { 2 } else { 1 }),
 
+            // Message queue (roadmap P5a.1), see [`crate::msg`].
+            Api::PostMessageApi => self.post_message(cpu, mem),
+            Api::PostThreadMessageApi => self.post_thread_message(cpu, mem),
+            Api::TranslateMessageApi => self.translate_message(cpu, mem),
+
             // Time/date backed by the host clock (roadmap P3.8), see [`crate::time`].
             Api::QueryPerformanceCounter => self.query_performance_counter(cpu, mem),
             Api::QueryPerformanceFrequency => self.query_performance_frequency(cpu, mem),
@@ -1865,6 +1880,12 @@ impl WinOs {
             // report WM_QUIT (return 0) to end the loop.
             Api::GetMessageApi => {
                 let lp = self.arg(cpu, mem, 0)?;
+                // Real per-thread message queue first (roadmap P5a.1): deliver a
+                // posted message, or a synthetic WM_QUIT (return 0) once drained.
+                if let Some(m) = self.msg_next() {
+                    self.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
+                    return ret((m.message != crate::msg::WM_QUIT) as u64);
+                }
                 if self.quit_posted {
                     self.quit_posted = false;
                     return ret(0);
@@ -1912,6 +1933,13 @@ impl WinOs {
             // PeekMessageW(lpMsg, hWnd, min, max, wRemoveMsg): same budget.
             Api::PeekMessageApi => {
                 let lp = self.arg(cpu, mem, 0)?;
+                // Real message queue first (roadmap P5a.1). PM_REMOVE (arg4 & 1)
+                // dequeues; PM_NOREMOVE peeks without consuming.
+                let remove = self.arg(cpu, mem, 4)? & 1 != 0;
+                if let Some(m) = self.msg_peek(remove) {
+                    self.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
+                    return ret(TRUE);
+                }
                 if self.gui_active() {
                     return match self.gui.pump(false) {
                         Some(exemu_core::GuiEvent::Command(id)) => {
@@ -1956,10 +1984,7 @@ impl WinOs {
                 self.gui.close();
                 ret(TRUE)
             }
-            Api::PostQuitMessageApi => {
-                self.quit_posted = true;
-                ret(0)
-            }
+            Api::PostQuitMessageApi => self.post_quit_message(cpu, mem),
             Api::EndDialogApi => {
                 // Ends a modal dialog with the given result; closes the window.
                 let result = self.arg(cpu, mem, 1)?;
@@ -2717,7 +2742,7 @@ impl WinOs {
     }
 
     /// Read a MSG (hwnd, message, wParam, lParam) from a guest buffer.
-    fn read_msg(&self, mem: &dyn Memory, lp: u64) -> Result<(u64, u64, u64, u64)> {
+    pub(crate) fn read_msg(&self, mem: &dyn Memory, lp: u64) -> Result<(u64, u64, u64, u64)> {
         if self.cfg.is_64bit {
             Ok((mem.read_u64(lp)?, mem.read_u32(lp + 8)? as u64, mem.read_u64(lp + 16)?, mem.read_u64(lp + 24)?))
         } else {
