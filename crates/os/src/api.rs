@@ -242,6 +242,15 @@ pub enum Api {
     SendMessageApi,
     SetWindowTextApi,
     GetWindowTextApi,
+    /// Real window-object queries (roadmap P5a.2), see [`crate::win`].
+    WindowLong { set: bool },
+    IsWindowApi,
+    GetWindowRectApi,
+    ShowWindowApi,
+    GetClassNameApi { wide: bool },
+    SetPropApi { wide: bool },
+    GetPropApi { wide: bool },
+    RemovePropApi { wide: bool },
     GetMessageApi,
     PeekMessageApi,
     IsDialogMessageApi,
@@ -514,6 +523,24 @@ impl Api {
             "TranslateMessage" => Api::TranslateMessageApi,
             "SetWindowTextW" => Api::SetWindowTextApi,
             "GetWindowTextW" => Api::GetWindowTextApi,
+            // Real window-object queries (roadmap P5a.2).
+            "GetWindowLongW" | "GetWindowLongA" | "GetWindowLongPtrW" | "GetWindowLongPtrA" => {
+                Api::WindowLong { set: false }
+            }
+            "SetWindowLongW" | "SetWindowLongA" | "SetWindowLongPtrW" | "SetWindowLongPtrA" => {
+                Api::WindowLong { set: true }
+            }
+            "IsWindow" => Api::IsWindowApi,
+            "GetWindowRect" => Api::GetWindowRectApi,
+            "ShowWindow" => Api::ShowWindowApi,
+            "GetClassNameW" => Api::GetClassNameApi { wide: true },
+            "GetClassNameA" => Api::GetClassNameApi { wide: false },
+            "SetPropW" => Api::SetPropApi { wide: true },
+            "SetPropA" => Api::SetPropApi { wide: false },
+            "GetPropW" => Api::GetPropApi { wide: true },
+            "GetPropA" => Api::GetPropApi { wide: false },
+            "RemovePropW" => Api::RemovePropApi { wide: true },
+            "RemovePropA" => Api::RemovePropApi { wide: false },
             "GetMessageW" | "GetMessageA" => Api::GetMessageApi,
             "PeekMessageW" | "PeekMessageA" => Api::PeekMessageApi,
             "IsDialogMessageW" | "IsDialogMessage" => Api::IsDialogMessageApi,
@@ -585,7 +612,7 @@ impl Api {
             "LineTo" => Api::LineToApi,
             "SetPixel" | "SetPixelV" => Api::SetPixelApi,
             // Accepted no-effect window/GDI stubs.
-            "ShowWindow" | "UpdateWindow" | "DeleteObject" | "InvalidateRect"
+            "UpdateWindow" | "DeleteObject" | "InvalidateRect"
             | "SetBkColor" | "SetBkMode" | "ReleaseDC" | "GetSysColor" | "GetSystemMetrics"
             | "SetWindowPos" | "MoveWindow" | "ValidateRect" => {
                 let r = match name {
@@ -738,6 +765,11 @@ impl Api {
             // Message queue (roadmap P5a.1).
             Api::PostMessageApi | Api::PostThreadMessageApi => 4,
             Api::TranslateMessageApi => 1,
+            // Window-object queries (roadmap P5a.2).
+            Api::IsWindowApi => 1,
+            Api::WindowLong { set: false } | Api::GetWindowRectApi | Api::ShowWindowApi
+            | Api::GetPropApi { .. } | Api::RemovePropApi { .. } => 2,
+            Api::WindowLong { set: true } | Api::SetPropApi { .. } | Api::GetClassNameApi { .. } => 3,
             Api::EncodeDecodePointer => 1,
             Api::GetLastError => 0,
             Api::SetLastError => 1,
@@ -983,7 +1015,7 @@ fn control_id(hwnd: u64) -> Option<u32> {
 }
 
 /// Read a NUL-terminated UTF-16 string as code units (no terminator).
-fn read_wstr_units(mem: &dyn Memory, addr: u64) -> Result<Vec<u16>> {
+pub(crate) fn read_wstr_units(mem: &dyn Memory, addr: u64) -> Result<Vec<u16>> {
     let mut v = Vec::new();
     if addr == 0 {
         return Ok(v);
@@ -1410,6 +1442,16 @@ impl WinOs {
             Api::PostMessageApi => self.post_message(cpu, mem),
             Api::PostThreadMessageApi => self.post_thread_message(cpu, mem),
             Api::TranslateMessageApi => self.translate_message(cpu, mem),
+
+            // Window-object queries (roadmap P5a.2), see [`crate::win`].
+            Api::WindowLong { set } => self.window_long(cpu, mem, *set),
+            Api::IsWindowApi => self.is_window(cpu, mem),
+            Api::GetWindowRectApi => self.get_window_rect(cpu, mem),
+            Api::ShowWindowApi => self.show_window(cpu, mem),
+            Api::GetClassNameApi { wide } => self.get_class_name(cpu, mem, *wide),
+            Api::SetPropApi { wide } => self.set_prop(cpu, mem, *wide),
+            Api::GetPropApi { wide } => self.get_prop(cpu, mem, *wide),
+            Api::RemovePropApi { wide } => self.remove_prop(cpu, mem, *wide),
 
             // Time/date backed by the host clock (roadmap P3.8), see [`crate::time`].
             Api::QueryPerformanceCounter => self.query_performance_counter(cpu, mem),
@@ -1859,8 +1901,10 @@ impl WinOs {
             }
             Api::SetWindowTextApi => {
                 let hwnd = self.arg(cpu, mem, 0)?;
-                if let Some(id) = control_id(hwnd) {
-                    let text = read_wstr_units(mem, self.arg(cpu, mem, 1)?)?;
+                let text = read_wstr_units(mem, self.arg(cpu, mem, 1)?)?;
+                if let Some(w) = self.gdi.windows.get_mut(&hwnd) {
+                    w.title = text; // real top-level window (roadmap P5a.2)
+                } else if let Some(id) = control_id(hwnd) {
                     self.controls.insert(id, text);
                 }
                 ret(TRUE)
@@ -1869,8 +1913,12 @@ impl WinOs {
                 let hwnd = self.arg(cpu, mem, 0)?;
                 let buf = self.arg(cpu, mem, 1)?;
                 let max = self.arg(cpu, mem, 2)? as usize;
-                let text = control_id(hwnd)
-                    .and_then(|id| self.controls.get(&id).cloned())
+                let text = self
+                    .gdi
+                    .windows
+                    .get(&hwnd)
+                    .map(|w| w.title.clone())
+                    .or_else(|| control_id(hwnd).and_then(|id| self.controls.get(&id).cloned()))
                     .unwrap_or_default();
                 ret(write_wstr_units(mem, buf, &text, max)?)
             }
@@ -1893,15 +1941,16 @@ impl WinOs {
                 // A custom (GDI-drawn) window: deliver WM_PAINT, then mouse
                 // input, as real messages the app dispatches to its WndProc.
                 if self.is_custom_window() {
+                    let hwnd = self.gdi.active_hwnd;
                     if self.gdi.paint_pending {
                         self.gdi.paint_pending = false;
-                        self.write_msg_full(mem, lp, crate::gdi::HWND_CUSTOM, crate::gdi::WM_PAINT, 0, 0)?;
+                        self.write_msg_full(mem, lp, hwnd, crate::gdi::WM_PAINT, 0, 0)?;
                         return ret(1);
                     }
                     return match self.gui.pump(true) {
                         Some(exemu_core::GuiEvent::MouseDown(x, y)) => {
                             let lparam = (((y as u32 & 0xffff) << 16) | (x as u32 & 0xffff)) as u64;
-                            self.write_msg_full(mem, lp, crate::gdi::HWND_CUSTOM, crate::gdi::WM_LBUTTONDOWN, 0, lparam)?;
+                            self.write_msg_full(mem, lp, hwnd, crate::gdi::WM_LBUTTONDOWN, 0, lparam)?;
                             ret(1)
                         }
                         _ => ret(0), // Close / nothing → WM_QUIT
@@ -2000,13 +2049,21 @@ impl WinOs {
                 ret(self.register_class(mem, wc, *ex)?)
             }
             Api::CreateWindowExApi => {
+                // CreateWindowEx(exStyle, class, name, style, x, y, w, h, parent,
+                //                menu, instance, param)
+                let ex_style = self.arg(cpu, mem, 0)? as u32;
                 let class_ptr = self.arg(cpu, mem, 1)?;
                 let name_ptr = self.arg(cpu, mem, 2)?;
+                let style = self.arg(cpu, mem, 3)? as u32;
+                let x = self.arg(cpu, mem, 4)? as i32;
+                let y = self.arg(cpu, mem, 5)? as i32;
                 let w = self.arg(cpu, mem, 6)? as u32 as i64;
                 let h = self.arg(cpu, mem, 7)? as u32 as i64;
+                let parent = self.arg(cpu, mem, 8)?;
                 let lp_param = self.arg(cpu, mem, 11)?;
-                let hwnd = self.create_window(mem, class_ptr, name_ptr, w, h)?;
-                if hwnd != crate::gdi::HWND_CUSTOM {
+                let hwnd = self.create_window(mem, class_ptr, name_ptr, style, ex_style, x, y, w, h, parent)?;
+                // Unknown class (fake handle) → nothing to WM_CREATE.
+                if !self.gdi.windows.contains_key(&hwnd) {
                     return ret(hwnd);
                 }
                 // Deliver WM_CREATE with a minimal CREATESTRUCT (lpCreateParams).
@@ -2014,7 +2071,7 @@ impl WinOs {
                 if cs != 0 {
                     mem.write_u64(cs, lp_param)?;
                 }
-                let wndproc = self.gdi.wndproc;
+                let wndproc = self.gdi.windows.get(&hwnd).map(|w| w.wndproc).unwrap_or(0);
                 self.invoke_callbacks(cpu, mem, vec![(wndproc, vec![hwnd, crate::gdi::WM_CREATE, 0, cs])], hwnd, 12, false)
             }
             Api::DefWindowProcApi => {
@@ -2030,7 +2087,9 @@ impl WinOs {
             Api::DispatchMessageApi => {
                 let lp = self.arg(cpu, mem, 0)?;
                 let (hwnd, message, wparam, lparam) = self.read_msg(mem, lp)?;
-                let wndproc = self.gdi.wndproc;
+                // Route to the target window's WNDPROC (roadmap P5a.2); fall back
+                // to the legacy single WNDPROC (dialogs) for unknown/null HWNDs.
+                let wndproc = self.gdi.windows.get(&hwnd).map(|w| w.wndproc).unwrap_or(self.gdi.wndproc);
                 if wndproc == 0 {
                     return ret(0);
                 }
@@ -2044,11 +2103,7 @@ impl WinOs {
                 self.end_paint();
                 ret(TRUE)
             }
-            Api::GetClientRectApi => {
-                let rect = self.arg(cpu, mem, 1)?;
-                self.get_client_rect(mem, rect)?;
-                ret(TRUE)
-            }
+            Api::GetClientRectApi => self.get_client_rect_win(cpu, mem),
             Api::FillRectApi => {
                 let rect = self.arg(cpu, mem, 1)?;
                 let brush = self.arg(cpu, mem, 2)?;

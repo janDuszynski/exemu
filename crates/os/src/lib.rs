@@ -29,6 +29,7 @@ mod sync;
 mod thread;
 mod time;
 mod vm;
+mod win;
 
 use std::collections::HashMap;
 

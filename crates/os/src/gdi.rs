@@ -26,17 +26,49 @@ pub const WM_DESTROY: u64 = 0x0002;
 pub const WM_LBUTTONDOWN: u64 = 0x0201;
 pub const WM_CLOSE: u64 = 0x0010;
 
+/// A real Win32 window object (roadmap P5a.2). Keyed by its HWND in
+/// [`Gdi::windows`], so guest code that stores an HWND and later queries it
+/// (`GetWindowLongPtr`, `GetProp`, `IsWindow`, subclassing) sees consistent
+/// per-window state instead of a single shared fake.
+#[derive(Default)]
+pub(crate) struct Window {
+    pub class: String,
+    pub wndproc: u64,
+    pub style: u32,
+    pub ex_style: u32,
+    /// Screen rectangle as (x, y, width, height).
+    pub rect: (i32, i32, i32, i32),
+    pub parent: u64,
+    pub title: Vec<u16>,
+    /// GWLP_USERDATA.
+    pub userdata: u64,
+    /// Extra window-long slots (`cbWndExtra` bytes / non-standard GWL indices)
+    /// keyed by byte offset, so `Get/SetWindowLongPtr` round-trips arbitrary
+    /// per-window data (dialog/control frameworks stash state here).
+    pub longs: HashMap<i32, u64>,
+    /// SetProp/GetProp store (property name → handle value).
+    pub props: HashMap<String, u64>,
+    pub visible: bool,
+}
+
 /// Custom-window + GDI state.
 #[derive(Default)]
 pub(crate) struct Gdi {
     /// A custom window is shown (drives GetMessage/DispatchMessage routing).
     pub active: bool,
-    /// The window's WndProc.
+    /// The top-level window's WndProc (legacy single-window rendering path).
     pub wndproc: u64,
     /// Registered window classes: class name → WndProc.
     pub classes: HashMap<String, u64>,
     /// A WM_PAINT is due.
     pub paint_pending: bool,
+
+    /// Real window objects by HWND (roadmap P5a.2).
+    pub windows: HashMap<u64, Window>,
+    /// Monotonic HWND allocator (lazily seeded to [`HWND_CUSTOM`]).
+    pub next_hwnd: u64,
+    /// The top-level window shown by the GUI backend (target of WM_PAINT/input).
+    pub active_hwnd: u64,
 
     /// GDI object handle → packed 0x00RRGGBB color.
     pub objects: HashMap<u64, u32>,
@@ -100,33 +132,72 @@ impl WinOs {
         Ok(0xC0DE) // a non-zero ATOM
     }
 
-    /// CreateWindowExW: if the class has a registered WndProc, open a real
-    /// window and remember its proc. Returns the window handle.
+    /// CreateWindowExW: if the class has a registered WndProc, allocate a real
+    /// window object (roadmap P5a.2), open the GUI window, and return the real
+    /// HWND. Unknown classes (child controls etc.) yield a fake handle.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_window(
         &mut self,
         mem: &dyn Memory,
         class_name_ptr: u64,
         window_name_ptr: u64,
+        style: u32,
+        ex_style: u32,
+        x: i32,
+        y: i32,
         width: i64,
         height: i64,
+        parent: u64,
     ) -> Result<u64> {
         let class = crate::api::read_wstr(mem, class_name_ptr)?;
         let Some(&wndproc) = self.gdi.classes.get(&class) else {
             // Unknown class → just a fake handle (child controls etc.).
             return Ok(crate::api::FAKE_HANDLE);
         };
-        let title = crate::api::read_wstr(mem, window_name_ptr).unwrap_or_default();
+        let title_units = crate::api::read_wstr_units(mem, window_name_ptr).unwrap_or_default();
+        let title = String::from_utf16_lossy(&title_units);
         // CW_USEDEFAULT (0x80000000) → a sensible default size.
         let w = if width <= 0 || width == 0x8000_0000 { 640 } else { width } as u32;
         let h = if height <= 0 || height == 0x8000_0000 { 480 } else { height } as u32;
+
+        let hwnd = self.alloc_hwnd();
+        self.gdi.windows.insert(
+            hwnd,
+            Window {
+                class,
+                wndproc,
+                style,
+                ex_style,
+                rect: (x, y, w as i32, h as i32),
+                parent,
+                title: title_units,
+                userdata: 0,
+                longs: HashMap::new(),
+                props: HashMap::new(),
+                visible: false,
+            },
+        );
+
+        // The first top-level window drives the (single-window) GUI backend.
         self.gui.open_window(&title, w, h);
         self.gdi.active = true;
+        self.gdi.active_hwnd = hwnd;
         self.gdi.wndproc = wndproc;
         self.gdi.paint_pending = true;
         self.gdi.text_color = 0x0000_0000;
         self.gdi.pen_color = 0x0000_0000;
         self.gdi.brush_color = 0x00FF_FFFF;
-        Ok(HWND_CUSTOM)
+        Ok(hwnd)
+    }
+
+    /// Allocate a fresh, distinct HWND value.
+    fn alloc_hwnd(&mut self) -> u64 {
+        if self.gdi.next_hwnd == 0 {
+            self.gdi.next_hwnd = HWND_CUSTOM;
+        }
+        let h = self.gdi.next_hwnd;
+        self.gdi.next_hwnd += 0x10;
+        h
     }
 
     pub(crate) fn is_custom_window(&self) -> bool {
@@ -148,17 +219,6 @@ impl WinOs {
 
     pub(crate) fn end_paint(&mut self) {
         self.gui.present();
-    }
-
-    pub(crate) fn get_client_rect(&self, mem: &mut dyn Memory, lprect: u64) -> Result<()> {
-        let (w, h) = self.gui.client_size().unwrap_or((640, 480));
-        if lprect != 0 {
-            mem.write_u32(lprect, 0)?;
-            mem.write_u32(lprect + 4, 0)?;
-            mem.write_u32(lprect + 8, w)?;
-            mem.write_u32(lprect + 12, h)?;
-        }
-        Ok(())
     }
 
     // ---- GDI object management -------------------------------------------
