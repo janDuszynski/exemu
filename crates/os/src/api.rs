@@ -292,6 +292,13 @@ pub enum Api {
     SetTextColorApi,
     CreateSolidBrushApi,
     CreatePenApi,
+    /// GDI device-context objects (roadmap P5b.1).
+    CreateFontApi,
+    GetObjectApi { wide: bool },
+    SaveDCApi,
+    RestoreDCApi,
+    SetBkColorApi,
+    SetBkModeApi,
     GetStockObjectApi,
     SelectObjectApi,
     MoveToExApi,
@@ -611,7 +618,7 @@ impl Api {
             | "LoadCursorW" | "LoadCursorA" | "LoadIconW" | "LoadIconA"
             | "LoadImageW" | "LoadImageA"
             | "LoadBitmapW" | "GetSystemMenu" | "CreatePopupMenu" | "CreateBrushIndirect"
-            | "CreateFontIndirectW" | "FindWindowExW" | "SetTimer" | "GetModuleHandleExW"
+            | "FindWindowExW" | "SetTimer" | "GetModuleHandleExW"
             // Window-station / desktop / window handles: a console app that
             // probes its station (Total Commander does) treats a null result
             // as "no interactive session" and exits with an error box, so hand
@@ -637,7 +644,14 @@ impl Api {
             "TextOutW" | "TextOutA" => Api::TextOutApi,
             "SetTextColor" => Api::SetTextColorApi,
             "CreateSolidBrush" => Api::CreateSolidBrushApi,
-            "CreatePen" => Api::CreatePenApi,
+            "CreatePen" | "CreatePenIndirect" => Api::CreatePenApi,
+            "CreateFontIndirectW" | "CreateFontIndirectA" => Api::CreateFontApi,
+            "GetObjectW" => Api::GetObjectApi { wide: true },
+            "GetObjectA" => Api::GetObjectApi { wide: false },
+            "SaveDC" => Api::SaveDCApi,
+            "RestoreDC" => Api::RestoreDCApi,
+            "SetBkColor" => Api::SetBkColorApi,
+            "SetBkMode" => Api::SetBkModeApi,
             "GetStockObject" => Api::GetStockObjectApi,
             "SelectObject" => Api::SelectObjectApi,
             "MoveToEx" => Api::MoveToExApi,
@@ -645,7 +659,7 @@ impl Api {
             "SetPixel" | "SetPixelV" => Api::SetPixelApi,
             // Accepted no-effect window/GDI stubs.
             "UpdateWindow" | "DeleteObject"
-            | "SetBkColor" | "SetBkMode" | "GetSysColor" | "GetSystemMetrics" => {
+            | "GetSysColor" | "GetSystemMetrics" => {
                 let r = match name {
                     "GetSysColor" => 0x00C0_C0C0,
                     "GetSystemMetrics" => 0,
@@ -873,10 +887,10 @@ impl Api {
             Api::CreateFileW => 7,
             // Custom windows + GDI.
             Api::RegisterClassApi { .. } | Api::CreateSolidBrushApi | Api::GetStockObjectApi
-            | Api::DispatchMessageApi => 1,
+            | Api::DispatchMessageApi | Api::CreateFontApi | Api::SaveDCApi => 1,
             Api::BeginPaintApi | Api::EndPaintApi | Api::GetClientRectApi | Api::SetTextColorApi
-            | Api::SelectObjectApi => 2,
-            Api::FillRectApi | Api::CreatePenApi | Api::LineToApi => 3,
+            | Api::SelectObjectApi | Api::RestoreDCApi | Api::SetBkColorApi | Api::SetBkModeApi => 2,
+            Api::FillRectApi | Api::CreatePenApi | Api::LineToApi | Api::GetObjectApi { .. } => 3,
             Api::DefWindowProcApi | Api::MoveToExApi | Api::SetPixelApi => 4,
             Api::RectangleApi | Api::TextOutApi => 5,
             Api::CreateWindowExApi => 12,
@@ -2214,6 +2228,30 @@ impl WinOs {
             Api::CreatePenApi => {
                 let c = self.arg(cpu, mem, 2)? as u32;
                 ret(self.create_pen(c))
+            }
+            // GDI device-context objects (roadmap P5b.1), see [`crate::gdi`].
+            Api::CreateFontApi => {
+                let lplf = self.arg(cpu, mem, 0)?;
+                ret(self.create_font_indirect(mem, lplf)?)
+            }
+            Api::GetObjectApi { wide } => {
+                let hobj = self.arg(cpu, mem, 0)?;
+                let cb = self.arg(cpu, mem, 1)?;
+                let out = self.arg(cpu, mem, 2)?;
+                ret(self.get_object(mem, hobj, cb, out, *wide)?)
+            }
+            Api::SaveDCApi => ret(self.save_dc()),
+            Api::RestoreDCApi => {
+                let level = self.arg(cpu, mem, 1)? as i32 as i64;
+                ret(self.restore_dc(level))
+            }
+            Api::SetBkColorApi => {
+                let c = self.arg(cpu, mem, 1)? as u32;
+                ret(self.set_bk_color(c))
+            }
+            Api::SetBkModeApi => {
+                let m = self.arg(cpu, mem, 1)? as u32;
+                ret(self.set_bk_mode(m))
             }
             Api::GetStockObjectApi => {
                 let i = self.arg(cpu, mem, 0)?;

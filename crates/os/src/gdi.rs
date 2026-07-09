@@ -55,6 +55,38 @@ pub(crate) struct Window {
     pub update_rect: (i32, i32, i32, i32),
 }
 
+/// A subset of `LOGFONT` captured by `CreateFontIndirect` (roadmap P5b.1).
+#[derive(Clone, Default)]
+pub(crate) struct LogFont {
+    pub height: i32,
+    pub weight: i32,
+    pub italic: bool,
+    pub face: String,
+}
+
+/// A GDI object: a pen or brush (each carries a packed 0x00RRGGBB color) or a
+/// font. Typing objects lets `SelectObject` update the right device-context slot
+/// and return the *previously selected* object of that kind.
+pub(crate) enum GdiObject {
+    Pen(u32),
+    Brush(u32),
+    Font(LogFont),
+}
+
+/// Saved device-context state for `SaveDC`/`RestoreDC`.
+#[derive(Clone, Default)]
+struct DcState {
+    text_color: u32,
+    pen_color: u32,
+    brush_color: u32,
+    bk_color: u32,
+    bk_mode: u32,
+    cur: (i32, i32),
+    cur_pen: u64,
+    cur_brush: u64,
+    cur_font: u64,
+}
+
 /// Custom-window + GDI state.
 #[derive(Default)]
 pub(crate) struct Gdi {
@@ -78,13 +110,22 @@ pub(crate) struct Gdi {
     /// The window that has captured the mouse (`SetCapture`/`GetCapture`).
     pub capture_hwnd: u64,
 
-    /// GDI object handle → packed 0x00RRGGBB color.
-    pub objects: HashMap<u64, u32>,
+    /// GDI object handle → the typed object (pen/brush/font), roadmap P5b.1.
+    pub objects: HashMap<u64, GdiObject>,
     pub next_handle: u64,
     pub text_color: u32,
     pub pen_color: u32,
     pub brush_color: u32,
+    pub bk_color: u32,
+    pub bk_mode: u32,
     pub cur: (i32, i32),
+    /// Currently-selected object handles (returned as the "previous" by the next
+    /// `SelectObject` of the same kind).
+    pub cur_pen: u64,
+    pub cur_brush: u64,
+    pub cur_font: u64,
+    /// SaveDC/RestoreDC state stack.
+    dc_stack: Vec<DcState>,
 }
 
 /// Union of two rectangles (left, top, right, bottom).
@@ -110,13 +151,13 @@ impl WinOs {
         ))
     }
 
-    fn alloc_gdi(&mut self, color: u32) -> u64 {
+    fn alloc_obj(&mut self, obj: GdiObject) -> u64 {
         if self.gdi.next_handle == 0 {
             self.gdi.next_handle = 0x00E0_0000;
         }
         let h = self.gdi.next_handle;
         self.gdi.next_handle += 8;
-        self.gdi.objects.insert(h, color);
+        self.gdi.objects.insert(h, obj);
         h
     }
 
@@ -316,38 +357,130 @@ impl WinOs {
     // ---- GDI object management -------------------------------------------
 
     pub(crate) fn create_solid_brush(&mut self, colorref: u32) -> u64 {
-        self.alloc_gdi(colorref_to_rgb(colorref))
+        self.alloc_obj(GdiObject::Brush(colorref_to_rgb(colorref)))
     }
 
-    /// CreatePen(style, width, colorref) — we only track the color.
+    /// CreatePen(style, width, colorref) — we track the color.
     pub(crate) fn create_pen(&mut self, colorref: u32) -> u64 {
-        self.alloc_gdi(colorref_to_rgb(colorref))
+        self.alloc_obj(GdiObject::Pen(colorref_to_rgb(colorref)))
     }
 
-    /// GetStockObject: map the common stock objects to colors.
-    pub(crate) fn get_stock_object(&mut self, index: u64) -> u64 {
-        let color = match index {
-            0 => 0x00FF_FFFF, // WHITE_BRUSH
-            1 => 0x00C0_C0C0, // LTGRAY_BRUSH
-            2 => 0x0080_8080, // GRAY_BRUSH
-            4 => 0x0000_0000, // BLACK_BRUSH
-            5 => 0x00FF_FFFF, // NULL_BRUSH (treat as white)
-            7 => 0x0000_0000, // BLACK_PEN
-            8 => 0x00FF_FFFF, // WHITE_PEN
-            _ => 0x0000_0000,
+    /// CreateFontIndirect(lplf): parse a subset of `LOGFONT`. Fields (x64/x86
+    /// identical here): lfHeight @0 (i32), lfWeight @16 (i32), lfItalic @20 (u8),
+    /// lfFaceName @28 (WCHAR[32]).
+    pub(crate) fn create_font_indirect(&mut self, mem: &dyn Memory, lplf: u64) -> Result<u64> {
+        let height = mem.read_u32(lplf)? as i32;
+        let weight = mem.read_u32(lplf + 16)? as i32;
+        let italic = mem.read_u8(lplf + 20)? != 0;
+        let face = crate::api::read_wstr(mem, lplf + 28).unwrap_or_default();
+        Ok(self.alloc_obj(GdiObject::Font(LogFont { height, weight, italic, face })))
+    }
+
+    /// GetObject(hgdiobj, cb, lpvObject): for a font handle, marshal a subset of
+    /// `LOGFONT` back to the caller; returns the structure size (0 if not a
+    /// font). Lets an app read back the font metrics it selected.
+    pub(crate) fn get_object(&self, mem: &mut dyn Memory, hobj: u64, cb: u64, out: u64, wide: bool) -> Result<u64> {
+        let Some(GdiObject::Font(lf)) = self.gdi.objects.get(&hobj) else {
+            return Ok(0);
         };
-        self.alloc_gdi(color)
+        let (height, weight, italic, face) = (lf.height, lf.weight, lf.italic, lf.face.clone());
+        let size: u64 = if wide { 92 } else { 60 }; // sizeof(LOGFONTW)/(LOGFONTA)
+        if out != 0 && cb >= 28 {
+            for i in 0..size.min(cb) {
+                mem.write_u8(out + i, 0)?;
+            }
+            mem.write_u32(out, height as u32)?; // lfHeight
+            mem.write_u32(out + 16, weight as u32)?; // lfWeight
+            mem.write_u8(out + 20, u8::from(italic))?; // lfItalic
+            if wide {
+                WinOs::write_wstr(mem, out + 28, &face, 32)?;
+            } else {
+                crate::api::write_astr(mem, out + 28, &face, 32)?;
+            }
+        }
+        Ok(size)
     }
 
-    /// SelectObject: adopt the object's color as the current pen/brush/text.
-    /// We can't tell pen from brush from the handle alone, so update all —
-    /// callers select one right before using it, which is good enough here.
+    /// GetStockObject: the common stock brushes/pens/fonts as typed objects.
+    pub(crate) fn get_stock_object(&mut self, index: u64) -> u64 {
+        let obj = match index {
+            0 => GdiObject::Brush(0x00FF_FFFF), // WHITE_BRUSH
+            1 => GdiObject::Brush(0x00C0_C0C0), // LTGRAY_BRUSH
+            2 => GdiObject::Brush(0x0080_8080), // GRAY_BRUSH
+            4 => GdiObject::Brush(0x0000_0000), // BLACK_BRUSH
+            5 => GdiObject::Brush(0x00FF_FFFF), // NULL_BRUSH (treat as white)
+            7 => GdiObject::Pen(0x0000_0000),   // BLACK_PEN
+            8 => GdiObject::Pen(0x00FF_FFFF),   // WHITE_PEN
+            10..=17 => GdiObject::Font(LogFont::default()), // the stock fonts
+            _ => GdiObject::Brush(0x0000_0000),
+        };
+        self.alloc_obj(obj)
+    }
+
+    /// SelectObject: install the object into the matching device-context slot
+    /// and return the *previously selected* object of that kind (real GDI
+    /// semantics), so a paint that saves-and-restores works.
     pub(crate) fn select_object(&mut self, obj: u64) -> u64 {
-        if let Some(&color) = self.gdi.objects.get(&obj) {
-            self.gdi.pen_color = color;
-            self.gdi.brush_color = color;
+        match self.gdi.objects.get(&obj) {
+            Some(GdiObject::Pen(c)) => {
+                let (c, prev) = (*c, self.gdi.cur_pen);
+                self.gdi.pen_color = c;
+                self.gdi.cur_pen = obj;
+                prev
+            }
+            Some(GdiObject::Brush(c)) => {
+                let (c, prev) = (*c, self.gdi.cur_brush);
+                self.gdi.brush_color = c;
+                self.gdi.cur_brush = obj;
+                prev
+            }
+            Some(GdiObject::Font(_)) => {
+                let prev = self.gdi.cur_font;
+                self.gdi.cur_font = obj;
+                prev
+            }
+            None => 0,
         }
-        obj
+    }
+
+    /// SaveDC(): push the current DC state, returning the new save level.
+    pub(crate) fn save_dc(&mut self) -> u64 {
+        let g = &self.gdi;
+        let state = DcState {
+            text_color: g.text_color,
+            pen_color: g.pen_color,
+            brush_color: g.brush_color,
+            bk_color: g.bk_color,
+            bk_mode: g.bk_mode,
+            cur: g.cur,
+            cur_pen: g.cur_pen,
+            cur_brush: g.cur_brush,
+            cur_font: g.cur_font,
+        };
+        self.gdi.dc_stack.push(state);
+        self.gdi.dc_stack.len() as u64
+    }
+
+    /// RestoreDC(nSavedDC): pop back to the given level (a negative value counts
+    /// back from the top). Returns TRUE on success.
+    pub(crate) fn restore_dc(&mut self, level: i64) -> u64 {
+        let depth = self.gdi.dc_stack.len() as i64;
+        let target = if level < 0 { depth + level } else { level - 1 };
+        if target < 0 || target >= depth {
+            return 0;
+        }
+        self.gdi.dc_stack.truncate(target as usize + 1);
+        let Some(s) = self.gdi.dc_stack.pop() else { return 0 };
+        self.gdi.text_color = s.text_color;
+        self.gdi.pen_color = s.pen_color;
+        self.gdi.brush_color = s.brush_color;
+        self.gdi.bk_color = s.bk_color;
+        self.gdi.bk_mode = s.bk_mode;
+        self.gdi.cur = s.cur;
+        self.gdi.cur_pen = s.cur_pen;
+        self.gdi.cur_brush = s.cur_brush;
+        self.gdi.cur_font = s.cur_font;
+        1
     }
 
     pub(crate) fn set_text_color(&mut self, colorref: u32) -> u64 {
@@ -356,11 +489,28 @@ impl WinOs {
         prev as u64
     }
 
+    /// SetBkColor(colorref) → previous background color.
+    pub(crate) fn set_bk_color(&mut self, colorref: u32) -> u64 {
+        let prev = self.gdi.bk_color;
+        self.gdi.bk_color = colorref_to_rgb(colorref);
+        prev as u64
+    }
+
+    /// SetBkMode(mode) → previous background mode (1 TRANSPARENT, 2 OPAQUE).
+    pub(crate) fn set_bk_mode(&mut self, mode: u32) -> u64 {
+        let prev = self.gdi.bk_mode;
+        self.gdi.bk_mode = mode;
+        prev as u64
+    }
+
     // ---- GDI drawing → DrawOps -------------------------------------------
 
     pub(crate) fn gdi_fill_rect(&mut self, mem: &dyn Memory, rect: u64, brush: u64) -> Result<()> {
         let (l, t, r, b) = Self::read_rect(mem, rect)?;
-        let color = self.gdi.objects.get(&brush).copied().unwrap_or(self.gdi.brush_color);
+        let color = match self.gdi.objects.get(&brush) {
+            Some(GdiObject::Brush(c)) => *c,
+            _ => self.gdi.brush_color,
+        };
         self.gui.draw(&DrawOp::FillRect { x: l, y: t, w: r - l, h: b - t, color });
         Ok(())
     }
