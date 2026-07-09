@@ -1,6 +1,6 @@
 # exemu — a Windows `.exe` emulator for Apple Silicon
 
-**Version 0.0.3** (a real process) — see [CHANGELOG.md](CHANGELOG.md).
+**Version 0.0.4** (the windowing substrate) — see [CHANGELOG.md](CHANGELOG.md).
 Versions before 1.0 track capability, not API stability: `0.1.0` will be the
 first real interactive native window, `1.0.0` the notarized product.
 
@@ -174,6 +174,21 @@ exemu sample <out.exe>
   - **Registry:** an in-memory hive with W **and A** variants —
     create/open/set/query/delete, enumeration (`RegEnumKeyEx`/`RegEnumValue`/
     `RegQueryInfoKey`), every `REG_*` value type, and seeded HKLM/HKCU keys.
+* **A real windowing substrate** (USER32/GDI object model — the layer *beneath*
+  a native window; there is not yet a native window itself):
+  - **Message queue:** a real per-thread queue behind `PostMessage`/
+    `PostThreadMessage`/`GetMessage`/`PeekMessage`/`PostQuitMessage`/
+    `TranslateMessage` (WM_KEYDOWN→WM_CHAR), with proper `WM_QUIT`.
+  - **Window objects:** `CreateWindowEx` yields real, distinct, dereferenceable
+    HWNDs; `Get/SetWindowLongPtr` (WNDPROC subclassing, user data, styles),
+    `IsWindow`, `GetClientRect`/`GetWindowRect`, `GetClassName`, `ShowWindow`,
+    `Get/Set/RemoveProp`, per-window text; `DispatchMessage` routes per-HWND.
+  - **Painting:** per-window invalidation — `InvalidateRect`/`ValidateRect`/
+    `GetUpdateRect`, `BeginPaint`/`EndPaint` (real PAINTSTRUCT), `GetDC`.
+  - **Input & geometry:** focus/capture/key-state, `MoveWindow`/`SetWindowPos`
+    (posting `WM_MOVE`/`WM_SIZE`).
+  - **GDI objects:** typed pens/brushes/fonts, `SelectObject` returning the prior
+    object, `CreateFontIndirect`/`GetObject`, `SaveDC`/`RestoreDC`.
 * A **host-backed sandbox filesystem**: `CreateFileW`/`ReadFile`/`WriteFile`/
   `CloseHandle`, `CreateDirectory`, `GetTempPathW`/`GetTempFileNameW`,
   `GetFileSize`/`SetFilePointer`/`GetFileAttributes`/`DeleteFile`,
