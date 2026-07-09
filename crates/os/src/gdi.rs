@@ -49,6 +49,10 @@ pub(crate) struct Window {
     /// SetProp/GetProp store (property name → handle value).
     pub props: HashMap<String, u64>,
     pub visible: bool,
+    /// A `WM_PAINT` is owed for this window (roadmap P5a.4).
+    pub paint_pending: bool,
+    /// The accumulated invalid rectangle (left, top, right, bottom).
+    pub update_rect: (i32, i32, i32, i32),
 }
 
 /// Custom-window + GDI state.
@@ -77,6 +81,11 @@ pub(crate) struct Gdi {
     pub pen_color: u32,
     pub brush_color: u32,
     pub cur: (i32, i32),
+}
+
+/// Union of two rectangles (left, top, right, bottom).
+fn union(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
 
 /// Convert a Win32 COLORREF (0x00BBGGRR) to packed 0x00RRGGBB.
@@ -175,6 +184,8 @@ impl WinOs {
                 longs: HashMap::new(),
                 props: HashMap::new(),
                 visible: false,
+                paint_pending: true, // a fresh window owes its first WM_PAINT
+                update_rect: (0, 0, w as i32, h as i32),
             },
         );
 
@@ -204,21 +215,98 @@ impl WinOs {
         self.gdi.active && self.gui.is_open()
     }
 
-    // ---- device contexts + painting --------------------------------------
+    // ---- device contexts + painting (roadmap P5a.4) ----------------------
 
-    pub(crate) fn begin_paint(&mut self, mem: &mut dyn Memory, paintstruct: u64) -> Result<u64> {
-        // PAINTSTRUCT: hdc @0, fErase @8, rcPaint @12.. — write hdc, zero rest.
+    /// A window's client size `(w, h)` (falls back to the GUI backend's size,
+    /// then 640×480, for dialog/unknown HWNDs).
+    fn window_client(&self, hwnd: u64) -> (i32, i32) {
+        self.gdi
+            .windows
+            .get(&hwnd)
+            .map(|w| (w.rect.2, w.rect.3))
+            .or_else(|| self.gui.client_size().map(|(w, h)| (w as i32, h as i32)))
+            .unwrap_or((640, 480))
+    }
+
+    /// The pending invalid rectangle for `hwnd` (or the whole client if none).
+    fn update_region(&self, hwnd: u64) -> (bool, (i32, i32, i32, i32)) {
+        if let Some(w) = self.gdi.windows.get(&hwnd) {
+            (w.paint_pending, w.update_rect)
+        } else {
+            let (cw, ch) = self.window_client(hwnd);
+            (self.gdi.paint_pending, (0, 0, cw, ch))
+        }
+    }
+
+    pub(crate) fn begin_paint(&mut self, mem: &mut dyn Memory, hwnd: u64, paintstruct: u64) -> Result<u64> {
+        let (cw, ch) = self.window_client(hwnd);
+        let (pending, rect) = self.update_region(hwnd);
+        let rc = if pending { rect } else { (0, 0, cw, ch) };
+        // PAINTSTRUCT (x64): hdc @0, fErase @8, rcPaint @12 (l,t,r,b), rest 0.
         if paintstruct != 0 {
-            for i in 0..64u64 {
+            for i in 0..72u64 {
                 mem.write_u8(paintstruct + i, 0)?;
             }
             mem.write_u64(paintstruct, HDC_HANDLE)?;
+            mem.write_u32(paintstruct + 8, 1)?; // fErase = TRUE
+            mem.write_u32(paintstruct + 12, rc.0 as u32)?;
+            mem.write_u32(paintstruct + 16, rc.1 as u32)?;
+            mem.write_u32(paintstruct + 20, rc.2 as u32)?;
+            mem.write_u32(paintstruct + 24, rc.3 as u32)?;
         }
+        // The paint is now being serviced.
+        if let Some(w) = self.gdi.windows.get_mut(&hwnd) {
+            w.paint_pending = false;
+            w.update_rect = (0, 0, 0, 0);
+        }
+        self.gdi.paint_pending = false;
         Ok(HDC_HANDLE)
     }
 
     pub(crate) fn end_paint(&mut self) {
         self.gui.present();
+    }
+
+    /// GetDC(hWnd)/GetWindowDC → the (currently single) device context.
+    pub(crate) fn get_dc(&mut self, _hwnd: u64) -> u64 {
+        HDC_HANDLE
+    }
+
+    /// InvalidateRect(hWnd, lpRect, bErase): mark a region as needing repaint.
+    pub(crate) fn invalidate_rect(&mut self, mem: &dyn Memory, hwnd: u64, lprect: u64) -> Result<u64> {
+        let (cw, ch) = self.window_client(hwnd);
+        let rect = if lprect != 0 { Self::read_rect(mem, lprect)? } else { (0, 0, cw, ch) };
+        if let Some(w) = self.gdi.windows.get_mut(&hwnd) {
+            w.update_rect = if w.paint_pending { union(w.update_rect, rect) } else { rect };
+            w.paint_pending = true;
+        } else {
+            self.gdi.paint_pending = true;
+        }
+        Ok(1)
+    }
+
+    /// ValidateRect(hWnd, lpRect): clear the pending paint (whole-window; partial
+    /// subtraction is not modelled).
+    pub(crate) fn validate_rect(&mut self, hwnd: u64) -> u64 {
+        if let Some(w) = self.gdi.windows.get_mut(&hwnd) {
+            w.paint_pending = false;
+            w.update_rect = (0, 0, 0, 0);
+        }
+        self.gdi.paint_pending = false;
+        1
+    }
+
+    /// GetUpdateRect(hWnd, lpRect, bErase) → TRUE if a paint is pending.
+    pub(crate) fn get_update_rect(&mut self, mem: &mut dyn Memory, hwnd: u64, lprect: u64) -> Result<u64> {
+        let (pending, rect) = self.update_region(hwnd);
+        let r = if pending { rect } else { (0, 0, 0, 0) };
+        if lprect != 0 {
+            mem.write_u32(lprect, r.0 as u32)?;
+            mem.write_u32(lprect + 4, r.1 as u32)?;
+            mem.write_u32(lprect + 8, r.2 as u32)?;
+            mem.write_u32(lprect + 12, r.3 as u32)?;
+        }
+        Ok(pending as u64)
     }
 
     // ---- GDI object management -------------------------------------------

@@ -169,6 +169,58 @@ fn props_roundtrip_and_remove() {
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetPropW", &[hwnd, prop]), 0, "removed prop is gone");
 }
 
+fn read_rect(mem: &VirtualMemory, addr: u64) -> (u32, u32, u32, u32) {
+    (
+        mem.read_u32(addr).unwrap(),
+        mem.read_u32(addr + 4).unwrap(),
+        mem.read_u32(addr + 8).unwrap(),
+        mem.read_u32(addr + 12).unwrap(),
+    )
+}
+
+#[test]
+fn painting_invalidate_validate_beginpaint() {
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::default();
+    let hwnd = make_window(&mut os, &mut mem, &mut cpu, "C", "T");
+    let rect = SCRATCH + 0x400;
+
+    // A fresh window owes a paint over its whole client (0,0,300,200).
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetUpdateRect", &[hwnd, rect, 0]), 1);
+    assert_eq!(read_rect(&mem, rect), (0, 0, 300, 200));
+
+    // ValidateRect clears the pending paint.
+    call(&mut os, &mut mem, &mut cpu, "ValidateRect", &[hwnd, 0]);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetUpdateRect", &[hwnd, rect, 0]), 0);
+
+    // InvalidateRect with a specific rectangle marks exactly it.
+    let inv = SCRATCH + 0x500;
+    for (i, v) in [10u32, 20, 110, 120].iter().enumerate() {
+        mem.write_u32(inv + i as u64 * 4, *v).unwrap();
+    }
+    call(&mut os, &mut mem, &mut cpu, "InvalidateRect", &[hwnd, inv, 1]);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetUpdateRect", &[hwnd, rect, 0]), 1);
+    assert_eq!(read_rect(&mem, rect), (10, 20, 110, 120));
+
+    // BeginPaint fills the PAINTSTRUCT (hdc + rcPaint) and clears the paint.
+    let ps = SCRATCH + 0x600;
+    let hdc = call(&mut os, &mut mem, &mut cpu, "BeginPaint", &[hwnd, ps]);
+    assert_ne!(hdc, 0, "BeginPaint returns a device context");
+    assert_eq!(mem.read_u64(ps).unwrap(), hdc, "PAINTSTRUCT.hdc");
+    assert_eq!(read_rect(&mem, ps + 12), (10, 20, 110, 120), "PAINTSTRUCT.rcPaint");
+    call(&mut os, &mut mem, &mut cpu, "EndPaint", &[hwnd, ps]);
+    assert_eq!(
+        call(&mut os, &mut mem, &mut cpu, "GetUpdateRect", &[hwnd, rect, 0]),
+        0,
+        "BeginPaint serviced the paint"
+    );
+
+    // GetDC / ReleaseDC.
+    let dc = call(&mut os, &mut mem, &mut cpu, "GetDC", &[hwnd]);
+    assert_ne!(dc, 0, "GetDC returns a device context");
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "ReleaseDC", &[hwnd, dc]), 1);
+}
+
 #[test]
 fn client_rect_class_name_and_text() {
     let (mut os, mut mem) = setup();

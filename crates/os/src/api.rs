@@ -251,6 +251,12 @@ pub enum Api {
     SetPropApi { wide: bool },
     GetPropApi { wide: bool },
     RemovePropApi { wide: bool },
+    /// Painting model (roadmap P5a.4).
+    InvalidateRectApi,
+    ValidateRectApi,
+    GetUpdateRectApi,
+    GetDCApi,
+    ReleaseDCApi,
     GetMessageApi,
     PeekMessageApi,
     IsDialogMessageApi,
@@ -541,6 +547,12 @@ impl Api {
             "GetPropA" => Api::GetPropApi { wide: false },
             "RemovePropW" => Api::RemovePropApi { wide: true },
             "RemovePropA" => Api::RemovePropApi { wide: false },
+            // Painting model (roadmap P5a.4).
+            "InvalidateRect" => Api::InvalidateRectApi,
+            "ValidateRect" => Api::ValidateRectApi,
+            "GetUpdateRect" => Api::GetUpdateRectApi,
+            "GetDC" | "GetWindowDC" => Api::GetDCApi,
+            "ReleaseDC" => Api::ReleaseDCApi,
             "GetMessageW" | "GetMessageA" => Api::GetMessageApi,
             "PeekMessageW" | "PeekMessageA" => Api::PeekMessageApi,
             "IsDialogMessageW" | "IsDialogMessage" => Api::IsDialogMessageApi,
@@ -576,7 +588,7 @@ impl Api {
             | "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "SetConsoleTitleA"
             | "FlushConsoleInputBuffer"
             | "SetHandleCount" | "SetThreadPriority"
-            | "GetDC" | "GetWindowDC" | "LoadCursorW" | "LoadCursorA" | "LoadIconW" | "LoadIconA"
+            | "LoadCursorW" | "LoadCursorA" | "LoadIconW" | "LoadIconA"
             | "LoadImageW" | "LoadImageA"
             | "LoadBitmapW" | "GetSystemMenu" | "CreatePopupMenu" | "CreateBrushIndirect"
             | "CreateFontIndirectW" | "FindWindowExW" | "SetTimer" | "GetModuleHandleExW"
@@ -612,9 +624,9 @@ impl Api {
             "LineTo" => Api::LineToApi,
             "SetPixel" | "SetPixelV" => Api::SetPixelApi,
             // Accepted no-effect window/GDI stubs.
-            "UpdateWindow" | "DeleteObject" | "InvalidateRect"
-            | "SetBkColor" | "SetBkMode" | "ReleaseDC" | "GetSysColor" | "GetSystemMetrics"
-            | "SetWindowPos" | "MoveWindow" | "ValidateRect" => {
+            "UpdateWindow" | "DeleteObject"
+            | "SetBkColor" | "SetBkMode" | "GetSysColor" | "GetSystemMetrics"
+            | "SetWindowPos" | "MoveWindow" => {
                 let r = match name {
                     "GetSysColor" => 0x00C0_C0C0,
                     "GetSystemMetrics" => 0,
@@ -770,6 +782,10 @@ impl Api {
             Api::WindowLong { set: false } | Api::GetWindowRectApi | Api::ShowWindowApi
             | Api::GetPropApi { .. } | Api::RemovePropApi { .. } => 2,
             Api::WindowLong { set: true } | Api::SetPropApi { .. } | Api::GetClassNameApi { .. } => 3,
+            // Painting model (roadmap P5a.4).
+            Api::GetDCApi => 1,
+            Api::ValidateRectApi | Api::ReleaseDCApi => 2,
+            Api::InvalidateRectApi | Api::GetUpdateRectApi => 3,
             Api::EncodeDecodePointer => 1,
             Api::GetLastError => 0,
             Api::SetLastError => 1,
@@ -2096,9 +2112,30 @@ impl WinOs {
                 self.invoke_callbacks(cpu, mem, vec![(wndproc, vec![hwnd, message, wparam, lparam])], 0, 1, false)
             }
             Api::BeginPaintApi => {
+                let hwnd = self.arg(cpu, mem, 0)?;
                 let ps = self.arg(cpu, mem, 1)?;
-                ret(self.begin_paint(mem, ps)?)
+                ret(self.begin_paint(mem, hwnd, ps)?)
             }
+            // Painting model (roadmap P5a.4), see [`crate::gdi`].
+            Api::InvalidateRectApi => {
+                let hwnd = self.arg(cpu, mem, 0)?;
+                let lprect = self.arg(cpu, mem, 1)?;
+                ret(self.invalidate_rect(mem, hwnd, lprect)?)
+            }
+            Api::ValidateRectApi => {
+                let hwnd = self.arg(cpu, mem, 0)?;
+                ret(self.validate_rect(hwnd))
+            }
+            Api::GetUpdateRectApi => {
+                let hwnd = self.arg(cpu, mem, 0)?;
+                let lprect = self.arg(cpu, mem, 1)?;
+                ret(self.get_update_rect(mem, hwnd, lprect)?)
+            }
+            Api::GetDCApi => {
+                let hwnd = self.arg(cpu, mem, 0)?;
+                ret(self.get_dc(hwnd))
+            }
+            Api::ReleaseDCApi => ret(TRUE),
             Api::EndPaintApi => {
                 self.end_paint();
                 ret(TRUE)
