@@ -169,6 +169,48 @@ fn props_roundtrip_and_remove() {
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetPropW", &[hwnd, prop]), 0, "removed prop is gone");
 }
 
+#[test]
+fn focus_capture_and_keystate() {
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::default();
+    let hwnd = make_window(&mut os, &mut mem, &mut cpu, "C", "T");
+
+    // Focus: previous is 0, then GetFocus reflects it.
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetFocus", &[hwnd]), 0);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetFocus", &[]), hwnd);
+
+    // Capture: set, query, release.
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetCapture", &[hwnd]), 0);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetCapture", &[]), hwnd);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "ReleaseCapture", &[]), 1);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetCapture", &[]), 0);
+
+    // No synthetic input is pressed headless.
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetAsyncKeyState", &[0x41]), 0);
+}
+
+#[test]
+fn move_window_updates_rect_and_posts_size() {
+    let (mut os, mut mem) = setup();
+    let mut cpu = CpuState::default();
+    let hwnd = make_window(&mut os, &mut mem, &mut cpu, "C", "T"); // created at (100,100,300,200)
+
+    // MoveWindow to (50,60) size 400x300.
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "MoveWindow", &[hwnd, 50, 60, 400, 300, 1]), 1);
+    let rect = SCRATCH + 0x400;
+    call(&mut os, &mut mem, &mut cpu, "GetWindowRect", &[hwnd, rect]);
+    assert_eq!(read_rect(&mem, rect), (50, 60, 450, 360), "GetWindowRect is (x,y,x+w,y+h)");
+
+    // WM_MOVE then WM_SIZE were posted to the message queue.
+    let msg = SCRATCH + 0x500;
+    call(&mut os, &mut mem, &mut cpu, "GetMessageW", &[msg, 0, 0, 0]);
+    assert_eq!(mem.read_u32(msg + 8).unwrap(), 0x0003, "WM_MOVE");
+    assert_eq!(mem.read_u64(msg + 24).unwrap(), 50 | (60u64 << 16), "WM_MOVE lParam");
+    call(&mut os, &mut mem, &mut cpu, "GetMessageW", &[msg, 0, 0, 0]);
+    assert_eq!(mem.read_u32(msg + 8).unwrap(), 0x0005, "WM_SIZE");
+    assert_eq!(mem.read_u64(msg + 24).unwrap(), 400 | (300u64 << 16), "WM_SIZE lParam");
+}
+
 fn read_rect(mem: &VirtualMemory, addr: u64) -> (u32, u32, u32, u32) {
     (
         mem.read_u32(addr).unwrap(),

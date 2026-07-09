@@ -257,6 +257,16 @@ pub enum Api {
     GetUpdateRectApi,
     GetDCApi,
     ReleaseDCApi,
+    /// Focus/capture/input + geometry (roadmap P5a.3).
+    SetFocusApi,
+    GetFocusApi,
+    SetCaptureApi,
+    GetCaptureApi,
+    ReleaseCaptureApi,
+    GetKeyStateApi,
+    GetCursorPosApi,
+    MoveWindowApi,
+    SetWindowPosApi,
     GetMessageApi,
     PeekMessageApi,
     IsDialogMessageApi,
@@ -553,6 +563,16 @@ impl Api {
             "GetUpdateRect" => Api::GetUpdateRectApi,
             "GetDC" | "GetWindowDC" => Api::GetDCApi,
             "ReleaseDC" => Api::ReleaseDCApi,
+            // Focus/capture/input + geometry (roadmap P5a.3).
+            "SetFocus" => Api::SetFocusApi,
+            "GetFocus" => Api::GetFocusApi,
+            "SetCapture" => Api::SetCaptureApi,
+            "GetCapture" => Api::GetCaptureApi,
+            "ReleaseCapture" => Api::ReleaseCaptureApi,
+            "GetKeyState" | "GetAsyncKeyState" => Api::GetKeyStateApi,
+            "GetCursorPos" => Api::GetCursorPosApi,
+            "MoveWindow" => Api::MoveWindowApi,
+            "SetWindowPos" => Api::SetWindowPosApi,
             "GetMessageW" | "GetMessageA" => Api::GetMessageApi,
             "PeekMessageW" | "PeekMessageA" => Api::PeekMessageApi,
             "IsDialogMessageW" | "IsDialogMessage" => Api::IsDialogMessageApi,
@@ -625,8 +645,7 @@ impl Api {
             "SetPixel" | "SetPixelV" => Api::SetPixelApi,
             // Accepted no-effect window/GDI stubs.
             "UpdateWindow" | "DeleteObject"
-            | "SetBkColor" | "SetBkMode" | "GetSysColor" | "GetSystemMetrics"
-            | "SetWindowPos" | "MoveWindow" => {
+            | "SetBkColor" | "SetBkMode" | "GetSysColor" | "GetSystemMetrics" => {
                 let r = match name {
                     "GetSysColor" => 0x00C0_C0C0,
                     "GetSystemMetrics" => 0,
@@ -786,6 +805,11 @@ impl Api {
             Api::GetDCApi => 1,
             Api::ValidateRectApi | Api::ReleaseDCApi => 2,
             Api::InvalidateRectApi | Api::GetUpdateRectApi => 3,
+            // Focus/capture/input + geometry (roadmap P5a.3).
+            Api::GetFocusApi | Api::GetCaptureApi | Api::ReleaseCaptureApi => 0,
+            Api::SetFocusApi | Api::SetCaptureApi | Api::GetKeyStateApi | Api::GetCursorPosApi => 1,
+            Api::MoveWindowApi => 6,
+            Api::SetWindowPosApi => 7,
             Api::EncodeDecodePointer => 1,
             Api::GetLastError => 0,
             Api::SetLastError => 1,
@@ -2136,6 +2160,17 @@ impl WinOs {
                 ret(self.get_dc(hwnd))
             }
             Api::ReleaseDCApi => ret(TRUE),
+
+            // Focus/capture/input + geometry (roadmap P5a.3), see [`crate::win`].
+            Api::SetFocusApi => self.set_focus(cpu, mem),
+            Api::GetFocusApi => self.get_focus(),
+            Api::SetCaptureApi => self.set_capture(cpu, mem),
+            Api::GetCaptureApi => self.get_capture(),
+            Api::ReleaseCaptureApi => self.release_capture(),
+            Api::GetKeyStateApi => self.get_key_state(cpu, mem),
+            Api::GetCursorPosApi => self.get_cursor_pos(cpu, mem),
+            Api::MoveWindowApi => self.move_window(cpu, mem),
+            Api::SetWindowPosApi => self.set_window_pos(cpu, mem),
             Api::EndPaintApi => {
                 self.end_paint();
                 ret(TRUE)
