@@ -6,6 +6,46 @@ API stability: `0.0.x` is the pre-GUI foundation, `0.1.0` will be the first real
 interactive native window, and `1.0.0` is the notarized product. A version
 advertises only what is actually implemented.
 
+## v0.0.4 — the windowing substrate
+
+The last foundation layer *under* the GUI: a real USER32/GDI object model the
+guest can drive — a message queue, real window objects, a painting model, input
+state, and a typed GDI object model. There is still **no native window** (that is
+the 0.1.0 headline); this hardens everything beneath it. It dismantles the
+documented "GUI wall": guest code (and installer plugins like nsDialogs) can now
+treat an HWND as a real, dereferenceable object with consistent per-window state.
+199 tests, clippy clean; 7-Zip still installs end-to-end.
+
+### Message queue (P5a.1)
+- A real per-thread queue: `PostMessage`/`PostThreadMessage` enqueue,
+  `GetMessage`/`PeekMessage` (PM_REMOVE vs PM_NOREMOVE) drain, `PostQuitMessage`
+  delivers a synthetic `WM_QUIT` (carrying the exit code) once the queue drains,
+  and a real `TranslateMessage` (WM_KEYDOWN→WM_CHAR).
+
+### Window objects (P5a.2)
+- `CreateWindowEx` allocates distinct, dereferenceable HWNDs holding per-window
+  class/wndproc/style/rect/parent/title/userdata/props. `Get/SetWindowLong[Ptr]`
+  (GWLP_WNDPROC subclassing, GWLP_USERDATA, GWL_STYLE/EXSTYLE, arbitrary
+  cbWndExtra), `IsWindow`, `GetClientRect`/`GetWindowRect`, `GetClassName`,
+  `ShowWindow`, `Get/Set/RemoveProp`, per-window `Get/SetWindowText`.
+  `DispatchMessage` routes to the target HWND's WNDPROC.
+
+### Painting model (P5a.4)
+- Per-window invalidation: `InvalidateRect`/`ValidateRect`/`GetUpdateRect`,
+  `BeginPaint` fills a real PAINTSTRUCT (rcPaint = update region) and services the
+  paint, `EndPaint`, `GetDC`/`GetWindowDC`/`ReleaseDC`.
+
+### Input & geometry (P5a.3)
+- Focus (`Set/GetFocus`), mouse capture (`Set/Get/ReleaseCapture`),
+  `GetKeyState`/`GetAsyncKeyState`, `GetCursorPos`; `MoveWindow`/`SetWindowPos`
+  update the window rect and post `WM_MOVE`/`WM_SIZE`.
+
+### GDI object model (P5b.1)
+- **Typed** GDI objects (pen/brush/font). `SelectObject` installs into the
+  matching device-context slot and returns the *previously selected* object of
+  that kind; `CreateFontIndirect` parses a LOGFONT subset and `GetObject` marshals
+  it back; `SaveDC`/`RestoreDC` (a real DC-state stack); `SetBkColor`/`SetBkMode`.
+
 ## v0.0.3 — a real process
 
 The kernel personality underneath the (still-headless) GUI grew up: a program
