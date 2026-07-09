@@ -40,6 +40,13 @@ impl WinOs {
         self.threads[idx].msgs.push_back(m);
     }
 
+    /// Post a message the OS synthesizes itself (e.g. `WM_SIZE`/`WM_MOVE` from a
+    /// geometry change) to the window's owning thread.
+    pub(crate) fn post_internal(&mut self, hwnd: u64, message: u32, wparam: u64, lparam: u64) {
+        let idx = self.msg_target(hwnd);
+        self.enqueue(idx, PostedMsg { hwnd, message, wparam, lparam });
+    }
+
     /// The next message for the running thread: a queued one, or a synthetic
     /// `WM_QUIT` exactly once after `PostQuitMessage` drains the queue.
     pub(crate) fn msg_next(&mut self) -> Option<PostedMsg> {

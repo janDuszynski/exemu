@@ -73,6 +73,10 @@ pub(crate) struct Gdi {
     pub next_hwnd: u64,
     /// The top-level window shown by the GUI backend (target of WM_PAINT/input).
     pub active_hwnd: u64,
+    /// The window with keyboard focus (`SetFocus`/`GetFocus`), roadmap P5a.3.
+    pub focus_hwnd: u64,
+    /// The window that has captured the mouse (`SetCapture`/`GetCapture`).
+    pub capture_hwnd: u64,
 
     /// GDI object handle → packed 0x00RRGGBB color.
     pub objects: HashMap<u64, u32>,

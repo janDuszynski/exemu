@@ -165,6 +165,108 @@ impl WinOs {
         Ok(Outcome::Return(v))
     }
 
+    // ---- focus / capture / input state (roadmap P5a.3) -------------------
+
+    /// SetFocus(hWnd) → the previously focused window.
+    pub(crate) fn set_focus(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let hwnd = self.arg(cpu, mem, 0)?;
+        let prev = self.gdi.focus_hwnd;
+        self.gdi.focus_hwnd = hwnd;
+        Ok(Outcome::Return(prev))
+    }
+
+    /// GetFocus() → the focused window (0 if none).
+    pub(crate) fn get_focus(&mut self) -> Result<Outcome> {
+        Ok(Outcome::Return(self.gdi.focus_hwnd))
+    }
+
+    /// SetCapture(hWnd) → the window that previously had capture.
+    pub(crate) fn set_capture(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let hwnd = self.arg(cpu, mem, 0)?;
+        let prev = self.gdi.capture_hwnd;
+        self.gdi.capture_hwnd = hwnd;
+        Ok(Outcome::Return(prev))
+    }
+
+    /// GetCapture() → the capturing window (0 if none).
+    pub(crate) fn get_capture(&mut self) -> Result<Outcome> {
+        Ok(Outcome::Return(self.gdi.capture_hwnd))
+    }
+
+    /// ReleaseCapture() → TRUE, clearing the mouse capture.
+    pub(crate) fn release_capture(&mut self) -> Result<Outcome> {
+        self.gdi.capture_hwnd = 0;
+        Ok(Outcome::Return(1))
+    }
+
+    /// GetKeyState/GetAsyncKeyState(vKey): no synthetic input is pressed in a
+    /// headless run, so report "up" (0).
+    pub(crate) fn get_key_state(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let _ = self.arg(cpu, mem, 0)?;
+        Ok(Outcome::Return(0))
+    }
+
+    /// GetCursorPos(lpPoint): report the origin (no pointer device headless).
+    pub(crate) fn get_cursor_pos(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let p = self.arg(cpu, mem, 0)?;
+        if p != 0 {
+            mem.write_u32(p, 0)?;
+            mem.write_u32(p + 4, 0)?;
+        }
+        Ok(Outcome::Return(1))
+    }
+
+    /// MoveWindow(hWnd, x, y, w, h, bRepaint): resize/move; post WM_MOVE/WM_SIZE.
+    pub(crate) fn move_window(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let hwnd = self.arg(cpu, mem, 0)?;
+        let x = self.arg(cpu, mem, 1)? as i32;
+        let y = self.arg(cpu, mem, 2)? as i32;
+        let w = self.arg(cpu, mem, 3)? as i32;
+        let h = self.arg(cpu, mem, 4)? as i32;
+        let repaint = self.arg(cpu, mem, 5)? != 0;
+        self.reposition(hwnd, x, y, w, h, repaint)
+    }
+
+    /// SetWindowPos(hWnd, after, x, y, cx, cy, flags): honour SWP_NOMOVE/NOSIZE.
+    pub(crate) fn set_window_pos(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        const SWP_NOSIZE: u64 = 0x0001;
+        const SWP_NOMOVE: u64 = 0x0002;
+        let hwnd = self.arg(cpu, mem, 0)?;
+        let x = self.arg(cpu, mem, 2)? as i32;
+        let y = self.arg(cpu, mem, 3)? as i32;
+        let cx = self.arg(cpu, mem, 4)? as i32;
+        let cy = self.arg(cpu, mem, 5)? as i32;
+        let flags = self.arg(cpu, mem, 6)?;
+        let cur = self.gdi.windows.get(&hwnd).map(|w| w.rect).unwrap_or((0, 0, 640, 480));
+        let (nx, ny) = if flags & SWP_NOMOVE != 0 { (cur.0, cur.1) } else { (x, y) };
+        let (nw, nh) = if flags & SWP_NOSIZE != 0 { (cur.2, cur.3) } else { (cx, cy) };
+        self.reposition(hwnd, nx, ny, nw, nh, true)
+    }
+
+    /// Apply a new window rectangle and post WM_MOVE / WM_SIZE as needed.
+    fn reposition(&mut self, hwnd: u64, x: i32, y: i32, w: i32, h: i32, repaint: bool) -> Result<Outcome> {
+        let Some(win) = self.gdi.windows.get_mut(&hwnd) else {
+            return Ok(Outcome::Return(0));
+        };
+        let moved = (win.rect.0, win.rect.1) != (x, y);
+        let sized = (win.rect.2, win.rect.3) != (w, h);
+        win.rect = (x, y, w, h);
+        if repaint {
+            win.paint_pending = true;
+            win.update_rect = (0, 0, w, h);
+        }
+        // WM_MOVE lParam = x | (y<<16); WM_SIZE wParam = SIZE_RESTORED, lParam = w | (h<<16).
+        if moved {
+            let lp = (x as u32 as u64 & 0xFFFF) | ((y as u32 as u64 & 0xFFFF) << 16);
+            self.post_internal(hwnd, 0x0003, 0, lp); // WM_MOVE
+        }
+        if sized {
+            let lp = (w as u32 as u64 & 0xFFFF) | ((h as u32 as u64 & 0xFFFF) << 16);
+            self.post_internal(hwnd, 0x0005, 0, lp); // WM_SIZE, SIZE_RESTORED
+        }
+        Ok(Outcome::Return(1))
+    }
+
     /// A property name is either a string pointer or, when the high bits are
     /// zero, a global atom (encoded as `#<atom>`).
     fn prop_name(&self, mem: &dyn Memory, ptr: u64, wide: bool) -> Result<String> {
