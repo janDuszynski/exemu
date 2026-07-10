@@ -42,6 +42,71 @@ pub mod flags {
     pub const RESERVED_ONE: u64 = 1 << 1;
 }
 
+/// The x87 FPU register stack and its control/status/tag words.
+///
+/// **Storage model.** The eight physical data registers `st[0..8]` each hold a
+/// full 80-bit (double-extended) value in the low 80 bits of a `u128` (bits
+/// 0..64 = mantissa, 64..80 = sign+exponent). This is *real* 80-bit storage,
+/// so `FLD`/`FSTP` of a `long double` round-trip bit-exactly. Arithmetic,
+/// however, is evaluated in the host `f64` (double, 53-bit) — see
+/// `crates/cpu/src/x87.rs`. That is an honest limitation: results are correct
+/// to double precision, not to the true 64-bit extended significand. Code that
+/// runs the FPU in the standard double or single precision-control mode (the
+/// overwhelmingly common case, incl. MSVC/mingw `long double==double` on
+/// Windows) is unaffected; only code that deliberately keeps 64-bit-extended
+/// precision control would see rounding differ in the last significand bits.
+///
+/// Registers are addressed **TOP-relative**: `ST(i)` is physical register
+/// `(top + i) & 7`, where `top` is the 3-bit TOP field of the status word.
+#[derive(Debug, Clone)]
+pub struct X87 {
+    /// The eight physical 80-bit data registers, indexed by physical number
+    /// (not ST-relative). Use [`X87::st`]/[`X87::set_st`] for ST-relative
+    /// access.
+    pub st: [u128; 8],
+    /// Control word: precision control (bits 8..10), rounding control
+    /// (bits 10..12), exception masks (bits 0..6). Reset value `0x037F`.
+    pub cw: u16,
+    /// Status word: condition codes C0..C3, exception flags, and the 3-bit
+    /// TOP field (bits 11..14). Reset value `0x0000`.
+    pub sw: u16,
+    /// Tag word: two bits per physical register (00=valid, 01=zero,
+    /// 10=special/NaN/Inf/denormal, 11=empty). Reset value `0xFFFF` (all
+    /// empty).
+    pub tw: u16,
+}
+
+impl Default for X87 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl X87 {
+    /// A freshly-reset FPU (the state `FNINIT` installs).
+    pub const fn new() -> Self {
+        X87 { st: [0; 8], cw: 0x037F, sw: 0x0000, tw: 0xFFFF }
+    }
+
+    /// The 3-bit TOP field of the status word.
+    #[inline]
+    pub fn top(&self) -> u8 {
+        ((self.sw >> 11) & 7) as u8
+    }
+
+    /// Overwrite the TOP field of the status word.
+    #[inline]
+    pub fn set_top(&mut self, top: u8) {
+        self.sw = (self.sw & !0x3800) | (((top as u16) & 7) << 11);
+    }
+
+    /// The physical register index backing `ST(i)`.
+    #[inline]
+    pub fn phys(&self, i: u8) -> usize {
+        ((self.top().wrapping_add(i)) & 7) as usize
+    }
+}
+
 /// The full architectural register file.
 #[derive(Debug, Clone)]
 pub struct CpuState {
@@ -49,6 +114,8 @@ pub struct CpuState {
     pub gpr: [u64; 16],
     /// The 16 128-bit SSE/SSE2 vector registers (`xmm0`..`xmm15`).
     pub xmm: [u128; 16],
+    /// The x87 FPU register stack and its control/status/tag words.
+    pub x87: X87,
     /// Instruction pointer.
     pub rip: u64,
     /// Status/control flags.
@@ -66,6 +133,7 @@ impl CpuState {
         CpuState {
             gpr: [0; 16],
             xmm: [0; 16],
+            x87: X87::new(),
             rip: 0,
             rflags: flags::RESERVED_ONE | flags::IF,
         }

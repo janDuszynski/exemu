@@ -43,6 +43,18 @@ const REGS64: [RegisterX86; 16] = [
     RegisterX86::R15,
 ];
 
+/// The eight x87 stack registers (TOP-relative: `ST0` is the current top).
+const STS: [RegisterX86; 8] = [
+    RegisterX86::ST0,
+    RegisterX86::ST1,
+    RegisterX86::ST2,
+    RegisterX86::ST3,
+    RegisterX86::ST4,
+    RegisterX86::ST5,
+    RegisterX86::ST6,
+    RegisterX86::ST7,
+];
+
 /// The eight low XMM registers (all the generator uses; XMM8-15 need REX).
 const XMMS: [RegisterX86; 16] = [
     RegisterX86::XMM0,
@@ -70,6 +82,13 @@ struct Post {
     ip: u64,
     xmm: [u128; 16],
     data: Vec<u8>,
+    /// x87 physical data registers (80-bit) in ST-relative order as read out
+    /// from the *final* TOP, so both engines are compared register-for-register
+    /// regardless of how many pushes/pops the instruction did.
+    st: [u128; 8],
+    /// x87 status and control words.
+    sw: u16,
+    cw: u16,
 }
 
 /// Per-lane XMM equality under a NaN-aware policy (`nan` = 0 bit-exact, 4 f32
@@ -122,20 +141,32 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         s.gpr = seed.gpr;
         s.rflags = seed.rflags;
         s.xmm = seed.xmm;
+        s.x87.st = seed.st;
+        s.x87.cw = seed.cw;
+        s.x87.sw = seed.sw; // TOP=0 at seed time
+        s.x87.tw = seed.tw;
         s.rip = CODE_BASE;
     }
     let mut hooks = NoHooks;
     match cpu.step(&mut mem, &mut hooks) {
         Ok(Exit::Continue) => {
-            let (gpr, rflags, ip, xmm) = {
+            let (gpr, rflags, ip, xmm, sw, cw) = {
                 let s = cpu.state();
-                (s.gpr, s.rflags, s.rip, s.xmm)
+                (s.gpr, s.rflags, s.rip, s.xmm, s.x87.sw, s.x87.cw)
             };
+            // Read the ST stack ST-relative to the final TOP.
+            let mut st = [0u128; 8];
+            {
+                let x = &cpu.state().x87;
+                for (i, slot) in st.iter_mut().enumerate() {
+                    *slot = x.st[x.phys(i as u8)] & ((1u128 << 80) - 1);
+                }
+            }
             let mut data = vec![0u8; gen::DATA_LEN];
             if mem.read(gen::DATA_BASE, &mut data).is_err() {
                 return Outcome::Fault;
             }
-            Outcome::Ok(Post { gpr, rflags, ip, xmm, data })
+            Outcome::Ok(Post { gpr, rflags, ip, xmm, data, st, sw, cw })
         }
         // #DE (Interrupt(0)), Halted, ProcessExit, or a memory/decode error.
         _ => Outcome::Fault,
@@ -173,6 +204,18 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             return Outcome::Fault;
         }
     }
+    // Seed the x87 FPU: control/status/tag words, then the eight stack
+    // registers (TOP=0 at seed time, so ST(i) == seed.st[i]).
+    let _ = uc.reg_write(RegisterX86::FPCW, seed.cw as u64);
+    let _ = uc.reg_write(RegisterX86::FPSW, seed.sw as u64);
+    let _ = uc.reg_write(RegisterX86::FPTAG, seed.tw as u64);
+    for (i, r) in STS.iter().enumerate() {
+        let mut bytes = [0u8; 10];
+        bytes.copy_from_slice(&seed.st[i].to_le_bytes()[..10]);
+        if uc.reg_write_long(*r, &bytes).is_err() {
+            return Outcome::Fault;
+        }
+    }
     let _ = uc.reg_write(RegisterX86::EFLAGS, seed.rflags & 0xffff_ffff);
     let _ = uc.reg_write(ip_reg, CODE_BASE);
     // Run until rip reaches the end of the instruction (count=0 = no limit), so
@@ -201,7 +244,20 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             if uc.mem_read(gen::DATA_BASE, &mut data).is_err() {
                 return Outcome::Fault;
             }
-            Outcome::Ok(Post { gpr, rflags, ip, xmm, data })
+            // x87 stack (ST-relative to Unicorn's final TOP), status + control.
+            let mut st = [0u128; 8];
+            for (i, r) in STS.iter().enumerate() {
+                if let Ok(bytes) = uc.reg_read_long(*r) {
+                    if bytes.len() >= 10 {
+                        let mut a = [0u8; 16];
+                        a[..10].copy_from_slice(&bytes[..10]);
+                        st[i] = u128::from_le_bytes(a);
+                    }
+                }
+            }
+            let sw = uc.reg_read(RegisterX86::FPSW).unwrap_or(0) as u16;
+            let cw = uc.reg_read(RegisterX86::FPCW).unwrap_or(0) as u16;
+            Outcome::Ok(Post { gpr, rflags, ip, xmm, data, st, sw, cw })
         }
         Err(_) => Outcome::Fault,
     }
@@ -260,10 +316,93 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
             return Some(format!("mem[{:#x}] exemu={:#04x} unicorn={:#04x}", gen::DATA_BASE + i as u64, x, y));
         }
     }
+    if trial.fpu {
+        if let Some(r) = diff_fpu(a, b, trial) {
+            return Some(r);
+        }
+    }
     if a.ip != b.ip {
         return Some(format!("ip exemu={:#x} unicorn={:#x}", a.ip, b.ip));
     }
     None
+}
+
+/// x87 stack + status/control comparison (only for `trial.fpu` trials).
+/// Registers flagged `fpu_approx` are compared NaN-aware and to the value they
+/// represent as `f64` (transcendental/ROM-constant slop), not bit-exact.
+fn diff_fpu(a: &Post, b: &Post, trial: &gen::Trial) -> Option<String> {
+    for i in 0..8u8 {
+        let (x, y) = (a.st[i as usize], b.st[i as usize]);
+        if x == y {
+            continue;
+        }
+        if trial.fpu_approx & (1 << i) != 0 {
+            // Loose compare for transcendental results: the host math library
+            // and the reference x87 agree only to a few ULP in the last
+            // significand bits, so accept a small tolerance (or both NaN).
+            let fx = ext80_to_f64(x);
+            let fy = ext80_to_f64(y);
+            if (fx.is_nan() && fy.is_nan()) || f64_within_ulps(fx, fy, 4) {
+                continue;
+            }
+        }
+        // Both-NaN (possibly different payloads) counts as equal.
+        if ext80_is_nan(x) && ext80_is_nan(y) {
+            continue;
+        }
+        return Some(format!("st{i} exemu={x:#022x} unicorn={y:#022x}"));
+    }
+    let sa = a.sw & trial.sw_mask;
+    let sb = b.sw & trial.sw_mask;
+    if sa != sb {
+        return Some(format!("fpsw(mask={:#x}) exemu={:#06x} unicorn={:#06x} Δ={:#x}", trial.sw_mask, sa, sb, sa ^ sb));
+    }
+    if a.cw != b.cw {
+        return Some(format!("fpcw exemu={:#06x} unicorn={:#06x}", a.cw, b.cw));
+    }
+    None
+}
+
+/// Decode a raw 80-bit extended value to the nearest f64 (for loose compares).
+fn ext80_to_f64(v: u128) -> f64 {
+    let sign = ((v >> 79) & 1) as u64;
+    let exp = ((v >> 64) & 0x7fff) as u32;
+    let signif = v as u64;
+    if exp == 0x7fff {
+        let frac = signif & 0x7fff_ffff_ffff_ffff;
+        return if frac == 0 {
+            if sign == 1 { f64::NEG_INFINITY } else { f64::INFINITY }
+        } else {
+            f64::NAN
+        };
+    }
+    if exp == 0 && signif == 0 {
+        return f64::from_bits(sign << 63);
+    }
+    let mantissa = signif as f64;
+    let e2 = exp as i32 - 16383 - 63;
+    let mag = mantissa * (e2 as f64).exp2();
+    if sign == 1 { -mag } else { mag }
+}
+
+/// True when `a` and `b` are within `max_ulps` units-in-the-last-place of each
+/// other (used only for transcendental result tolerance).
+fn f64_within_ulps(a: f64, b: f64, max_ulps: u64) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_nan() || b.is_nan() || a.is_sign_negative() != b.is_sign_negative() {
+        return false;
+    }
+    let ua = a.to_bits();
+    let ub = b.to_bits();
+    ua.abs_diff(ub) <= max_ulps
+}
+
+fn ext80_is_nan(v: u128) -> bool {
+    let exp = ((v >> 64) & 0x7fff) as u32;
+    let frac = (v as u64) & 0x7fff_ffff_ffff_ffff;
+    exp == 0x7fff && frac != 0
 }
 
 /// Configuration for a fuzzing run.

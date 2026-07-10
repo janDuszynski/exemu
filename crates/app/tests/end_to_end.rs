@@ -105,22 +105,23 @@ fn decode_miss_surfaces_structured_cause() {
     // the fault reporter used to collapse every error into `EmuError::Os`, which
     // silently disabled the telemetry recording.
     let mut bytes = sample::build();
-    // Overwrite the entry prologue's first byte with 0xD9 (x87 ESC, not yet
-    // implemented — roadmap P1.1) to force a decode miss at the entry point.
-    // Locating the prologue by pattern keeps this robust to layout changes.
+    // Overwrite the entry prologue's first byte with 0xC4 (VEX 3-byte prefix,
+    // not yet implemented — roadmap W1.5) to force a decode miss at the entry
+    // point. Locating the prologue by pattern keeps this robust to layout
+    // changes. (x87 ESC 0xD8..0xDF is now implemented — roadmap W1.1.)
     let entry_prologue = [0x48u8, 0x83, 0xEC, 0x38]; // sub rsp, 0x38
     let at = bytes
         .windows(entry_prologue.len())
         .position(|w| w == entry_prologue)
         .expect("sample entry prologue present");
-    bytes[at] = 0xD9;
+    bytes[at] = 0xC4;
 
     let err = match load_and_run(&bytes, silent_cfg()) {
         Err(e) => e,
         Ok(_) => panic!("decode miss must fault, but the run succeeded"),
     };
     match err.cause() {
-        exemu_core::EmuError::Decode { opcode, .. } => assert_eq!(opcode, "0xd9"),
+        exemu_core::EmuError::Decode { opcode, .. } => assert_eq!(opcode, "0xc4"),
         other => panic!("expected a structured Decode cause, got {other:?}"),
     }
 }

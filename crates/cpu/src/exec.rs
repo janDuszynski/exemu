@@ -516,6 +516,14 @@ impl Interpreter {
                 }
             }
 
+            // ---- x87 FPU escapes ----------------------------------------
+            0xD8..=0xDF => {
+                self.exec_x87(&mut ctx, mem, opcode)?;
+            }
+
+            // ---- FWAIT / WAIT: no pending unmasked FP exceptions here ----
+            0x9B => {}
+
             // ---- Two-byte opcodes ---------------------------------------
             0x0F => {
                 let op2 = ctx.u8(mem)?;
