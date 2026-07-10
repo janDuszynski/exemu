@@ -73,6 +73,21 @@ pub struct WinConfig {
     /// fresh reservations (the VM manager bumps upward from here, skipping any
     /// region already mapped). Must be clear of every other region above.
     pub valloc_base: u64,
+    /// Guest virtual address of the process PEB (mapped by the app behind
+    /// `fs:`/`gs:`). The loader materializes `PEB_LDR_DATA` +
+    /// `LDR_DATA_TABLE_ENTRY` doubly-linked lists in guest memory and stores a
+    /// pointer to the `PEB_LDR_DATA` at `peb_addr + peb_ldr_off`
+    /// (`PEB.Ldr`, roadmap W0.6). Zero disables Ldr materialization.
+    pub peb_addr: u64,
+    /// Offset of the `Ldr` field within the PEB (0x18 for 64-bit, 0x0C for
+    /// 32-bit — public winternl.h/ntdef layout).
+    pub peb_ldr_off: u64,
+    /// Virtual size of the main image (`SizeOfImage`), for its Ldr entry.
+    pub image_size: u64,
+    /// Entry-point virtual address of the main image, for its Ldr entry.
+    pub image_entry: u64,
+    /// The main image's DLL/base name (e.g. `program.exe`), for its Ldr entry.
+    pub image_name: String,
 }
 
 impl Default for WinConfig {
@@ -92,6 +107,11 @@ impl Default for WinConfig {
             dll_base: 0x0000_0006_0000_0000,
             dll_size: 0x0800_0000, // 128 MiB
             valloc_base: 0x0000_0040_0000_0000, // 256 GiB: between stack and thunks
+            peb_addr: 0,
+            peb_ldr_off: 0x18,
+            image_size: 0,
+            image_entry: 0,
+            image_name: String::new(),
         }
     }
 }

@@ -54,6 +54,10 @@ struct Layout {
     teb_stack_base: u64,
     teb_stack_limit: u64,
     peb_image_base: u64,
+    /// Offset of the `Ldr` (`PEB_LDR_DATA*`) field within the PEB — 0x18 for
+    /// 64-bit, 0x0C for 32-bit (public winternl.h layout). The loader stores
+    /// the `PEB_LDR_DATA` pointer here (roadmap W0.6).
+    peb_ldr_off: u64,
     /// Address window the VirtualAlloc manager grows from (roadmap P3.2).
     valloc_base: u64,
 }
@@ -77,6 +81,7 @@ impl Layout {
                 teb_stack_base: 0x08,
                 teb_stack_limit: 0x10,
                 peb_image_base: 0x10,
+                peb_ldr_off: 0x18,
                 valloc_base: 0x0000_0040_0000_0000, // 256 GiB, between stack and thunks
             }
         } else {
@@ -97,6 +102,7 @@ impl Layout {
                 teb_stack_base: 0x04,
                 teb_stack_limit: 0x08,
                 peb_image_base: 0x08,
+                peb_ldr_off: 0x0c,
                 valloc_base: 0x3000_0000, // between the DLL arena and the thunks
             }
         }
@@ -286,6 +292,11 @@ impl Process {
             dll_base: lay.dll_base,
             dll_size: lay.dll_size,
             valloc_base: lay.valloc_base,
+            peb_addr: lay.peb_addr,
+            peb_ldr_off: lay.peb_ldr_off,
+            image_size: align_up(image.size_of_image as u64, PAGE).max(PAGE),
+            image_entry: image.entry_va(),
+            image_name: module_name.clone(),
         });
 
         // Map the thunk region as real read/write memory. Function imports
@@ -343,6 +354,13 @@ impl Process {
             tls_callbacks = tls.callback_rvas.iter().map(|&rva| base + rva as u64).collect();
         }
         os.set_tls_callbacks(tls_callbacks);
+
+        // --- PEB.Ldr module lists -----------------------------------------
+        // Build the PEB_LDR_DATA + LDR_DATA_TABLE_ENTRY doubly-linked lists in
+        // guest memory and thread the main image on as the first module, so a
+        // guest that walks its own loader list (anti-debug, GetModuleHandle by
+        // walk) sees the same modules the OS APIs report (roadmap W0.6).
+        os.init_ldr(&mut mem)?;
 
         // --- Optional GUI backend -----------------------------------------
         // EXEMU_GUI_SHOT=<dir> selects the offscreen PNG renderer (for

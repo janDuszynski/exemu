@@ -1307,10 +1307,17 @@ impl WinOs {
                 let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
                 let argc = *argc;
                 let handle = self.load_library(mem, &name)?;
-                // Run a freshly loaded plugin's DllMain(base, ATTACH, 0) before
-                // returning the handle to the caller.
-                if let Some((entry, base)) = self.dll.pending_dllmain.take() {
-                    let calls = vec![(entry, vec![base, 1 /* DLL_PROCESS_ATTACH */, 0])];
+                // Run each freshly loaded module's DllMain(base, ATTACH, 0)
+                // before returning the handle to the caller. A recursive
+                // dependency load queues the whole chain leaves-first, so the
+                // dependencies' DllMains run before the requested DLL's — the
+                // load order a real loader uses (roadmap W0.6).
+                let pending = std::mem::take(&mut self.dll.pending_dllmain);
+                if !pending.is_empty() {
+                    let calls: Vec<(u64, Vec<u64>)> = pending
+                        .into_iter()
+                        .map(|(entry, base)| (entry, vec![base, 1 /* DLL_PROCESS_ATTACH */, 0]))
+                        .collect();
                     return self.invoke_callbacks(cpu, mem, calls, handle, argc, false);
                 }
                 ret(handle)
@@ -1720,7 +1727,10 @@ impl WinOs {
                 ret(units.len() as u64)
             }
 
-            Api::FreeLibrary => ret(TRUE),
+            Api::FreeLibrary => {
+                let hmodule = self.arg(cpu, mem, 0)?;
+                ret(if self.free_library(hmodule) { TRUE } else { FALSE })
+            }
             Api::GetProcAddress => {
                 let hmodule = self.arg(cpu, mem, 0)?;
                 let name_ptr = self.arg(cpu, mem, 1)?;
