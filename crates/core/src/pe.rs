@@ -114,6 +114,67 @@ pub struct Reloc {
     pub kind: u8,
 }
 
+// ---------------------------------------------------------------------------
+// SxS / activation-context types (W0.8)
+// ---------------------------------------------------------------------------
+
+/// Identity fields from an `<assemblyIdentity>` element in an application
+/// manifest. All fields are taken verbatim from the XML attributes; unknown
+/// attributes are ignored. Absent optional attributes are left empty or `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AssemblyIdentity {
+    /// `name` attribute — the assembly's logical name, e.g.
+    /// `"7-Zip.7-Zip.7zipInstall"` or `"Microsoft.Windows.Common-Controls"`.
+    pub name: String,
+    /// `version` attribute — four-part dotted string, e.g. `"6.0.0.0"`.
+    pub version: String,
+    /// `type` attribute — nearly always `"win32"`.
+    pub type_: String,
+    /// `processorArchitecture` — `"x86"`, `"amd64"`, `"*"`, etc.
+    pub processor_architecture: String,
+    /// `publicKeyToken` — hex string identifying the publisher; absent for
+    /// private assemblies (most exe identities).
+    pub public_key_token: Option<String>,
+    /// `language` — locale or `"*"` for language-neutral.
+    pub language: Option<String>,
+}
+
+/// The parsed information from an application (or DLL) manifest. Derived from
+/// either the embedded `RT_MANIFEST` resource or a side-by-side `.manifest`
+/// file. This is the minimum needed to seed an activation context the OS layer
+/// can answer queries against (real consumers arrive with Wine ntdll in W3).
+#[derive(Debug, Clone)]
+pub struct ManifestInfo {
+    /// The identity declared by the `<assemblyIdentity>` element at the top
+    /// level of the manifest (the *this* assembly).
+    pub identity: AssemblyIdentity,
+    /// All `<assemblyIdentity>` elements found inside `<dependentAssembly>`
+    /// elements — the assemblies this image requires. For most Windows apps the
+    /// only interesting entry is the `Microsoft.Windows.Common-Controls`
+    /// dependency that gates comctl32 v6 themed controls.
+    pub dependencies: Vec<AssemblyIdentity>,
+}
+
+/// A minimal activation context, seeded from the parsed manifest. The query
+/// surface is stubbed (real consumers arrive in W3 when Wine's ntdll calls
+/// `RtlQueryActivationContextApplicationSettings` et al.). Its purpose here
+/// is to hold the parsed identity/dependency information so later phases do
+/// not need to re-parse the manifest.
+///
+/// Per the Windows SxS design, an executable has exactly one default
+/// activation context (the "process default"); its contents determine which
+/// side-by-side assembly versions are activated — most importantly whether
+/// comctl32 v6 (themed controls) is enabled.
+#[derive(Debug, Clone)]
+pub struct ActivationContext {
+    /// The manifest that seeded this context.
+    pub manifest: ManifestInfo,
+    /// True when the manifest declares a dependency on
+    /// `Microsoft.Windows.Common-Controls` version `6.*`. This is the flag
+    /// later phases check to decide whether comctl32 v6 is in effect.
+    pub comctl32_v6: bool,
+}
+
 /// A fully parsed PE image, ready to be mapped and run.
 #[derive(Debug, Clone)]
 pub struct PeImage {
@@ -148,6 +209,11 @@ pub struct PeImage {
     /// `begin_rva`. Empty for 32-bit images (x86 uses the `fs:[0]` SEH chain)
     /// and for images without an exception directory.
     pub function_table: Vec<crate::unwind::UnwindEntry>,
+    /// The activation context seeded from the image's embedded `RT_MANIFEST`
+    /// resource (resource ID 1 for executables, ID 2 for DLLs) or, if absent,
+    /// from the external `<exe>.manifest` sidecar file. `None` if no manifest
+    /// was found or if the manifest contained no usable identity.
+    pub activation_context: Option<ActivationContext>,
 }
 
 impl PeImage {

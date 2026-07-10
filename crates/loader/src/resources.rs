@@ -1,6 +1,6 @@
 //! Minimal PE resource parsing: extract `RT_DIALOG` templates so the GUI can
-//! render them. Best-effort — any malformed input yields no dialogs rather
-//! than an error, since rendering is optional.
+//! render them, and general-purpose resource lookup for `RT_MANIFEST` (W0.8).
+//! Best-effort — any malformed input yields no resources rather than an error.
 
 use std::collections::HashMap;
 
@@ -9,10 +9,90 @@ use exemu_core::gui::{Control, ControlKind, DialogTemplate};
 use crate::reader::Reader;
 
 const RT_DIALOG: u32 = 5;
+/// `RT_MANIFEST` (24) — from the public `winuser.h` header.
+pub const RT_MANIFEST: u32 = 24;
 
 /// Parse all dialog templates in `bytes`, keyed by their (integer) resource id.
 pub fn parse_dialogs(bytes: &[u8]) -> HashMap<u32, DialogTemplate> {
     try_parse(bytes).unwrap_or_default()
+}
+
+/// Find the raw bytes of the first language variant of a resource identified
+/// by `(type_id, resource_id)` in the PE `bytes`. Returns a slice of the PE
+/// byte buffer on success, or `None` if the resource is absent or the
+/// directory is malformed.
+///
+/// The PE resource directory is a three-level tree:
+///   Level 0: resource type (e.g. `RT_MANIFEST = 24`, `RT_DIALOG = 5`).
+///   Level 1: resource name or integer ID.
+///   Level 2: language subdirectory — we take the first entry (any language).
+///
+/// Matching at each level follows the PE/COFF spec: named entries have the
+/// high bit of the name field set; integer IDs have it clear. We match only
+/// integer IDs here (named resources are uncommon for the types we parse).
+pub fn find_resource_data(bytes: &[u8], type_id: u32, resource_id: u32) -> Option<&[u8]> {
+    let r = Reader::new(bytes);
+    let pe = r.u32(0x3c).ok()? as usize;
+    let coff = pe + 4;
+    let opt = coff + 20;
+    let magic = r.u16(opt).ok()?;
+    let is64 = magic == 0x20b;
+    let num_sections = r.u16(coff + 2).ok()? as usize;
+    let opt_size = r.u16(coff + 16).ok()? as usize;
+
+    // Resource data directory (data directory index 2).
+    let dd = opt + if is64 { 112 } else { 96 };
+    let res_rva = r.u32(dd + 2 * 8).ok()?;
+    if res_rva == 0 {
+        return None;
+    }
+
+    let sec_table = opt + opt_size;
+    let mut sections: Vec<(u32, u32, u32)> = Vec::with_capacity(num_sections);
+    for i in 0..num_sections {
+        let s = sec_table + i * 40;
+        let vsize = r.u32(s + 8).ok()?;
+        let va = r.u32(s + 12).ok()?;
+        let rawsz = r.u32(s + 16).ok()?;
+        let rawp = r.u32(s + 20).ok()?;
+        sections.push((va, vsize.max(rawsz), rawp));
+    }
+    let rva2off = |rva: u32| -> Option<usize> {
+        for &(va, size, rawp) in &sections {
+            if rva >= va && rva < va + size {
+                return Some((rawp + (rva - va)) as usize);
+            }
+        }
+        None
+    };
+
+    let res_base = rva2off(res_rva)?;
+
+    // Level 0: find the matching type entry.
+    for (tid, sub_off, is_dir) in dir_entries(&r, res_base)? {
+        if tid != type_id || !is_dir {
+            continue;
+        }
+        // Level 1: find the matching resource ID entry.
+        for (rid, name_off, name_is_dir) in dir_entries(&r, res_base + sub_off)? {
+            if rid != resource_id || !name_is_dir {
+                continue;
+            }
+            // Level 2: take the first language entry (any language is fine).
+            for (_lang, data_off, data_is_dir) in dir_entries(&r, res_base + name_off)? {
+                if data_is_dir {
+                    continue;
+                }
+                let de = res_base + data_off;
+                let data_rva = r.u32(de).ok()?;
+                let size = r.u32(de + 4).ok()? as usize;
+                let doff = rva2off(data_rva)?;
+                let end = doff.checked_add(size)?.min(bytes.len());
+                return Some(&bytes[doff..end]);
+            }
+        }
+    }
+    None
 }
 
 fn try_parse(bytes: &[u8]) -> Option<HashMap<u32, DialogTemplate>> {

@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 mod api_set;
+mod manifest;
 mod reader;
 mod reloc;
 mod resolve;
@@ -19,6 +20,8 @@ mod resources;
 mod unwind;
 
 pub use api_set::resolve as resolve_api_set;
+pub use manifest::parse_from_pe_resources as parse_activation_context;
+pub use manifest::parse_from_external_manifest as parse_activation_context_from_manifest;
 pub use reloc::apply as apply_relocations;
 pub use resolve::{resolve as resolve_import, LoadedModule, ModuleSet, Resolved};
 pub use resources::parse_dialogs;
@@ -50,6 +53,8 @@ const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
 const DIR_TLS: usize = 9;
 const DIR_DELAY_IMPORT: usize = 13;
+// DIR_RESOURCE = 2 — used by the manifest parser via resources::find_resource_data,
+// which re-reads the directory itself from the raw PE bytes.
 
 // Section characteristics bits.
 const SCN_CNT_UNINIT_DATA: u32 = 0x0000_0080;
@@ -216,6 +221,14 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
 
     let headers = r.bytes(0, (size_of_headers as usize).min(r.len()))?;
 
+    // ---- SxS / activation context (W0.8) ---------------------------------
+    // Parse the embedded RT_MANIFEST resource (type 24, ID 1 for exe / ID 2
+    // for DLL). Absent or malformed manifests yield None rather than failing
+    // the load. The external <exe>.manifest sidecar path is exposed separately
+    // via `parse_activation_context_from_manifest` for callers that have a
+    // filesystem path (the app layer).
+    let activation_context = manifest::parse_from_pe_resources(bytes);
+
     Ok(PeImage {
         is_64bit,
         image_base,
@@ -232,6 +245,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         dll_name,
         headers,
         function_table,
+        activation_context,
     })
 }
 
