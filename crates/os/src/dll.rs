@@ -183,14 +183,18 @@ impl WinOs {
             }
         }
 
-        // Resolve the DLL's own imports to thunks and patch its IAT.
-        for imp in &image.imports {
-            let thunk = self.resolve_import(&imp.dll, &imp.symbol);
-            mem.write(base + imp.iat_rva as u64, &thunk.to_le_bytes()[..ptr_size])?;
-        }
-
+        // Record this module's exports/handle *before* resolving its imports,
+        // so a self-referential or mutually-forwarding import can see it too.
         self.dll.exports.insert(base, image.exports.clone());
         self.dll.by_name.insert(name.to_string(), base);
+
+        // Resolve the DLL's own imports and patch its IAT. Imports of another
+        // co-loaded guest image bind to that image's real export address
+        // (forwarders chased); imports of an emulated system DLL get a thunk.
+        for imp in &image.imports {
+            let addr = self.resolve_import_addr(&imp.dll, &imp.symbol);
+            mem.write(base + imp.iat_rva as u64, &addr.to_le_bytes()[..ptr_size])?;
+        }
         if self.cfg.trace {
             eprintln!(
                 "[exemu] loaded plugin {name} at {base:#x} ({} exports, {} relocs)",
@@ -205,6 +209,27 @@ impl WinOs {
         let run_dllmain = std::env::var_os("EXEMU_NO_DLLMAIN").is_none();
         self.dll.pending_dllmain = if entry != 0 && run_dllmain { Some((entry, base)) } else { None };
         Ok(Some(base))
+    }
+
+    /// Resolve an imported `(dll, symbol)` to the address the IAT slot should
+    /// hold. When the target DLL is a **co-loaded guest image** (another plugin
+    /// PE already mapped into the address space), this returns the real code
+    /// address of that export — chasing export forwarders
+    /// (`KERNEL32.foo → NTDLL.bar`) recursively, cycle-guarded — so the two
+    /// images call each other's actual code. Only when the target DLL is *not*
+    /// a loaded guest image (an emulated system DLL, or one not present) does it
+    /// fall back to an OS thunk, exactly as before (roadmap W0.4).
+    pub fn resolve_import_addr(&mut self, dll: &str, symbol: &ImportSymbol) -> u64 {
+        // Snapshot the loaded-module view for the resolver. `by_name` maps a
+        // lower-cased base name to a handle; for a *plugin* that handle is the
+        // real mapped base and `exports` holds its export table. (Emulated
+        // system DLLs have synthetic handles not present in `exports`, so they
+        // are invisible here and correctly take the thunk fallback.)
+        let view = GuestModules { dll: &self.dll };
+        match exemu_loader::resolve_import(&view, dll, symbol) {
+            exemu_loader::Resolved::GuestCode(addr) => addr,
+            exemu_loader::Resolved::Fallback => self.resolve_import(dll, symbol),
+        }
     }
 
     /// GetProcAddress(hModule, name-or-ordinal). `name_ptr` is a string
@@ -265,6 +290,24 @@ impl WinOs {
             return find_in_tree(std::path::Path::new(&self.cfg.sandbox), name, 0);
         }
         None
+    }
+}
+
+/// A read-only view of the loaded *guest* modules for the import resolver.
+/// Only real plugin images (those with an export table recorded in
+/// `Loader::exports`) are visible; emulated system DLLs are deliberately absent
+/// so their imports fall through to OS thunks.
+struct GuestModules<'a> {
+    dll: &'a Loader,
+}
+
+impl exemu_loader::ModuleSet for GuestModules<'_> {
+    fn module(&self, dll: &str) -> Option<exemu_loader::LoadedModule<'_>> {
+        // `dll` is already lower-cased with a `.dll` extension (the resolver
+        // normalizes it). A plugin's handle *is* its mapped base.
+        let &base = self.dll.by_name.get(dll)?;
+        let exports = self.dll.exports.get(&base)?;
+        Some(exemu_loader::LoadedModule { base, exports })
     }
 }
 
