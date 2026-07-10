@@ -702,6 +702,36 @@ impl Api {
                 Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
+            // SxS / activation-context stubs (W0.8).
+            //
+            // These are stubbed here to keep the stack balanced; real query
+            // semantics arrive in W3 when Wine's ntdll drives them as guest code.
+            //
+            // CreateActCtxW/A: returns a non-null fake handle so callers do not
+            // error out. The argc table already carries the right counts.
+            "CreateActCtxA" | "CreateActCtxW" => {
+                Api::FakeHandle {
+                    sym: format!("{dll}!{name}"),
+                    argc: win32_argc(dll, name).unwrap_or(0),
+                }
+            }
+            // ActivateActCtx(hActCtx, lpCookie) → BOOL TRUE; writes the cookie
+            // slot is a no-op (lpCookie may be null; we do not dereference it).
+            // DeactivateActCtx(dwFlags, ulCookie) → BOOL TRUE.
+            // AddRefActCtx / ZombifyActCtx / ReleaseActCtx → void (return 0).
+            // GetCurrentActCtx(lphActCtx) → BOOL FALSE (no active context yet).
+            // Find/Query → BOOL FALSE (section not found / query not serviced).
+            "ActivateActCtx" | "DeactivateActCtx"
+            | "AddRefActCtx" | "ZombifyActCtx" | "ReleaseActCtx" => {
+                Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+            "GetCurrentActCtx"
+            | "FindActCtxSectionStringW" | "FindActCtxSectionStringA"
+            | "FindActCtxSectionGuidW"
+            | "QueryActCtxW" => {
+                Api::WinStub { r: FALSE, argc: win32_argc(dll, name).unwrap_or(0) }
+            }
+
             // Event/mutex/semaphore/waitable-timer objects with real signaling
             // state (roadmap P3.6), see [`crate::sync`].
             "CreateEventA" | "CreateEventW" => Api::CreateSync { kind: SyncKind::Event, ex: false, wide: name.ends_with('W') },
@@ -973,7 +1003,13 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "HeapDestroy"
         // DLL search-path setters: each takes one DWORD/pointer argument.
         // BOOL SetDefaultDllDirectories(DWORD); BOOL SetDllDirectory[AW](LPCTSTR).
-        | "SetDefaultDllDirectories" | "SetDllDirectoryW" | "SetDllDirectoryA" => 1,
+        | "SetDefaultDllDirectories" | "SetDllDirectoryW" | "SetDllDirectoryA"
+        // SxS/activation-context (W0.8): 1-arg forms.
+        // CreateActCtxW(PCACTCTXW) -> HANDLE; ReleaseActCtx / AddRefActCtx /
+        // ZombifyActCtx / GetCurrentActCtx take or return one pointer/handle.
+        | "CreateActCtxA" | "CreateActCtxW"
+        | "ReleaseActCtx" | "AddRefActCtx" | "ZombifyActCtx"
+        | "GetCurrentActCtx" => 1,
 
         // --- 2 args ---
         "SetConsoleCtrlHandler" | "SetThreadPriority"
@@ -990,7 +1026,10 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "lstrcpyA" | "lstrcpyW" | "FindFirstFileW" | "FindFirstFileA" | "FindNextFileW"
         | "FindNextFileA" | "RegNotifyChangeKeyValue"
         // Window property list (nsDialogs attaches state to the dialog HWND).
-        | "GetPropW" | "GetPropA" | "RemovePropW" | "RemovePropA" => 2,
+        | "GetPropW" | "GetPropA" | "RemovePropW" | "RemovePropA"
+        // SxS/activation-context (W0.8): 2-arg forms.
+        // ActivateActCtx(HANDLE, PULONG_PTR); DeactivateActCtx(DWORD, ULONG_PTR).
+        | "ActivateActCtx" | "DeactivateActCtx" => 2,
 
         // --- 3 args ---
         // BOOL ReleaseSemaphore(HANDLE, LONG, LPLONG); CreateMutex[AW](attr,
@@ -1024,7 +1063,12 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         "WaitForMultipleObjectsEx"
         | "ReadFile" | "WriteFile" | "GetDiskFreeSpaceW" | "CallWindowProcW" | "CreateDialogParamW"
         | "DialogBoxParamW" | "PeekMessageW" | "RegOpenKeyExW" | "SHGetFileInfoW"
-        | "CoCreateInstance" | "ImageList_Create" => 5,
+        | "CoCreateInstance" | "ImageList_Create"
+        // SxS/activation-context (W0.8): 5-arg forms.
+        // FindActCtxSectionStringW/GuidW(dwFlags, rGuid, ulSectionId,
+        //                               lpStringToFind, pvFindData) — 5 args.
+        | "FindActCtxSectionStringW" | "FindActCtxSectionStringA"
+        | "FindActCtxSectionGuidW" => 5,
 
         // --- 6 args ---
         "GetPrivateProfileStringW" | "SearchPathW" | "MultiByteToWideChar" | "CreateThread"
@@ -1033,7 +1077,11 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
 
         // --- 7 args ---
         "CreateFileW" | "SetWindowPos" | "SendMessageTimeoutW" | "TrackPopupMenu"
-        | "RegGetValueW" => 7,
+        | "RegGetValueW"
+        // QueryActCtxW(dwFlags, hActCtx, pvSubInstance, ulInfoClass,
+        //              pvBuffer, cbBuffer, lpcbWrittenOrRequired) — 7 args.
+        // Stub returns FALSE (not-found); real consumers arrive in W3 via Wine ntdll.
+        | "QueryActCtxW" => 7,
 
         // --- 8, 9, 10, 12 args ---
         "WideCharToMultiByte" | "RegEnumValueW" | "RegEnumKeyExW" => 8,
