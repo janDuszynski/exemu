@@ -82,6 +82,12 @@ pub struct WinConfig {
     /// Offset of the `Ldr` field within the PEB (0x18 for 64-bit, 0x0C for
     /// 32-bit — public winternl.h/ntdef layout).
     pub peb_ldr_off: u64,
+    /// Offset of the `LoaderLock` (`PRTL_CRITICAL_SECTION`) field within the PEB
+    /// (0x110 for 64-bit, 0xA0 for 32-bit — public/community winnt PEB layout).
+    /// The loader seeds a real `RTL_CRITICAL_SECTION` and stores its pointer
+    /// here (roadmap W0.7). Zero disables the field publish (the CS is still
+    /// materialized and used internally).
+    pub peb_loaderlock_off: u64,
     /// Virtual size of the main image (`SizeOfImage`), for its Ldr entry.
     pub image_size: u64,
     /// Entry-point virtual address of the main image, for its Ldr entry.
@@ -109,6 +115,7 @@ impl Default for WinConfig {
             valloc_base: 0x0000_0040_0000_0000, // 256 GiB: between stack and thunks
             peb_addr: 0,
             peb_ldr_off: 0x18,
+            peb_loaderlock_off: 0x110,
             image_size: 0,
             image_entry: 0,
             image_name: String::new(),
@@ -271,6 +278,12 @@ pub struct WinOs {
     exc_stack: Vec<exc::DispatchFrame>,
     /// The filter installed by `SetUnhandledExceptionFilter`, or 0.
     unhandled_filter: u64,
+
+    /// When `Some`, the process is exiting: after the currently-driven callback
+    /// queue (the loaded DLLs' `DLL_PROCESS_DETACH` notifications) drains and no
+    /// callback frames remain, terminate the process with this code instead of
+    /// returning to guest code (roadmap W0.7).
+    pending_process_exit: Option<i32>,
 }
 
 // Sentinel handle values returned by GetStdHandle and understood by WriteFile.
@@ -335,6 +348,7 @@ impl WinOs {
             exc_driver: 0,
             exc_stack: Vec::new(),
             unhandled_filter: 0,
+            pending_process_exit: None,
         };
         // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);

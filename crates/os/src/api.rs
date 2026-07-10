@@ -127,6 +127,7 @@ pub enum Api {
     WideCharToMultiByte,
     MultiByteToWideChar,
     FreeLibrary,
+    DisableThreadLibraryCalls,
     GetProcAddress,
 
     /// Thread/Fiber Local Storage (`Tls*`/`Fls*`). We run single-threaded, so
@@ -462,6 +463,7 @@ impl Api {
             "LoadLibraryA" => Api::LoadLibraryApi { wide: false, argc: 1 },
             "LoadLibraryExA" => Api::LoadLibraryApi { wide: false, argc: 3 },
             "FreeLibrary" => Api::FreeLibrary,
+            "DisableThreadLibraryCalls" => Api::DisableThreadLibraryCalls,
             "GetProcAddress" => Api::GetProcAddress,
 
             // Thread/Fiber Local Storage. FLS shares the TLS implementation
@@ -853,6 +855,7 @@ impl Api {
             Api::WideCharToMultiByte => 8,
             Api::LoadLibraryApi { argc, .. } => *argc,
             Api::FreeLibrary => 1,
+            Api::DisableThreadLibraryCalls => 1,
             Api::GetProcAddress => 2,
             // TlsAlloc() takes no args; FlsAlloc(callback) takes one.
             Api::TlsAlloc { fiber } => *fiber as u32,
@@ -1215,14 +1218,15 @@ impl WinOs {
         match api {
             Api::ExitProcess => {
                 let code = self.arg(cpu, mem, 0)? as u32 as i32;
-                Ok(Outcome::Exit(code))
+                self.begin_process_exit(cpu, mem, code)
             }
             Api::ReturnExit => {
                 // The entry function returned; its exit code is in EAX.
                 let code = cpu.gpr_read(0, 4) as u32 as i32;
-                Ok(Outcome::Exit(code))
+                self.begin_process_exit(cpu, mem, code)
             }
             Api::TerminateProcess => {
+                // TerminateProcess is abrupt: no orderly DLL_PROCESS_DETACH.
                 let code = self.arg(cpu, mem, 1)? as u32 as i32;
                 Ok(Outcome::Exit(code))
             }
@@ -1306,14 +1310,23 @@ impl WinOs {
                 let name_ptr = self.arg(cpu, mem, 0)?;
                 let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
                 let argc = *argc;
+                // Hold the loader lock across the graph mutation (map, relocate,
+                // thread the Ldr lists) — the loader operation a real ntdll
+                // serializes on PEB.LoaderLock (roadmap W0.7).
+                self.enter_loader_lock(mem)?;
                 let handle = self.load_library(mem, &name)?;
+                let pending = std::mem::take(&mut self.dll.pending_dllmain);
+                self.leave_loader_lock(mem)?;
                 // Run each freshly loaded module's DllMain(base, ATTACH, 0)
                 // before returning the handle to the caller. A recursive
                 // dependency load queues the whole chain leaves-first, so the
                 // dependencies' DllMains run before the requested DLL's — the
-                // load order a real loader uses (roadmap W0.6).
-                let pending = std::mem::take(&mut self.dll.pending_dllmain);
+                // load order a real loader uses (roadmap W0.6/W0.7). Mark each as
+                // attached so a later FreeLibrary/exit fires exactly one matching
+                // DLL_PROCESS_DETACH.
                 if !pending.is_empty() {
+                    let bases: Vec<u64> = pending.iter().map(|&(_, b)| b).collect();
+                    self.mark_attached(&bases);
                     let calls: Vec<(u64, Vec<u64>)> = pending
                         .into_iter()
                         .map(|(entry, base)| (entry, vec![base, 1 /* DLL_PROCESS_ATTACH */, 0]))
@@ -1729,7 +1742,28 @@ impl WinOs {
 
             Api::FreeLibrary => {
                 let hmodule = self.arg(cpu, mem, 0)?;
-                ret(if self.free_library(hmodule) { TRUE } else { FALSE })
+                // Under the loader lock, decrement the ref count; a drop to zero
+                // queues the module's DLL_PROCESS_DETACH (roadmap W0.7).
+                self.enter_loader_lock(mem)?;
+                let ok = self.free_library(hmodule);
+                let pending = std::mem::take(&mut self.dll.pending_detach);
+                self.leave_loader_lock(mem)?;
+                let result = if ok { TRUE } else { FALSE };
+                if !pending.is_empty() {
+                    // Drive DllMain(base, DLL_PROCESS_DETACH=0, lpvReserved=NULL)
+                    // for each module that just reached zero references, then
+                    // return TRUE/FALSE to the caller.
+                    let calls: Vec<(u64, Vec<u64>)> = pending
+                        .into_iter()
+                        .map(|(entry, base)| (entry, vec![base, 0 /* DLL_PROCESS_DETACH */, 0]))
+                        .collect();
+                    return self.invoke_callbacks(cpu, mem, calls, result, 1, false);
+                }
+                ret(result)
+            }
+            Api::DisableThreadLibraryCalls => {
+                let hmodule = self.arg(cpu, mem, 0)?;
+                ret(if self.disable_thread_library_calls(hmodule) { TRUE } else { FALSE })
             }
             Api::GetProcAddress => {
                 let hmodule = self.arg(cpu, mem, 0)?;
@@ -2720,6 +2754,40 @@ impl WinOs {
         Ok(())
     }
 
+    /// Begin an orderly process exit: run each still-attached loaded DLL's
+    /// `DllMain(DLL_PROCESS_DETACH)` (dependents before dependencies), then
+    /// terminate with `code` (roadmap W0.7). If no DLL needs a detach — or we
+    /// are already inside a guest-callback chain, where nesting a shutdown
+    /// sequence would race the drain hook — exit immediately.
+    fn begin_process_exit(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, code: i32) -> Result<Outcome> {
+        if !self.cb_stack.is_empty() {
+            return Ok(Outcome::Exit(code));
+        }
+        self.enter_loader_lock(mem)?;
+        let targets = self.take_process_detach_targets();
+        self.leave_loader_lock(mem)?;
+        if targets.is_empty() {
+            return Ok(Outcome::Exit(code));
+        }
+        // The callback machinery reads the drain-return address from `[rsp]`;
+        // seat a return slot so the final frame is balanced. The value never
+        // executes — the drain hook returns `Exit(code)` before returning to it.
+        let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
+        let sp = cpu.rsp() - ptr;
+        if self.cfg.is_64bit {
+            mem.write_u64(sp, self.exit_thunk())?;
+        } else {
+            mem.write_u32(sp, self.exit_thunk() as u32)?;
+        }
+        cpu.set_rsp(sp);
+        self.pending_process_exit = Some(code);
+        let calls: Vec<(u64, Vec<u64>)> = targets
+            .into_iter()
+            .map(|(entry, base)| (entry, vec![base, 0 /* DLL_PROCESS_DETACH */, 0]))
+            .collect();
+        self.invoke_callbacks(cpu, mem, calls, code as u64, 0, false)
+    }
+
     /// Invoke a sequence of guest callbacks, then return `result` to the
     /// current API's caller. `argc` is the API's own stdcall footprint (for
     /// 32-bit stack cleanup on the final return). Returns `Outcome::Resume`
@@ -2785,6 +2853,14 @@ impl WinOs {
 
         // Return to the API's caller. A modal dialog returns its EndDialog value.
         let f = self.cb_stack.pop().expect("cb driver without frame");
+        // Process shutdown: once the DLL_PROCESS_DETACH queue has fully drained
+        // (no callback frames remain), terminate rather than resuming guest code
+        // (roadmap W0.7).
+        if self.cb_stack.is_empty() {
+            if let Some(code) = self.pending_process_exit.take() {
+                return Ok(Outcome::Exit(code));
+            }
+        }
         let result = if f.modal { self.dialog_result.take().unwrap_or(IDCANCEL as u64) } else { f.result };
         cpu.set_rsp(f.final_rsp);
         cpu.rip = f.ret_addr;

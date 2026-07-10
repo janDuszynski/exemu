@@ -227,14 +227,15 @@ impl WinOs {
 
         // Build the start state. Normally this is a `call entry(param)` frame
         // returning to the thread-exit thunk. When the image carries TLS
-        // callbacks, the thread must first run each one with `DLL_THREAD_ATTACH`
-        // (roadmap W0.3): we instead start it at the TLS-attach driver thunk
-        // over a stack whose top is the entry-seating thunk (the callbacks'
-        // drain target), and stash the real `(entry, param)` to seat afterward.
+        // callbacks, or any loaded DLL wants thread notifications, the thread
+        // must first run each with `DLL_THREAD_ATTACH` (roadmap W0.3/W0.7): we
+        // instead start it at the TLS-attach driver thunk over a stack whose top
+        // is the entry-seating thunk (the callbacks' drain target), and stash
+        // the real `(entry, param)` to seat afterward.
         let mut st = CpuState::new();
         let stack_top = stack_base + stack_size;
         let exit_thunk = self.thread_exit_thunk;
-        let has_tls = !self.tls_callbacks.is_empty();
+        let has_tls = !self.tls_callbacks.is_empty() || !self.thread_notify_targets().is_empty();
         let mut pending_entry = None;
         if self.cfg.is_64bit {
             let mut sp = (stack_top - 0x100) & !0xf;
@@ -330,17 +331,25 @@ impl WinOs {
         self.exit_thread(cpu, mem, code)
     }
 
-    /// A new thread's initial `rip` when the image has TLS callbacks: run each
-    /// one with `callback(hModule, DLL_THREAD_ATTACH, NULL)` before the thread's
-    /// start routine (roadmap W0.3). The thread's stack top already holds the
-    /// entry-seating thunk, so the drained callback queue returns there.
+    /// A new thread's initial `rip` when the image has TLS callbacks or any
+    /// loaded DLL wants thread notifications: run each with
+    /// `callback(hModule, DLL_THREAD_ATTACH, NULL)` before the thread's start
+    /// routine (roadmap W0.3/W0.7). The main image's TLS callbacks run first
+    /// (with `hModule` = the exe), then every loaded plugin's `DllMain` that did
+    /// not `DisableThreadLibraryCalls` (in initialization order, with `hModule`
+    /// = that DLL's base). The thread's stack top already holds the entry-seating
+    /// thunk, so the drained callback queue returns there.
     pub(crate) fn thread_tls_attach(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let module = self.cfg.image_base;
-        let calls: Vec<(u64, Vec<u64>)> = self
+        let mut calls: Vec<(u64, Vec<u64>)> = self
             .tls_callbacks
             .iter()
             .map(|&cb| (cb, vec![module, 2 /* DLL_THREAD_ATTACH */, 0]))
             .collect();
+        // Then each loaded plugin DllMain(base, DLL_THREAD_ATTACH, NULL).
+        for (entry, base) in self.thread_notify_targets() {
+            calls.push((entry, vec![base, 2 /* DLL_THREAD_ATTACH */, 0]));
+        }
         // `invoke_callbacks` reads the drain-return address from `[rsp]` (the
         // entry-seating thunk seated by `create_thread`) and cleans up 0 args.
         self.invoke_callbacks(cpu, mem, calls, 0, 0, false)

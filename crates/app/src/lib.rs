@@ -58,6 +58,10 @@ struct Layout {
     /// 64-bit, 0x0C for 32-bit (public winternl.h layout). The loader stores
     /// the `PEB_LDR_DATA` pointer here (roadmap W0.6).
     peb_ldr_off: u64,
+    /// Offset of the `LoaderLock` (`PRTL_CRITICAL_SECTION`) field within the
+    /// PEB — 0x110 for 64-bit, 0xA0 for 32-bit (public winnt PEB layout). The
+    /// loader stores a real critical section pointer here (roadmap W0.7).
+    peb_loaderlock_off: u64,
     /// Address window the VirtualAlloc manager grows from (roadmap P3.2).
     valloc_base: u64,
 }
@@ -82,6 +86,7 @@ impl Layout {
                 teb_stack_limit: 0x10,
                 peb_image_base: 0x10,
                 peb_ldr_off: 0x18,
+                peb_loaderlock_off: 0x110,
                 valloc_base: 0x0000_0040_0000_0000, // 256 GiB, between stack and thunks
             }
         } else {
@@ -103,6 +108,7 @@ impl Layout {
                 teb_stack_limit: 0x08,
                 peb_image_base: 0x08,
                 peb_ldr_off: 0x0c,
+                peb_loaderlock_off: 0xa0,
                 valloc_base: 0x3000_0000, // between the DLL arena and the thunks
             }
         }
@@ -294,6 +300,7 @@ impl Process {
             valloc_base: lay.valloc_base,
             peb_addr: lay.peb_addr,
             peb_ldr_off: lay.peb_ldr_off,
+            peb_loaderlock_off: lay.peb_loaderlock_off,
             image_size: align_up(image.size_of_image as u64, PAGE).max(PAGE),
             image_entry: image.entry_va(),
             image_name: module_name.clone(),
