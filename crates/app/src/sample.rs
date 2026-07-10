@@ -118,6 +118,216 @@ pub fn build() -> Vec<u8> {
 // The optional header is the fixed 112-byte part plus 16 data directories.
 const OPT_HEADER_SIZE: usize = 112 + 16 * 8;
 
+/// The sentinel byte a TLS `DLL_PROCESS_ATTACH` callback writes, which the
+/// entry point then reads and reports as the process exit code — proving the
+/// callback fired before the entry point ran (roadmap W0.3).
+pub const TLS_SENTINEL: u8 = 0x2A;
+
+/// Build a minimal, *real* 64-bit PE with a load-time TLS callback.
+///
+/// The image's `IMAGE_TLS_DIRECTORY` names one callback that stores
+/// [`TLS_SENTINEL`] into a `.data` cell. The entry point reads that cell and
+/// exits with its value: if the loader ran the callback before entry (as the
+/// PE spec requires) the process exits `TLS_SENTINEL`; otherwise it exits `0`.
+/// The directory also carries a non-empty initialization template and an
+/// `AddressOfIndex` slot so the loader's index-publish + template-copy paths
+/// are exercised end to end.
+pub fn build_with_tls() -> Vec<u8> {
+    const TEXT_RVA_L: u32 = 0x1000;
+    const RDATA_RVA_L: u32 = 0x2000;
+    const DATA_RVA_L: u32 = 0x3000;
+
+    // --- .data layout: sentinel byte, TLS index slot, template ------------
+    let sentinel_rva = DATA_RVA_L; // 1 byte
+    let tls_index_rva = DATA_RVA_L + 8; // DWORD (8-aligned)
+    let tls_tmpl_rva = DATA_RVA_L + 0x10; // 8-byte init template
+    let tls_tmpl_len = 8u32;
+
+    // --- .rdata layout: imports + TLS directory + callback array ----------
+    // Imports: a single kernel32!ExitProcess.
+    let import_dir_off = 0u32;
+    let import_dir_size = 2 * 20u32; // one descriptor + null terminator
+    let ilt_off = import_dir_off + import_dir_size;
+    let ilt_size = 2 * 8u32; // one entry + null
+    let iat_off = ilt_off + ilt_size;
+    let iat_size = ilt_size;
+    let mut pos = iat_off + iat_size;
+    // IMAGE_IMPORT_BY_NAME for ExitProcess.
+    pos = align_up_u32(pos, 2);
+    let ibn_off = pos;
+    let ibn_name = b"ExitProcess";
+    pos += 2 + ibn_name.len() as u32 + 1;
+    let dllname_off = pos;
+    let dllname = b"kernel32.dll\0";
+    pos += dllname.len() as u32;
+    // TLS directory (40 bytes, 8-aligned) then the callback array [cb, 0].
+    pos = align_up_u32(pos, 8);
+    let tls_dir_off = pos;
+    let tls_dir_size = 40u32;
+    pos += tls_dir_size;
+    let tls_cb_off = pos;
+    pos += 16; // [callback VA, 0]
+
+    let iat_exit_process_rva = RDATA_RVA_L + iat_off;
+
+    let mut rd = vec![0u8; pos as usize];
+    // Import descriptor for kernel32: OriginalFirstThunk / Name / FirstThunk.
+    put_u32(&mut rd, import_dir_off as usize, RDATA_RVA_L + ilt_off);
+    put_u32(&mut rd, import_dir_off as usize + 12, RDATA_RVA_L + dllname_off);
+    put_u32(&mut rd, import_dir_off as usize + 16, RDATA_RVA_L + iat_off);
+    // ILT and IAT both point at the IBN blob.
+    put_u64(&mut rd, ilt_off as usize, (RDATA_RVA_L + ibn_off) as u64);
+    put_u64(&mut rd, iat_off as usize, (RDATA_RVA_L + ibn_off) as u64);
+    // IBN: hint (0) + name.
+    let ibn = ibn_off as usize;
+    rd[ibn + 2..ibn + 2 + ibn_name.len()].copy_from_slice(ibn_name);
+    let dn = dllname_off as usize;
+    rd[dn..dn + dllname.len()].copy_from_slice(dllname);
+
+    // TLS directory: addresses are preferred-base VAs.
+    let td = tls_dir_off as usize;
+    put_u64(&mut rd, td, IMAGE_BASE + tls_tmpl_rva as u64); // StartAddressOfRawData
+    put_u64(&mut rd, td + 8, IMAGE_BASE + (tls_tmpl_rva + tls_tmpl_len) as u64); // End
+    put_u64(&mut rd, td + 16, IMAGE_BASE + tls_index_rva as u64); // AddressOfIndex
+    put_u64(&mut rd, td + 24, IMAGE_BASE + (RDATA_RVA_L + tls_cb_off) as u64); // AddressOfCallBacks
+    // SizeOfZeroFill (0) and Characteristics (0) stay zero.
+    // Callback array: [callback VA, 0].
+    put_u64(&mut rd, tls_cb_off as usize, IMAGE_BASE + (TEXT_RVA_L + TLS_CB_OFF) as u64);
+
+    // --- .text: the TLS callback and the entry point ----------------------
+    // Callback lives at TEXT_RVA + TLS_CB_OFF, entry at TEXT_RVA + ENTRY_OFF.
+    let text = build_tls_text(sentinel_rva, iat_exit_process_rva);
+
+    // --- .data body: the template bytes (a recognizable pattern) ----------
+    let data_len = (tls_tmpl_rva + tls_tmpl_len - DATA_RVA_L) as usize;
+    let mut data = vec![0u8; data_len];
+    let tmpl_start = (tls_tmpl_rva - DATA_RVA_L) as usize;
+    for j in 0..tls_tmpl_len as usize {
+        data[tmpl_start + j] = 0xB0u8.wrapping_add(j as u8);
+    }
+
+    // --- Assemble the file ------------------------------------------------
+    let headers_raw = FILE_ALIGN as usize;
+    let text_ptr = headers_raw;
+    let text_raw = align_up(text.len(), FILE_ALIGN as usize);
+    let rdata_ptr = text_ptr + text_raw;
+    let rdata_raw = align_up(rd.len(), FILE_ALIGN as usize);
+    let data_ptr = rdata_ptr + rdata_raw;
+    let data_raw = align_up(data.len(), FILE_ALIGN as usize);
+    let file_len = data_ptr + data_raw;
+
+    let mut f = vec![0u8; file_len];
+    f[0] = b'M';
+    f[1] = b'Z';
+    put_u32(&mut f, 0x3C, PE_OFF as u32);
+    put_u32(&mut f, PE_OFF, 0x0000_4550);
+    let coff = PE_OFF + 4;
+    put_u16(&mut f, coff, 0x8664); // AMD64
+    put_u16(&mut f, coff + 2, 3); // 3 sections
+    put_u16(&mut f, coff + 16, OPT_HEADER_SIZE as u16);
+    put_u16(&mut f, coff + 18, 0x0022); // EXECUTABLE | LARGE_ADDRESS_AWARE
+
+    let opt = coff + 20;
+    let image_size = align_up_u32(DATA_RVA_L + data.len() as u32, SECTION_ALIGN);
+    put_u16(&mut f, opt, 0x20B); // PE32+
+    f[opt + 2] = 14;
+    put_u32(&mut f, opt + 16, TEXT_RVA_L + ENTRY_OFF); // AddressOfEntryPoint
+    put_u32(&mut f, opt + 20, TEXT_RVA_L); // BaseOfCode
+    put_u64(&mut f, opt + 24, IMAGE_BASE);
+    put_u32(&mut f, opt + 32, SECTION_ALIGN);
+    put_u32(&mut f, opt + 36, FILE_ALIGN);
+    put_u16(&mut f, opt + 40, 6);
+    put_u16(&mut f, opt + 48, 6);
+    put_u32(&mut f, opt + 56, image_size);
+    put_u32(&mut f, opt + 60, headers_raw as u32);
+    put_u16(&mut f, opt + 68, 3); // CONSOLE
+    put_u64(&mut f, opt + 72, 0x10_0000);
+    put_u64(&mut f, opt + 80, 0x1000);
+    put_u64(&mut f, opt + 88, 0x10_0000);
+    put_u64(&mut f, opt + 96, 0x1000);
+    put_u32(&mut f, opt + 108, 16); // NumberOfRvaAndSizes
+
+    let dir = |i: usize| opt + 112 + i * 8;
+    put_u32(&mut f, dir(1), RDATA_RVA_L + import_dir_off); // Import table
+    put_u32(&mut f, dir(1) + 4, import_dir_size);
+    put_u32(&mut f, dir(9), RDATA_RVA_L + tls_dir_off); // TLS directory
+    put_u32(&mut f, dir(9) + 4, tls_dir_size);
+    put_u32(&mut f, dir(12), RDATA_RVA_L + iat_off); // IAT
+    put_u32(&mut f, dir(12) + 4, iat_size);
+
+    let sec = opt + OPT_HEADER_SIZE;
+    write_section(&mut f, sec, SecHeader {
+        name: b".text",
+        vsize: text.len() as u32,
+        vaddr: TEXT_RVA_L,
+        raw_size: text_raw as u32,
+        raw_ptr: text_ptr as u32,
+        chars: 0x6000_0020, // CODE | EXECUTE | READ
+    });
+    write_section(&mut f, sec + 40, SecHeader {
+        name: b".rdata",
+        vsize: rd.len() as u32,
+        vaddr: RDATA_RVA_L,
+        raw_size: rdata_raw as u32,
+        raw_ptr: rdata_ptr as u32,
+        chars: 0x4000_0040, // INITIALIZED_DATA | READ
+    });
+    write_section(&mut f, sec + 80, SecHeader {
+        name: b".data",
+        vsize: data.len() as u32,
+        vaddr: DATA_RVA_L,
+        raw_size: data_raw as u32,
+        raw_ptr: data_ptr as u32,
+        chars: 0xC000_0040, // INITIALIZED_DATA | READ | WRITE
+    });
+
+    f[text_ptr..text_ptr + text.len()].copy_from_slice(&text);
+    f[rdata_ptr..rdata_ptr + rd.len()].copy_from_slice(&rd);
+    f[data_ptr..data_ptr + data.len()].copy_from_slice(&data);
+    f
+}
+
+// Fixed offsets within the TLS fixture's `.text` (see `build_tls_text`).
+const TLS_CB_OFF: u32 = 0x00; // the callback comes first
+const ENTRY_OFF: u32 = 0x20; // the entry point follows, at a fixed offset
+
+/// Emit the TLS fixture's `.text`: a callback that stores [`TLS_SENTINEL`] into
+/// the `.data` sentinel cell, then the entry point that reads that cell and
+/// exits with its value. Both use RIP-relative addressing patched from RVAs.
+fn build_tls_text(sentinel_rva: u32, iat_exit_process_rva: u32) -> Vec<u8> {
+    let mut c: Vec<u8> = Vec::new();
+
+    // _tls_cb @ TLS_CB_OFF: mov byte [rip+sentinel], TLS_SENTINEL ; ret
+    // Encoding: C6 05 <disp32> <imm8>. disp is from end of instruction (after imm8).
+    c.extend_from_slice(&[0xC6, 0x05]);
+    let next_rva = TEXT_RVA as i64 + c.len() as i64 + 4 + 1; // +disp32 +imm8
+    let disp = sentinel_rva as i64 - next_rva;
+    c.extend_from_slice(&(disp as i32).to_le_bytes());
+    c.push(TLS_SENTINEL);
+    c.push(0xC3); // ret
+
+    // Pad to ENTRY_OFF.
+    while c.len() < ENTRY_OFF as usize {
+        c.push(0xCC);
+    }
+
+    // _entry @ ENTRY_OFF:
+    //   sub rsp, 0x28              (shadow space + alignment)
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);
+    //   movzx ecx, byte [rip+sentinel]   ; 0F B6 0D <disp32>
+    c.extend_from_slice(&[0x0F, 0xB6, 0x0D]);
+    let next_rva = TEXT_RVA as i64 + c.len() as i64 + 4;
+    let disp = sentinel_rva as i64 - next_rva;
+    c.extend_from_slice(&(disp as i32).to_le_bytes());
+    //   call [rip+ExitProcess]     ; FF 15 <disp32>
+    c.extend_from_slice(&[0xFF, 0x15]);
+    let next_rva = TEXT_RVA as i64 + c.len() as i64 + 4;
+    let disp = iat_exit_process_rva as i64 - next_rva;
+    c.extend_from_slice(&(disp as i32).to_le_bytes());
+    c.push(0xCC); // int3 (unreached)
+    c
+}
+
 /// The `.rdata` blob: imports (descriptor table, ILT, IAT, name table),
 /// the DLL name and the message, with the RVAs the code and headers need.
 struct Rdata {

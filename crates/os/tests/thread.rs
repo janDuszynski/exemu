@@ -104,6 +104,96 @@ fn worker_runs_and_main_joins() {
 }
 
 #[test]
+fn tls_thread_attach_callback_runs_before_the_start_routine() {
+    // With TLS callbacks registered (roadmap W0.3), a freshly created thread
+    // must run each callback with DLL_THREAD_ATTACH *before* its start routine.
+    // The callback (only when reason == 2 = DLL_THREAD_ATTACH) writes a sentinel
+    // that the worker's start routine reads and reports; a start routine that
+    // ran first would read zero.
+    const TLS_CB: u64 = 0x0040_1400;
+    const TLS_FLAG: u64 = 0x0040_3008;
+
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("prog", REGION, 0x4000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", STACK_BASE, 0x0020_0000, Perm::RW)).unwrap();
+
+    let mut os = WinOs::new(WinConfig {
+        is_64bit: false,
+        api_base: 0x7000_0000,
+        heap_base: 0x1000_0000,
+        heap_size: 0x0010_0000,
+        valloc_base: 0x3000_0000,
+        echo: false,
+        ..WinConfig::default()
+    });
+    let create = os.resolve_import("kernel32.dll", &exemu_core::ImportSymbol::Named("CreateThread".into()));
+    let wfso = os.resolve_import("kernel32.dll", &exemu_core::ImportSymbol::Named("WaitForSingleObject".into()));
+    let exit_thunk = os.exit_thunk();
+    mem.write_u32(IAT_CREATE, create as u32).unwrap();
+    mem.write_u32(IAT_WFSO, wfso as u32).unwrap();
+    // Register the TLS callback; the worker thread must invoke it first.
+    os.set_tls_callbacks(vec![TLS_CB]);
+
+    // --- TLS callback: cb(hModule, reason, reserved) [stdcall] ------------
+    // if [esp+8] == 2 (DLL_THREAD_ATTACH) { [TLS_FLAG] = 0x55; } ret 12
+    let mut cb = Vec::new();
+    // cmp dword [esp+8], 2
+    cb.extend([0x83, 0x7C, 0x24, 0x08, 0x02]);
+    // jne +7 (skip the store)
+    cb.extend([0x75, 0x0A]);
+    // mov dword [TLS_FLAG], 0x55  (C7 05 <addr> <imm32> = 10 bytes)
+    cb.extend([0xC7, 0x05]); cb.extend(le32(TLS_FLAG as u32)); cb.extend(le32(0x55));
+    // ret 12  (clean the three stdcall args)
+    cb.extend([0xC2, 0x0C, 0x00]);
+    mem.write(TLS_CB, &cb).unwrap();
+
+    // --- main: CreateThread(worker); join; return [FLAG] ------------------
+    let mut main = Vec::new();
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0x68]); main.extend(le32(WORKER as u32));
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0xFF, 0x15]); main.extend(le32(IAT_CREATE as u32));
+    main.extend([0xA3]); main.extend(le32(HANDLE as u32)); // mov [HANDLE], eax
+    main.extend([0x68]); main.extend(le32(0xFFFF_FFFF)); // push INFINITE
+    main.extend([0xFF, 0x35]); main.extend(le32(HANDLE as u32)); // push [HANDLE]
+    main.extend([0xFF, 0x15]); main.extend(le32(IAT_WFSO as u32));
+    main.extend([0xA1]); main.extend(le32(FLAG as u32)); // mov eax, [FLAG]
+    main.extend([0xC3]);
+    mem.write(MAIN, &main).unwrap();
+
+    // --- worker: [FLAG] = [TLS_FLAG]; ret 4 -------------------------------
+    // The worker copies whatever the TLS callback left; if the callback had not
+    // run yet, TLS_FLAG is still zero.
+    let mut worker = Vec::new();
+    worker.extend([0xA1]); worker.extend(le32(TLS_FLAG as u32)); // mov eax, [TLS_FLAG]
+    worker.extend([0xA3]); worker.extend(le32(FLAG as u32)); // mov [FLAG], eax
+    worker.extend([0xC2, 0x04, 0x00]); // ret 4
+    mem.write(WORKER, &worker).unwrap();
+
+    let mut cpu = Interpreter::with_bits(Bits::B32);
+    mem.write_u32(STACK_TOP - 4, exit_thunk as u32).unwrap();
+    cpu.state_mut().set_rsp(STACK_TOP - 4);
+    cpu.state_mut().rip = MAIN;
+
+    let mut exit_code = None;
+    for _ in 0..100_000 {
+        match cpu.step(&mut mem, &mut os).unwrap() {
+            Exit::Continue => {}
+            Exit::ProcessExit(code) => {
+                exit_code = Some(code);
+                break;
+            }
+            other => panic!("unexpected exit: {other:?}"),
+        }
+    }
+    assert_eq!(mem.read_u32(TLS_FLAG).unwrap(), 0x55, "TLS DLL_THREAD_ATTACH callback did not run");
+    assert_eq!(exit_code, Some(0x55), "start routine ran before its TLS callback");
+}
+
+#[test]
 fn spinning_main_is_preempted_so_worker_runs() {
     // Main busy-waits on a flag with NO API call in the loop; only timeslice
     // preemption (roadmap P3.4) can let the worker run and set the flag.

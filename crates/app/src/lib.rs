@@ -311,6 +311,33 @@ impl Process {
             }
         }
 
+        // --- TLS: allocate the slot index and register callbacks ----------
+        // The Windows loader allocates a per-module TLS index, writes it to the
+        // image's `AddressOfIndex`, lays down the initialization template, and
+        // runs the TLS callbacks (`DLL_PROCESS_ATTACH`) before the entry point
+        // (roadmap W0.3). The parsed TLS `AddressOfIndex`/template addresses are
+        // preferred-base virtual addresses, so shift them by the load delta when
+        // the image was relocated; the callback list is stored as image-base
+        // RVAs and is already base-independent.
+        let mut tls_callbacks: Vec<u64> = Vec::new();
+        if let Some(tls) = &image.tls {
+            let delta = base.wrapping_sub(preferred_base);
+            // Allocate a TLS index and publish it at AddressOfIndex.
+            if tls.address_of_index != 0 {
+                let idx = os.alloc_tls_index();
+                let index_va = tls.address_of_index.wrapping_add(delta);
+                mem.poke(index_va, &idx.to_le_bytes()[..4])?;
+            }
+            // Lay the initialization template down at [Start, End) so the main
+            // thread's TLS data begins from the linker's initialized image.
+            if !tls.raw_template.is_empty() {
+                let start_va = tls.start_address_of_raw_data.wrapping_add(delta);
+                mem.poke(start_va, &tls.raw_template)?;
+            }
+            tls_callbacks = tls.callback_rvas.iter().map(|&rva| base + rva as u64).collect();
+        }
+        os.set_tls_callbacks(tls_callbacks);
+
         // --- Optional GUI backend -----------------------------------------
         // EXEMU_GUI_SHOT=<dir> selects the offscreen PNG renderer (for
         // headless testing); otherwise a live minifb window.
@@ -340,7 +367,10 @@ impl Process {
             sp
         };
         cpu.state_mut().set_rsp(rsp);
-        cpu.state_mut().rip = image.entry_va();
+        // Seat the initial rip. When the image has TLS callbacks, they run with
+        // `DLL_PROCESS_ATTACH` before the entry point (roadmap W0.3); otherwise
+        // this is just `rip = entry`.
+        os.start_process(cpu.state_mut(), &mut mem, image.entry_va())?;
 
         Ok(Process {
             mem,
@@ -356,6 +386,16 @@ impl Process {
     /// The entry-point virtual address.
     pub fn entry(&self) -> u64 {
         self.entry
+    }
+
+    /// Read a byte of guest memory (for tests/tools inspecting the loaded image).
+    pub fn peek_u8(&self, addr: u64) -> Result<u8> {
+        self.mem.read_u8(addr)
+    }
+
+    /// Read a little-endian `u32` of guest memory (for tests/tools).
+    pub fn peek_u32(&self, addr: u64) -> Result<u32> {
+        self.mem.read_u32(addr)
     }
 
     /// Run until the process exits (or the step cap / a fault is hit).
