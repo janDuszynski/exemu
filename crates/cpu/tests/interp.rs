@@ -356,7 +356,7 @@ fn cpuid_vendor_string_is_intel() {
     assert_eq!(rbx(&cpu) as u32, 0x756e_6547); // "Genu"
     assert_eq!(rcx(&cpu) as u32, 0x6c65_746e); // "ntel"
     assert_eq!(rdx(&cpu) as u32, 0x4965_6e69); // "ineI"
-    assert_eq!(rax(&cpu) as u32, 7); // max standard leaf
+    assert_eq!(rax(&cpu) as u32, 0xD); // max standard leaf (0xD = XSAVE enumeration)
 }
 
 #[test]
@@ -374,7 +374,10 @@ fn cpuid_advertises_sse2_but_not_avx() {
     assert!(edx & (1 << 25) != 0, "SSE (EDX.25) must be set");
     assert!(ecx & (1 << 23) != 0, "POPCNT (ECX.23) must be set");
     assert!(ecx & (1 << 28) == 0, "AVX (ECX.28) must NOT be advertised");
-    assert!(ecx & (1 << 26) == 0, "XSAVE (ECX.26) must NOT be advertised");
+    // XSAVE + OSXSAVE are advertised now that FXSAVE/XSAVE/XGETBV/XSETBV are
+    // implemented and oracle-clean (roadmap W1.2).
+    assert!(ecx & (1 << 26) != 0, "XSAVE (ECX.26) must be advertised");
+    assert!(ecx & (1 << 27) != 0, "OSXSAVE (ECX.27) must be advertised");
     // Three-byte SSSE3/SSE4 escapes are not decoded, so those bits stay off.
     assert!(ecx & (1 << 9) == 0, "SSSE3 (ECX.9) must NOT be advertised");
     assert!(ecx & (1 << 20) == 0, "SSE4.2 (ECX.20) must NOT be advertised");

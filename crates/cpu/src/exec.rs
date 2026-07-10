@@ -864,8 +864,8 @@ impl Interpreter {
         let (eax, ebx, ecx, edx) = match leaf {
             // Standard: max leaf + "GenuineIntel" so feature detection that
             // keys off the vendor takes its Intel path (all we implement is
-            // Intel-compatible).
-            0x0 => (0x7, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
+            // Intel-compatible). Max standard leaf is 0xD (XSAVE enumeration).
+            0x0 => (0xD, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
             // Family/model/stepping + feature flags. ECX/EDX enumerate ONLY
             // implemented features. The interpreter covers the one-byte SSE/
             // SSE2 map plus POPCNT; the three-byte 0F 38 / 0F 3A escapes that
@@ -874,8 +874,14 @@ impl Interpreter {
             // pcmpistri / crc32 we cannot execute). AVX/XSAVE/MMX/AES: absent.
             0x1 => {
                 // POPCNT (ECX.23) is a discrete feature bit, valid to report
-                // without SSE4.2 (ECX.20), which we do not implement.
-                let ecx: u32 = 1 << 23; // POPCNT
+                // without SSE4.2 (ECX.20), which we do not implement. XSAVE
+                // (ECX.26) + OSXSAVE (ECX.27) are advertised now that the full
+                // FXSAVE/XSAVE/XGETBV/XSETBV state is implemented and oracle-
+                // clean; a guest may XGETBV(XCR0) and see exactly the x87+SSE
+                // components (0x3) the interpreter can restore.
+                let ecx: u32 = (1 << 23)   // POPCNT
+                    | (1 << 26)            // XSAVE
+                    | (1 << 27); // OSXSAVE (XCR0 accessible / CR4.OSXSAVE = 1)
                 let edx: u32 = 1        // FPU (bit 0; guaranteed in long mode)
                     | (1 << 4)          // TSC
                     | (1 << 15)         // CMOV
@@ -888,6 +894,22 @@ impl Interpreter {
             // (we have TZCNT/LZCNT but not the rest of BMI1, so we do not claim
             // the BMI1 bit).
             0x7 => (0, 0, 0, 0),
+            // XSAVE feature enumeration. Sub-leaf in ECX selects the view:
+            //   ECX==0: EAX/EDX = XCR0 valid-bit mask (x87+SSE = 0x3), EBX = size
+            //           of the XSAVE area for the *enabled* features in XCR0,
+            //           ECX = maximum XSAVE area size for all supported features.
+            //   ECX==1: XSAVE extended features (XSAVEOPT/XSAVEC/XGETBV1/XSAVES);
+            //           none implemented ⇒ all zero.
+            //   ECX>=2: per-component enumeration; none beyond x87+SSE ⇒ zero.
+            // The x87+SSE standard area is the 512-byte legacy region plus the
+            // 64-byte XSAVE header = 576 bytes.
+            0xD => {
+                let subleaf = self.state.gpr_read(1, 4) as u32;
+                match subleaf {
+                    0 => (XCR0_SUPPORTED as u32, 576, 576, (XCR0_SUPPORTED >> 32) as u32),
+                    _ => (0, 0, 0, 0),
+                }
+            }
             // Extended: max extended leaf.
             0x8000_0000 => (0x8000_0004, 0, 0, 0),
             // Extended features: LZCNT/ABM (ECX bit 5), SYSCALL (EDX bit 11)
@@ -902,6 +924,157 @@ impl Interpreter {
         self.state.gpr_write(3, 4, ebx as u64);
         self.state.gpr_write(1, 4, ecx as u64);
         self.state.gpr_write(2, 4, edx as u64);
+    }
+
+    /// Build the 512-byte FXSAVE / XSAVE legacy area from the current x87 + SSE
+    /// state, per the Intel SDM "FXSAVE Area" layout:
+    ///
+    /// | off | field            | off | field                     |
+    /// |-----|------------------|-----|---------------------------|
+    /// | 0   | FCW (2)          | 24  | MXCSR (4)                 |
+    /// | 2   | FSW (2)          | 28  | MXCSR_MASK (4)            |
+    /// | 4   | abridged FTW (1) | 32  | ST0..ST7, 16 bytes each   |
+    /// | 6   | FOP (2)          | 160 | XMM0..XMM15, 16 bytes each|
+    /// | 8   | FIP (4 or 8)     |     |                           |
+    /// | 16  | FDP (4 or 8)     |     |                           |
+    ///
+    /// `rexw` selects the 64-bit-pointer form (FXSAVE64), where FIP occupies
+    /// bytes 8..16 and FDP bytes 16..24; the 32-bit form stores FIP at 8..12,
+    /// FCS at 12..14, FDP at 16..20, FDS at 20..22 (the two-word "pointer +
+    /// selector" packing). ST registers are stored as their raw 80 bits in the
+    /// low 10 bytes of each 16-byte slot **ST-relative to TOP** (ST0 first).
+    fn build_fxsave_area(&self, rexw: bool) -> [u8; 512] {
+        let x = &self.state.x87;
+        let mut buf = [0u8; 512];
+        buf[0..2].copy_from_slice(&x.cw.to_le_bytes());
+        buf[2..4].copy_from_slice(&x.sw.to_le_bytes());
+        buf[4] = abridged_ftw(x.tw); // FTW: 1 bit per physical register
+        // buf[5] reserved
+        buf[6..8].copy_from_slice(&x.fop.to_le_bytes());
+        if rexw {
+            buf[8..16].copy_from_slice(&x.fip.to_le_bytes());
+            buf[16..24].copy_from_slice(&x.fdp.to_le_bytes());
+        } else {
+            buf[8..12].copy_from_slice(&(x.fip as u32).to_le_bytes());
+            buf[12..14].copy_from_slice(&x.fcs.to_le_bytes());
+            buf[16..20].copy_from_slice(&(x.fdp as u32).to_le_bytes());
+            buf[20..22].copy_from_slice(&x.fds.to_le_bytes());
+        }
+        buf[24..28].copy_from_slice(&self.mxcsr.to_le_bytes());
+        buf[28..32].copy_from_slice(&MXCSR_MASK.to_le_bytes());
+        // ST registers, ST-relative (ST0 = physical TOP), 10 raw bytes each.
+        for i in 0..8u8 {
+            let v = x.st[x.phys(i)];
+            let off = 32 + i as usize * 16;
+            buf[off..off + 10].copy_from_slice(&v.to_le_bytes()[..10]);
+        }
+        // XMM registers. In 64-bit mode all 16 are saved; in 32-bit mode only
+        // XMM0..7 exist, so XMM8..15 (offset 288..416) is left as the zeroed
+        // reserved region — hardware leaves it undefined there.
+        let nxmm = match self.bits {
+            Bits::B64 => 16,
+            Bits::B32 => 8,
+        };
+        for (i, r) in self.state.xmm.iter().take(nxmm).enumerate() {
+            let off = 160 + i * 16;
+            buf[off..off + 16].copy_from_slice(&r.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Restore x87 + SSE state from a 512-byte FXSAVE area (the inverse of
+    /// [`Self::build_fxsave_area`]). The abridged FTW is expanded back to the
+    /// full 2-bit-per-register tag word by classifying each restored 80-bit
+    /// register, exactly as real hardware does on FXRSTOR.
+    fn restore_fxsave_area(&mut self, buf: &[u8; 512], rexw: bool) {
+        self.restore_x87_component(buf, rexw);
+        self.mxcsr = u32::from_le_bytes(buf[24..28].try_into().unwrap()) & MXCSR_MASK;
+        self.restore_xmm_component(buf);
+    }
+
+    /// Restore the x87 slice (FCW/FSW/abridged-FTW/FOP/FIP/FDP + ST0–7) from a
+    /// 512-byte area. Sets `sw` first so `phys()` reflects the restored TOP, then
+    /// expands the abridged FTW back to the full tag word by classifying each
+    /// loaded 80-bit register, exactly as hardware does.
+    fn restore_x87_component(&mut self, buf: &[u8; 512], rexw: bool) {
+        let ftw_abridged = buf[4];
+        self.state.x87.sw = u16::from_le_bytes([buf[2], buf[3]]);
+        self.state.x87.cw = u16::from_le_bytes([buf[0], buf[1]]);
+        self.state.x87.fop = u16::from_le_bytes([buf[6], buf[7]]);
+        if rexw {
+            self.state.x87.fip = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            self.state.x87.fcs = 0;
+            self.state.x87.fdp = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+            self.state.x87.fds = 0;
+        } else {
+            self.state.x87.fip = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as u64;
+            self.state.x87.fcs = u16::from_le_bytes([buf[12], buf[13]]);
+            self.state.x87.fdp = u32::from_le_bytes(buf[16..20].try_into().unwrap()) as u64;
+            self.state.x87.fds = u16::from_le_bytes([buf[20], buf[21]]);
+        }
+        let mut full_tw: u16 = 0;
+        for i in 0..8u8 {
+            let off = 32 + i as usize * 16;
+            let mut b = [0u8; 16];
+            b[..10].copy_from_slice(&buf[off..off + 10]);
+            let v = u128::from_le_bytes(b) & ((1u128 << 80) - 1);
+            let phys = self.state.x87.phys(i);
+            self.state.x87.st[phys] = v;
+            // Expand the abridged bit: 0 ⇒ empty (0b11); 1 ⇒ classify the value.
+            let tag = if ftw_abridged & (1 << phys) == 0 { 0b11 } else { full_tag(v) };
+            full_tw |= (tag & 0b11) << (phys as u16 * 2);
+        }
+        self.state.x87.tw = full_tw;
+    }
+
+    /// Restore the XMM registers from a 512-byte area (offset 160, 16 bytes
+    /// each). 64-bit mode restores XMM0–15; 32-bit mode restores only XMM0–7
+    /// (XMM8–15 do not exist there and are left unchanged).
+    fn restore_xmm_component(&mut self, buf: &[u8; 512]) {
+        let nxmm = match self.bits {
+            Bits::B64 => 16,
+            Bits::B32 => 8,
+        };
+        for i in 0..nxmm {
+            let off = 160 + i * 16;
+            let mut b = [0u8; 16];
+            b.copy_from_slice(&buf[off..off + 16]);
+            self.state.xmm[i] = u128::from_le_bytes(b);
+        }
+    }
+
+    /// The requested-feature bitmap for an XSAVE/XRSTOR: `(EDX:EAX) AND XCR0`,
+    /// intersected with the components the interpreter implements.
+    fn xsave_rfbm(&self) -> u64 {
+        let eax = self.state.gpr_read(0, 4);
+        let edx = self.state.gpr_read(2, 4);
+        ((edx << 32) | eax) & self.xcr0 & XCR0_SUPPORTED
+    }
+
+    /// Apply an XRSTOR: for each requested component, restore it from `area` if
+    /// its `xstate_bv` bit is set, otherwise reset it to its INIT configuration.
+    fn xrstor_apply(&mut self, area: &[u8; 512], rfbm: u64, xstate_bv: u64, rexw: bool) {
+        // x87 component (bit 0): restore from memory, or reset to the FNINIT
+        // state (control words reset, registers zeroed) if not in XSTATE_BV.
+        if rfbm & 1 != 0 {
+            if xstate_bv & 1 != 0 {
+                self.restore_x87_component(area, rexw);
+            } else {
+                self.state.x87 = exemu_core::X87::new();
+            }
+        }
+        // SSE component (bit 1): the XMM registers *and* MXCSR. Per the SDM,
+        // MXCSR is always loaded from the area when RFBM[1] is set (regardless
+        // of XSTATE_BV[1]); the XMM registers are loaded only if XSTATE_BV[1] is
+        // set, else reset to zero.
+        if rfbm & 2 != 0 {
+            self.mxcsr = u32::from_le_bytes(area[24..28].try_into().unwrap()) & MXCSR_MASK;
+            if xstate_bv & 2 != 0 {
+                self.restore_xmm_component(area);
+            } else {
+                self.state.xmm = [0u128; 16];
+            }
+        }
     }
 
     /// Two-byte (0x0F) opcode group. Returns `Some(exit)` only for the rare
@@ -962,6 +1135,30 @@ impl Interpreter {
                         self.state.gpr_write(2, 4, t >> 32); // EDX = TSC[63:32]
                         self.state.gpr_write(1, 4, 0); // ECX = IA32_TSC_AUX (processor 0)
                     }
+                    // XGETBV (0F 01 D0): read the extended-control register
+                    // selected by ECX into EDX:EAX. Only XCR0 (ECX==0) exists.
+                    0xD0 => {
+                        let ecx = self.state.gpr_read(1, 4);
+                        // ECX != 0 selects a non-existent XCR ⇒ #GP on hardware;
+                        // Wine only ever reads XCR0, so report 0 for anything else
+                        // rather than faulting.
+                        let val = if ecx == 0 { self.xcr0 } else { 0 };
+                        self.state.gpr_write(0, 4, val & 0xffff_ffff);
+                        self.state.gpr_write(2, 4, val >> 32);
+                    }
+                    // XSETBV (0F 01 D1): write EDX:EAX to the XCR selected by ECX.
+                    // Only XCR0 exists, bit 0 (x87) is mandatory, and only bits
+                    // the interpreter implements may be enabled.
+                    0xD1 => {
+                        let ecx = self.state.gpr_read(1, 4);
+                        if ecx == 0 {
+                            let eax = self.state.gpr_read(0, 4);
+                            let edx = self.state.gpr_read(2, 4);
+                            let requested = (edx << 32) | eax;
+                            // Silently clamp to the supported set (bit 0 forced on).
+                            self.xcr0 = (requested & XCR0_SUPPORTED) | 1;
+                        }
+                    }
                     other => {
                         return Err(EmuError::Unsupported(format!(
                             "0f 01 {other:#04x} at {start:#x}"
@@ -971,48 +1168,70 @@ impl Interpreter {
             }
 
             // 0F AE group 15: FXSAVE/FXRSTOR (/0,/1), LDMXCSR/STMXCSR (/2,/3),
-            // and the memory fences LFENCE/MFENCE/SFENCE + CLFLUSH (/5,/6,/7).
+            // XSAVE/XRSTOR (/4,/5 memory form), and the register-form memory
+            // fences LFENCE (/5)/MFENCE (/6)/SFENCE (/7) + CLFLUSH (/7 memory).
             0xAE => {
                 self.read_modrm(ctx, mem)?;
                 let digit = ctx.reg & 7;
-                // Fences and CLFLUSH: single-threaded, so no-ops (ModRM consumed).
-                if digit >= 5 {
+                let is_mem = matches!(ctx.rm, Rm::Mem { .. });
+                // Register-form /5,/6,/7 are the fences (LFENCE/MFENCE/SFENCE),
+                // single-threaded ⇒ no-ops. Memory-form /6 (CLFLUSH) is also a
+                // no-op. Memory-form /4 (XSAVE) and /5 (XRSTOR) are handled below.
+                if !is_mem && digit >= 5 {
                     return Ok(None);
                 }
+                if is_mem && (digit == 6 || digit == 7) {
+                    return Ok(None); // CLFLUSH / CLFLUSHOPT: no-op
+                }
                 let addr = ctx.rm_addr();
+                let rexw = ctx.pfx.w();
                 match digit {
-                    // FXSAVE: 512-byte area. We model MXCSR (off 24) + MXCSR_MASK
-                    // (off 28) + XMM0..15 (off 160, 16 bytes each); the x87 area
-                    // is zeroed (no x87 state yet).
+                    // FXSAVE / FXSAVE64 (REX.W): write the full 512-byte area.
                     0 => {
-                        let mut buf = [0u8; 512];
-                        buf[24..28].copy_from_slice(&self.mxcsr.to_le_bytes());
-                        buf[28..32].copy_from_slice(&MXCSR_MASK.to_le_bytes());
-                        for i in 0..16 {
-                            let off = 160 + i * 16;
-                            buf[off..off + 16].copy_from_slice(&self.state.xmm[i].to_le_bytes());
-                        }
+                        let buf = self.build_fxsave_area(rexw);
                         mem.write(addr, &buf)?;
                     }
-                    // FXRSTOR: restore MXCSR + XMM from the 512-byte area.
+                    // FXRSTOR / FXRSTOR64: load the full 512-byte area.
                     1 => {
                         let mut buf = [0u8; 512];
                         mem.read(addr, &mut buf)?;
-                        self.mxcsr =
-                            u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]) & MXCSR_MASK;
-                        for i in 0..16 {
-                            let off = 160 + i * 16;
-                            let mut b = [0u8; 16];
-                            b.copy_from_slice(&buf[off..off + 16]);
-                            self.state.xmm[i] = u128::from_le_bytes(b);
-                        }
+                        self.restore_fxsave_area(&buf, rexw);
                     }
                     // LDMXCSR / STMXCSR: load/store the 32-bit control word.
                     2 => self.mxcsr = mem.read_u32(addr)? & MXCSR_MASK,
                     3 => mem.write_u32(addr, self.mxcsr)?,
+                    // XSAVE / XSAVE64: standard form. The state to save is
+                    // (EDX:EAX requested-feature-mask) AND XCR0; only the x87
+                    // (bit 0) and SSE (bit 1) components are implemented.
+                    4 => {
+                        let rfbm = self.xsave_rfbm();
+                        let buf = self.build_fxsave_area(rexw);
+                        mem.write(addr, &buf)?;
+                        // XSAVE header: standard form writes only the 8-byte
+                        // XSTATE_BV at offset 512, updating exactly the bits in
+                        // RFBM and preserving the rest (SDM: "XSTATE_BV[i] is set
+                        // to modified value only for i in RFBM; other bits keep
+                        // their prior value"). The standard form always writes
+                        // the x87+SSE FXSAVE sub-area, so both are marked in-use.
+                        // XCOMP_BV (offset 520) and the reserved header bytes are
+                        // left untouched, matching hardware's standard form.
+                        let old_bv = mem.read_u64(addr + 512)?;
+                        let new_bv = (old_bv & !rfbm) | (rfbm & XCR0_SUPPORTED);
+                        mem.write_u64(addr + 512, new_bv)?;
+                    }
+                    // XRSTOR / XRSTOR64: standard form. Restore each requested
+                    // component from memory if its XSTATE_BV bit is set, else
+                    // reset it to its INIT value (x87 → FNINIT, SSE → zeroed).
+                    5 => {
+                        let rfbm = self.xsave_rfbm();
+                        let mut area = [0u8; 512];
+                        mem.read(addr, &mut area)?;
+                        let xstate_bv = mem.read_u64(addr + 512)?;
+                        self.xrstor_apply(&area, rfbm, xstate_bv, rexw);
+                    }
                     _ => {
                         return Err(EmuError::Unsupported(format!(
-                            "0f ae /{digit} (xsave) at {start:#x}"
+                            "0f ae /{digit} at {start:#x}"
                         )))
                     }
                 }
@@ -1238,5 +1457,38 @@ impl Interpreter {
             }
         }
         Ok(None)
+    }
+}
+
+/// Compress the full 2-bit-per-register x87 tag word into the 1-bit-per-register
+/// **abridged** form stored in the FXSAVE area (byte 4): bit *j* is 0 when
+/// physical register *j* is empty (full tag `0b11`), 1 otherwise. This is the
+/// exact encoding real hardware writes — FXSAVE never records the fine-grained
+/// zero/special/valid distinction, only empty-vs-not.
+fn abridged_ftw(full: u16) -> u8 {
+    let mut out = 0u8;
+    for j in 0..8 {
+        let tag = (full >> (j * 2)) & 0b11;
+        if tag != 0b11 {
+            out |= 1 << j;
+        }
+    }
+    out
+}
+
+/// Classify an 80-bit register value into its full 2-bit x87 tag (valid / zero /
+/// special). Used by FXRSTOR to expand the abridged FTW back to the tag word,
+/// exactly as hardware does: a non-empty register's tag is recomputed from its
+/// stored bit pattern.
+fn full_tag(v: u128) -> u16 {
+    let exp = ((v >> 64) & 0x7fff) as u32;
+    let signif = v as u64;
+    let integer_bit = signif & 0x8000_0000_0000_0000 != 0;
+    if exp == 0 && signif == 0 {
+        0b01 // zero
+    } else if exp == 0x7fff || (exp == 0 && signif != 0) || (exp != 0 && !integer_bit) {
+        0b10 // special (NaN/Inf/denormal/unnormal)
+    } else {
+        0b00 // valid
     }
 }

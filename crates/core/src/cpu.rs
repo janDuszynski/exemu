@@ -74,6 +74,18 @@ pub struct X87 {
     /// 10=special/NaN/Inf/denormal, 11=empty). Reset value `0xFFFF` (all
     /// empty).
     pub tw: u16,
+    /// Last-instruction opcode (the low 11 bits of the last non-control x87
+    /// instruction). Not tracked per-instruction by the interpreter — only
+    /// round-tripped through `FXSAVE`/`FXRSTOR`/`XSAVE`/`XRSTOR` so a guest that
+    /// saves and restores an FPU context (Wine's ntdll does) sees it preserved.
+    pub fop: u16,
+    /// Last x87 instruction pointer (`FPU IP`), and its code selector `FCS`.
+    /// Round-tripped through the save-area, not updated per-instruction.
+    pub fip: u64,
+    pub fcs: u16,
+    /// Last x87 data-operand pointer (`FPU DP`), and its data selector `FDS`.
+    pub fdp: u64,
+    pub fds: u16,
 }
 
 impl Default for X87 {
@@ -85,7 +97,7 @@ impl Default for X87 {
 impl X87 {
     /// A freshly-reset FPU (the state `FNINIT` installs).
     pub const fn new() -> Self {
-        X87 { st: [0; 8], cw: 0x037F, sw: 0x0000, tw: 0xFFFF }
+        X87 { st: [0; 8], cw: 0x037F, sw: 0x0000, tw: 0xFFFF, fop: 0, fip: 0, fcs: 0, fdp: 0, fds: 0 }
     }
 
     /// The 3-bit TOP field of the status word.
