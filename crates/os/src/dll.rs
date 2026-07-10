@@ -81,6 +81,14 @@ struct Module {
     /// Guest address of this module's `LDR_DATA_TABLE_ENTRY`, once threaded
     /// onto the loader lists.
     ldr_entry: u64,
+    /// Set by `DisableThreadLibraryCalls(hModule)`: this DLL opted out of
+    /// `DLL_THREAD_ATTACH`/`DLL_THREAD_DETACH` notifications, so a new thread
+    /// must **not** call its `DllMain` with those reasons (roadmap W0.7).
+    thread_calls_disabled: bool,
+    /// True once this module's `DllMain(DLL_PROCESS_ATTACH)` has run and its
+    /// matching `DLL_PROCESS_DETACH` has not — i.e. it is eligible for a detach
+    /// notification on `FreeLibrary` ref-count-zero or process exit.
+    attached: bool,
 }
 
 #[derive(Default)]
@@ -111,6 +119,18 @@ pub(crate) struct Loader {
     peb_ldr_data: u64,
     /// Recursion guard for the dependency-order loader.
     loading: Vec<String>,
+    /// A module whose `DllMain(DLL_PROCESS_DETACH)` is awaiting invocation
+    /// because a `FreeLibrary` dropped its ref count to zero: `(entry, base)`.
+    /// The `FreeLibrary` handler drains it through the callback machinery.
+    pub(crate) pending_detach: Vec<(u64, u64)>,
+    /// Guest address of the process `PEB.LoaderLock` `RTL_CRITICAL_SECTION`
+    /// (0 until `init_ldr` seeds it). Held during loader operations that run
+    /// `DllMain` (roadmap W0.7).
+    loader_lock: u64,
+    /// Recursion depth of the held loader lock (its `RecursionCount`). Lets
+    /// nested loader operations (a `DllMain` that itself calls `LoadLibrary`)
+    /// keep the lock owned until the outermost operation completes.
+    loader_lock_depth: i32,
 }
 
 /// The last path component, lower-cased, with a `.dll` extension ensured.
@@ -196,18 +216,85 @@ impl WinOs {
     /// `FreeLibrary(hModule)`: decrement the ref count of a loaded plugin. We
     /// never actually unmap (the DLL arena is a bump allocator and a stale
     /// mapping is harmless), but the count is tracked honestly so a program
-    /// that balances Load/Free sees the module drop to zero references. Returns
-    /// TRUE for any recognized handle, as the real API does.
+    /// that balances Load/Free sees the module drop to zero references. When a
+    /// module's count reaches zero and it was attached, its
+    /// `DllMain(DLL_PROCESS_DETACH)` is queued in `pending_detach` for the
+    /// caller to drive (roadmap W0.7). Returns TRUE for any recognized handle,
+    /// as the real API does.
     pub(crate) fn free_library(&mut self, hmodule: u64) -> bool {
         if hmodule == self.cfg.image_base {
             return true; // the exe itself is pinned
         }
         if let Some(m) = self.dll.modules.iter_mut().find(|m| m.base == hmodule) {
             m.ref_count = m.ref_count.saturating_sub(1);
+            // Ref count hit zero: run DLL_PROCESS_DETACH exactly once (only if
+            // the module actually ran its process-attach and hasn't detached).
+            if m.ref_count == 0 && m.attached && m.entry != 0 {
+                m.attached = false;
+                let (entry, base) = (m.entry, m.base);
+                self.dll.pending_detach.push((entry, base));
+            }
             return true;
         }
         // A synthetic emulated-DLL handle: always succeeds, nothing to free.
         self.dll.system.contains_key(&hmodule) || self.dll.by_name.values().any(|&h| h == hmodule)
+    }
+
+    /// Mark a loaded plugin as having opted out of thread-attach/-detach
+    /// notifications (`DisableThreadLibraryCalls`). Returns TRUE for any real
+    /// loaded module (the main image and emulated system DLLs also succeed —
+    /// they never get thread notifications anyway). Returns FALSE for an
+    /// unrecognized handle, matching the real API (roadmap W0.7).
+    pub(crate) fn disable_thread_library_calls(&mut self, hmodule: u64) -> bool {
+        if hmodule == self.cfg.image_base {
+            return true;
+        }
+        if let Some(m) = self.dll.modules.iter_mut().find(|m| m.base == hmodule) {
+            m.thread_calls_disabled = true;
+            return true;
+        }
+        self.dll.system.contains_key(&hmodule)
+    }
+
+    /// Mark every queued module (those whose `DllMain(DLL_PROCESS_ATTACH)` is
+    /// about to run) as attached, so a later `FreeLibrary`/exit fires exactly
+    /// one matching `DLL_PROCESS_DETACH`. Called by the `LoadLibrary` handler
+    /// right before it drives the pending attach queue.
+    pub(crate) fn mark_attached(&mut self, bases: &[u64]) {
+        for &b in bases {
+            if let Some(m) = self.dll.modules.iter_mut().find(|m| m.base == b) {
+                m.attached = true;
+            }
+        }
+    }
+
+    /// The `(DllMain entry, hModule)` of every loaded plugin that should receive
+    /// a thread notification `reason` (`DLL_THREAD_ATTACH`=2 / `DLL_THREAD_DETACH`=3),
+    /// in **initialization order** (the order they were attached). Modules that
+    /// called `DisableThreadLibraryCalls`, or have no entry point, are skipped
+    /// (roadmap W0.7).
+    pub(crate) fn thread_notify_targets(&self) -> Vec<(u64, u64)> {
+        self.dll
+            .modules
+            .iter()
+            .filter(|m| m.entry != 0 && m.attached && !m.thread_calls_disabled)
+            .map(|m| (m.entry, m.base))
+            .collect()
+    }
+
+    /// The `(DllMain entry, hModule)` of every still-attached loaded plugin, in
+    /// **reverse initialization order** (dependents before dependencies — the
+    /// order a real loader runs `DLL_PROCESS_DETACH` at process shutdown).
+    /// Marks each as detached so it is reported at most once (roadmap W0.7).
+    pub(crate) fn take_process_detach_targets(&mut self) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        for m in self.dll.modules.iter_mut().rev() {
+            if m.entry != 0 && m.attached {
+                m.attached = false;
+                out.push((m.entry, m.base));
+            }
+        }
+        out
     }
 
     /// Assign (or reuse) a synthetic handle for an emulated system DLL.
@@ -342,6 +429,8 @@ impl WinOs {
             entry,
             ref_count: 1,
             ldr_entry: 0,
+            thread_calls_disabled: false,
+            attached: false,
         });
         self.ldr_add_module(mem, self.dll.modules.len() - 1)?;
 
@@ -474,6 +563,30 @@ impl WinOs {
         // Publish PEB.Ldr.
         self.write_ptr(mem, self.cfg.peb_addr + self.cfg.peb_ldr_off, ldr)?;
 
+        // Seed a real PEB.LoaderLock CRITICAL_SECTION (roadmap W0.7). ntdll's
+        // loader takes this lock across every module-graph mutation; a guest
+        // that queries it (anti-debug, `ntdll!LdrLockLoaderLock`) must see a
+        // valid, initialized RTL_CRITICAL_SECTION, and it must read as *held*
+        // while a DllMain runs (a DllMain that re-enters the loader recurses on
+        // it). Public winnt.h RTL_CRITICAL_SECTION layout:
+        //   DebugInfo ptr @0, LockCount i32 @ptr, RecursionCount i32 @ptr+4,
+        //   OwningThread ptr @ptr+8, LockSemaphore ptr @ptr+8+ptr,
+        //   SpinCount usize @ptr+8+2*ptr. Size 0x28 (64) / 0x18 (32).
+        let cs_size = if self.cfg.is_64bit { 0x28 } else { 0x18 };
+        let cs = self.ldr_alloc(cs_size);
+        self.dll.loader_lock = cs;
+        // Unowned, uncontended: DebugInfo NULL, LockCount -1 (the "not locked"
+        // value modern ntdll uses), RecursionCount 0, OwningThread 0.
+        self.write_ptr(mem, cs, 0)?; // DebugInfo
+        mem.write_u32(cs + ptr, (-1_i32) as u32)?; // LockCount
+        mem.write_u32(cs + ptr + 4, 0)?; // RecursionCount
+        self.write_ptr(mem, cs + ptr + 8, 0)?; // OwningThread
+        self.write_ptr(mem, cs + ptr + 8 + ptr, 0)?; // LockSemaphore
+        self.write_ptr(mem, cs + ptr + 8 + 2 * ptr, 0)?; // SpinCount
+        if self.cfg.peb_loaderlock_off != 0 {
+            self.write_ptr(mem, self.cfg.peb_addr + self.cfg.peb_loaderlock_off, cs)?;
+        }
+
         // Thread the main image on as the first loader entry, so a walk of the
         // list starting at PEB.Ldr finds the exe just like real NT.
         let name = if self.cfg.image_name.is_empty() {
@@ -490,6 +603,45 @@ impl WinOs {
             &name,
             &full,
         )?;
+        Ok(())
+    }
+
+    /// Acquire the process `PEB.LoaderLock` for a loader operation, updating the
+    /// guest `RTL_CRITICAL_SECTION` so a guest that reads it sees the lock held
+    /// by the current thread. Recursive (a `DllMain` that re-enters the loader).
+    /// A no-op when the loader lock was never seeded (headless test path).
+    pub(crate) fn enter_loader_lock(&mut self, mem: &mut dyn Memory) -> Result<()> {
+        let cs = self.dll.loader_lock;
+        if cs == 0 {
+            return Ok(());
+        }
+        let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
+        self.dll.loader_lock_depth += 1;
+        // LockCount = -1 + threads_waiting_plus_owner; for a single-threaded
+        // uncontended acquire, ntdll bumps it to 0 on the first entry.
+        mem.write_u32(cs + ptr, (self.dll.loader_lock_depth - 1) as u32)?;
+        mem.write_u32(cs + ptr + 4, self.dll.loader_lock_depth as u32)?; // RecursionCount
+        let owner = u64::from(self.current_tid);
+        self.write_ptr(mem, cs + ptr + 8, owner)?; // OwningThread
+        Ok(())
+    }
+
+    /// Release one level of the loader lock acquired by [`Self::enter_loader_lock`].
+    pub(crate) fn leave_loader_lock(&mut self, mem: &mut dyn Memory) -> Result<()> {
+        let cs = self.dll.loader_lock;
+        if cs == 0 || self.dll.loader_lock_depth == 0 {
+            return Ok(());
+        }
+        let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
+        self.dll.loader_lock_depth -= 1;
+        if self.dll.loader_lock_depth == 0 {
+            mem.write_u32(cs + ptr, (-1_i32) as u32)?; // LockCount → unlocked
+            mem.write_u32(cs + ptr + 4, 0)?; // RecursionCount
+            self.write_ptr(mem, cs + ptr + 8, 0)?; // OwningThread cleared
+        } else {
+            mem.write_u32(cs + ptr, (self.dll.loader_lock_depth - 1) as u32)?;
+            mem.write_u32(cs + ptr + 4, self.dll.loader_lock_depth as u32)?;
+        }
         Ok(())
     }
 
