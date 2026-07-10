@@ -116,13 +116,25 @@ pub struct RunConfig {
     /// Render dialogs in a real window and let the user drive them, instead
     /// of headlessly auto-clicking the default button.
     pub gui: bool,
+    /// Override the address the main image is mapped at. `None` uses the PE's
+    /// preferred `ImageBase`; `Some(base)` maps the image there instead and
+    /// applies its base relocations (`.reloc`) with the resulting load delta.
+    /// The image must carry a relocation table for a non-preferred base to work.
+    pub load_base: Option<u64>,
 }
 
 impl Default for RunConfig {
     fn default() -> Self {
         // High enough for a real installer's decompression (7-Zip needs
         // ~500M) while still bounding a runaway loop.
-        RunConfig { args: vec!["program.exe".into()], echo: true, trace: false, max_steps: 2_000_000_000, gui: false }
+        RunConfig {
+            args: vec!["program.exe".into()],
+            echo: true,
+            trace: false,
+            max_steps: 2_000_000_000,
+            gui: false,
+            load_base: None,
+        }
     }
 }
 
@@ -153,11 +165,32 @@ pub struct Process {
 impl Process {
     /// Parse and lay out `pe_bytes` into a runnable process.
     pub fn load(pe_bytes: &[u8], cfg: &RunConfig) -> Result<Process> {
-        let image = loader::parse(pe_bytes)?;
+        let mut image = loader::parse(pe_bytes)?;
         let mut mem = VirtualMemory::new();
 
-        // --- Map headers and sections at the preferred image base ---------
-        let base = image.image_base;
+        // --- Choose a load base and relocate if it differs from preferred --
+        // `cfg.load_base` lets a caller deliberately map the image away from
+        // its preferred `ImageBase` (exercising the relocation path even for an
+        // .exe that would otherwise always land at its preferred address). When
+        // it moves, apply the base relocations to the section bytes *before*
+        // mapping, then treat the requested base as the image base everywhere.
+        let preferred_base = image.image_base;
+        let base = cfg.load_base.unwrap_or(preferred_base);
+        if base != preferred_base {
+            if image.relocations.is_empty() {
+                return Err(EmuError::InvalidPe(format!(
+                    "cannot load image at non-preferred base {base:#x}: no relocation table \
+                     (preferred base {preferred_base:#x})"
+                )));
+            }
+            loader::apply_relocations(&mut image.sections, &image.relocations, preferred_base, base)?;
+            // Patch the header copy's ImageBase field so a guest that reads its
+            // own PE header sees where it was actually loaded, and rebase the
+            // parsed image so entry_va()/imports/unwind all use the real base.
+            patch_header_image_base(&mut image.headers, image.is_64bit, base);
+            image.image_base = base;
+        }
+
         let hdr_len = align_up(image.size_of_headers as u64, PAGE).max(PAGE);
         // Writable: packers (UPX etc.) reconstruct headers/import tables in
         // place at the image base as they unpack.
@@ -478,6 +511,26 @@ fn align_up(v: u64, align: u64) -> u64 {
 #[inline]
 fn align_down(v: u64, align: u64) -> u64 {
     v & !(align - 1)
+}
+
+/// Rewrite the `ImageBase` field in a copy of the PE headers so a guest that
+/// walks its own header (via `PEB.ImageBaseAddress`) sees the address it was
+/// actually loaded at. The field is a QWORD at `opt+24` in PE32+ and a DWORD at
+/// `opt+28` in PE32, where `opt` is the start of the optional header. Any header
+/// too short to contain the field is left untouched (best-effort).
+fn patch_header_image_base(headers: &mut [u8], is_64bit: bool, base: u64) {
+    let read_u32 = |h: &[u8], at: usize| -> Option<u32> {
+        h.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let Some(pe_off) = read_u32(headers, 0x3C).map(|v| v as usize) else { return };
+    let opt = pe_off + 4 + 20; // PE signature (4) + COFF header (20)
+    if is_64bit {
+        if let Some(dst) = headers.get_mut(opt + 24..opt + 32) {
+            dst.copy_from_slice(&base.to_le_bytes());
+        }
+    } else if let Some(dst) = headers.get_mut(opt + 28..opt + 32) {
+        dst.copy_from_slice(&(base as u32).to_le_bytes());
+    }
 }
 
 fn section_name(raw: &str) -> String {

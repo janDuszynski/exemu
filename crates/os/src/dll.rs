@@ -139,7 +139,7 @@ impl WinOs {
         let Ok(bytes) = std::fs::read(&host) else {
             return Ok(None);
         };
-        let Ok(image) = exemu_loader::parse(&bytes) else {
+        let Ok(mut image) = exemu_loader::parse(&bytes) else {
             return Ok(None);
         };
 
@@ -155,25 +155,31 @@ impl WinOs {
         self.dll.arena_next = base + img_size;
         let ptr_size = if self.cfg.is_64bit { 8 } else { 4 };
 
-        // Map headers + section data (the arena is pre-zeroed, so gaps and
-        // uninitialized data are already zero).
+        // Apply base relocations for the load delta *before* mapping, using the
+        // same exact fixup code as the main image (DIR64 + HIGHLOW, unknown
+        // types rejected). Patching the section bytes up front means the
+        // relocated image is what lands in guest memory. If the DLL happens to
+        // load at its preferred base the delta is zero and this is a no-op, but
+        // the fixups are still validated. A malformed `.reloc` (bad type or
+        // out-of-section target) aborts the load rather than mapping a
+        // half-relocated image.
+        let preferred = image.image_base;
+        if let Err(e) =
+            exemu_loader::apply_relocations(&mut image.sections, &image.relocations, preferred, base)
+        {
+            if self.cfg.trace {
+                eprintln!("[exemu] plugin {name}: bad relocations ({e}); not loading");
+            }
+            self.dll.arena_next = base; // release the reservation
+            return Ok(None);
+        }
+
+        // Map headers + relocated section data (the arena is pre-zeroed, so gaps
+        // and uninitialized data are already zero).
         mem.write(base, &image.headers)?;
         for s in &image.sections {
             if !s.data.is_empty() {
                 mem.write(base + s.rva as u64, &s.data)?;
-            }
-        }
-
-        // Apply base relocations for the load delta.
-        let delta = base.wrapping_sub(image.image_base);
-        if delta != 0 {
-            for r in &image.relocations {
-                let at = base + r.rva as u64;
-                match r.kind {
-                    10 => mem.write_u64(at, mem.read_u64(at)?.wrapping_add(delta))?, // DIR64
-                    3 => mem.write_u32(at, (mem.read_u32(at)? as u64).wrapping_add(delta) as u32)?, // HIGHLOW
-                    _ => {}
-                }
             }
         }
 

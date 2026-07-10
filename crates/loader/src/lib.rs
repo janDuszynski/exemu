@@ -12,9 +12,11 @@
 #![forbid(unsafe_code)]
 
 mod reader;
+mod reloc;
 mod resources;
 mod unwind;
 
+pub use reloc::apply as apply_relocations;
 pub use resources::parse_dialogs;
 
 use exemu_core::{EmuError, Export, Import, ImportSymbol, PeImage, Reloc, Result, Section};

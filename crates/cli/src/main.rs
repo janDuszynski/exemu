@@ -72,6 +72,8 @@ RUN OPTIONS:\n\
     --no-echo       Do not mirror guest console output to the host\n\
     --gui           Render dialogs in a real window (drive them yourself)\n\
     --max-steps N   Instruction budget (0 = unlimited; default 2e9)\n\
+    --load-base H   Map the image at hex address H instead of its preferred\n\
+                    ImageBase and apply its base relocations (needs a .reloc)\n\
     --telemetry P   Opcode-miss log file (default $TMPDIR/exemu-telemetry.log,\n\
                     or the EXEMU_TELEMETRY env var)\n\
     -- <args>       Pass the remaining arguments to the guest program\n\
@@ -94,6 +96,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut gui = false;
     let mut max_steps: Option<u64> = None;
     let mut telemetry: Option<String> = None;
+    let mut load_base: Option<u64> = None;
     let mut guest_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -110,6 +113,14 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             "--telemetry" => {
                 i += 1;
                 telemetry = Some(rest.get(i).ok_or("--telemetry needs a <path>")?.clone());
+            }
+            "--load-base" => {
+                i += 1;
+                let v = rest.get(i).ok_or("--load-base needs a <hex-address>")?;
+                let s = v.trim_start_matches("0x").replace('_', "");
+                load_base = Some(
+                    u64::from_str_radix(&s, 16).map_err(|_| "bad --load-base value (hex)")?,
+                );
             }
             "--" => {
                 guest_args.extend(rest[i + 1..].iter().cloned());
@@ -136,7 +147,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut argv = vec![path.to_string()];
     argv.extend(guest_args);
 
-    let mut cfg = RunConfig { args: argv, echo, trace, gui, ..RunConfig::default() };
+    let mut cfg = RunConfig { args: argv, echo, trace, gui, load_base, ..RunConfig::default() };
     if let Some(m) = max_steps {
         cfg.max_steps = m;
     }
