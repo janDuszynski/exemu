@@ -148,9 +148,18 @@ exemu sample <out.exe>
   `HUW`, `PMULUDQ`, `PMADDWD`), `PAVGB/W`, `PSADBW`, `PACK*`, `PEXTRW`,
   `MOVMSKPS/PD`, shifts, shuffles, pack/unpack — plus `LDMXCSR`/`STMXCSR`
   and `FXSAVE`/`FXRSTOR` — all with faithful EFLAGS and cross-checked against
-  a Unicorn differential oracle. `CPUID` reports an honest feature set (only
-  the instructions actually implemented), so CRTs dispatch onto code paths the
-  interpreter can execute rather than into AVX it cannot.
+  a Unicorn differential oracle. The **x87 FPU** is implemented too: the ST0–ST7
+  register stack (with real 80-bit storage, so `long double` loads/stores are
+  bit-exact), the control/status/tag words, `FLD`/`FST`/`FIST` and their integer
+  and 80-bit forms, the arithmetic family (`FADD`/`FSUB(R)`/`FMUL`/`FDIV(R)`),
+  compares (`FCOM`/`FCOMI`/`FUCOMI` + the `fnstsw ax`→`jcc` idiom),
+  `FSQRT`/`FSCALE`/`FPREM`/`FRNDINT`, and the transcendentals
+  (`FSIN`/`FCOS`/`FPATAN`/`F2XM1`/`FYL2X`, as documented host-math
+  approximations). Arithmetic uses a double-precision core; the x87 category of
+  the oracle diffs the whole stack + status/control words against Unicorn.
+  `CPUID` reports an honest feature set (only the instructions actually
+  implemented), so CRTs dispatch onto code paths the interpreter can execute
+  rather than into AVX it cannot.
 * **~200 Win32 functions** across `kernel32`/`user32`/`gdi32`/`advapi32`/
   `shell32`/`ole32`/`comctl32`: console I/O, the `Heap*`/`Global*` allocators,
   the `lstr*` string family, `CharNext`/`CharPrev`, command line, module
@@ -248,7 +257,7 @@ Complex apps will hit unimplemented calls.
 
 ### Not implemented (yet)
 
-AVX and x87 floating point; native-themed / GDI+ / DirectX rendering (the
+AVX/AVX2 (VEX-encoded) instructions; native-themed / GDI+ / DirectX rendering (the
 GDI is a solid-fill/text subset); **COM** object creation; **preemptive** threads
 (the scheduler is cooperative — it yields at blocking points and on a timeslice,
 not on true OS preemption); and **registry persistence to disk** (the `Reg*`

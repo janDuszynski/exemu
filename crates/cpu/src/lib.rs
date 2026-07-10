@@ -485,3 +485,4 @@ impl RegAt for CpuState {
 
 mod exec;
 mod sse;
+mod x87;
