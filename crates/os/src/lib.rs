@@ -426,7 +426,18 @@ impl WinOs {
 
     /// Assign (or reuse) a thunk address for an imported symbol. The returned
     /// address is what the loader writes into the IAT slot.
+    ///
+    /// API-set contract names (`api-ms-win-*`, `ext-ms-win-*`) are resolved to
+    /// their host DLL before the look-up so that, e.g.,
+    /// `api-ms-win-crt-runtime-l1-1-0` is treated identically to `ucrtbase`.
     pub fn resolve_import(&mut self, dll: &str, symbol: &ImportSymbol) -> u64 {
+        // Resolve API-set virtual name → concrete host DLL if applicable.
+        let dll_cow: std::borrow::Cow<str> = match exemu_loader::resolve_api_set(dll) {
+            Some(host) => std::borrow::Cow::Borrowed(host),
+            None => std::borrow::Cow::Borrowed(dll),
+        };
+        let dll = dll_cow.as_ref();
+
         let name = match symbol {
             ImportSymbol::Named(n) => n.clone(),
             ImportSymbol::Ordinal(o) => format!("#ord{o}"),

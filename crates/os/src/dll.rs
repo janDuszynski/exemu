@@ -87,7 +87,22 @@ impl WinOs {
         if path.is_empty() {
             return Ok(self.cfg.image_base); // LoadLibrary(NULL) → the exe itself
         }
-        let name = base_name(path);
+        // Resolve API-set contract names before any look-up so that, e.g.,
+        // LoadLibrary("api-ms-win-crt-runtime-l1-1-0.dll") returns the handle
+        // for ucrtbase exactly as if ucrtbase had been requested directly.
+        let name_raw = base_name(path);
+        let name = match exemu_loader::resolve_api_set(&name_raw) {
+            Some(host) => {
+                // Ensure .dll extension on the resolved name.
+                let mut s = host.to_string();
+                if !s.ends_with(".dll") {
+                    s.push_str(".dll");
+                }
+                s
+            }
+            None => name_raw,
+        };
+
         if let Some(&h) = self.dll.by_name.get(&name) {
             return Ok(h);
         }
@@ -107,7 +122,17 @@ impl WinOs {
     /// The handle of an already-loaded (or emulated) module, without loading a
     /// plugin from disk. `GetModuleHandle` semantics: 0 if not present.
     pub(crate) fn module_handle(&mut self, path: &str) -> u64 {
-        let name = base_name(path);
+        let name_raw = base_name(path);
+        let name = match exemu_loader::resolve_api_set(&name_raw) {
+            Some(host) => {
+                let mut s = host.to_string();
+                if !s.ends_with(".dll") {
+                    s.push_str(".dll");
+                }
+                s
+            }
+            None => name_raw,
+        };
         if let Some(&h) = self.dll.by_name.get(&name) {
             return h;
         }
@@ -219,16 +244,27 @@ impl WinOs {
     /// images call each other's actual code. Only when the target DLL is *not*
     /// a loaded guest image (an emulated system DLL, or one not present) does it
     /// fall back to an OS thunk, exactly as before (roadmap W0.4).
+    ///
+    /// API-set contract names (`api-ms-win-*`, `ext-ms-win-*`) are resolved to
+    /// their concrete host DLL name before any module look-up, so a plugin that
+    /// imports `api-ms-win-crt-runtime-l1-1-0` is correctly treated as
+    /// importing `ucrtbase`.
     pub fn resolve_import_addr(&mut self, dll: &str, symbol: &ImportSymbol) -> u64 {
+        // Resolve API-set virtual name → concrete host DLL if applicable.
+        let host: &str = match exemu_loader::resolve_api_set(dll) {
+            Some(h) => h,
+            None => dll,
+        };
+
         // Snapshot the loaded-module view for the resolver. `by_name` maps a
         // lower-cased base name to a handle; for a *plugin* that handle is the
         // real mapped base and `exports` holds its export table. (Emulated
         // system DLLs have synthetic handles not present in `exports`, so they
         // are invisible here and correctly take the thunk fallback.)
         let view = GuestModules { dll: &self.dll };
-        match exemu_loader::resolve_import(&view, dll, symbol) {
+        match exemu_loader::resolve_import(&view, host, symbol) {
             exemu_loader::Resolved::GuestCode(addr) => addr,
-            exemu_loader::Resolved::Fallback => self.resolve_import(dll, symbol),
+            exemu_loader::Resolved::Fallback => self.resolve_import(host, symbol),
         }
     }
 

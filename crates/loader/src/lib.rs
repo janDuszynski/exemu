@@ -11,12 +11,14 @@
 
 #![forbid(unsafe_code)]
 
+mod api_set;
 mod reader;
 mod reloc;
 mod resolve;
 mod resources;
 mod unwind;
 
+pub use api_set::resolve as resolve_api_set;
 pub use reloc::apply as apply_relocations;
 pub use resolve::{resolve as resolve_import, LoadedModule, ModuleSet, Resolved};
 pub use resources::parse_dialogs;
