@@ -24,7 +24,14 @@ pub use manifest::parse_from_pe_resources as parse_activation_context;
 pub use manifest::parse_from_external_manifest as parse_activation_context_from_manifest;
 pub use reloc::apply as apply_relocations;
 pub use resolve::{resolve as resolve_import, LoadedModule, ModuleSet, Resolved};
-pub use resources::parse_dialogs;
+pub use resources::{
+    find_resource, find_resource_by_id, find_string, find_version_info, list_resources,
+    parse_dialogs, parse_string_block, parse_version_info, rt_name, FixedFileInfo, ResourceEntry,
+    ResourceName, LANG_ANY, RT_ACCELERATOR, RT_ANIICON, RT_ANICURSOR, RT_BITMAP, RT_CURSOR,
+    RT_DIALOG, RT_DLGINCLUDE, RT_FONT, RT_FONTDIR, RT_GROUP_CURSOR, RT_GROUP_ICON, RT_HTML,
+    RT_ICON, RT_MANIFEST, RT_MENU, RT_MESSAGETABLE, RT_PLUGPLAY, RT_RCDATA, RT_STRING,
+    RT_VERSION, RT_VXD,
+};
 
 use exemu_core::{EmuError, Export, Import, ImportSymbol, PeImage, Reloc, Result, Section, Tls};
 use reader::Reader;

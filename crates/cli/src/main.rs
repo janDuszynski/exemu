@@ -313,16 +313,64 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
         }
     }
 
-    let dialogs = exemu_loader::parse_dialogs(&bytes);
-    if !dialogs.is_empty() {
-        let mut ids: Vec<_> = dialogs.keys().copied().collect();
-        ids.sort();
-        println!("\n  dialogs ({}):", dialogs.len());
-        for id in ids {
-            let d = &dialogs[&id];
-            println!("    #{id} \"{}\" ({}x{} du, {} controls)", d.title, d.cx, d.cy, d.controls.len());
-            for c in &d.controls {
-                println!("      id={:<5} {:?} {:?}", c.id, c.kind, c.text);
+    // Resource directory summary (W0.9): group entries by type and print a
+    // one-line count per type, then expand RT_DIALOG (unchanged existing
+    // detail) and RT_VERSION (new: print the file version).
+    let res_entries = exemu_loader::list_resources(&bytes);
+    if !res_entries.is_empty() {
+        use std::collections::BTreeMap;
+        // Group by type_id (use 0 as sentinel for named types; sort by type).
+        let mut by_type: BTreeMap<u32, (Option<String>, usize)> = BTreeMap::new();
+        for e in &res_entries {
+            let entry = by_type.entry(e.type_id).or_insert_with(|| (e.type_name.clone(), 0));
+            entry.1 += 1;
+        }
+        println!("\n  resources ({} entries):", res_entries.len());
+        for (tid, (tname, count)) in &by_type {
+            let label = if let Some(n) = tname {
+                format!("named:{n}")
+            } else {
+                exemu_loader::rt_name(*tid)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("type#{tid}"))
+            };
+            println!("    {label:<20} {count} entrie(s)");
+        }
+
+        // RT_VERSION detail: print the file version string.
+        if let Some(info) = exemu_loader::find_version_info(&bytes) {
+            let (ma, mi, pa, bu) = info.file_version();
+            println!("  version              : {ma}.{mi}.{pa}.{bu}");
+        }
+
+        // RT_DIALOG detail (existing behaviour, unchanged).
+        let dialogs = exemu_loader::parse_dialogs(&bytes);
+        if !dialogs.is_empty() {
+            let mut ids: Vec<_> = dialogs.keys().copied().collect();
+            ids.sort();
+            println!("\n  dialogs ({}):", dialogs.len());
+            for id in ids {
+                let d = &dialogs[&id];
+                println!("    #{id} \"{}\" ({}x{} du, {} controls)", d.title, d.cx, d.cy, d.controls.len());
+                for c in &d.controls {
+                    println!("      id={:<5} {:?} {:?}", c.id, c.kind, c.text);
+                }
+            }
+        }
+    } else {
+        // Fallback: show dialogs even if list_resources returned empty (e.g.
+        // resources in an unusual layout).
+        let dialogs = exemu_loader::parse_dialogs(&bytes);
+        if !dialogs.is_empty() {
+            let mut ids: Vec<_> = dialogs.keys().copied().collect();
+            ids.sort();
+            println!("\n  dialogs ({}):", dialogs.len());
+            for id in ids {
+                let d = &dialogs[&id];
+                println!("    #{id} \"{}\" ({}x{} du, {} controls)", d.title, d.cx, d.cy, d.controls.len());
+                for c in &d.controls {
+                    println!("      id={:<5} {:?} {:?}", c.id, c.kind, c.text);
+                }
             }
         }
     }
