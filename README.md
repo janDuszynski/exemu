@@ -146,9 +146,11 @@ exemu sample <out.exe>
   (incl. `CVTDQ2PS`/`CVTPS2DQ`/`CVTTPS2DQ`), the packed-integer family —
   add/sub (incl. **saturating** `PADD/PSUB S/US`), multiply (`PMULLW`/`HW`/
   `HUW`, `PMULUDQ`, `PMADDWD`), `PAVGB/W`, `PSADBW`, `PACK*`, `PEXTRW`,
-  `MOVMSKPS/PD`, shifts, shuffles, pack/unpack — plus `LDMXCSR`/`STMXCSR`
-  and `FXSAVE`/`FXRSTOR` — all with faithful EFLAGS and cross-checked against
-  a Unicorn differential oracle. The **x87 FPU** is implemented too: the ST0–ST7
+  `MOVMSKPS/PD`, shifts, shuffles, pack/unpack — plus `LDMXCSR`/`STMXCSR`,
+  the full 512-byte `FXSAVE`/`FXRSTOR` save area, and the extended-state
+  `XSAVE`/`XRSTOR`/`XGETBV`/`XSETBV` (x87+SSE components) — all with faithful
+  EFLAGS and cross-checked against a Unicorn differential oracle (byte-exact
+  save-area diff). The **x87 FPU** is implemented too: the ST0–ST7
   register stack (with real 80-bit storage, so `long double` loads/stores are
   bit-exact), the control/status/tag words, `FLD`/`FST`/`FIST` and their integer
   and 80-bit forms, the arithmetic family (`FADD`/`FSUB(R)`/`FMUL`/`FDIV(R)`),

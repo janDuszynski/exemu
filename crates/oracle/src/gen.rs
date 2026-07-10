@@ -50,6 +50,16 @@ pub struct Seed {
     pub sw: u16,
     /// Initial x87 tag word.
     pub tw: u16,
+    /// Initial SSE control/status register (`MXCSR`).
+    pub mxcsr: u32,
+    /// Initial x87 last-instruction pointer/opcode/data-pointer state. Only ever
+    /// non-zero for the FXSAVE/XSAVE category, where the save-area layout must
+    /// round-trip these fields byte-exactly against the reference.
+    pub fip: u64,
+    pub fdp: u64,
+    pub fop: u16,
+    pub fcs: u16,
+    pub fds: u16,
 }
 
 /// One generated instruction plus the policy for comparing its result.
@@ -74,6 +84,14 @@ pub struct Trial {
     /// Status-word bits to compare for this trial (TOP + condition codes;
     /// exception/precision flags are excluded — exemu models them loosely).
     pub sw_mask: u16,
+    /// Byte offsets *within the DATA region* that are excluded from the memory
+    /// diff. Used by the FXSAVE/XSAVE category for the FOP field (offset 6–7 of
+    /// the save area): FOP is the opcode of the *last x87 instruction*, which is
+    /// implementation-defined when no such instruction ran (modern CPUs store 0
+    /// unless the last op raised an unmasked exception), so exemu and the
+    /// reference legitimately differ there. Everything else in the 512/576-byte
+    /// area is compared byte-exactly.
+    pub skip_mem: Vec<usize>,
     pub label: String,
 }
 
@@ -182,10 +200,11 @@ const ALU_MNEM: [&str; 8] = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cm
 /// memory operand or a REP string op (exercising the ModRM/SIB/disp decoder and
 /// the "touched pages" half of the oracle); the rest are register/immediate.
 pub fn build(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
-    match rng.below(4) {
+    match rng.below(5) {
         0 => build_sse(rng, bits, seed),
         1 => build_mem(rng, bits, seed),
         2 => build_x87(rng, bits, seed),
+        3 => build_fxsave(rng, bits, seed),
         _ => build_reg(rng, bits, seed),
     }
 }
@@ -243,6 +262,7 @@ fn alu_rr(rng: &mut Rng, bits: Bits) -> Trial {
         bytes: b,
         defined_flags: alu_defined(op),
         skip_reg: 0,
+        skip_mem: Vec::new(),
         label: format!("{} w{} {}", ALU_MNEM[op as usize], width, if dir { "r,rm" } else { "rm,r" }),
     }
 }
@@ -269,7 +289,7 @@ fn alu_imm(rng: &mut Rng, bits: Bits) -> Trial {
         b.push(modrm_reg(op, rm));
         emit_imm(&mut b, imm, if width == 2 { 2 } else { 4 });
     }
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: alu_defined(op), skip_reg: 0, label: format!("{} w{} rm,imm", ALU_MNEM[op as usize], width) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: alu_defined(op), skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{} rm,imm", ALU_MNEM[op as usize], width) }
 }
 
 const SH_MNEM: [&str; 8] = ["rol", "ror", "rcl", "rcr", "shl", "shr", "sal", "sar"];
@@ -300,7 +320,7 @@ fn shift_imm(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
     b.push(if width == 1 { 0xC0 } else { 0xC1 });
     b.push(modrm_reg(reg, rm));
     emit_imm(&mut b, count as u64, 1);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: shift_defined(reg, masked), skip_reg: 0, label: format!("{} w{} imm={}", SH_MNEM[(reg & 7) as usize], width, count) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: shift_defined(reg, masked), skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{} imm={}", SH_MNEM[(reg & 7) as usize], width, count) }
 }
 
 fn shift_cl(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -315,7 +335,7 @@ fn shift_cl(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(0xD3);
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: shift_defined(reg, masked), skip_reg: 0, label: format!("{} w{} cl(={})", SH_MNEM[(reg & 7) as usize], width, cl & 0xff) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: shift_defined(reg, masked), skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{} cl(={})", SH_MNEM[(reg & 7) as usize], width, cl & 0xff) }
 }
 
 fn shld_shrd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -341,7 +361,7 @@ fn shld_shrd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
         emit_imm(&mut b, count as u64, 1);
     }
     let defined = if count == 0 { 0 } else { CF | SF | ZF | PF };
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: defined, skip_reg: 0, label: format!("{} w{} {}", if is_shrd { "shrd" } else { "shld" }, width, count_label) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: defined, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{} {}", if is_shrd { "shrd" } else { "shld" }, width, count_label) }
 }
 
 fn mul_one(rng: &mut Rng, bits: Bits) -> Trial {
@@ -352,7 +372,7 @@ fn mul_one(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if width == 1 { 0xF6 } else { 0xF7 });
     b.push(modrm_reg(if signed { 5 } else { 4 }, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("{} w{} (one-op)", if signed { "imul" } else { "mul" }, width) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: MULF, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{} (one-op)", if signed { "imul" } else { "mul" }, width) }
 }
 
 fn imul2(rng: &mut Rng, bits: Bits) -> Trial {
@@ -363,7 +383,7 @@ fn imul2(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(0xAF);
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("imul2 w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: MULF, skip_reg: 0, skip_mem: Vec::new(), label: format!("imul2 w{width}") }
 }
 
 fn imul3(rng: &mut Rng, bits: Bits) -> Trial {
@@ -376,7 +396,7 @@ fn imul3(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(if imm8 { 0x6B } else { 0x69 });
     b.push(modrm_reg(reg, rm));
     emit_imm(&mut b, imm, if imm8 { 1 } else if width == 2 { 2 } else { 4 });
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: MULF, skip_reg: 0, label: format!("imul3 w{width} {}", if imm8 { "imm8" } else { "immZ" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: MULF, skip_reg: 0, skip_mem: Vec::new(), label: format!("imul3 w{width} {}", if imm8 { "imm8" } else { "immZ" }) }
 }
 
 fn div_op(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -408,7 +428,7 @@ fn div_op(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(0xF7);
     b.push(modrm_reg(if signed { 7 } else { 6 }, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} w{width}", if signed { "idiv" } else { "div" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{width}", if signed { "idiv" } else { "div" }) }
 }
 
 fn incdec(rng: &mut Rng, bits: Bits) -> Trial {
@@ -424,7 +444,7 @@ fn incdec(rng: &mut Rng, bits: Bits) -> Trial {
         b.push(if width == 1 { 0xFE } else { 0xFF });
         b.push(modrm_reg(if dec { 1 } else { 0 }, rm));
     }
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: INCDEC, skip_reg: 0, label: format!("{} w{width}", if dec { "dec" } else { "inc" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: INCDEC, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{width}", if dec { "dec" } else { "inc" }) }
 }
 
 fn neg(rng: &mut Rng, bits: Bits) -> Trial {
@@ -434,7 +454,7 @@ fn neg(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if width == 1 { 0xF6 } else { 0xF7 });
     b.push(modrm_reg(3, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("neg w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, skip_mem: Vec::new(), label: format!("neg w{width}") }
 }
 
 fn not(rng: &mut Rng, bits: Bits) -> Trial {
@@ -444,7 +464,7 @@ fn not(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if width == 1 { 0xF6 } else { 0xF7 });
     b.push(modrm_reg(2, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("not w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("not w{width}") }
 }
 
 fn test_rr(rng: &mut Rng, bits: Bits) -> Trial {
@@ -460,7 +480,7 @@ fn test_rr(rng: &mut Rng, bits: Bits) -> Trial {
     }
     b.push(if byte { 0x84 } else { 0x85 });
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: LOGIC, skip_reg: 0, label: format!("test w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: LOGIC, skip_reg: 0, skip_mem: Vec::new(), label: format!("test w{width}") }
 }
 
 const BT_MNEM: [(&str, u8); 4] = [("bt", 0xA3), ("bts", 0xAB), ("btr", 0xB3), ("btc", 0xBB)];
@@ -474,7 +494,7 @@ fn bt_reg(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
     b.push(0x0F);
     b.push(op2);
     b.push(modrm_reg(reg, rm)); // reg = bit index, rm = bit base register
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF, skip_reg: 0, label: format!("{name} w{width} (reg)") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF, skip_reg: 0, skip_mem: Vec::new(), label: format!("{name} w{width} (reg)") }
 }
 
 fn bt_imm(rng: &mut Rng, bits: Bits) -> Trial {
@@ -488,7 +508,7 @@ fn bt_imm(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0xBA);
     b.push(modrm_reg(4 + sub, rm));
     emit_imm(&mut b, idx as u64, 1);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF, skip_reg: 0, label: format!("{} w{width} imm={idx}", ["bt", "bts", "btr", "btc"][sub as usize]) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{width} imm={idx}", ["bt", "bts", "btr", "btc"][sub as usize]) }
 }
 
 fn bsf_bsr(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -503,7 +523,7 @@ fn bsf_bsr(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(modrm_reg(reg, rm));
     // When the source is zero the destination is architecturally undefined.
     let skip = if src_zero { 1u16 << (reg & 7) } else { 0 };
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ZF, skip_reg: skip, label: format!("{} w{width}{}", if bsr { "bsr" } else { "bsf" }, if src_zero { " (src=0)" } else { "" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ZF, skip_reg: skip, skip_mem: Vec::new(), label: format!("{} w{width}{}", if bsr { "bsr" } else { "bsf" }, if src_zero { " (src=0)" } else { "" }) }
 }
 
 fn tzcnt_lzcnt(rng: &mut Rng, bits: Bits) -> Trial {
@@ -515,7 +535,7 @@ fn tzcnt_lzcnt(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(if lz { 0xBD } else { 0xBC });
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF | ZF, skip_reg: 0, label: format!("{} w{width}", if lz { "lzcnt" } else { "tzcnt" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF | ZF, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{width}", if lz { "lzcnt" } else { "tzcnt" }) }
 }
 
 fn popcnt(rng: &mut Rng, bits: Bits) -> Trial {
@@ -526,7 +546,7 @@ fn popcnt(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(0xB8);
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF | OF | SF | ZF | AF | PF, skip_reg: 0, label: format!("popcnt w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF | OF | SF | ZF | AF | PF, skip_reg: 0, skip_mem: Vec::new(), label: format!("popcnt w{width}") }
 }
 
 fn movzx_movsx(rng: &mut Rng, bits: Bits) -> Trial {
@@ -534,7 +554,7 @@ fn movzx_movsx(rng: &mut Rng, bits: Bits) -> Trial {
     if bits == Bits::B64 && rng.below(4) == 0 {
         let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8);
         let b = vec![0x48, 0x63, modrm_reg(reg, rm)];
-        return Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "movsxd r64,rm32".into() };
+        return Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "movsxd r64,rm32".into() };
     }
     let src = if rng.boolean() { 1 } else { 2 };
     // Destination wider than source.
@@ -552,7 +572,7 @@ fn movzx_movsx(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(op2);
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} dst{dst}<-src{src}", if signed { "movsx" } else { "movzx" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} dst{dst}<-src{src}", if signed { "movsx" } else { "movzx" }) }
 }
 
 const CC: [&str; 16] = ["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"];
@@ -561,7 +581,7 @@ fn setcc(rng: &mut Rng) -> Trial {
     let cc = rng.below(16) as u8;
     let rm = rng.below(8) as u8;
     let b = vec![0x0F, 0x90 + cc, modrm_reg(0, rm)];
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("set{}", CC[cc as usize]) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("set{}", CC[cc as usize]) }
 }
 
 fn cmovcc(rng: &mut Rng, bits: Bits) -> Trial {
@@ -573,7 +593,7 @@ fn cmovcc(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(0x40 + cc);
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("cmov{} w{width}", CC[cc as usize]) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("cmov{} w{width}", CC[cc as usize]) }
 }
 
 fn bswap(rng: &mut Rng, bits: Bits) -> Trial {
@@ -585,7 +605,7 @@ fn bswap(rng: &mut Rng, bits: Bits) -> Trial {
     }
     b.push(0x0F);
     b.push(0xC8 + reg);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("bswap w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("bswap w{width}") }
 }
 
 fn xadd(rng: &mut Rng, bits: Bits) -> Trial {
@@ -597,7 +617,7 @@ fn xadd(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(if byte { 0xC0 } else { 0xC1 });
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("xadd w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, skip_mem: Vec::new(), label: format!("xadd w{width}") }
 }
 
 fn cmpxchg(rng: &mut Rng, bits: Bits) -> Trial {
@@ -609,7 +629,7 @@ fn cmpxchg(rng: &mut Rng, bits: Bits) -> Trial {
     b.push(0x0F);
     b.push(if byte { 0xB0 } else { 0xB1 });
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("cmpxchg w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, skip_mem: Vec::new(), label: format!("cmpxchg w{width}") }
 }
 
 fn xchg(rng: &mut Rng, bits: Bits) -> Trial {
@@ -620,7 +640,7 @@ fn xchg(rng: &mut Rng, bits: Bits) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0x86 } else { 0x87 });
     b.push(modrm_reg(reg, rm));
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("xchg w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("xchg w{width}") }
 }
 
 fn cdq_cwde(rng: &mut Rng, bits: Bits) -> Trial {
@@ -633,7 +653,7 @@ fn cdq_cwde(rng: &mut Rng, bits: Bits) -> Trial {
         b.push(0x66);
     }
     b.push(if cdq { 0x99 } else { 0x98 });
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} w{width}", if cdq { "cdq/cqo" } else { "cwde/cdqe" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{width}", if cdq { "cdq/cqo" } else { "cwde/cdqe" }) }
 }
 
 // ---- memory-operand and string families ------------------------------------
@@ -682,7 +702,7 @@ fn mem_alu(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push((op << 3) | ((dir as u8) << 1) | (!byte as u8));
     push_mem(&mut b, reg, base, disp);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: alu_defined(op), skip_reg: 0, label: format!("{} w{} {}", ALU_MNEM[op as usize], width, if dir { "r,[m]" } else { "[m],r" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: alu_defined(op), skip_reg: 0, skip_mem: Vec::new(), label: format!("{} w{} {}", ALU_MNEM[op as usize], width, if dir { "r,[m]" } else { "[m],r" }) }
 }
 
 fn mem_mov(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -711,7 +731,7 @@ fn mem_mov(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
             format!("mov [m],imm w{width}")
         }
     };
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label }
 }
 
 fn mem_movzx_movsx(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -732,7 +752,7 @@ fn mem_movzx_movsx(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(0x0F);
     b.push(op2);
     push_mem(&mut b, reg, base, disp);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{} dst{dst}<-[m]{src}", if signed { "movsx" } else { "movzx" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} dst{dst}<-[m]{src}", if signed { "movsx" } else { "movzx" }) }
 }
 
 fn mem_incdec(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -745,7 +765,7 @@ fn mem_incdec(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0xFE } else { 0xFF });
     push_mem(&mut b, if dec { 1 } else { 0 }, base, disp);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: INCDEC, skip_reg: 0, label: format!("{} [m] w{width}", if dec { "dec" } else { "inc" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: INCDEC, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} [m] w{width}", if dec { "dec" } else { "inc" }) }
 }
 
 fn mem_neg_not(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -758,7 +778,7 @@ fn mem_neg_not(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0xF6 } else { 0xF7 });
     push_mem(&mut b, if is_neg { 3 } else { 2 }, base, disp);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: if is_neg { ARITH } else { 0 }, skip_reg: 0, label: format!("{} [m] w{width}", if is_neg { "neg" } else { "not" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: if is_neg { ARITH } else { 0 }, skip_reg: 0, skip_mem: Vec::new(), label: format!("{} [m] w{width}", if is_neg { "neg" } else { "not" }) }
 }
 
 fn mem_shift(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -775,7 +795,7 @@ fn mem_shift(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(if byte { 0xC0 } else { 0xC1 });
     push_mem(&mut b, regf, base, disp);
     emit_imm(&mut b, count as u64, 1);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: shift_defined(regf, masked), skip_reg: 0, label: format!("{} [m] w{width} imm={count}", SH_MNEM[(regf & 7) as usize]) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: shift_defined(regf, masked), skip_reg: 0, skip_mem: Vec::new(), label: format!("{} [m] w{width} imm={count}", SH_MNEM[(regf & 7) as usize]) }
 }
 
 fn mem_xadd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -789,7 +809,7 @@ fn mem_xadd(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(0x0F);
     b.push(if byte { 0xC0 } else { 0xC1 });
     push_mem(&mut b, reg, base, disp);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("xadd [m],r w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, skip_mem: Vec::new(), label: format!("xadd [m],r w{width}") }
 }
 
 fn mem_cmpxchg(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -803,7 +823,7 @@ fn mem_cmpxchg(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(0x0F);
     b.push(if byte { 0xB0 } else { 0xB1 });
     push_mem(&mut b, reg, base, disp);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, label: format!("cmpxchg [m],r w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: ARITH, skip_reg: 0, skip_mem: Vec::new(), label: format!("cmpxchg [m],r w{width}") }
 }
 
 fn mem_test(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
@@ -816,7 +836,7 @@ fn mem_test(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     prefixes(&mut b, width, false);
     b.push(if byte { 0x84 } else { 0x85 });
     push_mem(&mut b, reg, base, disp);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: LOGIC, skip_reg: 0, label: format!("test [m],r w{width}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: LOGIC, skip_reg: 0, skip_mem: Vec::new(), label: format!("test [m],r w{width}") }
 }
 
 /// REP-able string ops (MOVS/STOS/CMPS/SCAS/LODS). Pointers are placed with a
@@ -851,7 +871,7 @@ fn string_op(rng: &mut Rng, _bits: Bits, seed: &mut Seed) -> Trial {
     };
     b.push(opc);
     let sz = if byte { "b" } else if width == 2 { "w" } else { "d" };
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: defined, skip_reg: 0, label: format!("{}{}{} n={}{}", if rep { "rep " } else { "" }, mnem, sz, count, if df { " df" } else { "" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: defined, skip_reg: 0, skip_mem: Vec::new(), label: format!("{}{}{} n={}{}", if rep { "rep " } else { "" }, mnem, sz, count, if df { " df" } else { "" }) }
 }
 
 // ---- SSE / SSE2 families (register form) ------------------------------------
@@ -911,7 +931,7 @@ fn sse_arith(rng: &mut Rng) -> Trial {
     let mut b = Vec::new();
     sse_prefix(&mut b, mp, false);
     b.extend([0x0F, op2, modrm_reg(d, s)]);
-    Trial { xmm_nan: nan_lane(mp), fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{name}{}", KIND[mp as usize]) }
+    Trial { xmm_nan: nan_lane(mp), fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("{name}{}", KIND[mp as usize]) }
 }
 
 fn sse_sqrt(rng: &mut Rng) -> Trial {
@@ -920,7 +940,7 @@ fn sse_sqrt(rng: &mut Rng) -> Trial {
     let mut b = Vec::new();
     sse_prefix(&mut b, mp, false);
     b.extend([0x0F, 0x51, modrm_reg(d, s)]);
-    Trial { xmm_nan: nan_lane(mp), fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("sqrt{}", KIND[mp as usize]) }
+    Trial { xmm_nan: nan_lane(mp), fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("sqrt{}", KIND[mp as usize]) }
 }
 
 fn sse_logic(rng: &mut Rng) -> Trial {
@@ -935,7 +955,7 @@ fn sse_logic(rng: &mut Rng) -> Trial {
     let mut b = Vec::new();
     sse_prefix(&mut b, mp, false);
     b.extend([0x0F, op2, modrm_reg(d, s)]);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: name.into() }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: name.into() }
 }
 
 fn sse_comis(rng: &mut Rng) -> Trial {
@@ -945,7 +965,7 @@ fn sse_comis(rng: &mut Rng) -> Trial {
     let mut b = Vec::new();
     sse_prefix(&mut b, if dbl { 1 } else { 0 }, false);
     b.extend([0x0F, op2, modrm_reg(reg, rm)]);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF | PF | AF | ZF | SF | OF, skip_reg: 0, label: format!("{}comis{}", if op2 == 0x2E { "u" } else { "" }, if dbl { "d" } else { "s" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF | PF | AF | ZF | SF | OF, skip_reg: 0, skip_mem: Vec::new(), label: format!("{}comis{}", if op2 == 0x2E { "u" } else { "" }, if dbl { "d" } else { "s" }) }
 }
 
 fn sse_cvt_i2f(rng: &mut Rng, bits: Bits) -> Trial {
@@ -955,7 +975,7 @@ fn sse_cvt_i2f(rng: &mut Rng, bits: Bits) -> Trial {
     let mut b = Vec::new();
     sse_prefix(&mut b, if sd { 3 } else { 2 }, rexw);
     b.extend([0x0F, 0x2A, modrm_reg(d, rm)]);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("cvtsi2s{}{}", if sd { "d" } else { "s" }, if rexw { " r64" } else { "" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("cvtsi2s{}{}", if sd { "d" } else { "s" }, if rexw { " r64" } else { "" }) }
 }
 
 fn sse_cvt_f2i(rng: &mut Rng, bits: Bits) -> Trial {
@@ -966,7 +986,7 @@ fn sse_cvt_f2i(rng: &mut Rng, bits: Bits) -> Trial {
     let mut b = Vec::new();
     sse_prefix(&mut b, if sd { 3 } else { 2 }, rexw);
     b.extend([0x0F, op2, modrm_reg(reg, rm)]);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("cvt{}s{}2si{}", if op2 == 0x2C { "t" } else { "" }, if sd { "d" } else { "s" }, if rexw { " r64" } else { "" }) }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("cvt{}s{}2si{}", if op2 == 0x2C { "t" } else { "" }, if sd { "d" } else { "s" }, if rexw { " r64" } else { "" }) }
 }
 
 fn sse_cvt_f2f(rng: &mut Rng) -> Trial {
@@ -975,7 +995,7 @@ fn sse_cvt_f2f(rng: &mut Rng) -> Trial {
     let mut b = Vec::new();
     sse_prefix(&mut b, if sd2ss { 3 } else { 2 }, false); // F2 = cvtsd2ss, F3 = cvtss2sd
     b.extend([0x0F, 0x5A, modrm_reg(d, s)]);
-    Trial { xmm_nan: if sd2ss { 4 } else { 8 }, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: if sd2ss { "cvtsd2ss".into() } else { "cvtss2sd".into() } }
+    Trial { xmm_nan: if sd2ss { 4 } else { 8 }, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: if sd2ss { "cvtsd2ss".into() } else { "cvtss2sd".into() } }
 }
 
 /// CVTDQ2PS (NP) / CVTPS2DQ (66) / CVTTPS2DQ (F3) — packed int32 ↔ f32.
@@ -985,17 +1005,17 @@ fn sse_cvt_dq(rng: &mut Rng) -> Trial {
     let mut b = Vec::new();
     sse_prefix(&mut b, mp, false);
     b.extend([0x0F, 0x5B, modrm_reg(d, s)]);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: name.into() }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: name.into() }
 }
 
 fn sse_move(rng: &mut Rng, bits: Bits) -> Trial {
     let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
     match rng.below(6) {
-        0 => Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x0F, 0x28, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: "movaps".into() },
-        1 => Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, 0x6F, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: "movdqa".into() },
+        0 => Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x0F, 0x28, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "movaps".into() },
+        1 => Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, 0x6F, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "movdqa".into() },
         2 => {
             let sd = rng.boolean();
-            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![if sd { 0xF2 } else { 0xF3 }, 0x0F, 0x10, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: if sd { "movsd".into() } else { "movss".into() } }
+            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![if sd { 0xF2 } else { 0xF3 }, 0x0F, 0x10, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: if sd { "movsd".into() } else { "movss".into() } }
         }
         3 => {
             let rexw = bits == Bits::B64 && rng.boolean();
@@ -1004,7 +1024,7 @@ fn sse_move(rng: &mut Rng, bits: Bits) -> Trial {
                 b.push(0x48);
             }
             b.extend([0x0F, 0x6E, modrm_reg(d, s)]);
-            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "movd xmm,r".into() }
+            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "movd xmm,r".into() }
         }
         4 => {
             let rexw = bits == Bits::B64 && rng.boolean();
@@ -1013,9 +1033,9 @@ fn sse_move(rng: &mut Rng, bits: Bits) -> Trial {
                 b.push(0x48);
             }
             b.extend([0x0F, 0x7E, modrm_reg(d, s)]); // reg=xmm src, rm=GP dst
-            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "movd r,xmm".into() }
+            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "movd r,xmm".into() }
         }
-        _ => Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0xF3, 0x0F, 0x7E, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: "movq xmm".into() },
+        _ => Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0xF3, 0x0F, 0x7E, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "movq xmm".into() },
     }
 }
 
@@ -1069,7 +1089,7 @@ fn sse_int(rng: &mut Rng) -> Trial {
         (0x67, "packuswb"),
     ]);
     let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: name.into() }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: name.into() }
 }
 
 fn sse_pmovmskb(rng: &mut Rng, bits: Bits) -> Trial {
@@ -1080,7 +1100,7 @@ fn sse_pmovmskb(rng: &mut Rng, bits: Bits) -> Trial {
         b.push(0x48);
     }
     b.extend([0x0F, 0xD7, modrm_reg(reg, rm)]);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "pmovmskb".into() }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "pmovmskb".into() }
 }
 
 /// PEXTRW (66 0F C5 /r ib) — extract word[imm8&7] of an xmm into a GP reg.
@@ -1093,7 +1113,7 @@ fn sse_pextrw(rng: &mut Rng, bits: Bits) -> Trial {
         b.push(0x48);
     }
     b.extend([0x0F, 0xC5, modrm_reg(reg, rm), rng.below(8) as u8]);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "pextrw".into() }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "pextrw".into() }
 }
 
 /// MOVMSKPS (NP) / MOVMSKPD (66) — sign bits of the packed floats into a GP
@@ -1115,6 +1135,7 @@ fn sse_movmsk(rng: &mut Rng, bits: Bits) -> Trial {
         bytes: b,
         defined_flags: 0,
         skip_reg: 0,
+        skip_mem: Vec::new(),
         label: if pd { "movmskpd" } else { "movmskps" }.into(),
     }
 }
@@ -1124,7 +1145,7 @@ fn sse_shift_imm(rng: &mut Rng) -> Trial {
     let digit = if op2 == 0x73 { *rng.pick(&[2u8, 3, 6, 7]) } else { *rng.pick(&[2u8, 4, 6]) };
     let rm = rng.below(8) as u8; // xmm operand (shifted in place)
     let imm = rng.below(20) as u8;
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(digit, rm), imm], defined_flags: 0, skip_reg: 0, label: format!("psh-imm {op2:#x}/{digit} imm={imm}") }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(digit, rm), imm], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("psh-imm {op2:#x}/{digit} imm={imm}") }
 }
 
 fn sse_shift_var(rng: &mut Rng) -> Trial {
@@ -1139,7 +1160,7 @@ fn sse_shift_var(rng: &mut Rng) -> Trial {
         (0xF3, "psllq"),
     ]);
     let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
-    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, label: name.into() }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: name.into() }
 }
 
 fn sse_shuffle(rng: &mut Rng) -> Trial {
@@ -1150,13 +1171,13 @@ fn sse_shuffle(rng: &mut Rng) -> Trial {
         let mut b = Vec::new();
         sse_prefix(&mut b, mp, false);
         b.extend([0x0F, 0x70, modrm_reg(d, s), imm]);
-        Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "pshuf".into() }
+        Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "pshuf".into() }
     } else {
         let mp = rng.below(2) as u8; // shufps(none) / shufpd(66)
         let mut b = Vec::new();
         sse_prefix(&mut b, mp, false);
         b.extend([0x0F, 0xC6, modrm_reg(d, s), imm]);
-        Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, label: "shufp".into() }
+        Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "shufp".into() }
     }
 }
 
@@ -1219,7 +1240,7 @@ fn x87_reduce(rng: &mut Rng, seed: &mut Seed) -> Trial {
         _ => (vec![0xD9, 0xFD], "fscale"),
     };
     let mask = SW_TOP;
-    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: mask, bytes, defined_flags: 0, skip_reg: 0, label: label.into() }
+    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: mask, bytes, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: label.into() }
 }
 
 /// Transcendentals: FSIN/FCOS/FSINCOS/FPTAN/FPATAN/F2XM1/FYL2X/FYL2XP1. These
@@ -1247,7 +1268,7 @@ fn x87_transcendental(rng: &mut Rng, seed: &mut Seed) -> Trial {
     };
     seed.st[0] = f64_to_ext_seed(st0);
     seed.st[1] = f64_to_ext_seed(st1);
-    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0xFF, sw_mask: SW_TOP, bytes, defined_flags: 0, skip_reg: 0, label: label.into() }
+    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0xFF, sw_mask: SW_TOP, bytes, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: label.into() }
 }
 
 /// Register-form arithmetic: FADD/FMUL/FSUB(R)/FDIV(R) between ST0 and ST(i),
@@ -1265,6 +1286,7 @@ fn x87_arith_reg(rng: &mut Rng, seed: &mut Seed) -> Trial {
     Trial {
         xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP,
         bytes: vec![esc, modrm], defined_flags: 0, skip_reg: 0,
+        skip_mem: Vec::new(),
         label: format!("{mnem} {name_dst} st{sti}"),
     }
 }
@@ -1283,7 +1305,7 @@ fn x87_arith_mem(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     b.push(esc);
     push_mem(&mut b, reg, base, disp);
     let mnem = ["fadd", "fmul", "?", "?", "fsub", "fsubr", "fdiv", "fdivr"][reg as usize];
-    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, label: format!("{mnem} m{}", if is64 { 64 } else { 32 }) }
+    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: format!("{mnem} m{}", if is64 { 64 } else { 32 }) }
 }
 
 /// FLD m32/m64, FILD m16/m32/m64 — push a memory value onto the stack.
@@ -1303,7 +1325,7 @@ fn x87_load_mem(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     let disp = point_fp(seed, base, rng, &bytes);
     let mut b = vec![esc];
     push_mem(&mut b, reg, base, disp);
-    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, label: label.into() }
+    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: label.into() }
 }
 
 /// FST/FSTP m32/m64, FIST/FISTP m16/m32/m64 — store ST0 to memory. The stored
@@ -1323,7 +1345,7 @@ fn x87_store_mem(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     let disp = point_fp(seed, base, rng, &vec![0u8; wbytes]);
     let mut b = vec![esc];
     push_mem(&mut b, reg, base, disp);
-    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, label: label.into() }
+    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: label.into() }
 }
 
 /// FLD1/FLDZ/FLDPI/FLDL2T/FLDL2E/FLDLG2/FLDLN2 — push a ROM constant.
@@ -1335,7 +1357,7 @@ fn x87_ld_const(rng: &mut Rng, seed: &mut Seed) -> Trial {
     // their double rounding differs from a from-scratch f64; compare the pushed
     // register loosely for the log constants, bit-exact for 1.0/0.0/pi.
     let approx = if low == 1 || low == 2 || low == 4 || low == 5 { 1u8 << 7 /*new ST0 = phys 7*/ } else { 0 };
-    Trial { xmm_nan: 0, fpu: true, fpu_approx: approx, sw_mask: SW_TOP, bytes: vec![0xD9, 0xE8 + low], defined_flags: 0, skip_reg: 0, label: names[low as usize].into() }
+    Trial { xmm_nan: 0, fpu: true, fpu_approx: approx, sw_mask: SW_TOP, bytes: vec![0xD9, 0xE8 + low], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: names[low as usize].into() }
 }
 
 /// FCOM/FCOMP/FCOMPP/FUCOM/FUCOMI/FCOMI — compares that set condition codes or
@@ -1356,7 +1378,7 @@ fn x87_compare(rng: &mut Rng, seed: &mut Seed) -> Trial {
         4 => (vec![0xDB, 0xF0 | sti], format!("fcomi st{sti}"), CF | PF | ZF, SW_TOP),
         _ => (vec![0xDF, 0xF0 | sti], format!("fcomip st{sti}"), CF | PF | ZF, SW_TOP),
     };
-    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask, bytes, defined_flags: flags, skip_reg: 0, label }
+    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask, bytes, defined_flags: flags, skip_reg: 0, skip_mem: Vec::new(), label }
 }
 
 /// FXCH/FABS/FCHS/FSQRT/FRNDINT/FSCALE/FXAM/FTST/FINCSTP/FDECSTP and the pop
@@ -1377,7 +1399,7 @@ fn x87_misc(rng: &mut Rng, seed: &mut Seed) -> Trial {
         7 => (vec![0xD9, 0xF6], "fdecstp".into(), SW_TOP),
         _ => (vec![0xD9, 0xF7], "fincstp".into(), SW_TOP),
     };
-    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask, bytes, defined_flags: 0, skip_reg: 0, label }
+    Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask, bytes, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label }
 }
 
 /// FNINIT / FNSTCW / FLDCW / FNSTSW (m16 and AX). Exercises the control/status
@@ -1385,7 +1407,7 @@ fn x87_misc(rng: &mut Rng, seed: &mut Seed) -> Trial {
 fn x87_control(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     let _ = bits;
     match rng.below(4) {
-        0 => Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: vec![0xDB, 0xE3], defined_flags: 0, skip_reg: 0, label: "fninit".into() },
+        0 => Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: vec![0xDB, 0xE3], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "fninit".into() },
         1 => {
             // FLDCW m16: load a fresh (double-precision) control word.
             let base = *rng.pick(&MEM_BASES);
@@ -1393,7 +1415,7 @@ fn x87_control(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
             let disp = point_fp(seed, base, rng, &cw.to_le_bytes());
             let mut b = vec![0xD9];
             push_mem(&mut b, 5, base, disp);
-            Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, label: "fldcw".into() }
+            Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "fldcw".into() }
         }
         2 => {
             // FNSTCW m16.
@@ -1402,15 +1424,248 @@ fn x87_control(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
             let disp = point_fp(seed, base, rng, &[0u8, 0]);
             let mut b = vec![0xD9];
             push_mem(&mut b, 7, base, disp);
-            Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, label: "fnstcw".into() }
+            Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: b, defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "fnstcw".into() }
         }
         _ => {
             // fnstsw ax after seeding some condition codes via a compare would
             // be two instructions; here just FNSTSW AX reads the seeded SW.
             seed.tw = 0x0000;
             seed.sw = (rng.below(0x8) as u16) << 8; // seed some condition bits (TOP stays 0)
-            Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: vec![0xDF, 0xE0], defined_flags: 0, skip_reg: 0, label: "fnstsw ax".into() }
+            Trial { xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP, bytes: vec![0xDF, 0xE0], defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: "fnstsw ax".into() }
         }
+    }
+}
+
+// ---- FXSAVE / FXRSTOR / XSAVE / XRSTOR family -------------------------------
+//
+// FXSAVE writes the full 512-byte legacy area; the differential engine already
+// diffs the shared DATA region byte-for-byte, so an FXSAVE trial is *the*
+// byte-exact save-area check the roadmap step calls for. FXRSTOR/XRSTOR load a
+// pre-populated area and are diffed on the resulting register state (ST stack +
+// XMM + status/control). XSAVE additionally writes the 64-byte header.
+
+/// A 64-byte-aligned address inside the DATA region with room for a 576-byte
+/// XSAVE area (512 legacy + 64 header). `DATA_BASE` (0x10000) is 64-aligned, so
+/// this offset keeps the whole area inside the mapping.
+const FX_AREA: u64 = DATA_BASE + 0x400;
+
+/// Write a self-consistent 512-byte FXSAVE image into `seed.data`, built per the
+/// SDM layout from f64-exact ST values and matching abridged tag bits. Used to
+/// seed the memory operand for FXRSTOR/XRSTOR trials. Returns nothing; the
+/// caller diffs the resulting registers.
+fn fill_fxsave_image(rng: &mut Rng, seed: &mut Seed, rexw: bool) {
+    let base = (FX_AREA - DATA_BASE) as usize;
+    // Zero the whole 512-byte area first.
+    for b in &mut seed.data[base..base + 512] {
+        *b = 0;
+    }
+    let cw: u16 = 0x027F | ((rng.below(4) as u16) << 10); // vary RC bits
+    let sw: u16 = (rng.below(0x8) as u16) << 8; // some condition codes, TOP=0
+    seed.data[base..base + 2].copy_from_slice(&cw.to_le_bytes());
+    seed.data[base + 2..base + 4].copy_from_slice(&sw.to_le_bytes());
+    // ST registers + a consistent abridged FTW (bit set ⇔ register non-empty).
+    let mut ftw: u8 = 0;
+    for i in 0..8 {
+        let present = rng.boolean();
+        let v = if present {
+            ftw |= 1 << i;
+            f64_to_ext_seed(fpu_edge_f64(rng))
+        } else {
+            0
+        };
+        let off = base + 32 + i * 16;
+        seed.data[off..off + 10].copy_from_slice(&v.to_le_bytes()[..10]);
+    }
+    seed.data[base + 4] = ftw;
+    // FOP / FIP / FDP: only meaningful (non-zero) for the pointer round-trip.
+    let fop = (rng.next_u32() as u16) & 0x07FF; // 11-bit opcode
+    seed.data[base + 6..base + 8].copy_from_slice(&fop.to_le_bytes());
+    if rexw {
+        let fip = rng.operand();
+        let fdp = rng.operand();
+        seed.data[base + 8..base + 16].copy_from_slice(&fip.to_le_bytes());
+        seed.data[base + 16..base + 24].copy_from_slice(&fdp.to_le_bytes());
+    } else {
+        let fip = rng.next_u32();
+        let fcs = rng.next_u32() as u16;
+        let fdp = rng.next_u32();
+        let fds = rng.next_u32() as u16;
+        seed.data[base + 8..base + 12].copy_from_slice(&fip.to_le_bytes());
+        seed.data[base + 12..base + 14].copy_from_slice(&fcs.to_le_bytes());
+        seed.data[base + 16..base + 20].copy_from_slice(&fdp.to_le_bytes());
+        seed.data[base + 20..base + 22].copy_from_slice(&fds.to_le_bytes());
+    }
+    // MXCSR: reserved bits above bit 15 must be clear; keep the mask bits set so
+    // no exception is unmasked when loaded.
+    let mxcsr = 0x1F80 | (rng.next_u32() & 0x0000_003F);
+    seed.data[base + 24..base + 28].copy_from_slice(&mxcsr.to_le_bytes());
+    // MXCSR_MASK at +28 is architecturally ignored by FXRSTOR; leave it 0.
+    // XMM0..15.
+    for i in 0..16 {
+        let off = base + 160 + i * 16;
+        seed.data[off..off + 16].copy_from_slice(&xmm_seed(rng).to_le_bytes());
+    }
+}
+
+/// DATA-region byte offsets excluded from the FXSAVE/XSAVE memory diff, all of
+/// which are architecturally undefined or reference-uncontrollable here:
+///  - **FOP** (offset 6–7): the reference derives the last-x87-opcode field
+///    internally, independent of any seed, so its saved value is not
+///    controllable and differs from exemu's tracked (0) FOP.
+///  - the **6 reserved bytes** trailing each 10-byte ST register in its 16-byte
+///    slot (offsets 32+i*16+10 .. +16): the SDM leaves these undefined and
+///    implementations disagree — exemu zero-fills them while a real CPU may
+///    leave the prior memory untouched.
+///
+/// The 10 significant bytes of every ST register, FCW/FSW/FTW, FIP/FDP (seeded
+/// to 0), MXCSR/MXCSR_MASK, and the XMM registers that exist in the mode
+/// (XMM0–15 in 64-bit, XMM0–7 in 32-bit) are still compared byte-exactly —
+/// i.e. the entire architectural register file.
+fn save_reserved_skip(bits: Bits) -> Vec<usize> {
+    let base = (FX_AREA - DATA_BASE) as usize;
+    let mut v = vec![base + 6, base + 7];
+    for i in 0..8usize {
+        let slot = base + 32 + i * 16;
+        for r in 10..16 {
+            v.push(slot + r);
+        }
+    }
+    // In 32-bit mode XMM8–15 (offset 288..416) do not exist; FXSAVE leaves that
+    // region undefined (exemu zero-fills it, a real CPU leaves prior memory).
+    let xmm_end = if bits == Bits::B64 { 416 } else { 288 };
+    // The reserved / "available for software" tail plus (in 32-bit) the absent
+    // XMM8–15 region. exemu zero-fills it; a real CPU leaves prior memory.
+    for off in xmm_end..512 {
+        v.push(base + off);
+    }
+    v
+}
+
+/// Set up `[base]` to address the aligned FX area and return the base register.
+fn point_fx(seed: &mut Seed, rng: &mut Rng) -> u8 {
+    let base = *rng.pick(&MEM_BASES);
+    seed.gpr[base as usize] = FX_AREA;
+    base
+}
+
+fn build_fxsave(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let rexw = bits == Bits::B64 && rng.boolean();
+    match rng.below(4) {
+        // FXSAVE: seed random FPU/SSE register state, save it, diff the 512-byte
+        // area byte-for-byte (via the shared DATA region).
+        0 => {
+            seed_fx_registers(rng, seed);
+            let base = point_fx(seed, rng);
+            let mut b = Vec::new();
+            if rexw {
+                b.push(0x48);
+            }
+            b.extend([0x0F, 0xAE]);
+            push_mem(&mut b, 0, base, 0); // /0 = FXSAVE, disp8=0
+            Trial {
+                xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b,
+                defined_flags: 0, skip_reg: 0, skip_mem: save_reserved_skip(bits), label: if rexw { "fxsave64".into() } else { "fxsave".into() },
+            }
+        }
+        // FXRSTOR: pre-populate a valid image, restore it, diff the registers.
+        1 => {
+            fill_fxsave_image(rng, seed, rexw);
+            let base = point_fx(seed, rng);
+            let mut b = Vec::new();
+            if rexw {
+                b.push(0x48);
+            }
+            b.extend([0x0F, 0xAE]);
+            push_mem(&mut b, 1, base, 0); // /1 = FXRSTOR
+            // The restored ST stack + status/control words are compared; the
+            // full SW (incl. TOP + condition codes) is restored verbatim.
+            Trial {
+                xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP_CMP, bytes: b,
+                defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: if rexw { "fxrstor64".into() } else { "fxrstor".into() },
+            }
+        }
+        // XSAVE: request x87+SSE (EDX:EAX = 3), save, diff the 576-byte area.
+        2 => {
+            seed_fx_registers(rng, seed);
+            let base = point_fx(seed, rng);
+            seed.gpr[0] = 3; // EAX = requested-feature mask low = x87|SSE
+            seed.gpr[2] = 0; // EDX = high
+            let mut b = Vec::new();
+            if rexw {
+                b.push(0x48);
+            }
+            b.extend([0x0F, 0xAE]);
+            push_mem(&mut b, 4, base, 0); // /4 = XSAVE
+            // EAX/EDX are inputs, not written; RSP-family bases excluded.
+            Trial {
+                xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b,
+                defined_flags: 0, skip_reg: 0, skip_mem: save_reserved_skip(bits), label: if rexw { "xsave64".into() } else { "xsave".into() },
+            }
+        }
+        // XRSTOR: build a full XSAVE image (legacy area + header with both state
+        // bits set), request x87+SSE, restore, diff the registers.
+        _ => {
+            fill_fxsave_image(rng, seed, rexw);
+            // XSAVE header at +512: XSTATE_BV = 3 (x87+SSE present), XCOMP_BV = 0.
+            let hoff = (FX_AREA - DATA_BASE) as usize + 512;
+            for b in &mut seed.data[hoff..hoff + 64] {
+                *b = 0;
+            }
+            seed.data[hoff] = 0x03; // XSTATE_BV low byte = x87|SSE
+            let base = point_fx(seed, rng);
+            seed.gpr[0] = 3; // EAX requested mask
+            seed.gpr[2] = 0; // EDX
+            let mut b = Vec::new();
+            if rexw {
+                b.push(0x48);
+            }
+            b.extend([0x0F, 0xAE]);
+            push_mem(&mut b, 5, base, 0); // /5 = XRSTOR
+            Trial {
+                xmm_nan: 0, fpu: true, fpu_approx: 0, sw_mask: SW_TOP_CMP, bytes: b,
+                defined_flags: 0, skip_reg: 0, skip_mem: Vec::new(), label: if rexw { "xrstor64".into() } else { "xrstor".into() },
+            }
+        }
+    }
+}
+
+/// Seed random (but valid) x87 + SSE register state for a save trial: f64-exact
+/// ST values, a matching tag word, varied control/status words, random pointer
+/// state, MXCSR, and XMM registers.
+fn seed_fx_registers(rng: &mut Rng, seed: &mut Seed) {
+    // TOP=0 at seed time (physical == ST-relative). Randomly mark some
+    // registers empty so the abridged FTW exercises both bit values.
+    let mut tw: u16 = 0;
+    for i in 0..8u16 {
+        let present = rng.boolean();
+        if present {
+            seed.st[i as usize] = f64_to_ext_seed(fpu_edge_f64(rng));
+            // Leave the full tag as "valid/zero/special" — Unicorn recomputes it;
+            // for the abridged form only empty-vs-not matters, so 00 (valid)
+            // suffices here and hardware re-derives the fine tag on save.
+            tw |= 0b00 << (i * 2);
+        } else {
+            seed.st[i as usize] = 0;
+            tw |= 0b11 << (i * 2); // empty
+        }
+    }
+    seed.tw = tw;
+    seed.cw = 0x027F | ((rng.below(4) as u16) << 10);
+    seed.sw = (rng.below(0x8) as u16) << 8; // condition codes, TOP=0
+    seed.mxcsr = 0x1F80 | (rng.next_u32() & 0x0000_003F);
+    // The x87 environment pointers (FOP/FIP/FCS/FDP/FDS) record the *last x87
+    // instruction*. No such instruction runs before this save, so their saved
+    // value is implementation-defined (modern CPUs zero the deprecated FCS/FDS
+    // and, with FDP_EXCPTN_ONLY, the pointers too). Seed them to 0 so both
+    // engines agree on the environment block; the fields are still exercised for
+    // round-trip fidelity by the cpu/tests/fxsave.rs FXRSTOR→FXSAVE pin.
+    seed.fop = 0;
+    seed.fip = 0;
+    seed.fdp = 0;
+    seed.fcs = 0;
+    seed.fds = 0;
+    for x in seed.xmm.iter_mut() {
+        *x = xmm_seed(rng);
     }
 }
 
@@ -1444,7 +1699,22 @@ pub fn seed(rng: &mut Rng) -> Seed {
         *s = f64_to_ext_seed(fpu_edge_f64(rng));
     }
     let cw = 0x027F; // double precision, round-to-nearest, all masked
-    Seed { gpr, rflags, xmm, data, st, cw, sw: 0x0000, tw: 0xFFFF }
+    Seed {
+        gpr,
+        rflags,
+        xmm,
+        data,
+        st,
+        cw,
+        sw: 0x0000,
+        tw: 0xFFFF,
+        mxcsr: 0x1F80,
+        fip: 0,
+        fdp: 0,
+        fop: 0,
+        fcs: 0,
+        fds: 0,
+    }
 }
 
 /// Encode an `f64` into an x87 80-bit extended value (mirrors the interpreter's

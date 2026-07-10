@@ -136,6 +136,7 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         return Outcome::Fault;
     }
     let mut cpu = Interpreter::with_bits(bits);
+    cpu.set_mxcsr(seed.mxcsr);
     {
         let s = cpu.state_mut();
         s.gpr = seed.gpr;
@@ -145,6 +146,11 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         s.x87.cw = seed.cw;
         s.x87.sw = seed.sw; // TOP=0 at seed time
         s.x87.tw = seed.tw;
+        s.x87.fip = seed.fip;
+        s.x87.fdp = seed.fdp;
+        s.x87.fop = seed.fop;
+        s.x87.fcs = seed.fcs;
+        s.x87.fds = seed.fds;
         s.rip = CODE_BASE;
     }
     let mut hooks = NoHooks;
@@ -209,6 +215,14 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
     let _ = uc.reg_write(RegisterX86::FPCW, seed.cw as u64);
     let _ = uc.reg_write(RegisterX86::FPSW, seed.sw as u64);
     let _ = uc.reg_write(RegisterX86::FPTAG, seed.tw as u64);
+    let _ = uc.reg_write(RegisterX86::MXCSR, seed.mxcsr as u64);
+    // x87 last-instruction pointer/opcode/data-pointer state — only non-zero for
+    // the FXSAVE/XSAVE category, whose save area must round-trip these fields.
+    let _ = uc.reg_write(RegisterX86::FIP, seed.fip);
+    let _ = uc.reg_write(RegisterX86::FDP, seed.fdp);
+    let _ = uc.reg_write(RegisterX86::FOP, seed.fop as u64);
+    let _ = uc.reg_write(RegisterX86::FCS, seed.fcs as u64);
+    let _ = uc.reg_write(RegisterX86::FDS, seed.fds as u64);
     for (i, r) in STS.iter().enumerate() {
         let mut bytes = [0u8; 10];
         bytes.copy_from_slice(&seed.st[i].to_le_bytes()[..10]);
@@ -312,7 +326,7 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
         }
     }
     for (i, (x, y)) in a.data.iter().zip(b.data.iter()).enumerate() {
-        if x != y {
+        if x != y && !trial.skip_mem.contains(&i) {
             return Some(format!("mem[{:#x}] exemu={:#04x} unicorn={:#04x}", gen::DATA_BASE + i as u64, x, y));
         }
     }

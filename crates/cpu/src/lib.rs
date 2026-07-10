@@ -44,10 +44,19 @@ pub struct Interpreter {
     /// round-to-nearest). Only the round-nearest default currently affects
     /// float→int conversions.
     mxcsr: u32,
+    /// Extended-control register `XCR0` (read by `XGETBV`, written by `XSETBV`).
+    /// Only the two state components the interpreter implements are ever set:
+    /// bit 0 (x87, always 1) and bit 1 (SSE). Default 0x3.
+    xcr0: u64,
 }
 
 /// The bits of `MXCSR` that are defined (reserved bits 16..31 read as 0).
 const MXCSR_MASK: u32 = 0x0000_FFFF;
+
+/// `XCR0` state components the interpreter implements: bit 0 = x87 (mandatory,
+/// always set), bit 1 = SSE. AVX (bit 2) and beyond are not implemented, so
+/// `XSETBV` rejects any attempt to enable them.
+const XCR0_SUPPORTED: u64 = 0b11;
 
 impl Default for Interpreter {
     fn default() -> Self {
@@ -58,20 +67,36 @@ impl Default for Interpreter {
 impl Interpreter {
     /// A fresh 64-bit interpreter.
     pub fn new() -> Self {
-        Interpreter { state: CpuState::new(), bits: Bits::B64, tsc: 0, mxcsr: 0x1F80 }
+        Interpreter { state: CpuState::new(), bits: Bits::B64, tsc: 0, mxcsr: 0x1F80, xcr0: XCR0_SUPPORTED }
     }
 
     /// A fresh interpreter in the given mode.
     pub fn with_bits(bits: Bits) -> Self {
-        Interpreter { state: CpuState::new(), bits, tsc: 0, mxcsr: 0x1F80 }
+        Interpreter { state: CpuState::new(), bits, tsc: 0, mxcsr: 0x1F80, xcr0: XCR0_SUPPORTED }
     }
 
     pub fn with_state(state: CpuState) -> Self {
-        Interpreter { state, bits: Bits::B64, tsc: 0, mxcsr: 0x1F80 }
+        Interpreter { state, bits: Bits::B64, tsc: 0, mxcsr: 0x1F80, xcr0: XCR0_SUPPORTED }
     }
 
     pub fn bits(&self) -> Bits {
         self.bits
+    }
+
+    /// The SSE control/status register (`MXCSR`).
+    pub fn mxcsr(&self) -> u32 {
+        self.mxcsr
+    }
+
+    /// Overwrite `MXCSR` (used by the differential oracle to seed state; masked
+    /// to the defined bits just as `LDMXCSR` would).
+    pub fn set_mxcsr(&mut self, v: u32) {
+        self.mxcsr = v & MXCSR_MASK;
+    }
+
+    /// The extended-control register `XCR0`.
+    pub fn xcr0(&self) -> u64 {
+        self.xcr0
     }
 
     /// Address-space mask: full 64-bit, or 32-bit in protected mode.
