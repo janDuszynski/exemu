@@ -302,11 +302,17 @@ impl Process {
         mem.map(Region::new("imports", lay.api_base, API_SIZE, Perm::RW))?;
 
         for imp in &image.imports {
-            let thunk = os.resolve_import(&imp.dll, &imp.symbol);
-            mem.poke(base + imp.iat_rva as u64, &thunk.to_le_bytes()[..ptr_size])?;
+            // Bind to a co-loaded guest module's real export when one is
+            // present (forwarders chased); otherwise this returns an OS thunk.
+            // At initial process load no plugins are mapped yet, so the main
+            // exe's imports of system DLLs all resolve to thunks as before — but
+            // routing through the same seam keeps inter-module resolution
+            // uniform for images loaded alongside it (roadmap W0.4).
+            let addr = os.resolve_import_addr(&imp.dll, &imp.symbol);
+            mem.poke(base + imp.iat_rva as u64, &addr.to_le_bytes()[..ptr_size])?;
             if let exemu_core::ImportSymbol::Named(name) = &imp.symbol {
                 if let Some(value) = data_import_seed(name, cmd_a, cmd_w) {
-                    mem.poke(thunk, &value.to_le_bytes()[..ptr_size])?;
+                    mem.poke(addr, &value.to_le_bytes()[..ptr_size])?;
                 }
             }
         }

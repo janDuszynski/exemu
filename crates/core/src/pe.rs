@@ -51,8 +51,17 @@ pub struct Export {
     pub name: Option<String>,
     /// The export ordinal (biased by the directory's ordinal base).
     pub ordinal: u16,
-    /// RVA of the exported function/variable within the module.
+    /// RVA of the exported function/variable within the module. Meaningless
+    /// (points inside the export directory) when this is a forwarder — see
+    /// [`Export::forwarder`].
     pub rva: u32,
+    /// A forwarder target string when this export re-exports a symbol from
+    /// another module. Per the PE/COFF spec, an export whose address RVA lands
+    /// *inside* the export directory is not code — it is an ASCIIZ string of
+    /// the form `"OTHERDLL.FuncName"` or `"OTHERDLL.#Ordinal"`. Resolving the
+    /// export means loading that other module and looking the target up there
+    /// (recursively, since a forwarder may point at another forwarder).
+    pub forwarder: Option<String>,
 }
 
 /// The parsed thread-local-storage directory (`IMAGE_TLS_DIRECTORY`).

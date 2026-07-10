@@ -13,10 +13,12 @@
 
 mod reader;
 mod reloc;
+mod resolve;
 mod resources;
 mod unwind;
 
 pub use reloc::apply as apply_relocations;
+pub use resolve::{resolve as resolve_import, LoadedModule, ModuleSet, Resolved};
 pub use resources::parse_dialogs;
 
 use exemu_core::{EmuError, Export, Import, ImportSymbol, PeImage, Reloc, Result, Section, Tls};
@@ -45,6 +47,7 @@ const DIR_IMPORT: usize = 1;
 const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
 const DIR_TLS: usize = 9;
+const DIR_DELAY_IMPORT: usize = 13;
 
 // Section characteristics bits.
 const SCN_CNT_UNINIT_DATA: u32 = 0x0000_0080;
@@ -116,6 +119,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     let (exc_dir_rva, exc_dir_size) = dir(DIR_EXCEPTION)?;
     let (reloc_dir_rva, reloc_dir_size) = dir(DIR_BASERELOC)?;
     let (tls_dir_rva, _tls_dir_size) = dir(DIR_TLS)?;
+    let (delay_dir_rva, delay_dir_size) = dir(DIR_DELAY_IMPORT)?;
 
     // ---- Section table ---------------------------------------------------
     let sec_table = opt + size_opt_header;
@@ -153,15 +157,30 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     }
 
     // ---- Imports ---------------------------------------------------------
-    let imports = if import_dir_rva != 0 && import_dir_size != 0 {
+    let mut imports = if import_dir_rva != 0 && import_dir_size != 0 {
         parse_imports(&sections, import_dir_rva, is_64bit)?
     } else {
         Vec::new()
     };
 
+    // ---- Delay-load imports ----------------------------------------------
+    // The delay-import descriptor table (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT)
+    // names DLLs a program would normally bind lazily on first call, through a
+    // helper stub, rather than at load time. exemu resolves them **eagerly**
+    // for now — folding them into the ordinary import list so their IAT slots
+    // are patched up front exactly like static imports. This is correct (a
+    // delay-loaded symbol is a real import; binding it early only removes the
+    // lazy-fault) and keeps the resolver single-path; a future step may honour
+    // true lazy binding if a program depends on a delay-load never resolving.
+    if delay_dir_rva != 0 && delay_dir_size != 0 {
+        if let Ok(mut delay) = parse_delay_imports(&sections, delay_dir_rva, image_base, is_64bit) {
+            imports.append(&mut delay);
+        }
+    }
+
     // ---- Exports (DLLs) --------------------------------------------------
     let (exports, dll_name) = if export_dir_rva != 0 && export_dir_size != 0 {
-        parse_exports(&sections, export_dir_rva).unwrap_or_default()
+        parse_exports(&sections, export_dir_rva, export_dir_size).unwrap_or_default()
     } else {
         (Vec::new(), None)
     };
@@ -216,7 +235,18 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
 
 /// Parse the export directory into a flat list of exports (resolving name and
 /// ordinal tables) plus the module's own name.
-fn parse_exports(sections: &[Section], dir_rva: u32) -> Result<(Vec<Export>, Option<String>)> {
+///
+/// `dir_size` is the exception directory's size from the data directory — it
+/// bounds the export-directory byte range `[dir_rva, dir_rva + dir_size)`. Per
+/// the PE/COFF spec, an export function RVA that falls *inside* that range is a
+/// **forwarder**: the RVA points at an ASCIIZ `"OTHERDLL.Symbol"` string
+/// (the target is `.Name` or `.#Ordinal`), not at code. Such exports are
+/// recorded with [`Export::forwarder`] set so the resolver can chase them.
+fn parse_exports(
+    sections: &[Section],
+    dir_rva: u32,
+    dir_size: u32,
+) -> Result<(Vec<Export>, Option<String>)> {
     let ordinal_base = slice_u32(sections, dir_rva + 16)?;
     let num_funcs = slice_u32(sections, dir_rva + 20)?;
     let num_names = slice_u32(sections, dir_rva + 24)?;
@@ -225,6 +255,10 @@ fn parse_exports(sections: &[Section], dir_rva: u32) -> Result<(Vec<Export>, Opt
     let ords_rva = slice_u32(sections, dir_rva + 36)?;
     let name_ptr = slice_u32(sections, dir_rva + 12)?;
     let dll_name = if name_ptr != 0 { cstr_at_rva(sections, name_ptr).ok() } else { None };
+
+    // The half-open RVA window occupied by the export directory itself. A
+    // function RVA landing here is a forwarder string, not a code address.
+    let dir_end = dir_rva.saturating_add(dir_size);
 
     // Map each function index → its exported name (if any).
     let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
@@ -242,10 +276,20 @@ fn parse_exports(sections: &[Section], dir_rva: u32) -> Result<(Vec<Export>, Opt
         if func_rva == 0 {
             continue; // empty slot
         }
+        // Forwarder detection: an address RVA inside the export directory is a
+        // forwarder string. Read it here so downstream resolution never has to
+        // re-derive the directory bounds. If the string is unreadable, fall
+        // back to treating the entry as an ordinary (if implausible) RVA.
+        let forwarder = if func_rva >= dir_rva && func_rva < dir_end {
+            cstr_at_rva(sections, func_rva).ok()
+        } else {
+            None
+        };
         exports.push(Export {
             name: names.get(&i).cloned(),
             ordinal: (ordinal_base + i) as u16,
             rva: func_rva,
+            forwarder,
         });
     }
     Ok((exports, dll_name))
@@ -440,6 +484,17 @@ fn cstr_at_rva(sections: &[Section], rva: u32) -> Result<String> {
 /// Walk the import directory, producing one [`Import`] per symbol with the
 /// RVA of the IAT slot that must be patched at load time. Thunk entries are
 /// 8 bytes for PE32+ and 4 bytes for PE32.
+///
+/// **Bound imports are re-resolved, never trusted.** When an image is *bound*
+/// (its `TimeDateStamp` in the descriptor is non-zero), the linker has
+/// pre-written resolved addresses into the IAT (`FirstThunk`) for a specific
+/// version of the target DLL. Those addresses are meaningless here — they name
+/// a Windows DLL's in-memory layout, not exemu's. This walk reads the **Import
+/// Lookup Table** (`OriginalFirstThunk`), which always holds the by-name/
+/// by-ordinal references regardless of binding, and re-derives every symbol
+/// from scratch; the stale bound IAT is simply overwritten when the caller
+/// patches each `iat_rva`. Only if the ILT is absent do we fall back to the
+/// IAT for the *reference* list (an unbound image where IAT == ILT on disk).
 fn parse_imports(sections: &[Section], dir_rva: u32, is_64bit: bool) -> Result<Vec<Import>> {
     let mut imports = Vec::new();
     let thunk_size = if is_64bit { 8 } else { 4 };
@@ -488,6 +543,106 @@ fn parse_imports(sections: &[Section], dir_rva: u32, is_64bit: bool) -> Result<V
         }
 
         desc += 20;
+    }
+
+    Ok(imports)
+}
+
+/// Walk the delay-load descriptor table (`ImgDelayDescr`), producing one
+/// [`Import`] per delay-bound symbol. The descriptor layout (per the public
+/// `delayimp.h` / PE documentation) is:
+///
+/// ```text
+///   +0   Attributes                 (DWORD; bit0 = dlattrRva → fields are RVAs)
+///   +4   DllNameRVA                 (RVA of the ASCIIZ module name)
+///   +8   ModuleHandleRVA
+///   +12  ImportAddressTableRVA      (the delay IAT — slots we patch)
+///   +16  ImportNameTableRVA         (the delay INT — ILT-format references)
+///   +20  BoundImportAddressTableRVA (stale; ignored — we re-resolve)
+///   +24  UnloadInformationTableRVA
+///   +28  TimeDateStamp
+/// ```
+///
+/// The INT entries use exactly the ordinary import thunk format (the
+/// `IMAGE_ORDINAL_FLAG` high bit for by-ordinal, else an RVA to an
+/// `IMAGE_IMPORT_BY_NAME`). Modern binaries are RVA-based (`dlattrRva`, bit 0
+/// set): all four `*RVA` fields are true RVAs. The ancient VA-based form
+/// (bit 0 clear) stored virtual addresses instead; we convert those back to
+/// RVAs via `image_base`. A descriptor whose fields are unreadable is skipped
+/// rather than aborting the whole load.
+fn parse_delay_imports(
+    sections: &[Section],
+    dir_rva: u32,
+    image_base: u64,
+    is_64bit: bool,
+) -> Result<Vec<Import>> {
+    let mut imports = Vec::new();
+    let thunk_size = if is_64bit { 8 } else { 4 };
+    let ordinal_flag: u64 = if is_64bit { 1 << 63 } else { 1 << 31 };
+
+    let read_thunk = |sections: &[Section], rva: u32| -> Result<u64> {
+        if is_64bit {
+            slice_u64(sections, rva)
+        } else {
+            slice_u32(sections, rva).map(|v| v as u64)
+        }
+    };
+
+    let mut desc = dir_rva;
+    loop {
+        let attributes = slice_u32(sections, desc)?;
+        let name_field = slice_u32(sections, desc + 4)?;
+        let iat_field = slice_u32(sections, desc + 12)?;
+        let int_field = slice_u32(sections, desc + 16)?;
+
+        // An all-zero descriptor terminates the array.
+        if attributes == 0 && name_field == 0 && iat_field == 0 && int_field == 0 {
+            break;
+        }
+
+        // Convert a descriptor field to an RVA. In the modern RVA-based form
+        // (dlattrRva, bit 0) the fields already are RVAs; in the legacy form
+        // they are VAs baked at the preferred base.
+        let rva_based = attributes & 1 != 0;
+        let to_rva = |field: u32| -> u32 {
+            if rva_based {
+                field
+            } else {
+                (field as u64).wrapping_sub(image_base) as u32
+            }
+        };
+
+        let name_rva = to_rva(name_field);
+        let iat_rva0 = to_rva(iat_field);
+        let int_rva0 = to_rva(int_field);
+
+        // A descriptor missing its name or reference table is unusable.
+        let Ok(dll) = cstr_at_rva(sections, name_rva).map(|s| s.to_ascii_lowercase()) else {
+            desc += 32;
+            continue;
+        };
+
+        let mut i = 0u32;
+        // Stop on a read error (corrupt/truncated INT) or the null terminator.
+        while let Ok(thunk) = read_thunk(sections, int_rva0 + i * thunk_size) {
+            if thunk == 0 {
+                break;
+            }
+            let iat_rva = iat_rva0 + i * thunk_size;
+            let symbol = if thunk & ordinal_flag != 0 {
+                ImportSymbol::Ordinal((thunk & 0xFFFF) as u16)
+            } else {
+                let by_name_rva = (thunk & 0x7FFF_FFFF) as u32;
+                match cstr_at_rva(sections, by_name_rva + 2) {
+                    Ok(name) => ImportSymbol::Named(name),
+                    Err(_) => break,
+                }
+            };
+            imports.push(Import { dll: dll.clone(), symbol, iat_rva });
+            i += 1;
+        }
+
+        desc += 32;
     }
 
     Ok(imports)
@@ -701,5 +856,101 @@ mod tests {
         f[sec + 20..sec + 24].copy_from_slice(&0x400u32.to_le_bytes()); // PointerToRawData
         f[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXEC|READ
         f
+    }
+
+    /// A named ordinal-flag helper for building thunk entries.
+    fn ordinal_thunk_64(ord: u16) -> u64 {
+        (1u64 << 63) | ord as u64
+    }
+
+    #[test]
+    fn delay_import_rva_based_parses_name_and_ordinal() {
+        // One RVA-based delay descriptor for kernel32.dll importing "Sleep"
+        // by name and #1 by ordinal. Everything lives in one section @ 0x1000.
+        const RVA: u32 = 0x1000;
+        // Layout inside the section:
+        //   +0x00 descriptor (32) + null descriptor (32)
+        //   +0x40 INT: [rva->IBN(Sleep), ordinal#1, 0]  (3 * 8)
+        //   +0x58 IAT: same shape (3 * 8)  — values don't matter for parsing
+        //   +0x70 IBN(Sleep): hint(2) + "Sleep\0"
+        //   +0x80 dll name "kernel32.dll\0"
+        let desc_off = 0usize;
+        let int_off = 0x40usize;
+        let iat_off = 0x58usize;
+        let ibn_off = 0x70usize;
+        let dll_off = 0x80usize;
+
+        let mut d = vec![0u8; 0x100];
+        // Descriptor: Attributes=1 (RVA-based), Name, IAT, INT.
+        d[desc_off..desc_off + 4].copy_from_slice(&1u32.to_le_bytes()); // dlattrRva
+        d[desc_off + 4..desc_off + 8].copy_from_slice(&(RVA + dll_off as u32).to_le_bytes());
+        d[desc_off + 12..desc_off + 16].copy_from_slice(&(RVA + iat_off as u32).to_le_bytes());
+        d[desc_off + 16..desc_off + 20].copy_from_slice(&(RVA + int_off as u32).to_le_bytes());
+        // second descriptor left zero (terminator).
+
+        // INT: entry 0 = RVA to IBN(Sleep); entry 1 = ordinal #1; entry 2 = 0.
+        d[int_off..int_off + 8].copy_from_slice(&((RVA + ibn_off as u32) as u64).to_le_bytes());
+        d[int_off + 8..int_off + 16].copy_from_slice(&ordinal_thunk_64(1).to_le_bytes());
+        // entry 2 already zero.
+        // IAT slot contents are irrelevant to parsing (re-resolved), left zero.
+
+        // IBN(Sleep).
+        d[ibn_off + 2..ibn_off + 2 + 5].copy_from_slice(b"Sleep");
+        // dll name.
+        d[dll_off..dll_off + 12].copy_from_slice(b"kernel32.dll");
+
+        let sections = vec![Section {
+            name: ".didat".into(),
+            rva: RVA,
+            virtual_size: 0x100,
+            data: d,
+            readable: true,
+            writable: true,
+            executable: false,
+        }];
+
+        let imports = parse_delay_imports(&sections, RVA, 0x1_4000_0000, true).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].dll, "kernel32.dll");
+        assert_eq!(imports[0].symbol, ImportSymbol::Named("Sleep".into()));
+        assert_eq!(imports[0].iat_rva, RVA + iat_off as u32);
+        assert_eq!(imports[1].symbol, ImportSymbol::Ordinal(1));
+        assert_eq!(imports[1].iat_rva, RVA + iat_off as u32 + 8);
+    }
+
+    #[test]
+    fn import_by_ordinal_sets_ordinal_symbol() {
+        // A regular (non-delay) import descriptor importing "a.dll" #7 by
+        // ordinal — proves the ordinal-flag path in parse_imports.
+        const RVA: u32 = 0x1000;
+        let ilt_off = 40usize;
+        let iat_off = ilt_off + 16;
+        let dll_off = iat_off + 16;
+        let mut d = vec![0u8; 0x80];
+        put_le32(&mut d, 0, RVA + ilt_off as u32); // OriginalFirstThunk
+        put_le32(&mut d, 12, RVA + dll_off as u32); // Name
+        put_le32(&mut d, 16, RVA + iat_off as u32); // FirstThunk
+        // ILT: [ordinal#7, 0]; IAT: same shape.
+        d[ilt_off..ilt_off + 8].copy_from_slice(&ordinal_thunk_64(7).to_le_bytes());
+        d[dll_off..dll_off + 5].copy_from_slice(b"a.dll");
+
+        let sections = vec![Section {
+            name: ".idata".into(),
+            rva: RVA,
+            virtual_size: 0x80,
+            data: d,
+            readable: true,
+            writable: true,
+            executable: false,
+        }];
+        let imports = parse_imports(&sections, RVA, true).unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].dll, "a.dll");
+        assert_eq!(imports[0].symbol, ImportSymbol::Ordinal(7));
+        assert_eq!(imports[0].iat_rva, RVA + iat_off as u32);
+    }
+
+    fn put_le32(d: &mut [u8], off: usize, v: u32) {
+        d[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
 }
