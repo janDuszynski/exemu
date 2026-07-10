@@ -25,6 +25,6 @@ pub use error::{EmuError, Result};
 pub use gui::{Control, ControlKind, DialogTemplate, DrawOp, Gui, GuiEvent, NoGui};
 pub use hooks::Hooks;
 pub use memory::{Memory, Perm, Region};
-pub use pe::{Export, Import, ImportSymbol, PeImage, Reloc, Section};
+pub use pe::{Export, Import, ImportSymbol, PeImage, Reloc, Section, Tls};
 pub use telemetry::{rank as rank_opcode_misses, MissRecord, OpcodeRank};
 pub use unwind::{FrameUnwind, HandlerType, UnwindCode, UnwindEntry, UnwindInfo, UnwindOp};
