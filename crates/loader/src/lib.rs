@@ -19,7 +19,7 @@ mod unwind;
 pub use reloc::apply as apply_relocations;
 pub use resources::parse_dialogs;
 
-use exemu_core::{EmuError, Export, Import, ImportSymbol, PeImage, Reloc, Result, Section};
+use exemu_core::{EmuError, Export, Import, ImportSymbol, PeImage, Reloc, Result, Section, Tls};
 use reader::Reader;
 
 // --- On-disk constants -------------------------------------------------------
@@ -44,6 +44,7 @@ const DIR_EXPORT: usize = 0;
 const DIR_IMPORT: usize = 1;
 const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
+const DIR_TLS: usize = 9;
 
 // Section characteristics bits.
 const SCN_CNT_UNINIT_DATA: u32 = 0x0000_0080;
@@ -114,6 +115,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     let (export_dir_rva, export_dir_size) = dir(DIR_EXPORT)?;
     let (exc_dir_rva, exc_dir_size) = dir(DIR_EXCEPTION)?;
     let (reloc_dir_rva, reloc_dir_size) = dir(DIR_BASERELOC)?;
+    let (tls_dir_rva, _tls_dir_size) = dir(DIR_TLS)?;
 
     // ---- Section table ---------------------------------------------------
     let sec_table = opt + size_opt_header;
@@ -171,6 +173,17 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         Vec::new()
     };
 
+    // ---- Thread-local storage directory ----------------------------------
+    // A missing directory is the common case (most images have no static
+    // TLS). A present-but-corrupt directory is tolerated (best-effort parse)
+    // rather than failing the whole load — the template/callbacks simply come
+    // back empty, matching the "no TLS" behaviour.
+    let tls = if tls_dir_rva != 0 {
+        parse_tls(&sections, tls_dir_rva, image_base, is_64bit).ok()
+    } else {
+        None
+    };
+
     // ---- x64 exception function table (.pdata/.xdata) ---------------------
     // 32-bit x86 uses the fs:[0] SEH chain instead; its directory 3 (when
     // present at all) holds a different format, so parse only for PE32+.
@@ -194,6 +207,7 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         imports,
         exports,
         relocations,
+        tls,
         dll_name,
         headers,
         function_table,
@@ -260,6 +274,102 @@ fn parse_relocs(sections: &[Section], dir_rva: u32, dir_size: u32) -> Result<Vec
         off += block_size;
     }
     Ok(relocs)
+}
+
+/// Parse the `IMAGE_TLS_DIRECTORY` (32-bit or 64-bit form) at `dir_rva`.
+///
+/// Layout (per the PE/COFF spec's `.tls` section / public `winnt.h`), where
+/// each pointer field is 4 bytes for PE32 and 8 bytes for PE32+:
+///
+/// ```text
+///   +0   StartAddressOfRawData   (VA)
+///   + p   EndAddressOfRawData     (VA)
+///   +2p  AddressOfIndex          (VA)
+///   +3p  AddressOfCallBacks      (VA of null-terminated VA array)
+///   +4p  SizeOfZeroFill          (DWORD)
+///   +4p+4 Characteristics        (DWORD)
+/// ```
+///
+/// The four address fields are **virtual addresses** (`image_base + rva`), so
+/// this converts each back to an RVA (by subtracting `image_base`) before
+/// reading the referenced bytes out of the sections. The initialization
+/// template `[Start, End)` is copied out, and the `AddressOfCallBacks` array
+/// is walked to its null terminator, each entry recorded as an `image_base`
+/// relative RVA.
+fn parse_tls(sections: &[Section], dir_rva: u32, image_base: u64, is_64bit: bool) -> Result<Tls> {
+    // Read one pointer-sized field (4 bytes on PE32, 8 on PE32+).
+    let ptr = |rva: u32| -> Result<u64> {
+        if is_64bit {
+            slice_u64(sections, rva)
+        } else {
+            slice_u32(sections, rva).map(u64::from)
+        }
+    };
+    let p: u32 = if is_64bit { 8 } else { 4 };
+
+    let start_address_of_raw_data = ptr(dir_rva)?;
+    let end_address_of_raw_data = ptr(dir_rva + p)?;
+    let address_of_index = ptr(dir_rva + 2 * p)?;
+    let address_of_callbacks = ptr(dir_rva + 3 * p)?;
+    let size_of_zero_fill = slice_u32(sections, dir_rva + 4 * p)?;
+    let characteristics = slice_u32(sections, dir_rva + 4 * p + 4)?;
+
+    // Convert a stored VA to an image-relative RVA, if it falls at or above
+    // the preferred base. VAs below the base (or a zero VA) yield None.
+    let va_to_rva = |va: u64| -> Option<u32> {
+        if va == 0 {
+            return None;
+        }
+        va.checked_sub(image_base).and_then(|off| u32::try_from(off).ok())
+    };
+
+    // Copy the raw initialization template out of [Start, End).
+    let raw_template = match (va_to_rva(start_address_of_raw_data), end_address_of_raw_data) {
+        (Some(start_rva), end) if end > start_address_of_raw_data => {
+            let len = (end - start_address_of_raw_data) as usize;
+            let mut buf = Vec::with_capacity(len);
+            let mut ok = true;
+            for i in 0..len {
+                match slice_u8(sections, start_rva + i as u32) {
+                    Ok(b) => buf.push(b),
+                    Err(_) => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok { buf } else { Vec::new() }
+        }
+        _ => Vec::new(),
+    };
+
+    // Walk the null-terminated array of callback VAs.
+    let mut callback_rvas = Vec::new();
+    if let Some(mut arr_rva) = va_to_rva(address_of_callbacks) {
+        // Stop on a read error (corrupt/truncated array) or the null
+        // terminator, keeping whatever was collected so far.
+        while let Ok(cb_va) = ptr(arr_rva) {
+            if cb_va == 0 {
+                break; // null terminator
+            }
+            match va_to_rva(cb_va) {
+                Some(rva) => callback_rvas.push(rva),
+                None => break, // implausible callback VA — stop
+            }
+            arr_rva += p;
+        }
+    }
+
+    Ok(Tls {
+        start_address_of_raw_data,
+        end_address_of_raw_data,
+        address_of_index,
+        address_of_callbacks,
+        size_of_zero_fill,
+        characteristics,
+        raw_template,
+        callback_rvas,
+    })
 }
 
 /// Read bytes living at a given RVA out of whichever section contains it.
@@ -395,5 +505,201 @@ mod tests {
     #[test]
     fn rejects_empty() {
         assert!(parse(&[]).is_err());
+    }
+
+    /// Build one `.tls`-like section at `rva` holding a 64-bit
+    /// `IMAGE_TLS_DIRECTORY`, a one-entry (+ null) callback array, and a small
+    /// initialization template, all laid out at hand so the byte offsets are
+    /// unambiguous. Returns the section and the directory RVA.
+    fn tls_fixture_64(image_base: u64) -> (Vec<Section>, u32) {
+        // Section starts at RVA 0x1000. Layout inside its data:
+        //   +0x00  TLS directory (40 bytes)
+        //   +0x40  callback array: [cb_va, 0]  (16 bytes)
+        //   +0x60  template bytes  (4 bytes: DE AD BE EF)
+        const SEC_RVA: u32 = 0x1000;
+        const DIR_OFF: usize = 0x00;
+        const CB_ARR_OFF: usize = 0x40;
+        const TMPL_OFF: usize = 0x60;
+        const TMPL_LEN: usize = 4;
+
+        let tmpl_rva = SEC_RVA + TMPL_OFF as u32;
+        let cb_arr_rva = SEC_RVA + CB_ARR_OFF as u32;
+        let cb_target_rva = 0x2345u32; // where the callback function "lives"
+
+        let tmpl_va = image_base + tmpl_rva as u64;
+        let cb_arr_va = image_base + cb_arr_rva as u64;
+        let cb_va = image_base + cb_target_rva as u64;
+        let index_va = image_base + 0x3000; // arbitrary AddressOfIndex
+
+        let mut data = vec![0u8; 0x80];
+        // TLS directory (PE32+ pointers are 8 bytes each).
+        data[DIR_OFF..DIR_OFF + 8].copy_from_slice(&tmpl_va.to_le_bytes()); // Start
+        data[DIR_OFF + 8..DIR_OFF + 16]
+            .copy_from_slice(&(tmpl_va + TMPL_LEN as u64).to_le_bytes()); // End
+        data[DIR_OFF + 16..DIR_OFF + 24].copy_from_slice(&index_va.to_le_bytes()); // AddressOfIndex
+        data[DIR_OFF + 24..DIR_OFF + 32].copy_from_slice(&cb_arr_va.to_le_bytes()); // AddressOfCallBacks
+        data[DIR_OFF + 32..DIR_OFF + 36].copy_from_slice(&0x100u32.to_le_bytes()); // SizeOfZeroFill
+        data[DIR_OFF + 36..DIR_OFF + 40].copy_from_slice(&0x0030_0000u32.to_le_bytes()); // Characteristics (align)
+
+        // Callback array: one real callback then the null terminator.
+        data[CB_ARR_OFF..CB_ARR_OFF + 8].copy_from_slice(&cb_va.to_le_bytes());
+        data[CB_ARR_OFF + 8..CB_ARR_OFF + 16].copy_from_slice(&0u64.to_le_bytes());
+
+        // Template contents.
+        data[TMPL_OFF..TMPL_OFF + TMPL_LEN].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let sections = vec![Section {
+            name: ".tls".into(),
+            rva: SEC_RVA,
+            virtual_size: 0x80,
+            data,
+            readable: true,
+            writable: true,
+            executable: false,
+        }];
+        (sections, SEC_RVA + DIR_OFF as u32)
+    }
+
+    #[test]
+    fn tls_directory_64_parses_fields_template_and_callback() {
+        let image_base = 0x1_4000_0000u64;
+        let (sections, dir_rva) = tls_fixture_64(image_base);
+        let tls = parse_tls(&sections, dir_rva, image_base, true).unwrap();
+
+        // Field VAs are recorded verbatim.
+        assert_eq!(tls.start_address_of_raw_data, image_base + 0x1060);
+        assert_eq!(tls.end_address_of_raw_data, image_base + 0x1064);
+        assert_eq!(tls.address_of_index, image_base + 0x3000);
+        assert_eq!(tls.address_of_callbacks, image_base + 0x1040);
+        assert_eq!(tls.size_of_zero_fill, 0x100);
+        assert_eq!(tls.characteristics, 0x0030_0000);
+
+        // Template copied out of [Start, End).
+        assert_eq!(tls.raw_template, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // Exactly one callback, recorded as an image_base-relative RVA (the
+        // null terminator is dropped).
+        assert_eq!(tls.callback_rvas, vec![0x2345]);
+    }
+
+    #[test]
+    fn tls_directory_32_uses_4byte_pointers() {
+        // Same shape, but a 32-bit directory: pointers are 4 bytes wide, so
+        // SizeOfZeroFill/Characteristics land at +16/+20.
+        const SEC_RVA: u32 = 0x1000;
+        let image_base = 0x0040_0000u64;
+        let tmpl_rva = SEC_RVA + 0x60;
+        let cb_arr_rva = SEC_RVA + 0x40;
+        let cb_target_rva = 0x1234u32;
+
+        let mut data = vec![0u8; 0x80];
+        let put32 = |d: &mut [u8], off: usize, v: u32| {
+            d[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        // Directory (4-byte VAs — image_base 0x400000 fits in 32 bits).
+        put32(&mut data, 0x00, (image_base as u32) + tmpl_rva); // Start
+        put32(&mut data, 0x04, (image_base as u32) + tmpl_rva + 4); // End
+        put32(&mut data, 0x08, (image_base as u32) + 0x3000); // AddressOfIndex
+        put32(&mut data, 0x0C, (image_base as u32) + cb_arr_rva); // AddressOfCallBacks
+        put32(&mut data, 0x10, 0x40); // SizeOfZeroFill
+        put32(&mut data, 0x14, 0x00A0_0000); // Characteristics
+        // Callback array (4-byte entries): one callback + null.
+        put32(&mut data, 0x40, (image_base as u32) + cb_target_rva);
+        put32(&mut data, 0x44, 0);
+        // Template.
+        data[0x60..0x64].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+
+        let sections = vec![Section {
+            name: ".tls".into(),
+            rva: SEC_RVA,
+            virtual_size: 0x80,
+            data,
+            readable: true,
+            writable: true,
+            executable: false,
+        }];
+
+        let tls = parse_tls(&sections, SEC_RVA, image_base, false).unwrap();
+        assert_eq!(tls.start_address_of_raw_data, image_base + 0x1060);
+        assert_eq!(tls.end_address_of_raw_data, image_base + 0x1064);
+        assert_eq!(tls.address_of_index, image_base + 0x3000);
+        assert_eq!(tls.address_of_callbacks, image_base + 0x1040);
+        assert_eq!(tls.size_of_zero_fill, 0x40);
+        assert_eq!(tls.characteristics, 0x00A0_0000);
+        assert_eq!(tls.raw_template, vec![0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(tls.callback_rvas, vec![0x1234]);
+    }
+
+    #[test]
+    fn tls_empty_callback_array_yields_no_callbacks() {
+        // AddressOfCallBacks points straight at a null terminator.
+        const SEC_RVA: u32 = 0x1000;
+        let image_base = 0x1_4000_0000u64;
+        let cb_arr_rva = SEC_RVA + 0x40;
+        let mut data = vec![0u8; 0x80];
+        // Zero template (Start == End == 0), index 0, callbacks -> empty array.
+        data[24..32].copy_from_slice(&(image_base + cb_arr_rva as u64).to_le_bytes());
+        // The array's first (and only) entry is the null terminator (already 0).
+        let sections = vec![Section {
+            name: ".tls".into(),
+            rva: SEC_RVA,
+            virtual_size: 0x80,
+            data,
+            readable: true,
+            writable: true,
+            executable: false,
+        }];
+        let tls = parse_tls(&sections, SEC_RVA, image_base, true).unwrap();
+        assert!(tls.callback_rvas.is_empty());
+        assert!(tls.raw_template.is_empty());
+    }
+
+    #[test]
+    fn no_tls_directory_leaves_tls_none() {
+        // A full hand-built minimal PE32+ with no TLS data directory must
+        // parse with `tls == None`.
+        let bytes = minimal_pe_no_tls();
+        let img = parse(&bytes).expect("minimal PE should parse");
+        assert!(img.tls.is_none());
+    }
+
+    /// A minimal valid PE32+ image with two sections and no data directories
+    /// populated — used to prove the absence of a TLS directory yields `None`.
+    fn minimal_pe_no_tls() -> Vec<u8> {
+        // 0x400 headers + one 0x200 section body is plenty.
+        let mut f = vec![0u8; 0x600];
+        // DOS header.
+        f[0] = 0x4D;
+        f[1] = 0x5A; // "MZ"
+        let pe_off = 0x80usize;
+        f[E_LFANEW_OFFSET..E_LFANEW_OFFSET + 4].copy_from_slice(&(pe_off as u32).to_le_bytes());
+        // PE signature.
+        f[pe_off..pe_off + 4].copy_from_slice(&PE_SIGNATURE.to_le_bytes());
+        let coff = pe_off + 4;
+        f[coff..coff + 2].copy_from_slice(&MACHINE_AMD64.to_le_bytes()); // Machine
+        f[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes()); // NumberOfSections
+        let size_opt = 0xF0u16; // room for 16 data dirs
+        f[coff + 16..coff + 18].copy_from_slice(&size_opt.to_le_bytes()); // SizeOfOptionalHeader
+        let opt = coff + 20;
+        f[opt..opt + 2].copy_from_slice(&OPT_MAGIC_PE32PLUS.to_le_bytes()); // magic
+        f[opt + OPT_ENTRY..opt + OPT_ENTRY + 4].copy_from_slice(&0x1000u32.to_le_bytes()); // entry
+        f[opt + 24..opt + 32].copy_from_slice(&0x1_4000_0000u64.to_le_bytes()); // ImageBase
+        f[opt + OPT_SIZE_OF_IMAGE..opt + OPT_SIZE_OF_IMAGE + 4]
+            .copy_from_slice(&0x2000u32.to_le_bytes()); // SizeOfImage
+        f[opt + OPT_SIZE_OF_HEADERS..opt + OPT_SIZE_OF_HEADERS + 4]
+            .copy_from_slice(&0x400u32.to_le_bytes()); // SizeOfHeaders
+        f[opt + OPT_SUBSYSTEM..opt + OPT_SUBSYSTEM + 2].copy_from_slice(&3u16.to_le_bytes()); // console
+        f[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes()); // NumberOfRvaAndSizes
+        // All 16 data directories left zero (no TLS, no imports, etc.).
+
+        // Section table (immediately after the optional header).
+        let sec = opt + size_opt as usize;
+        f[sec..sec + 5].copy_from_slice(b".text");
+        f[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes()); // VirtualSize
+        f[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
+        f[sec + 16..sec + 20].copy_from_slice(&0x200u32.to_le_bytes()); // SizeOfRawData
+        f[sec + 20..sec + 24].copy_from_slice(&0x400u32.to_le_bytes()); // PointerToRawData
+        f[sec + 36..sec + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes()); // CODE|EXEC|READ
+        f
     }
 }

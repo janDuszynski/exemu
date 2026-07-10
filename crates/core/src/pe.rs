@@ -55,6 +55,48 @@ pub struct Export {
     pub rva: u32,
 }
 
+/// The parsed thread-local-storage directory (`IMAGE_TLS_DIRECTORY`).
+///
+/// This is the load-time TLS support described by the PE/COFF spec's `.tls`
+/// section: an initialization template, the location where the loader writes
+/// the allocated TLS index, and a null-terminated array of per-thread
+/// initialization/termination callbacks.
+///
+/// The four address fields on disk are **virtual addresses** (`image_base +
+/// rva`), not RVAs — the linker bakes in the preferred base, so they are
+/// subject to base relocations. They are stored here exactly as they appear
+/// in the image; callers that need an RVA subtract the (possibly relocated)
+/// image base. The callback list, however, has already been walked and each
+/// entry converted to an RVA relative to `image_base` for the caller's
+/// convenience.
+#[derive(Debug, Clone)]
+pub struct Tls {
+    /// VA of the start of the TLS initialization template
+    /// (`StartAddressOfRawData`).
+    pub start_address_of_raw_data: u64,
+    /// VA of the end of the TLS initialization template
+    /// (`EndAddressOfRawData`). The template is `[start, end)`.
+    pub end_address_of_raw_data: u64,
+    /// VA of the `DWORD` slot where the loader stores the allocated TLS index
+    /// (`AddressOfIndex`).
+    pub address_of_index: u64,
+    /// VA of the null-terminated array of callback pointers
+    /// (`AddressOfCallBacks`). Zero if there are no callbacks.
+    pub address_of_callbacks: u64,
+    /// Number of extra zero-filled bytes appended to the template
+    /// (`SizeOfZeroFill`).
+    pub size_of_zero_fill: u32,
+    /// Reserved characteristics flags (`Characteristics`), including the
+    /// alignment field in the high bits.
+    pub characteristics: u32,
+    /// The raw TLS template bytes copied from `[start, end)`, ready to be
+    /// duplicated per thread. Empty if the template is empty or unreadable.
+    pub raw_template: Vec<u8>,
+    /// Each TLS callback as an RVA relative to `image_base` (the null
+    /// terminator is dropped). Empty if `address_of_callbacks` is zero.
+    pub callback_rvas: Vec<u32>,
+}
+
 /// A base-relocation fixup: apply the load delta to the value at `rva`.
 #[derive(Debug, Clone, Copy)]
 pub struct Reloc {
@@ -86,6 +128,8 @@ pub struct PeImage {
     pub exports: Vec<Export>,
     /// Base relocations, used to load a DLL away from its preferred base.
     pub relocations: Vec<Reloc>,
+    /// The parsed thread-local-storage directory, if the image has one.
+    pub tls: Option<Tls>,
     /// The module's own name from the export directory, if present.
     pub dll_name: Option<String>,
     /// The raw header bytes, mapped read-only at the image base so guests
