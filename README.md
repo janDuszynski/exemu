@@ -249,8 +249,7 @@ Complex apps will hit unimplemented calls.
 ### Not implemented (yet)
 
 AVX and x87 floating point; native-themed / GDI+ / DirectX rendering (the
-GDI is a solid-fill/text subset); TLS callbacks and base relocations (images
-load at their preferred base); **COM** object creation; **preemptive** threads
+GDI is a solid-fill/text subset); **COM** object creation; **preemptive** threads
 (the scheduler is cooperative — it yields at blocking points and on a timeslice,
 not on true OS preemption); and **registry persistence to disk** (the `Reg*`
 family round-trips through an in-memory hive with enumeration and seeded roots,

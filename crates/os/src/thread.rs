@@ -69,6 +69,12 @@ pub(crate) struct Thread {
     /// A pending `WM_QUIT` exit code set by `PostQuitMessage` (delivered once the
     /// queue drains).
     pub quit_code: Option<i32>,
+    /// When the image has TLS callbacks, a new thread starts at the TLS-attach
+    /// driver thunk instead of its start routine; this holds the real
+    /// `(start_routine, parameter)` to seat once the `DLL_THREAD_ATTACH`
+    /// callbacks have run (roadmap W0.3). `None` once consumed / for the main
+    /// thread.
+    pub pending_entry: Option<(u64, u64)>,
 }
 
 impl Thread {
@@ -88,6 +94,7 @@ impl Thread {
             fls: HashMap::new(),
             msgs: VecDeque::new(),
             quit_code: None,
+            pending_entry: None,
         }
     }
 
@@ -218,26 +225,47 @@ impl WinOs {
             return Ok(Outcome::Return(0));
         };
 
-        // Build the start state: a `call entry` frame returning to the
-        // thread-exit thunk, with the parameter passed per the ABI.
+        // Build the start state. Normally this is a `call entry(param)` frame
+        // returning to the thread-exit thunk. When the image carries TLS
+        // callbacks, the thread must first run each one with `DLL_THREAD_ATTACH`
+        // (roadmap W0.3): we instead start it at the TLS-attach driver thunk
+        // over a stack whose top is the entry-seating thunk (the callbacks'
+        // drain target), and stash the real `(entry, param)` to seat afterward.
         let mut st = CpuState::new();
         let stack_top = stack_base + stack_size;
         let exit_thunk = self.thread_exit_thunk;
+        let has_tls = !self.tls_callbacks.is_empty();
+        let mut pending_entry = None;
         if self.cfg.is_64bit {
             let mut sp = (stack_top - 0x100) & !0xf;
-            sp -= 8;
-            mem.write_u64(sp, exit_thunk)?;
+            if has_tls {
+                sp -= 8;
+                mem.write_u64(sp, self.thread_entry_thunk)?; // callbacks drain here
+                st.rip = self.thread_tls_thunk;
+                pending_entry = Some((entry, param));
+            } else {
+                sp -= 8;
+                mem.write_u64(sp, exit_thunk)?;
+                st.set_reg(Reg::Rcx, param);
+                st.rip = entry;
+            }
             st.set_rsp(sp);
-            st.set_reg(Reg::Rcx, param);
         } else {
             let mut sp = (stack_top - 0x100) & !0xf;
-            sp -= 4;
-            mem.write_u32(sp, param as u32)?; // [esp+4] = lpParameter
-            sp -= 4;
-            mem.write_u32(sp, exit_thunk as u32)?; // [esp] = return address
+            if has_tls {
+                sp -= 4;
+                mem.write_u32(sp, self.thread_entry_thunk as u32)?; // drain target
+                st.rip = self.thread_tls_thunk;
+                pending_entry = Some((entry, param));
+            } else {
+                sp -= 4;
+                mem.write_u32(sp, param as u32)?; // [esp+4] = lpParameter
+                sp -= 4;
+                mem.write_u32(sp, exit_thunk as u32)?; // [esp] = return address
+                st.rip = entry;
+            }
             st.set_rsp(sp);
         }
-        st.rip = entry;
 
         let tid = self.next_tid;
         self.next_tid += 1;
@@ -258,6 +286,7 @@ impl WinOs {
             fls: HashMap::new(),
             msgs: VecDeque::new(),
             quit_code: None,
+            pending_entry,
         });
         if tid_out != 0 {
             mem.write_u32(tid_out, tid)?;
@@ -299,6 +328,33 @@ impl WinOs {
     pub(crate) fn thread_start_returned(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let code = cpu.gpr_read(Reg::Rax as u8, 4) as u32;
         self.exit_thread(cpu, mem, code)
+    }
+
+    /// A new thread's initial `rip` when the image has TLS callbacks: run each
+    /// one with `callback(hModule, DLL_THREAD_ATTACH, NULL)` before the thread's
+    /// start routine (roadmap W0.3). The thread's stack top already holds the
+    /// entry-seating thunk, so the drained callback queue returns there.
+    pub(crate) fn thread_tls_attach(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let module = self.cfg.image_base;
+        let calls: Vec<(u64, Vec<u64>)> = self
+            .tls_callbacks
+            .iter()
+            .map(|&cb| (cb, vec![module, 2 /* DLL_THREAD_ATTACH */, 0]))
+            .collect();
+        // `invoke_callbacks` reads the drain-return address from `[rsp]` (the
+        // entry-seating thunk seated by `create_thread`) and cleans up 0 args.
+        self.invoke_callbacks(cpu, mem, calls, 0, 0, false)
+    }
+
+    /// The TLS-attach callbacks have drained: seat the real
+    /// `start_routine(parameter)` frame (returning to the thread-exit thunk).
+    pub(crate) fn thread_start_entry(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let cur = self.current;
+        let (entry, param) = self.threads[cur].pending_entry.take().unwrap_or((0, 0));
+        let exit_thunk = self.thread_exit_thunk;
+        let base = cpu.rsp();
+        self.setup_call_args(cpu, mem, entry, &[param], exit_thunk, base)?;
+        Ok(Outcome::Resume)
     }
 
     /// ExitThread(dwExitCode).

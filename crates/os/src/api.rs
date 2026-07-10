@@ -367,6 +367,13 @@ pub enum Api {
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
+    /// Not an import: a new thread's initial `rip` when the image has TLS
+    /// callbacks. Its interception fires the `DLL_THREAD_ATTACH` callbacks
+    /// before the thread's start routine (roadmap W0.3).
+    ThreadTlsAttach,
+    /// Not an import: the target the TLS-attach callbacks drain to; seats the
+    /// real `start_routine(parameter)` frame (roadmap W0.3).
+    ThreadStartEntry,
     /// A recognized-by-shape but unimplemented import (`dll!name`). We still
     /// record its stdcall argument count (from a table) so 32-bit stack
     /// cleanup stays correct even though the behavior is a stub.
@@ -855,6 +862,7 @@ impl Api {
             Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
             | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
             | Api::CrtNoop | Api::CrtGlobalPtr { .. } | Api::InittermDriver | Api::ReturnExit
+            | Api::ThreadTlsAttach | Api::ThreadStartEntry
             | Api::Fputs | Api::Fputc | Api::Fwrite | Api::Puts | Api::EhProlog => 0,
             // Win32 string helpers.
             Api::CharNextA | Api::CharNextW | Api::LstrlenA | Api::LstrlenW => 1,
@@ -1485,6 +1493,8 @@ impl WinOs {
             Api::CreateThread => self.create_thread(cpu, mem),
             Api::ExitThread => self.api_exit_thread(cpu, mem),
             Api::ThreadExit => self.thread_start_returned(cpu, mem),
+            Api::ThreadTlsAttach => self.thread_tls_attach(cpu, mem),
+            Api::ThreadStartEntry => self.thread_start_entry(cpu, mem),
             Api::ResumeThread => self.resume_thread(cpu, mem),
             Api::SuspendThread => self.suspend_thread(cpu, mem),
             Api::TerminateThread => self.terminate_thread(cpu, mem),

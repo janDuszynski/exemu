@@ -183,6 +183,12 @@ pub struct WinOs {
     /// model in a separate namespace. The MSVC CRT keeps its per-thread data
     /// pointer here.
     fls_alloc: Vec<bool>,
+    /// Absolute virtual addresses of the image's TLS callbacks
+    /// (`IMAGE_TLS_DIRECTORY.AddressOfCallBacks`), in order. Seeded by the app
+    /// after the module is mapped (roadmap W0.3). Each is invoked with
+    /// `(hModule, reason, NULL)` at process attach — before the entry point —
+    /// and again at every thread start (`DLL_THREAD_ATTACH`).
+    tls_callbacks: Vec<u64>,
 
     /// In-memory registry hive: full canonical key path → value map.
     /// Value map: value name → (REG_* type, raw bytes). The default value
@@ -217,6 +223,13 @@ pub struct WinOs {
     /// with the return value as its exit code (the thread analogue of
     /// `ReturnExit`).
     thread_exit_thunk: u64,
+    /// A new thread's initial `rip` when the image has TLS callbacks: its
+    /// interception fires the `DLL_THREAD_ATTACH` callbacks before the start
+    /// routine (roadmap W0.3).
+    thread_tls_thunk: u64,
+    /// Return target the TLS-attach callbacks drain to; its interception seats
+    /// the real `start_routine(parameter)` frame (roadmap W0.3).
+    thread_entry_thunk: u64,
     /// Instruction ticks since the last preemptive yield (timeslice counter).
     sched_ticks: u64,
 
@@ -282,6 +295,7 @@ impl WinOs {
             env: default_environment(),
             tls_alloc: Vec::new(),
             fls_alloc: Vec::new(),
+            tls_callbacks: Vec::new(),
             reg_hive: HashMap::new(),
             reg_handles: HashMap::new(),
             kobjects: HashMap::new(),
@@ -291,6 +305,8 @@ impl WinOs {
             current: 0,
             next_tid: 0x1002,
             thread_exit_thunk: 0,
+            thread_tls_thunk: 0,
+            thread_entry_thunk: 0,
             sched_ticks: 0,
             start_time: std::time::Instant::now(),
             stdout_buf: Vec::new(),
@@ -305,6 +321,8 @@ impl WinOs {
         os.cb_driver = os.alloc_thunk(Api::CallbackDriver);
         os.exc_driver = os.alloc_thunk(Api::ExceptionDriver);
         os.thread_exit_thunk = os.alloc_thunk(Api::ThreadExit);
+        os.thread_tls_thunk = os.alloc_thunk(Api::ThreadTlsAttach);
+        os.thread_entry_thunk = os.alloc_thunk(Api::ThreadStartEntry);
         // Seat the main thread as thread 0. Its saved register state is a
         // placeholder (the live state lives in the interpreter) until it yields.
         os.threads.push(thread::Thread::main(0x1001));
@@ -323,6 +341,62 @@ impl WinOs {
     /// The image's unwind function table (for the app's fault-report backtrace).
     pub fn unwind_table(&self) -> &[exemu_core::UnwindEntry] {
         &self.function_table
+    }
+
+    /// Register the main image's TLS callbacks (absolute virtual addresses, in
+    /// `AddressOfCallBacks` order). The app seeds these after mapping the image
+    /// so [`WinOs::start_process`] can invoke them at process attach and every
+    /// new thread runs them at `DLL_THREAD_ATTACH` (roadmap W0.3).
+    pub fn set_tls_callbacks(&mut self, callbacks: Vec<u64>) {
+        self.tls_callbacks = callbacks;
+    }
+
+    /// Allocate a process-wide TLS slot index for the loader (the value the
+    /// Windows loader stores at a module's `AddressOfIndex`). Shares the
+    /// `TlsAlloc` namespace so a later guest `TlsGetValue(index)` is consistent.
+    pub fn alloc_tls_index(&mut self) -> u32 {
+        self.tls_alloc(false) as u32
+    }
+
+    /// Seat the initial CPU state so that, on the next steps, every registered
+    /// TLS callback runs `callback(hModule, DLL_PROCESS_ATTACH, NULL)` **before**
+    /// the entry point — exactly as the Windows loader fires them ahead of the
+    /// process's `AddressOfEntryPoint` (roadmap W0.3).
+    ///
+    /// The app has already pushed the process-exit sentinel as the entry's
+    /// return address (so `rsp` points at it and `[rsp]` is the sentinel). We
+    /// push `entry` beneath it and drive the callbacks with the re-entrant
+    /// callback machinery: when the callback queue drains, control returns to
+    /// `entry` with `rsp` restored to exactly the frame a bare `call entry`
+    /// would have left (the sentinel back on top). With no TLS callbacks this is
+    /// just `rip = entry` — identical to the previous direct jump.
+    pub fn start_process(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, entry: u64) -> Result<()> {
+        if self.tls_callbacks.is_empty() {
+            cpu.rip = entry;
+            return Ok(());
+        }
+        let module = self.cfg.image_base;
+        let calls: Vec<(u64, Vec<u64>)> = self
+            .tls_callbacks
+            .iter()
+            .map(|&cb| (cb, vec![module, 1 /* DLL_PROCESS_ATTACH */, 0]))
+            .collect();
+        // Push `entry` beneath the already-seated sentinel so the drained
+        // callback queue "returns" to it. `invoke_callbacks` reads the return
+        // address from `[rsp]` and cleans up `argc` stack args after the last
+        // callback; with `argc = 0` the final `rsp` lands one pointer above —
+        // right back on the sentinel — matching a real `call entry`.
+        let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
+        let sp = cpu.rsp() - ptr;
+        if self.cfg.is_64bit {
+            mem.write_u64(sp, entry)?;
+        } else {
+            mem.write_u32(sp, entry as u32)?;
+        }
+        cpu.set_rsp(sp);
+        // Drive the callbacks; ignore the (unused) accumulator result of 0.
+        self.invoke_callbacks(cpu, mem, calls, 0, 0, false)?;
+        Ok(())
     }
 
     /// Install a windowing backend and the image's dialog templates. With a
