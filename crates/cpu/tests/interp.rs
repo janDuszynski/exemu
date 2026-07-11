@@ -1389,3 +1389,70 @@ fn syscall_routes_to_hook_with_context() {
     assert_eq!(cpu.state().reg(Reg::Rax), 0xC000_0001, "handler's NTSTATUS lands in RAX");
     let _ = syscall_rip;
 }
+
+/// The `gs` segment base is a **per-thread** value carried on `CpuState`
+/// (roadmap W2.9): `gs:[disp]` resolves against `state.gs_base`, not a fixed
+/// constant, so two threads with different bases read different TEBs. This
+/// exercises all three `gs:`-override SIB forms the interpreter decodes.
+#[test]
+fn gs_base_is_a_per_thread_state_value() {
+    use exemu_core::Reg;
+
+    // Two distinct TEB pages; the guest reads `gs:[0x30]` (SIB disp32 form) into
+    // rax, `gs:[rbx+8]` (base+disp form) into rcx, and `gs:[rbx]` into rdx.
+    let teb_a: u64 = 0x0000_7FFF_0000_0000;
+    let teb_b: u64 = 0x0000_0033_0000_0000;
+
+    // Every form resolves as gs_base + (register math) + disp. rbx is 0 so
+    // `gs:[rbx+8]`/`gs:[rbx]` land at gs_base+8 / gs_base+0 (a real Windows gs
+    // access never pre-adds the TEB into the base register).
+    let program: &[u8] = &[
+        // mov rax, gs:[0x30]        (65 48 8B 04 25 30 00 00 00) — SIB no-base disp32
+        0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00,
+        // mov rcx, gs:[rbx+8]       (65 48 8B 4B 08) — base rbx(=0), disp8
+        0x65, 0x48, 0x8B, 0x4B, 0x08,
+        // mov rdx, gs:[rbx]         (65 48 8B 13) — base rbx(=0), no disp
+        0x65, 0x48, 0x8B, 0x13,
+        0xF4, // hlt
+    ];
+
+    let run_with_teb = |teb: u64| -> (u64, u64, u64) {
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+        mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+        mem.map(Region::new("teb", teb, 0x1000, Perm::RW)).unwrap();
+        mem.write(CODE_BASE, program).unwrap();
+        // Seed TEB fields: [0x30]=teb (Self), [0]=0xAA, [8]=0xBB.
+        mem.write_u64(teb + 0x30, teb).unwrap();
+        mem.write_u64(teb, 0xAA).unwrap();
+        mem.write_u64(teb + 8, 0xBB).unwrap();
+
+        let mut cpu = Interpreter::new();
+        cpu.state_mut().rip = CODE_BASE;
+        cpu.state_mut().set_rsp(STACK_TOP);
+        cpu.state_mut().gs_base = teb; // the per-thread base
+        cpu.state_mut().set_reg(Reg::Rbx, 0); // gs_base is added by the override
+
+        let mut hooks = NoHooks;
+        for _ in 0..100 {
+            if let Exit::Halted = cpu.step(&mut mem, &mut hooks).unwrap() {
+                break;
+            }
+        }
+        (
+            cpu.state().reg(Reg::Rax),
+            cpu.state().reg(Reg::Rcx),
+            cpu.state().reg(Reg::Rdx),
+        )
+    };
+
+    // Thread A reads TEB A through every gs: form.
+    let (a_self, a_bb, a_aa) = run_with_teb(teb_a);
+    assert_eq!(a_self, teb_a, "gs:[0x30] resolves against thread A's gs base");
+    assert_eq!(a_bb, 0xBB, "gs:[rbx+8] under thread A");
+    assert_eq!(a_aa, 0xAA, "gs:[rbx] under thread A");
+
+    // Thread B (a different gs base) reads its OWN TEB B.
+    let (b_self, _, _) = run_with_teb(teb_b);
+    assert_eq!(b_self, teb_b, "the same gs:[0x30] reads thread B's TEB under B's gs base");
+}

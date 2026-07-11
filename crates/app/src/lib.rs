@@ -347,6 +347,14 @@ impl Process {
         // APIs and dispatch can walk guest frames (roadmap P4.3).
         os.set_unwind_table(image.function_table.clone());
 
+        // Complete the main thread's Wine-walkable TEB (roadmap W2.9). The app
+        // seeded Self/PEB/StackBase/StackLimit above; this fills the remaining
+        // fields Wine's ntdll reads (NtTib.ExceptionList, ClientId,
+        // ThreadLocalStoragePointer, StaticUnicodeString,
+        // CountOfOwnedCriticalSections). Spawned threads get their own seeded
+        // TEB in `NtCreateThreadEx`/`CreateThread`.
+        os.seed_main_teb(&mut mem, lay.stack_base, stack_top)?;
+
         mem.map(Region::new("imports", lay.api_base, API_SIZE, Perm::RW))?;
 
         for imp in &image.imports {

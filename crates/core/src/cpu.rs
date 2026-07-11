@@ -168,7 +168,28 @@ pub struct CpuState {
     pub rip: u64,
     /// Status/control flags.
     pub rflags: u64,
+    /// The `gs` segment base used to resolve `gs:[disp]` operands. In 64-bit
+    /// mode this is where the current thread's TEB lives, so it is a
+    /// **per-thread** value: the scheduler saves/loads it with the rest of the
+    /// state on a context switch, and each new thread gets its own TEB base
+    /// (roadmap W2.9). Defaults to the process's initial TEB base
+    /// ([`DEFAULT_GS_BASE`]); the `exemu-cpu` interpreter mirrors that constant.
+    pub gs_base: u64,
+    /// The `fs` segment base used to resolve `fs:[disp]` operands. In 32-bit
+    /// mode this is where the current thread's TEB lives (the 64-bit `fs` base
+    /// is unused by Windows guests). Per-thread for the same reason as
+    /// [`Self::gs_base`]. Defaults to [`DEFAULT_FS_BASE`].
+    pub fs_base: u64,
 }
+
+/// The default `gs` segment base (the process's initial 64-bit TEB). The
+/// `exemu-cpu` crate re-exports the same value as `GS_BASE`; the two must stay
+/// equal (a debug assertion in the interpreter checks it). Kept here so
+/// [`CpuState::new`] needs no dependency on the interpreter crate.
+pub const DEFAULT_GS_BASE: u64 = 0x0000_7FFF_0000_0000;
+/// The default 32-bit `fs` segment base (the process's initial 32-bit TEB).
+/// Mirrors `exemu-cpu`'s `FS_BASE_32`.
+pub const DEFAULT_FS_BASE: u64 = 0x7EFD_0000;
 
 impl Default for CpuState {
     fn default() -> Self {
@@ -185,6 +206,8 @@ impl CpuState {
             x87: X87::new(),
             rip: 0,
             rflags: flags::RESERVED_ONE | flags::IF,
+            gs_base: DEFAULT_GS_BASE,
+            fs_base: DEFAULT_FS_BASE,
         }
     }
 

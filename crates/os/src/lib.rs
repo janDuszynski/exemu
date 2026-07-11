@@ -311,6 +311,12 @@ pub struct WinOs {
     /// unix-stack switch. `Nt*` handlers (W2.6+) read stack args 5+ relative to
     /// it via [`WinOs::syscall_arg`] while running on the switched stack.
     syscall_guest_rsp: u64,
+    /// Set by an `Nt*` handler that has itself installed the guest resume state
+    /// (e.g. `NtTerminateThread` on the current thread, which switches to
+    /// another thread via the scheduler). When set, the dispatcher skips its
+    /// context restore/return and resumes the guest exactly as the handler left
+    /// it (roadmap W2.9). Cleared at the start of every dispatch.
+    syscall_resume_as_is: bool,
 
     /// Registered native unixlibs for the `__wine_unix_call` fast path (roadmap
     /// W2.4). A PE DLL's `unixlib_handle_t` is the index into this `Vec`; the
@@ -398,6 +404,7 @@ impl WinOs {
             ssdt: syscall::Ssdt::new(),
             unix_stack_top: 0,
             syscall_guest_rsp: 0,
+            syscall_resume_as_is: false,
             unixlibs: Vec::new(),
             unixlib_of_module: HashMap::new(),
             wine_unix_call_thunk: 0,
@@ -412,7 +419,11 @@ impl WinOs {
         os.thread_entry_thunk = os.alloc_thunk(Api::ThreadStartEntry);
         // Seat the main thread as thread 0. Its saved register state is a
         // placeholder (the live state lives in the interpreter) until it yields.
-        os.threads.push(thread::Thread::main(0x1001));
+        // Its TEB is the app-mapped `cfg.teb_base`; the syscall dispatcher and
+        // per-thread `gs` base follow it (roadmap W2.9).
+        let mut main_thread = thread::Thread::main(0x1001);
+        main_thread.teb_base = os.cfg.teb_base;
+        os.threads.push(main_thread);
         // Seed HKLM/HKCU with values installers commonly probe (roadmap P3.12).
         os.reg_seed();
         // Install the NtQueryVirtualMemory SSDT slot so a raw guest `SYSCALL`
@@ -444,6 +455,16 @@ impl WinOs {
         os.set_syscall_handler(
             fs::SSDT_NT_QUERY_VOLUME_INFORMATION_FILE,
             fs::ssdt_nt_query_volume_information_file,
+        );
+        // NT thread/process syscalls (roadmap W2.9): the NTSTATUS face of the
+        // P3.4 scheduler. Indices recovered from the pinned guest ntdll stubs.
+        os.set_syscall_handler(thread::SSDT_NT_CREATE_THREAD_EX, thread::ssdt_nt_create_thread_ex);
+        os.set_syscall_handler(thread::SSDT_NT_TERMINATE_THREAD, thread::ssdt_nt_terminate_thread);
+        os.set_syscall_handler(thread::SSDT_NT_SUSPEND_THREAD, thread::ssdt_nt_suspend_thread);
+        os.set_syscall_handler(thread::SSDT_NT_RESUME_THREAD, thread::ssdt_nt_resume_thread);
+        os.set_syscall_handler(
+            thread::SSDT_NT_QUERY_INFORMATION_THREAD,
+            thread::ssdt_nt_query_information_thread,
         );
         os
     }
