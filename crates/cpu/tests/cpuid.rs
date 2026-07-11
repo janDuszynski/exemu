@@ -87,12 +87,16 @@ fn leaf0_max_leaf_and_vendor() {
 #[test]
 fn leaf1_feature_words_exact() {
     let (_eax, _ebx, ecx, edx) = cpuid(1, 0);
-    // ECX: SSSE3(9) | SSE4.1(19) | SSE4.2(20) | POPCNT(23) | XSAVE(26) |
-    // OSXSAVE(27) | AVX(28) — and nothing else. SSSE3/SSE4.1/SSE4.2 are ON after
-    // W1.4; AVX is ON after W1.5.
-    assert_eq!(ecx, (1 << 9) | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28));
-    // EDX: FPU(0) | TSC(4) | CMOV(15) | FXSR(24) | SSE(25) | SSE2(26).
-    assert_eq!(edx, 1 | (1 << 4) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 26));
+    // ECX: SSSE3(9) | CX16(13) | SSE4.1(19) | SSE4.2(20) | POPCNT(23) | XSAVE(26)
+    // | OSXSAVE(27) | AVX(28) | F16C(29) — and nothing else. SSSE3/SSE4.1/SSE4.2
+    // are ON after W1.4; AVX after W1.5; CMPXCHG16B + F16C after W1.6.
+    assert_eq!(
+        ecx,
+        (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)
+    );
+    // EDX: FPU(0) | TSC(4) | CMOV(15) | MMX(23) | FXSR(24) | SSE(25) | SSE2(26).
+    // MMX is ON after W1.6 (bare-form MMX + EMMS).
+    assert_eq!(edx, 1 | (1 << 4) | (1 << 15) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26));
     // x87 must be ON now (W1.1).
     assert_ne!(edx & 1, 0, "x87 (leaf1 EDX bit0) must be advertised after W1.1");
 }
@@ -107,24 +111,27 @@ fn leaf1_withholds_unimplemented_bits() {
     assert_eq!(ecx & (1 << 0), 0, "SSE3 must be OFF");
     assert_eq!(ecx & (1 << 12), 0, "FMA must be OFF");
     assert_eq!(ecx & (1 << 25), 0, "AES must be OFF");
-    assert_eq!(edx & (1 << 23), 0, "MMX must be OFF (bare MMX unimplemented)");
+    // MMX is ON as of W1.6 (bare-form MMX + EMMS); see leaf1_feature_words_exact.
+    assert_ne!(edx & (1 << 23), 0, "MMX must be ON (W1.6)");
 }
 
 #[test]
-fn leaf7_avx2_only() {
-    // Structured extended features: only AVX2 (EBX bit 5) is advertised, ON after
-    // W1.5. Max sub-leaf (EAX) is 0. No BMI1/BMI2/ADX yet.
+fn leaf7_bmi_avx2_adx() {
+    // Structured extended features: BMI1(3) | AVX2(5) | BMI2(8) | ADX(19). AVX2 is
+    // ON after W1.5; BMI1/BMI2/ADX after W1.6. Max sub-leaf (EAX) is 0.
     let (eax, ebx, ecx, edx) = cpuid(7, 0);
     assert_eq!(eax, 0, "max sub-leaf 0");
-    assert_eq!(ebx, 1 << 5, "only AVX2 advertised in leaf 7 EBX");
+    assert_eq!(ebx, (1 << 3) | (1 << 5) | (1 << 8) | (1 << 19), "leaf 7 EBX = BMI1|AVX2|BMI2|ADX");
     assert_eq!(ecx, 0);
     assert_eq!(edx, 0);
     // Sub-leaf variation stays zero.
     assert_eq!(cpuid(7, 1), (0, 0, 0, 0));
     assert_ne!(ebx & (1 << 5), 0, "AVX2 must be ON (W1.5)");
-    assert_eq!(ebx & (1 << 3), 0, "BMI1 must be OFF (W1.6)");
-    assert_eq!(ebx & (1 << 8), 0, "BMI2 must be OFF (W1.6)");
-    assert_eq!(ebx & (1 << 19), 0, "ADX must be OFF (W1.6)");
+    assert_ne!(ebx & (1 << 3), 0, "BMI1 must be ON (W1.6)");
+    assert_ne!(ebx & (1 << 8), 0, "BMI2 must be ON (W1.6)");
+    assert_ne!(ebx & (1 << 19), 0, "ADX must be ON (W1.6)");
+    // AVX-512 foundation (EBX bit 16) stays OFF.
+    assert_eq!(ebx & (1 << 16), 0, "AVX-512F must be OFF");
 }
 
 #[test]

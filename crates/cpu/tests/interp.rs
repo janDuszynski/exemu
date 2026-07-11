@@ -586,3 +586,574 @@ fn pause_is_nop() {
         "rip must advance past PAUSE (2 bytes); HLT stops without advancing rip"
     );
 }
+
+// ============================================================================
+// W1.6 — BMI1/BMI2/ADX/CMPXCHG16B/F16C + MMX-x87 aliasing pins.
+//
+// Each carries the *reason* it exists — many pin behavior where the differential
+// oracle's Unicorn/QEMU-TCG reference is wrong or absent (documented per test),
+// so the correct (Intel SDM) semantics cannot regress under CI even though the
+// oracle can't check them.
+// ============================================================================
+
+use exemu_core::Reg;
+
+/// Run `code` after seeding the 16 GPRs from `regs` (indexed by exemu register
+/// order) and optionally seeding 16 bytes of a scratch data page at `DATA`.
+fn run_seeded(code: &[u8], regs: &[(Reg, u64)], data_at: Option<(u64, &[u8])>) -> Interpreter {
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, code).unwrap();
+    if let Some((addr, bytes)) = data_at {
+        mem.write(addr, bytes).unwrap();
+    }
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = CODE_BASE;
+    cpu.state_mut().set_rsp(STACK_TOP);
+    for (r, v) in regs {
+        cpu.state_mut().set_reg(*r, *v);
+    }
+    let mut hooks = NoHooks;
+    for _ in 0..10_000 {
+        match cpu.step(&mut mem, &mut hooks).unwrap() {
+            Exit::Continue => {}
+            Exit::Halted => return cpu,
+            other => panic!("unexpected exit: {other:?}"),
+        }
+    }
+    panic!("program did not halt within the step budget");
+}
+
+/// Like `run_seeded` but returns both the interpreter and the final data page so
+/// memory-writing ops (CMPXCHG8B/16B) can be asserted.
+fn run_seeded_mem(code: &[u8], regs: &[(Reg, u64)], data_addr: u64, data: &[u8]) -> (Interpreter, Vec<u8>) {
+    let mut mem = VirtualMemory::new();
+    let data_base = data_addr & !0xFFF;
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.map(Region::new("data", data_base, 0x1000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, code).unwrap();
+    mem.write(data_addr, data).unwrap();
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = CODE_BASE;
+    cpu.state_mut().set_rsp(STACK_TOP);
+    for (r, v) in regs {
+        cpu.state_mut().set_reg(*r, *v);
+    }
+    let mut hooks = NoHooks;
+    let mut halted = false;
+    for _ in 0..10_000 {
+        match cpu.step(&mut mem, &mut hooks).unwrap() {
+            Exit::Continue => {}
+            Exit::Halted => {
+                halted = true;
+                break;
+            }
+            other => panic!("unexpected exit: {other:?}"),
+        }
+    }
+    assert!(halted, "program did not halt");
+    let mut out = vec![0u8; data.len()];
+    mem.read(data_addr, &mut out).unwrap();
+    (cpu, out)
+}
+
+const DATA: u64 = 0x2_0000;
+
+// ---- BMI1 ANDN -------------------------------------------------------------
+
+#[test]
+fn andn_result_and_flags() {
+    // andn ecx, ebx, edx  (VEX.NDS.LZ.0F38.W0 F2 /r): ecx = ~ebx & edx.
+    // ebx=0x0F0F0F0F, edx=0xFFFFFFFF → ~ebx&edx = 0xF0F0F0F0 (msb set → SF=1).
+    let code = [0xC4, 0xE2, 0x60, 0xF2, 0xCA, 0xF4]; // vvvv=ebx(3), reg=ecx(1), rm=edx(2)
+    let cpu = run_seeded(&code, &[(Reg::Rbx, 0x0F0F_0F0F), (Reg::Rdx, 0xFFFF_FFFF)], None);
+    assert_eq!(rcx(&cpu) & 0xffff_ffff, 0xF0F0_F0F0);
+    assert!(flag(&cpu, flags::SF), "ANDN sets SF from result msb");
+    assert!(!flag(&cpu, flags::ZF), "ANDN ZF clear (result nonzero)");
+    assert!(!flag(&cpu, flags::CF), "ANDN clears CF");
+    assert!(!flag(&cpu, flags::OF), "ANDN clears OF");
+}
+
+// ---- BMI1 BLSI/BLSR/BLSMSK (CF pinned — QEMU BLSI CF is wrong) --------------
+
+#[test]
+fn blsi_extracts_lowest_set_bit_and_cf() {
+    // blsi ebx, ecx (VEX.NDD.LZ.0F38.W0 F3 /3): ebx = (-ecx) & ecx.
+    // The oracle EXCLUDES BLSI's CF because this QEMU build reports it wrong; the
+    // SDM sets CF = (src != 0), pinned here.
+    // ecx = 0b10110000 (0xB0) → lowest set bit = 0x10.
+    let code = [0xC4, 0xE2, 0x60, 0xF3, 0xD9, 0xF4]; // vvvv=ebx(3), /3, rm=ecx(1)
+    let cpu = run_seeded(&code, &[(Reg::Rcx, 0xB0)], None);
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0x10);
+    assert!(flag(&cpu, flags::CF), "BLSI CF = (src != 0) per SDM");
+    assert!(!flag(&cpu, flags::ZF), "BLSI ZF from result");
+
+    // src == 0 → result 0, CF = 0, ZF = 1.
+    let cpu0 = run_seeded(&code, &[(Reg::Rcx, 0)], None);
+    assert_eq!(rbx(&cpu0) & 0xffff_ffff, 0);
+    assert!(!flag(&cpu0, flags::CF), "BLSI CF = 0 when src == 0");
+    assert!(flag(&cpu0, flags::ZF), "BLSI ZF = 1 when result 0");
+}
+
+#[test]
+fn blsr_clears_lowest_set_bit() {
+    // blsr ebx, ecx (F3 /1): ebx = ecx & (ecx-1); CF = (ecx == 0).
+    let code = [0xC4, 0xE2, 0x60, 0xF3, 0xC9, 0xF4]; // vvvv=ebx(3), /1, rm=ecx(1)
+    let cpu = run_seeded(&code, &[(Reg::Rcx, 0xB0)], None);
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0xA0); // cleared the 0x10 bit
+    assert!(!flag(&cpu, flags::CF), "BLSR CF = (src == 0) = 0 here");
+}
+
+#[test]
+fn blsmsk_masks_up_to_lowest_set_bit_zf_clear() {
+    // blsmsk ebx, ecx (F3 /2): ebx = (ecx-1) ^ ecx; ZF forced 0; CF=(src==0).
+    let code = [0xC4, 0xE2, 0x60, 0xF3, 0xD1, 0xF4]; // vvvv=ebx(3), /2, rm=ecx(1)
+    let cpu = run_seeded(&code, &[(Reg::Rcx, 0xB0)], None);
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0x1F); // mask bits 0..=4
+    assert!(!flag(&cpu, flags::ZF), "BLSMSK forces ZF = 0");
+    assert!(!flag(&cpu, flags::CF), "BLSMSK CF = (src == 0) = 0 here");
+}
+
+// ---- BMI1 BEXTR (over-length pinned — QEMU mis-clamps) ----------------------
+
+#[test]
+fn bextr_extracts_field_and_overlength_passthrough() {
+    // bextr ecx, edx, ebx (0F38.W0 F7): start = ebx[7:0], len = ebx[15:8].
+    // edx = 0xDEADBEEF, start=4, len=8 → (edx>>4)&0xFF = 0xEE.
+    let code = [0xC4, 0xE2, 0x60, 0xF7, 0xCA, 0xF4]; // reg=ecx(1), vvvv=ebx(3), rm=edx(2)
+    let cpu = run_seeded(&code, &[(Reg::Rdx, 0xDEAD_BEEF), (Reg::Rbx, 0x08_04)], None);
+    assert_eq!(rcx(&cpu) & 0xffff_ffff, 0xEE);
+    assert!(!flag(&cpu, flags::ZF), "BEXTR ZF from result");
+
+    // Over-length (len >= opsize): the whole shifted source passes through — the
+    // case the oracle avoids because QEMU wrongly clamps and drops the top bit.
+    // 64-bit: start=0, len=200 → result = full src.
+    let code64 = [0xC4, 0xE2, 0xE0, 0xF7, 0xCA, 0xF4]; // W1 (64-bit), vvvv=rbx, rm=rdx
+    let cpu64 = run_seeded(&code64, &[(Reg::Rdx, 0x8000_0000_0000_0001), (Reg::Rbx, 200 << 8)], None);
+    assert_eq!(rcx(&cpu64), 0x8000_0000_0000_0001, "BEXTR len>=opsize returns full source");
+
+    // Exact boundary regression (32-bit start=0, len==opsize==32): the top bit
+    // must survive — result = full 32-bit source. This is the precise case the
+    // oracle found QEMU dropping bit 31 on (0xD445608C -> 0x5445608C); exemu is
+    // SDM-correct. Control ebx = start(0) | len(32<<8) = 0x2000.
+    let code32 = [0xC4, 0xE2, 0x60, 0xF7, 0xCA, 0xF4]; // ecx, edx, ebx (32-bit)
+    let cpu32 = run_seeded(&code32, &[(Reg::Rdx, 0xD445_608C), (Reg::Rbx, 32 << 8)], None);
+    assert_eq!(rcx(&cpu32) & 0xffff_ffff, 0xD445_608C, "BEXTR len==opsize keeps bit 31");
+}
+
+// ---- BMI2 MULX (flag-preserving) -------------------------------------------
+
+#[test]
+fn mulx_flag_preserving_and_product() {
+    // mulx ebx, ecx, edx (VEX.NDD.LZ.F2.0F38.W0 F6): {ebx:ecx} = edx * eDX(rdx).
+    // reg=ebx (high), vvvv=ecx (low), rm=edx (source); implicit multiplicand rdx.
+    // rdx = 0x1_0000_0002, but 32-bit uses edx=0x2; src edx = 0x2. Wait — for a
+    // 32-bit MULX the multiplicand is EDX. Set edx = 0xFFFF_FFFF (also the source
+    // == rm == edx), so product = 0xFFFF_FFFF * 0xFFFF_FFFF.
+    let code = [0xC4, 0xE2, 0x73, 0xF6, 0xDA, 0xF4]; // reg=ebx(3), vvvv=ecx(1), rm=edx(2)
+    // Seed all arithmetic flags set so we can prove MULX preserves them.
+    let mut cpu = Interpreter::new();
+    {
+        let s = cpu.state_mut();
+        s.rip = CODE_BASE;
+        s.set_rsp(STACK_TOP);
+        s.set_reg(Reg::Rdx, 0xFFFF_FFFF);
+        s.rflags |= flags::CF | flags::OF | flags::SF | flags::ZF | flags::AF | flags::PF;
+    }
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, &code).unwrap();
+    let mut hooks = NoHooks;
+    loop {
+        match cpu.step(&mut mem, &mut hooks).unwrap() {
+            Exit::Continue => {}
+            Exit::Halted => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    // 0xFFFF_FFFF^2 = 0xFFFF_FFFE_0000_0001 → low = 0x0000_0001, high = 0xFFFF_FFFE.
+    assert_eq!(rcx(&cpu) & 0xffff_ffff, 0x0000_0001, "MULX low half → vvvv");
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0xFFFF_FFFE, "MULX high half → reg");
+    for f in [flags::CF, flags::OF, flags::SF, flags::ZF, flags::AF, flags::PF] {
+        assert!(flag(&cpu, f), "MULX preserves every status flag");
+    }
+}
+
+// ---- BMI2 PDEP / PEXT ------------------------------------------------------
+
+#[test]
+fn pdep_pext_roundtrip() {
+    // pdep ebx, ecx, edx (F2.0F38.W0 F5): deposit low bits of ecx into mask edx.
+    // ecx = 0b111, mask edx = 0b10101 → deposit → 0b10101.
+    let code = [0xC4, 0xE2, 0x73, 0xF5, 0xDA, 0xF4]; // reg=ebx(3), vvvv=ecx(1), rm=edx(2)
+    let cpu = run_seeded(&code, &[(Reg::Rcx, 0b111), (Reg::Rdx, 0b10101)], None);
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0b10101);
+
+    // pext ebx, ecx, edx (F3.0F38.W0 F5): extract masked bits of ecx, packed low.
+    let code2 = [0xC4, 0xE2, 0x72, 0xF5, 0xDA, 0xF4]; // pp=F3
+    let cpu2 = run_seeded(&code2, &[(Reg::Rcx, 0b10101), (Reg::Rdx, 0b10101)], None);
+    assert_eq!(rbx(&cpu2) & 0xffff_ffff, 0b111, "PEXT packs the 3 masked bits low");
+}
+
+// ---- BMI2 BZHI (CF boundary pinned — QEMU off-by-one) ----------------------
+
+#[test]
+fn bzhi_zero_high_and_cf_boundary() {
+    // bzhi ebx, edx, ecx (0F38.W0 F5, pp=none): zero bits [31:idx] of edx; idx=ecx[7:0].
+    // edx=0xFFFFFFFF, idx=8 → keep low 8 bits = 0xFF. CF = (idx > 31) = 0.
+    let code = [0xC4, 0xE2, 0x70, 0xF5, 0xDA, 0xF4]; // reg=ebx(3), vvvv=ecx(1), rm=edx(2)
+    let cpu = run_seeded(&code, &[(Reg::Rdx, 0xFFFF_FFFF), (Reg::Rcx, 8)], None);
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0xFF);
+    assert!(!flag(&cpu, flags::CF), "BZHI CF=0 when idx <= opsize-1");
+
+    // idx == opsize-1 (31): keep low 31 bits, CF still 0 (31 > 31 is false).
+    let cpu31 = run_seeded(&code, &[(Reg::Rdx, 0xFFFF_FFFF), (Reg::Rcx, 31)], None);
+    assert_eq!(rbx(&cpu31) & 0xffff_ffff, 0x7FFF_FFFF);
+    assert!(!flag(&cpu31, flags::CF), "BZHI CF=0 at idx == opsize-1 (SDM: N > opsize-1)");
+
+    // idx >= opsize (32): pass through unchanged, CF = 1.
+    let cpu32 = run_seeded(&code, &[(Reg::Rdx, 0xFFFF_FFFF), (Reg::Rcx, 40)], None);
+    assert_eq!(rbx(&cpu32) & 0xffff_ffff, 0xFFFF_FFFF, "BZHI idx>=opsize passes source through");
+    assert!(flag(&cpu32, flags::CF), "BZHI CF=1 when idx >= opsize");
+}
+
+// ---- BMI2 RORX (no flags) --------------------------------------------------
+
+#[test]
+fn rorx_rotates_without_touching_flags() {
+    // rorx ebx, ecx, 4 (VEX.LZ.F2.0F3A.W0 F0 /r ib): ebx = ror(ecx, 4). No flags.
+    let code = [0xC4, 0xE3, 0x7B, 0xF0, 0xD9, 0x04, 0xF4]; // reg=ebx(3), rm=ecx(1), imm=4
+    let mut cpu = Interpreter::new();
+    {
+        let s = cpu.state_mut();
+        s.rip = CODE_BASE;
+        s.set_rsp(STACK_TOP);
+        s.set_reg(Reg::Rcx, 0x0000_000F);
+        s.rflags |= flags::CF | flags::OF | flags::ZF;
+    }
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, &code).unwrap();
+    let mut hooks = NoHooks;
+    loop {
+        match cpu.step(&mut mem, &mut hooks).unwrap() {
+            Exit::Continue => {}
+            Exit::Halted => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0xF000_0000, "ror(0xF, 4) in 32 bits");
+    assert!(flag(&cpu, flags::CF) && flag(&cpu, flags::OF) && flag(&cpu, flags::ZF), "RORX preserves all flags");
+}
+
+// ---- BMI2 SARX/SHLX/SHRX (flag-untouched shifts) ---------------------------
+
+#[test]
+fn sarx_shlx_shrx_flag_untouched() {
+    // sarx ebx, edx, ecx (VEX.LZ.F3.0F38.W0 F7): ebx = edx >>a (ecx & 31). No flags.
+    let code = [0xC4, 0xE2, 0x72, 0xF7, 0xDA, 0xF4]; // reg=ebx(3), vvvv=ecx(1), rm=edx(2)
+    let cpu = run_seeded(&code, &[(Reg::Rdx, 0x8000_0000), (Reg::Rcx, 4)], None);
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0xF800_0000, "SARX arithmetic shift keeps sign");
+
+    // shlx (66), shrx (F2).
+    let shlx = [0xC4, 0xE2, 0x71, 0xF7, 0xDA, 0xF4];
+    let cpu_l = run_seeded(&shlx, &[(Reg::Rdx, 0x1), (Reg::Rcx, 5)], None);
+    assert_eq!(rcx(&cpu_l) & 0xffff_ffff, 5); // ecx unchanged
+    assert_eq!(rbx(&cpu_l) & 0xffff_ffff, 0x20, "SHLX shift left");
+    let shrx = [0xC4, 0xE2, 0x73, 0xF7, 0xDA, 0xF4];
+    let cpu_r = run_seeded(&shrx, &[(Reg::Rdx, 0x8000_0000), (Reg::Rcx, 4)], None);
+    assert_eq!(rbx(&cpu_r) & 0xffff_ffff, 0x0800_0000, "SHRX logical shift right");
+}
+
+// ---- BMI 32-bit zero-extension (QEMU reference doesn't; SDM/exemu do) -------
+
+#[test]
+fn bmi_32bit_result_zero_extends_upper() {
+    // In 64-bit mode a W0 (32-bit) BMI op MUST zero the upper 32 bits of the
+    // destination — the property the oracle's Unicorn build fails to honor, so it
+    // is pinned here. andn ecx, ebx, edx with a destination pre-seeded nonzero.
+    let code = [0xC4, 0xE2, 0x60, 0xF2, 0xCA, 0xF4];
+    let cpu = run_seeded(
+        &code,
+        &[(Reg::Rbx, 0), (Reg::Rdx, 0xFFFF_FFFF), (Reg::Rcx, 0xDEAD_BEEF_0000_0000)],
+        None,
+    );
+    // ~0 & 0xFFFF_FFFF = 0xFFFF_FFFF, zero-extended → upper 32 cleared.
+    assert_eq!(rcx(&cpu), 0x0000_0000_FFFF_FFFF, "32-bit BMI zero-extends the upper half");
+}
+
+// ---- ADX ADCX / ADOX (isolated-carry, flag-preserving) ---------------------
+
+#[test]
+fn adcx_updates_only_cf() {
+    // adcx eax, ecx (66 0F38 F6): eax = eax + ecx + CF; only CF changes.
+    // Seed OF/SF/ZF/AF/PF set, CF set; eax=0xFFFF_FFFF, ecx=1 → sum=0 with carry.
+    let code = [0x66, 0x0F, 0x38, 0xF6, 0xC1, 0xF4]; // reg=eax(0), rm=ecx(1)
+    let mut cpu = Interpreter::new();
+    {
+        let s = cpu.state_mut();
+        s.rip = CODE_BASE;
+        s.set_rsp(STACK_TOP);
+        s.set_reg(Reg::Rax, 0xFFFF_FFFF);
+        s.set_reg(Reg::Rcx, 0);
+        // CF=1 (added), and OF/SF/ZF/AF/PF all set to prove preservation.
+        s.rflags |= flags::CF | flags::OF | flags::SF | flags::ZF | flags::AF | flags::PF;
+    }
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, &code).unwrap();
+    let mut hooks = NoHooks;
+    loop {
+        match cpu.step(&mut mem, &mut hooks).unwrap() {
+            Exit::Continue => {}
+            Exit::Halted => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    // 0xFFFF_FFFF + 0 + CF(1) = 0x1_0000_0000 → 32-bit result 0, CF out = 1.
+    assert_eq!(rax(&cpu) & 0xffff_ffff, 0, "ADCX result");
+    assert!(flag(&cpu, flags::CF), "ADCX carry out sets CF");
+    // Every other flag preserved (they were all set).
+    for f in [flags::OF, flags::SF, flags::ZF, flags::AF, flags::PF] {
+        assert!(flag(&cpu, f), "ADCX preserves non-CF flags");
+    }
+}
+
+#[test]
+fn adox_updates_only_of() {
+    // adox eax, ecx (F3 0F38 F6): eax = eax + ecx + OF; only OF changes.
+    let code = [0xF3, 0x0F, 0x38, 0xF6, 0xC1, 0xF4];
+    let mut cpu = Interpreter::new();
+    {
+        let s = cpu.state_mut();
+        s.rip = CODE_BASE;
+        s.set_rsp(STACK_TOP);
+        s.set_reg(Reg::Rax, 0xFFFF_FFFF);
+        s.set_reg(Reg::Rcx, 0);
+        // OF=1 (the carry-in for ADOX). CF/SF/ZF/AF/PF set → must be preserved.
+        s.rflags |= flags::OF | flags::CF | flags::SF | flags::ZF | flags::AF | flags::PF;
+    }
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, &code).unwrap();
+    let mut hooks = NoHooks;
+    loop {
+        match cpu.step(&mut mem, &mut hooks).unwrap() {
+            Exit::Continue => {}
+            Exit::Halted => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(rax(&cpu) & 0xffff_ffff, 0, "ADOX result = 0xFFFFFFFF + OF(1)");
+    assert!(flag(&cpu, flags::OF), "ADOX carry out sets OF");
+    for f in [flags::CF, flags::SF, flags::ZF, flags::AF, flags::PF] {
+        assert!(flag(&cpu, f), "ADOX preserves non-OF flags (incl. CF)");
+    }
+}
+
+// ---- CMPXCHG16B (equal + not-equal + alignment #GP) ------------------------
+
+#[test]
+fn cmpxchg16b_exchange_when_equal() {
+    // REX.W 0F C7 /1 [rsi]. RDX:RAX = mem → ZF=1, mem = RCX:RBX.
+    let code = [0x48, 0x0F, 0xC7, 0x0E, 0xF4]; // /1, rm=rsi(6)
+    let mut data = [0u8; 16];
+    data[..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes()); // low = RAX
+    data[8..].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes()); // high = RDX
+    let (cpu, out) = run_seeded_mem(
+        &code,
+        &[
+            (Reg::Rsi, DATA),
+            (Reg::Rax, 0x1111_2222_3333_4444),
+            (Reg::Rdx, 0x5555_6666_7777_8888),
+            (Reg::Rbx, 0xAAAA_BBBB_CCCC_DDDD), // store low
+            (Reg::Rcx, 0x0102_0304_0506_0708), // store high
+        ],
+        DATA,
+        &data,
+    );
+    assert!(flag(&cpu, flags::ZF), "CMPXCHG16B ZF=1 on match");
+    assert_eq!(&out[..8], &0xAAAA_BBBB_CCCC_DDDDu64.to_le_bytes(), "low ← RBX");
+    assert_eq!(&out[8..], &0x0102_0304_0506_0708u64.to_le_bytes(), "high ← RCX");
+}
+
+#[test]
+fn cmpxchg16b_loads_when_not_equal() {
+    // Mismatch → ZF=0, RDX:RAX loaded from memory, memory unchanged.
+    let code = [0x48, 0x0F, 0xC7, 0x0E, 0xF4];
+    let mut data = [0u8; 16];
+    data[..8].copy_from_slice(&0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes());
+    data[8..].copy_from_slice(&0x0BAD_F00D_1234_5678u64.to_le_bytes());
+    let (cpu, out) = run_seeded_mem(
+        &code,
+        &[
+            (Reg::Rsi, DATA),
+            (Reg::Rax, 0), // != mem low
+            (Reg::Rdx, 0),
+            (Reg::Rbx, 0x9999),
+            (Reg::Rcx, 0x8888),
+        ],
+        DATA,
+        &data,
+    );
+    assert!(!flag(&cpu, flags::ZF), "CMPXCHG16B ZF=0 on mismatch");
+    assert_eq!(rax(&cpu), 0xDEAD_BEEF_CAFE_BABE, "RAX ← mem low");
+    assert_eq!(rdx(&cpu), 0x0BAD_F00D_1234_5678, "RDX ← mem high");
+    assert_eq!(&out[..8], &0xDEAD_BEEF_CAFE_BABEu64.to_le_bytes(), "memory unchanged low");
+    assert_eq!(&out[8..], &0x0BAD_F00D_1234_5678u64.to_le_bytes(), "memory unchanged high");
+}
+
+#[test]
+fn cmpxchg16b_misaligned_faults_gp() {
+    // A non-16-byte-aligned operand must raise #GP(0) — Interrupt(13).
+    let code = [0x48, 0x0F, 0xC7, 0x0E, 0xF4];
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("data", DATA, 0x1000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, &code).unwrap();
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = CODE_BASE;
+    cpu.state_mut().set_reg(Reg::Rsi, DATA + 8); // 8-byte aligned but NOT 16
+    let mut hooks = NoHooks;
+    let exit = cpu.step(&mut mem, &mut hooks).unwrap();
+    assert_eq!(exit, Exit::Interrupt(13), "misaligned CMPXCHG16B raises #GP");
+}
+
+// ---- CMPXCHG8B (32-bit-mode form still works in 64-bit default) -------------
+
+#[test]
+fn cmpxchg8b_exchange_when_equal() {
+    // 0F C7 /1 [rsi] (no REX.W): EDX:EAX vs m64; on match ZF=1, m64 = ECX:EBX.
+    let code = [0x0F, 0xC7, 0x0E, 0xF4];
+    let data = 0x1122_3344_5566_7788u64.to_le_bytes(); // low32=EAX cmp, high32=EDX cmp
+    let (cpu, out) = run_seeded_mem(
+        &code,
+        &[
+            (Reg::Rsi, DATA),
+            (Reg::Rax, 0x5566_7788), // EAX = mem[31:0]
+            (Reg::Rdx, 0x1122_3344), // EDX = mem[63:32]
+            (Reg::Rbx, 0xAABB_CCDD), // store low
+            (Reg::Rcx, 0x0011_2233), // store high
+        ],
+        DATA,
+        &data,
+    );
+    assert!(flag(&cpu, flags::ZF), "CMPXCHG8B ZF=1 on match");
+    assert_eq!(u64::from_le_bytes(out.as_slice().try_into().unwrap()), 0x0011_2233_AABB_CCDD);
+}
+
+// ---- F16C VCVTPH2PS / VCVTPS2PH (behaviorally verified; QEMU lacks F16C) -----
+
+#[test]
+fn f16c_ph2ps_ps2ph_roundtrip() {
+    // The linked Unicorn build does not implement F16C, so these are pinned here.
+    // Put four fp16 values in xmm1's low 64 bits, convert up, convert back down.
+    // 1.0 = 0x3C00, 2.0 = 0x4000, -1.0 = 0xBC00, 0.5 = 0x3800.
+    let halfs: u64 = 0x3800_BC00_4000_3C00;
+    // vcvtph2ps xmm0, xmm1 (VEX.128.66.0F38.W0 13 /r): xmm0 = 4×fp32.
+    // vcvtps2ph xmm2, xmm0, 0 (VEX.128.66.0F3A.W0 1D /r ib): xmm2 = 4×fp16.
+    let code = [
+        0xC4, 0xE2, 0x79, 0x13, 0xC1, // vcvtph2ps xmm0, xmm1
+        0xC4, 0xE3, 0x79, 0x1D, 0xC2, 0x00, // vcvtps2ph xmm2, xmm0, 0
+        0xF4,
+    ];
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, &code).unwrap();
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = CODE_BASE;
+    cpu.state_mut().xmm[1] = halfs as u128;
+    let mut hooks = NoHooks;
+    loop {
+        match cpu.step(&mut mem, &mut hooks).unwrap() {
+            Exit::Continue => {}
+            Exit::Halted => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    // xmm0 = the four fp32 values.
+    let xmm0 = cpu.state().xmm[0];
+    let f = |i: usize| f32::from_bits((xmm0 >> (i * 32)) as u32);
+    assert_eq!(f(0), 1.0);
+    assert_eq!(f(1), 2.0);
+    assert_eq!(f(2), -1.0);
+    assert_eq!(f(3), 0.5);
+    // Round-trip back to fp16 recovers the exact half bit patterns (upper 64 zero).
+    let xmm2 = cpu.state().xmm[2];
+    assert_eq!(xmm2 as u64, halfs, "VCVTPS2PH recovers the fp16 patterns");
+    assert_eq!(xmm2 >> 64, 0, "VCVTPS2PH zeroes the unused upper lanes");
+}
+
+// ---- MMX / x87 aliasing + tag-word interaction ------------------------------
+
+#[test]
+fn mmx_write_sets_tag_valid_and_exponent_ones() {
+    // A bare-form MMX write aliases the low 64 bits of physical x87 register 0
+    // (MM0), sets its exponent+sign bits (64:79) to all 1s, and marks it valid
+    // in the tag word — the W1.1 tag-word interaction. movq mm0, mm1 after
+    // seeding mm1 via movd.
+    // movd mm0, eax (0F 6E C0), then read back with movd ebx, mm0 (0F 7E C3).
+    let code = [
+        0x0F, 0x6E, 0xC0, // movd mm0, eax
+        0x0F, 0x7E, 0xC3, // movd ebx, mm0
+        0xF4,
+    ];
+    let cpu = run_seeded(&code, &[(Reg::Rax, 0xCAFEBABE)], None);
+    assert_eq!(rbx(&cpu) & 0xffff_ffff, 0xCAFEBABE, "MMX movd round-trip");
+    let x = &cpu.state().x87;
+    // MM0 aliases physical st[0]; its low 64 = the value, bits 64:79 = 0xFFFF.
+    assert_eq!(x.st[0] as u64, 0xCAFEBABE);
+    assert_eq!((x.st[0] >> 64) & 0xFFFF, 0xFFFF, "MMX write sets exp+sign to all 1s");
+    // Tag word: physical register 0 marked valid (bits 0..2 == 00).
+    assert_eq!(x.tw & 0b11, 0, "MMX write marks the register valid in the tag word");
+}
+
+#[test]
+fn emms_marks_all_registers_empty() {
+    // EMMS (0F 77) sets the tag word to 0xFFFF (all empty) without touching the
+    // register contents.
+    let code = [
+        0x0F, 0x6E, 0xC0, // movd mm0, eax  (marks MM0 valid)
+        0x0F, 0x77, // emms
+        0xF4,
+    ];
+    let cpu = run_seeded(&code, &[(Reg::Rax, 0x12345678)], None);
+    let x = &cpu.state().x87;
+    assert_eq!(x.tw, 0xFFFF, "EMMS empties the whole tag word");
+    // The stored value survives EMMS (only the tag word changes).
+    assert_eq!(x.st[0] as u64, 0x12345678, "EMMS leaves register bytes intact");
+}
+
+#[test]
+fn mmx_paddb_lanes() {
+    // paddb mm0, mm1 (0F FC): byte-wise wrapping add. Seed both via movq from GP.
+    // movq mm0, rax ; movq mm1, rcx ; paddb mm0, mm1 ; movq rbx, mm0.
+    let code = [
+        0x48, 0x0F, 0x6E, 0xC0, // movq mm0, rax  (REX.W 0F 6E)
+        0x48, 0x0F, 0x6E, 0xC9, // movq mm1, rcx
+        0x0F, 0xFC, 0xC1, // paddb mm0, mm1
+        0x48, 0x0F, 0x7E, 0xC3, // movq rbx, mm0
+        0xF4,
+    ];
+    // 0x01_02_03_04_05_06_07_08 + 0x10_20_30_40_50_60_70_80 (byte lanes).
+    let a = 0x0102_0304_0506_0708u64;
+    let b = 0x1020_3040_5060_7080u64;
+    let cpu = run_seeded(&code, &[(Reg::Rax, a), (Reg::Rcx, b)], None);
+    let expect = {
+        let mut r = 0u64;
+        for i in 0..8 {
+            let x = (a >> (i * 8)) as u8;
+            let y = (b >> (i * 8)) as u8;
+            r |= (x.wrapping_add(y) as u64) << (i * 8);
+        }
+        r
+    };
+    assert_eq!(rbx(&cpu), expect, "PADDB byte-wise wrapping add");
+}

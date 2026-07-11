@@ -544,6 +544,19 @@ impl Interpreter {
 
     fn vex_0f38(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, op: u8) -> Result<()> {
         let reg = ctx.reg;
+        // ---- BMI1 / BMI2 GP-register ops (VEX.LZ.0F38) -------------------
+        // These are integer ops on general-purpose registers, not vectors, so
+        // they short-circuit before the packed-op dispatch. Operand size is
+        // 64-bit when VEX.W, else 32-bit. Semantics: Intel SDM Vol. 2.
+        match op {
+            0xF2 => return self.bmi_andn(ctx, mem, vex),
+            0xF3 => return self.bmi_group17(ctx, mem, vex), // BLSR/BLSMSK/BLSI (/reg)
+            0xF5 => return self.bmi_f5(ctx, mem, vex),      // BZHI / PEXT / PDEP
+            0xF6 => return self.bmi_mulx(ctx, mem, vex),    // MULX (F2 prefix)
+            0xF7 => return self.bmi_f7(ctx, mem, vex),      // BEXTR / SHLX / SARX / SHRX
+            0x13 if vex.pp == 1 => return self.vex_cvtph2ps(ctx, mem, vex, reg), // VCVTPH2PS (F16C)
+            _ => {}
+        }
         match op {
             0x00 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pshufb)?, // VPSHUFB
             0x01 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, false, false, false))?, // VPHADDW
@@ -618,6 +631,12 @@ impl Interpreter {
 
     fn vex_0f3a(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, op: u8) -> Result<()> {
         let reg = ctx.reg;
+        // ---- BMI2 RORX (VEX.LZ.F2.0F3A.W F0 /r ib) and F16C VCVTPS2PH ----
+        match op {
+            0xF0 if vex.f2() => return self.bmi_rorx(ctx, mem, vex),
+            0x1D if vex.pp == 1 => return self.vex_cvtps2ph(ctx, mem, vex, reg), // VCVTPS2PH (F16C)
+            _ => {}
+        }
         match op {
             // ---- VPALIGNR (0x0F) ------------------------------------------
             0x0F => {
@@ -708,6 +727,272 @@ impl Interpreter {
     /// or the value cached first).
     fn imm_after_rm(&self, ctx: &mut Ctx, mem: &dyn Memory) -> Result<u8> {
         ctx.u8(mem)
+    }
+
+    // ---- BMI1 / BMI2 general-purpose ops --------------------------------
+    //
+    // Operand size: 64-bit when VEX.W, else 32-bit (BMI is 32/64 only). The
+    // destination is ModRM.reg, the source(s) come from r/m and the `vvvv`
+    // field per op. Flag semantics follow the Intel SDM exactly — several of
+    // these deliberately touch *no* flags (MULX, PDEP/PEXT, the SARX/SHLX/SHRX
+    // shifts, RORX), which is a common correctness trap.
+
+    #[inline]
+    fn bmi_size(vex: &Vex) -> u8 {
+        if vex.w {
+            8
+        } else {
+            4
+        }
+    }
+
+    /// Set SF/ZF from a BMI result and clear OF; the caller sets CF; AF/PF
+    /// (architecturally undefined for these ops) are left untouched.
+    #[inline]
+    fn bmi_szf(&mut self, res: u64, size: u8) {
+        let sb = 1u64 << (size * 8 - 1);
+        self.state.set_flag(flags::SF, res & sb != 0);
+        self.state.set_flag(flags::ZF, res == 0);
+        self.state.set_flag(flags::OF, false);
+    }
+
+    /// ANDN dst, vvvv, r/m — `dst = ~vvvv & rm`. Sets SF/ZF; clears CF/OF.
+    fn bmi_andn(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
+        let size = Self::bmi_size(vex);
+        let vvvv = self.state.gpr_read(vex.vvvv, size);
+        let src = self.read_rm(ctx, &*mem, size)?;
+        let res = (!vvvv & src) & alu::mask(size);
+        self.write_reg_field(ctx, size, res);
+        self.state.set_flag(flags::CF, false);
+        self.bmi_szf(res, size);
+        Ok(())
+    }
+
+    /// Group-17 (VEX.0F38.pp=none F3 /reg): BLSR (/1), BLSMSK (/2), BLSI (/3).
+    /// Destination is `vvvv` (NDD), source is r/m. SDM flag rules per op.
+    fn bmi_group17(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
+        let size = Self::bmi_size(vex);
+        let m = alu::mask(size);
+        let src = self.read_rm(ctx, &*mem, size)? & m;
+        let digit = ctx.reg & 7;
+        let (res, cf) = match digit {
+            1 => (src & src.wrapping_sub(1) & m, src == 0),        // BLSR:  x & (x-1); CF = (x==0)
+            2 => ((src.wrapping_sub(1) ^ src) & m, src == 0),      // BLSMSK:(x-1) ^ x; CF = (x==0)
+            3 => (src.wrapping_neg() & src & m, src != 0),         // BLSI:  (-x) & x;  CF = (x!=0)
+            _ => return Err(EmuError::Unsupported(format!("VEX 0F38 F3 /{digit}"))),
+        };
+        self.state.gpr_write(vex.vvvv, size, res);
+        self.state.set_flag(flags::CF, cf);
+        // BLSMSK leaves ZF cleared (result always non-zero when src arbitrary?
+        // No — the SDM specifies ZF=0 for BLSMSK regardless). SF from msb.
+        if digit == 2 {
+            let sb = 1u64 << (size * 8 - 1);
+            self.state.set_flag(flags::SF, res & sb != 0);
+            self.state.set_flag(flags::ZF, false);
+            self.state.set_flag(flags::OF, false);
+        } else {
+            self.bmi_szf(res, size);
+        }
+        Ok(())
+    }
+
+    /// VEX.0F38 F5: BZHI (pp=none), PEXT (F3), PDEP (F2).
+    fn bmi_f5(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
+        let size = Self::bmi_size(vex);
+        let m = alu::mask(size);
+        let opbits = (size * 8) as u32;
+        if vex.pp == 0 {
+            // BZHI dst, r/m, vvvv — zero bits [opsize-1 : idx] of r/m; idx=vvvv[7:0].
+            let src = self.read_rm(ctx, &*mem, size)? & m;
+            let idx = (self.state.gpr_read(vex.vvvv, size) & 0xFF) as u32;
+            let res = if idx >= opbits { src } else { src & ((1u64 << idx) - 1) };
+            self.write_reg_field(ctx, size, res & m);
+            // CF set when the index was >= operand size (no bits cleared).
+            self.state.set_flag(flags::CF, idx >= opbits);
+            self.bmi_szf(res & m, size);
+        } else if vex.pp == 2 {
+            // PEXT dst, vvvv, r/m(mask) — gather masked bits of vvvv, packed low.
+            let val = self.state.gpr_read(vex.vvvv, size) & m;
+            let mask = self.read_rm(ctx, &*mem, size)? & m;
+            let mut res = 0u64;
+            let mut k = 0;
+            for i in 0..opbits {
+                if (mask >> i) & 1 != 0 {
+                    if (val >> i) & 1 != 0 {
+                        res |= 1u64 << k;
+                    }
+                    k += 1;
+                }
+            }
+            self.write_reg_field(ctx, size, res & m); // PEXT/PDEP touch no flags
+        } else if vex.pp == 3 {
+            // PDEP dst, vvvv, r/m(mask) — deposit low bits of vvvv into mask positions.
+            let val = self.state.gpr_read(vex.vvvv, size) & m;
+            let mask = self.read_rm(ctx, &*mem, size)? & m;
+            let mut res = 0u64;
+            let mut k = 0;
+            for i in 0..opbits {
+                if (mask >> i) & 1 != 0 {
+                    if (val >> k) & 1 != 0 {
+                        res |= 1u64 << i;
+                    }
+                    k += 1;
+                }
+            }
+            self.write_reg_field(ctx, size, res & m);
+        } else {
+            return Err(EmuError::Unsupported("VEX 0F38 F5 pp".into()));
+        }
+        Ok(())
+    }
+
+    /// MULX dst_hi(reg), dst_lo(vvvv), r/m (VEX.F2.0F38 F6). Unsigned
+    /// EDX/RDX × r/m → 128-bit product; low half to `vvvv`, high half to `reg`.
+    /// **Affects no flags.** If reg == vvvv, only the high half is written.
+    fn bmi_mulx(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
+        if !vex.f2() {
+            return Err(EmuError::Unsupported("VEX 0F38 F6 non-F2".into()));
+        }
+        let size = Self::bmi_size(vex);
+        let m = alu::mask(size);
+        let src = self.read_rm(ctx, &*mem, size)? & m;
+        let edx = self.state.gpr_read(2, size) & m; // implicit rDX
+        let prod = (edx as u128) * (src as u128);
+        let bits = (size * 8) as u32;
+        let lo = (prod as u64) & m;
+        let hi = ((prod >> bits) as u64) & m;
+        // Write the low half first, then the high half, so that when reg==vvvv the
+        // high half wins (per the SDM: the destination registers may be equal).
+        self.state.gpr_write(vex.vvvv, size, lo);
+        self.write_reg_field(ctx, size, hi);
+        Ok(())
+    }
+
+    /// VEX.0F38 F7: BEXTR (pp=none), SHLX (66), SARX (F3), SHRX (F2).
+    fn bmi_f7(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
+        let size = Self::bmi_size(vex);
+        let m = alu::mask(size);
+        let opbits = (size * 8) as u32;
+        let src = self.read_rm(ctx, &*mem, size)? & m; // r/m is the source for all four
+        match vex.pp {
+            0 => {
+                // BEXTR dst, r/m, vvvv — start=vvvv[7:0], len=vvvv[15:8].
+                let ctrl = self.state.gpr_read(vex.vvvv, size);
+                let start = (ctrl & 0xFF) as u32;
+                let len = ((ctrl >> 8) & 0xFF) as u32;
+                let shifted = if start >= opbits { 0 } else { src >> start };
+                let res = if len >= opbits {
+                    shifted & m
+                } else if len == 0 {
+                    0
+                } else {
+                    shifted & ((1u64 << len) - 1)
+                };
+                self.write_reg_field(ctx, size, res & m);
+                // ZF from result; CF/OF cleared; SF/AF/PF undefined (leave SF via szf? SDM: undefined).
+                self.state.set_flag(flags::ZF, res & m == 0);
+                self.state.set_flag(flags::CF, false);
+                self.state.set_flag(flags::OF, false);
+            }
+            // SHLX/SARX/SHRX dst, r/m, vvvv — shift r/m by (vvvv & (opsize-1)).
+            // These are flag-untouched shifts (the whole reason they exist).
+            1..=3 => {
+                let cnt = (self.state.gpr_read(vex.vvvv, size) & (opbits as u64 - 1)) as u32;
+                let res = match vex.pp {
+                    1 => (src << cnt) & m,                                 // SHLX
+                    3 => src >> cnt,                                       // SHRX (logical)
+                    _ => {
+                        // SARX: arithmetic right shift at the operand width.
+                        let sb = 1u64 << (opbits - 1);
+                        let sext = if src & sb != 0 { src | !m } else { src };
+                        ((sext as i64) >> cnt) as u64 & m
+                    }
+                };
+                self.write_reg_field(ctx, size, res);
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    /// RORX dst, r/m, imm8 (VEX.LZ.F2.0F3A.W F0). Rotate right by imm8; no flags.
+    fn bmi_rorx(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
+        let size = Self::bmi_size(vex);
+        let m = alu::mask(size);
+        let src = self.read_rm(ctx, &*mem, size)? & m;
+        let imm = self.imm_after_rm(ctx, mem)? as u32;
+        let opbits = (size * 8) as u32;
+        let n = imm & (opbits - 1);
+        let res = if n == 0 { src } else { ((src >> n) | (src << (opbits - n))) & m };
+        self.write_reg_field(ctx, size, res);
+        Ok(())
+    }
+
+    // ---- F16C (half-precision <-> single-precision conversion) -----------
+
+    /// VCVTPH2PS (VEX.128/256.66.0F38.W0 13): unpack packed FP16 → packed FP32.
+    /// 128-bit dst: 4 halfs from the low 64 bits of the source; 256-bit dst: 8
+    /// halfs from the 128-bit source. No `vvvv`, zero-upper.
+    fn vex_cvtph2ps(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
+        let n = if vex.l { 8 } else { 4 }; // number of fp16 lanes converted
+        // Source is n×2 bytes: 8 bytes for 128-bit dst, 16 for 256-bit dst.
+        let src = self.vrm128(ctx, mem, n * 2)?;
+        let mut lo = 0u128;
+        let mut hi = 0u128;
+        for i in 0..n {
+            let h = ((src >> (i * 16)) & 0xFFFF) as u16;
+            let f = f16_to_f32(h);
+            if i < 4 {
+                lo |= (f as u128) << (i * 32);
+            } else {
+                hi |= (f as u128) << ((i - 4) * 32);
+            }
+        }
+        if vex.l {
+            self.state.set_ymm(reg, lo, hi);
+        } else {
+            self.state.set_xmm_zero_upper(reg, lo);
+        }
+        Ok(())
+    }
+
+    /// VCVTPS2PH (VEX.128/256.66.0F3A.W0 1D /r ib): pack FP32 → FP16, storing to
+    /// the r/m operand (reg is the SOURCE). imm8[2]=1 selects MXCSR rounding,
+    /// else imm8[1:0] is the rounding mode. Zero-upper on a register destination.
+    fn vex_cvtps2ph(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
+        // The imm8 follows the ModRM (+ any SIB/disp), so cache the source and
+        // resolve the store address before reading it — but here the store target
+        // *is* the r/m operand, so read imm8 after computing rm_addr via a peek.
+        // Simpler: compute the FP16 result from the reg source, then read imm8,
+        // then store. Order matters for a RIP-relative memory destination, so read
+        // imm8 first (it sits at ctx.cur) to advance `cur` past the whole insn.
+        let n = if vex.l { 8 } else { 4 };
+        let (sl, sh) = (self.state.xmm(reg), self.state.ymm_hi(reg));
+        let imm = self.imm_after_rm(ctx, mem)?;
+        // Rounding: round-to-nearest-even is the default and the only mode the
+        // f16 conversion here implements; imm/MXCSR RC selection is honored only
+        // insofar as RNE is used (documented approximation, matching MXCSR reset).
+        let _ = imm;
+        let mut packed = 0u128;
+        for i in 0..n {
+            let bits32 = if i < 4 { (sl >> (i * 32)) as u32 } else { (sh >> ((i - 4) * 32)) as u32 };
+            let h = f32_to_f16(f32::from_bits(bits32));
+            packed |= (h as u128) << (i * 16);
+        }
+        // Destination width: 128-bit src → 64-bit (8 bytes) fp16; 256-bit src →
+        // 128-bit (16 bytes) fp16.
+        let nbytes = n * 2;
+        match ctx.rm {
+            Rm::Reg(i) => {
+                // Register destination: zero the upper (128 or 256) bits.
+                self.state.set_xmm_zero_upper(i, packed);
+            }
+            Rm::Mem { .. } => {
+                let bytes = packed.to_le_bytes();
+                mem.write(ctx.rm_addr(), &bytes[..nbytes])?;
+            }
+        }
+        Ok(())
     }
 
     /// `dst = f(vvvv, rm)` applied per 128-bit lane (AVX2 integer / lane-wise).
@@ -1361,4 +1646,101 @@ fn pmovx_from(src: u128, start: usize, count: usize, src_sz: usize, dst_sz: usiz
         out |= (widened & dmask) << (i * dbits);
     }
     out
+}
+
+/// Convert an IEEE-754 binary16 (half) to binary32 (single). Exact — half is a
+/// strict subset of single's dynamic range, so no rounding is needed (F16C
+/// VCVTPH2PS never rounds). Handles subnormals, zeros, Inf and NaN.
+fn f16_to_f32(h: u16) -> u32 {
+    let sign = (h as u32 & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1F;
+    let mant = (h & 0x3FF) as u32;
+    match exp {
+        0 => {
+            if mant == 0 {
+                sign // +/- 0
+            } else {
+                // Subnormal half → normalized single. Normalize the mantissa.
+                let mut m = mant;
+                let mut e: i32 = -1;
+                while m & 0x400 == 0 {
+                    m <<= 1;
+                    e -= 1;
+                }
+                m &= 0x3FF; // drop the implicit leading bit
+                let exp32 = (127 - 15 + 1 + e) as u32;
+                sign | (exp32 << 23) | (m << 13)
+            }
+        }
+        0x1F => {
+            // Inf / NaN: exponent all-ones.
+            sign | 0x7F80_0000 | (mant << 13)
+        }
+        _ => {
+            let exp32 = (exp as i32 - 15 + 127) as u32;
+            sign | (exp32 << 23) | (mant << 13)
+        }
+    }
+}
+
+/// Convert an IEEE-754 binary32 (single) to binary16 (half) with round-to-
+/// nearest-even (the F16C default; MXCSR-RC / imm rounding modes are documented
+/// as approximated to RNE — see `vex_cvtps2ph`). Handles overflow→Inf,
+/// underflow→subnormal/0, and NaN.
+fn f32_to_f16(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x007F_FFFF;
+
+    if exp == 0xFF {
+        // Inf or NaN.
+        return if mant != 0 {
+            // NaN: keep it quiet, preserve a non-zero payload.
+            sign | 0x7E00
+        } else {
+            sign | 0x7C00
+        };
+    }
+    // Unbiased exponent for half.
+    let e = exp - 127 + 15;
+    if e >= 0x1F {
+        // Overflow → Inf.
+        return sign | 0x7C00;
+    }
+    if e <= 0 {
+        // Subnormal or zero half.
+        if e < -10 {
+            return sign; // too small even for a subnormal → signed zero
+        }
+        // Add the implicit leading 1, then shift into the subnormal position with
+        // round-to-nearest-even.
+        let m = mant | 0x0080_0000;
+        let shift = 14 - e; // 14 = 23 - 10 + 1
+        let half_shifted = m >> shift;
+        let remainder = m & ((1 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        let mut r = half_shifted as u16;
+        if remainder > halfway || (remainder == halfway && (half_shifted & 1) != 0) {
+            r += 1;
+        }
+        return sign | r;
+    }
+    // Normalized half. Round the 23-bit mantissa to 10 bits (RNE).
+    let mut half_exp = e as u16;
+    let round_bits = mant & 0x1FFF; // low 13 bits dropped
+    let mut half_mant = (mant >> 13) as u16;
+    let halfway = 0x1000u32;
+    if round_bits > halfway || (round_bits == halfway && (half_mant & 1) != 0) {
+        half_mant += 1;
+        if half_mant == 0x400 {
+            // Mantissa overflow carries into the exponent.
+            half_mant = 0;
+            half_exp += 1;
+            if half_exp >= 0x1F {
+                return sign | 0x7C00; // → Inf
+            }
+        }
+    }
+    sign | (half_exp << 10) | half_mant
 }

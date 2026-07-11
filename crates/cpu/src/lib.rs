@@ -514,6 +514,7 @@ impl RegAt for CpuState {
 }
 
 mod exec;
+mod mmx;
 mod sse;
 mod vex;
 mod x87;
