@@ -43,7 +43,7 @@ pub(crate) fn is_sse(op2: u8) -> bool {
     matches!(op2,
         0x10..=0x17 | 0x28..=0x2F | 0x50..=0x5F |
         0x60..=0x76 | 0x7E | 0x7F |
-        0xC5 | 0xC6 | 0xD0..=0xFE)
+        0xC2 | 0xC4 | 0xC5 | 0xC6 | 0xD0..=0xFE)
 }
 
 impl Interpreter {
@@ -467,6 +467,70 @@ impl Interpreter {
                     Sse::Ss => pshufhw(src, imm),
                     Sse::Ps => return unsupported(op2, ctx, "pshufw(mm)"),
                 };
+                self.set_xmm(reg, out);
+            }
+
+            // ---- CMPPS/CMPPD/CMPSS/CMPSD (0F C2 ib) ---------------------
+            // Legacy (non-VEX) SSE compare producing an all-ones/zero lane mask.
+            // Packed forms compare 4×f32 / 2×f64; the scalar forms compare only
+            // the low element and preserve the destination's remaining bits.
+            // Reuses the oracle-verified predicate helpers from the VEX unit.
+            0xC2 => {
+                let dst = self.xmm(reg);
+                let out = match kind {
+                    Sse::Ps => {
+                        let src = self.sse_rm(ctx, mem, 16)?;
+                        let imm = ctx.u8(mem)?;
+                        crate::vex::pcmp_float(dst, src, false, imm)
+                    }
+                    Sse::Pd => {
+                        let src = self.sse_rm(ctx, mem, 16)?;
+                        let imm = ctx.u8(mem)?;
+                        crate::vex::pcmp_float(dst, src, true, imm)
+                    }
+                    Sse::Ss => {
+                        let src = self.sse_rm(ctx, mem, 4)?;
+                        let imm = ctx.u8(mem)?;
+                        let r = crate::vex::cmp_pred_full(
+                            f32::from_bits(dst as u32) as f64,
+                            f32::from_bits(src as u32) as f64,
+                            imm,
+                        );
+                        (dst & !LOW32) | (if r { LOW32 } else { 0 })
+                    }
+                    Sse::Sd => {
+                        let src = self.sse_rm(ctx, mem, 8)?;
+                        let imm = ctx.u8(mem)?;
+                        let r = crate::vex::cmp_pred_full(
+                            f64::from_bits(dst as u64),
+                            f64::from_bits(src as u64),
+                            imm,
+                        );
+                        (dst & !LOW64) | (if r { LOW64 } else { 0 })
+                    }
+                };
+                self.set_xmm(reg, out);
+            }
+
+            // ---- PINSRW (0F C4 ib) --------------------------------------
+            // Insert a 16-bit word from a GP register / m16 into the xmm lane
+            // selected by imm8 (66-prefixed XMM form; the bare-MMX form is
+            // handled by the MMX unit). The word source is the low 16 bits of
+            // the r/m operand (r32/m16).
+            0xC4 => {
+                let word = match ctx.rm {
+                    Rm::Reg(i) => self.state.gpr[i as usize & 0xf] as u16,
+                    Rm::Mem { .. } => {
+                        let mut b = [0u8; 2];
+                        mem.read(ctx.rm_addr(), &mut b)?;
+                        u16::from_le_bytes(b)
+                    }
+                };
+                let imm = ctx.u8(mem)?;
+                let lane = (imm & 7) as u128;
+                let dst = self.xmm(reg);
+                let mask = 0xFFFFu128 << (lane * 16);
+                let out = (dst & !mask) | ((word as u128) << (lane * 16));
                 self.set_xmm(reg, out);
             }
 

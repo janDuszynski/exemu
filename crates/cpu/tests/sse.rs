@@ -656,3 +656,70 @@ fn pmovzxbw_zero_extends_low_bytes() {
     assert_eq!((r >> 16) & 0xFFFF, 0x0001, "byte 0x01 → word 1");
     assert_eq!((r >> 48) & 0xFFFF, 0x00FF, "byte 0xFF → word 0x00FF (zero-ext)");
 }
+
+// ---- Legacy (non-VEX) CMPPS/CMPSS/CMPSD + PINSRW (0F C2 / 66 0F C4) ---------
+// These SSE1/SSE2 opcodes were decode-gaps until the W1 gate ntdll .text sweep
+// surfaced them (the VEX forms worked; the legacy forms fell through to a
+// Decode error). Pin the predicate/lane-mask + word-insert semantics.
+
+#[test]
+fn cmpps_eq_produces_lane_mask() {
+    // cmpps xmm0, xmm1, 0 (EQ): [eq, ne, eq, ne] → [~0, 0, ~0, 0] per 32-bit lane.
+    let code = [0x0F, 0xC2, 0xC1, 0x00, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        let a: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let b: [f32; 4] = [1.0, 9.0, 3.0, 9.0];
+        let pack = |v: [f32; 4]| {
+            (v[0].to_bits() as u128)
+                | ((v[1].to_bits() as u128) << 32)
+                | ((v[2].to_bits() as u128) << 64)
+                | ((v[3].to_bits() as u128) << 96)
+        };
+        cpu.state_mut().xmm[0] = pack(a);
+        cpu.state_mut().xmm[1] = pack(b);
+    });
+    let r = cpu.state().xmm[0];
+    assert_eq!(r as u32, 0xFFFF_FFFF, "lane0 1==1 → all ones");
+    assert_eq!((r >> 32) as u32, 0, "lane1 2!=9 → zero");
+    assert_eq!((r >> 64) as u32, 0xFFFF_FFFF, "lane2 3==3 → all ones");
+    assert_eq!((r >> 96) as u32, 0, "lane3 4!=9 → zero");
+}
+
+#[test]
+fn cmpss_scalar_preserves_upper_lanes() {
+    // cmpss xmm0, xmm1, 1 (LT): only the low 32-bit lane is compared/updated;
+    // the upper 96 bits of xmm0 are preserved.
+    let code = [0xF3, 0x0F, 0xC2, 0xC1, 0x01, 0xF4];
+    let upper: u128 = 0xAAAA_BBBB_CCCC_DDDD_1111_2222_0000_0000;
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = upper | (1.0f32.to_bits() as u128); // low = 1.0
+        cpu.state_mut().xmm[1] = 2.0f32.to_bits() as u128; // low = 2.0
+    });
+    let r = cpu.state().xmm[0];
+    assert_eq!(r as u32, 0xFFFF_FFFF, "1.0 < 2.0 → low lane all ones");
+    assert_eq!(r & !0xFFFF_FFFFu128, upper, "upper 96 bits preserved");
+}
+
+#[test]
+fn cmpsd_unordered_predicate() {
+    // cmpsd xmm0, xmm1, 3 (UNORD): true iff either operand is NaN.
+    let code = [0xF2, 0x0F, 0xC2, 0xC1, 0x03, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = f64::NAN.to_bits() as u128;
+        cpu.state_mut().xmm[1] = 1.0f64.to_bits() as u128;
+    });
+    assert_eq!(cpu.state().xmm[0] as u64, u64::MAX, "NaN is unordered → all ones");
+}
+
+#[test]
+fn pinsrw_inserts_word_at_selected_lane() {
+    // pinsrw xmm0, ecx, 3 (66 0F C4 /r ib) — insert cx into word lane 3.
+    let code = [0x66, 0x0F, 0xC4, 0xC1, 0x03, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = 0;
+        cpu.state_mut().gpr[1] = 0x1234_5678_9ABC_DEF0; // ecx low word = 0xDEF0
+    });
+    let r = cpu.state().xmm[0];
+    assert_eq!((r >> 48) & 0xFFFF, 0xDEF0, "word lane 3 = low 16 bits of ecx");
+    assert_eq!(r & 0xFFFF_FFFF_FFFF, 0, "other lanes untouched");
+}

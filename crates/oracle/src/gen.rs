@@ -986,11 +986,13 @@ fn build_sse(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
         8 => sse_int(rng),
         9 => sse_shift_imm(rng),
         10 => sse_shift_var(rng),
-        _ => match rng.below(5) {
+        _ => match rng.below(7) {
             0 => sse_shuffle(rng),
             1 => sse_pmovmskb(rng, bits),
             2 => sse_movmsk(rng, bits),
             3 => sse_pextrw(rng, bits),
+            4 => sse_cmp(rng),
+            5 => sse_pinsrw(rng, bits),
             _ => sse_cvt_dq(rng),
         },
     }
@@ -1234,6 +1236,34 @@ fn sse_shift_var(rng: &mut Rng) -> Trial {
     ]);
     let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
     Trial { xmm_nan: 0, ymm256: false, assert_upper_zero: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: vec![0x66, 0x0F, op2, modrm_reg(d, s)], defined_flags: 0, skip_reg: 0, subset_reg: 0, subset_ignore: 0, skip_mem: Vec::new(), label: name.into() }
+}
+
+/// Legacy (non-VEX) CMPPS/CMPPD/CMPSS/CMPSD (0F C2 ib). The imm predicate is
+/// restricted to the eight legacy encodings (0..7), which is all the legacy
+/// (SSE1/SSE2) form can express. The result is an all-ones/zero lane mask, so
+/// it is compared bit-exactly (no NaN-lane masking needed — a mask lane is
+/// exactly 0 or all-ones in both engines).
+fn sse_cmp(rng: &mut Rng) -> Trial {
+    let mp = rng.below(4) as u8; // ps / pd / ss / sd
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let imm = rng.below(8) as u8; // legacy predicates 0..7
+    let mut b = Vec::new();
+    sse_prefix(&mut b, mp, false);
+    b.extend([0x0F, 0xC2, modrm_reg(d, s), imm]);
+    Trial { xmm_nan: 0, ymm256: false, assert_upper_zero: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, subset_ignore: 0, skip_mem: Vec::new(), label: format!("cmp p{imm} {}", KIND[mp as usize]) }
+}
+
+/// PINSRW (66 0F C4 ib): insert a 16-bit word from a GP register into the xmm
+/// lane selected by imm8[2:0].
+fn sse_pinsrw(rng: &mut Rng, bits: Bits) -> Trial {
+    let rexw = bits == Bits::B64 && rng.boolean();
+    let (reg, rm) = (rng.below(8) as u8, rng.below(8) as u8); // reg = xmm dst, rm = GP src
+    let mut b = vec![0x66];
+    if rexw {
+        b.push(0x48);
+    }
+    b.extend([0x0F, 0xC4, modrm_reg(reg, rm), rng.below(8) as u8]);
+    Trial { xmm_nan: 0, ymm256: false, assert_upper_zero: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, subset_ignore: 0, skip_mem: Vec::new(), label: "pinsrw".into() }
 }
 
 fn sse_shuffle(rng: &mut Rng) -> Trial {

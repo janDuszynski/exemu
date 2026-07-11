@@ -67,8 +67,15 @@ pub(crate) fn f64_to_ext(x: f64) -> u128 {
             (e as u32, 0x8000_0000_0000_0000 | signif)
         }
     } else {
-        // Normal double: rebias exponent, restore the implicit integer bit.
-        let e = exp - 1023 + 16383;
+        // Normal double: rebias the exponent from the double bias (1023) to the
+        // extended bias (16383) and restore the implicit integer bit. `exp` is a
+        // normal double exponent here (1..=0x7fe), so the rebias is written as a
+        // single addition (`+15360`) rather than `exp - 1023 + 16383`: the latter
+        // underflows `u32` for any magnitude below 1.0 (biased exp < 1023, e.g.
+        // 0.5 → exp 1022), which panics in a debug/overflow-checked build even
+        // though the value is perfectly ordinary. The result always fits the
+        // 15-bit extended exponent field.
+        let e = exp + (16383 - 1023);
         let signif = 0x8000_0000_0000_0000 | (frac << 11);
         (e, signif)
     };

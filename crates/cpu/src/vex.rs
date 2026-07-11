@@ -1524,7 +1524,7 @@ fn cmp_pred(a: f64, b: f64, imm: u8) -> bool {
 }
 
 /// The unordered-equal predicate (0x08) must be true when either is NaN.
-fn pcmp_float(a: u128, b: u128, dbl: bool, imm: u8) -> u128 {
+pub(crate) fn pcmp_float(a: u128, b: u128, dbl: bool, imm: u8) -> u128 {
     let mut out = 0u128;
     if dbl {
         for l in 0..2 {
@@ -1547,7 +1547,7 @@ fn pcmp_float(a: u128, b: u128, dbl: bool, imm: u8) -> u128 {
 }
 
 /// Compare predicate with correct unordered handling for the 0x08 (EQ_UQ) case.
-fn cmp_pred_full(a: f64, b: f64, imm: u8) -> bool {
+pub(crate) fn cmp_pred_full(a: f64, b: f64, imm: u8) -> bool {
     match imm & 0x1F {
         0x08 => a == b || a.is_nan() || b.is_nan(), // EQ_UQ
         _ => cmp_pred(a, b, imm),

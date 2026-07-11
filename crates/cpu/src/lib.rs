@@ -520,3 +520,17 @@ mod vex;
 mod x87;
 
 pub use exec::{CpuidFeature, CpuidReg};
+
+/// True if `op2` (the byte after a `0F` escape) is a two-byte opcode the SSE
+/// unit decodes. Exposed for out-of-crate decode-coverage tooling (e.g. the W1
+/// ntdll `.text` decode sweep) so it can tell an implemented vector family from
+/// a privileged/system/undefined `0F` opcode.
+pub fn is_sse_opcode(op2: u8) -> bool {
+    sse::is_sse(op2)
+}
+
+/// True if `op2` (the byte after a `0F` escape) is a two-byte opcode the MMX
+/// unit decodes (bare-form MMX). Companion to [`is_sse_opcode`].
+pub fn is_mmx_opcode(op2: u8) -> bool {
+    mmx::is_mmx(op2)
+}
