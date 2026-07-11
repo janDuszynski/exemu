@@ -212,6 +212,35 @@ fn fdecstp_fincstp_decode() {
     assert_eq!(cpu.state().x87.top(), 0, "TOP back to 0 after dec+inc");
 }
 
+/// Regression: loading a normal `double` with magnitude below 1.0 (biased
+/// exponent < 1023, e.g. 0.5 → 1022, ln2 → 1022) must not underflow the
+/// double→extended exponent rebias. `f64_to_ext` computed `exp - 1023 + 16383`,
+/// which underflows `u32` for any such value and panics under debug/overflow
+/// checks — even though the value is a perfectly ordinary finite double. Found
+/// by the W1 ntdll `.text` decode sweep. FLD then FSTP must round-trip the exact
+/// bits for a range of sub-1.0 magnitudes (and their negatives).
+#[test]
+fn fld_fstp_sub_one_magnitude_no_exponent_underflow() {
+    // Ordinary sub-1.0 magnitudes down to ~1e-300 (the class the fix covers and
+    // that a modern toolchain's ntdll produces). Values within a few powers of
+    // two of the f64 denormal floor exercise a *separate* store-path scaling
+    // edge (documented follow-up) and are deliberately excluded here.
+    for v in [0.5_f64, -0.5, std::f64::consts::LN_2, 0.75, 0.1, -0.1, 1e-300, 2.5e-200] {
+        let mut m = mem();
+        m.write_u64(DATA, v.to_bits()).unwrap();
+        let mut code = vec![0x48, 0xB8];
+        code.extend_from_slice(&DATA.to_le_bytes()); // mov rax, DATA
+        code.extend_from_slice(&[0xDD, 0x00]); // fld qword [rax]
+        code.extend_from_slice(&[0xDD, 0x58, 0x08]); // fstp qword [rax+8]
+        run(&mut m, &code, 3);
+        assert_eq!(
+            f64::from_bits(m.read_u64(DATA + 8).unwrap()),
+            v,
+            "FLD/FSTP must round-trip {v} (magnitude < 1.0) without exponent underflow"
+        );
+    }
+}
+
 // Re-expose the crate's conversion for the tests via a tiny reimplementation
 // mirror (the crate keeps it private). Kept minimal: normal + zero paths.
 fn exemu_cpu_ext_to_f64(v: u128) -> f64 {
