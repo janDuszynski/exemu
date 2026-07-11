@@ -365,6 +365,12 @@ pub enum Api {
     RegEnumValue { wide: bool },
     RegQueryInfoKey,
 
+    /// Not an import: the `__wine_unix_call` fast-path thunk (roadmap W2.4). The
+    /// loader stores this thunk's address in ntdll's `__wine_unix_call_dispatcher`
+    /// pointer; the guest's indirect `call` lands here with RCX = unixlib handle,
+    /// EDX = code, R8 = args pointer. See [`crate::unixlib`].
+    WineUnixCall,
+
     /// Not an import: the sentinel return address pushed under the entry
     /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
@@ -895,7 +901,7 @@ impl Api {
             Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
             | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
             | Api::CrtNoop | Api::CrtGlobalPtr { .. } | Api::InittermDriver | Api::ReturnExit
-            | Api::ThreadTlsAttach | Api::ThreadStartEntry
+            | Api::WineUnixCall | Api::ThreadTlsAttach | Api::ThreadStartEntry
             | Api::Fputs | Api::Fputc | Api::Fwrite | Api::Puts | Api::EhProlog => 0,
             // Win32 string helpers.
             Api::CharNextA | Api::CharNextW | Api::LstrlenA | Api::LstrlenW => 1,
@@ -1537,6 +1543,14 @@ impl WinOs {
             Api::RaiseException => self.raise_exception(cpu, mem),
             Api::RtlUnwindEx => self.rtl_unwind_ex(cpu, mem),
             Api::ExceptionDriver => self.exc_advance(cpu, mem),
+
+            // The `__wine_unix_call` fast path (roadmap W2.4): dispatch to the
+            // native unixlib entry and return its NTSTATUS. An ordinary call —
+            // the intercept seam does the `ret` (see [`crate::unixlib`]).
+            Api::WineUnixCall => {
+                let status = self.wine_unix_call(cpu, mem)?;
+                ret(status as u64)
+            }
             Api::SetUnhandledExceptionFilter => {
                 let old = self.unhandled_filter;
                 self.unhandled_filter = self.arg(cpu, mem, 0)?;

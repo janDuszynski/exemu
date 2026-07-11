@@ -316,6 +316,13 @@ impl WinOs {
         self.ssdt.set(index, handler);
     }
 
+    /// Test-only: publish the guest RSP a native `Nt*` handler reads stack args
+    /// relative to, without driving a full `SYSCALL` through the interpreter.
+    #[cfg(test)]
+    pub(crate) fn set_syscall_guest_rsp_for_test(&mut self, rsp: u64) {
+        self.syscall_guest_rsp = rsp;
+    }
+
     /// Full NT-syscall dispatch (see the module note for the four phases).
     pub(crate) fn dispatch_syscall(
         &mut self,
