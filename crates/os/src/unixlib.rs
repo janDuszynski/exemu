@@ -64,11 +64,19 @@ pub(crate) const SSDT_NT_QUERY_VIRTUAL_MEMORY: u32 = 0x23;
 
 /// `STATUS_SUCCESS`.
 const STATUS_SUCCESS: u32 = 0x0000_0000;
+/// `STATUS_UNSUCCESSFUL` — generic "no result" (entry 1 has nothing to unwind).
+const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
 /// `STATUS_INVALID_PARAMETER` — bad handle / code / unknown info class.
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 /// `STATUS_INVALID_ADDRESS` — the queried base is not a registered unixlib
 /// module.
 const STATUS_INVALID_ADDRESS: u32 = 0xC000_0141;
+/// `STATUS_DLL_NOT_FOUND` — `load_so_dll` for a `.so` that does not exist in
+/// exemu's all-native-builtin personality.
+const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+/// `STATUS_NOT_IMPLEMENTED` — re-exported from [`crate::syscall`] for the
+/// unixlib stubs (`wine_server_call` until W2.11, `server_*_to_*`, `spawnvp`).
+use crate::syscall::STATUS_NOT_IMPLEMENTED;
 
 /// One native unixlib entry: it receives the packed `args` pointer (read from
 /// guest memory as its own typed struct) and returns an NTSTATUS. It runs on the
@@ -86,34 +94,126 @@ pub struct Unixlib {
     pub table: &'static [UnixEntry],
 }
 
-/// W2.4 placeholder ntdll unixlib table. W2.5 replaces this with the fixed
-/// 8-entry contract (`load_so_dll`, `unwind_builtin_dll`, `wine_dbg_write`,
-/// `wine_server_call`, `server_fd_to_handle`, `server_handle_to_fd`, `spawnvp`,
-/// `system_time_precise`). For now entry 0 is a live handler so the fast path is
-/// end-to-end testable; every other index is [`ntdll_unimplemented`].
-static NTDLL_UNIXLIB: &[UnixEntry] = &[ntdll_probe];
+/// The fixed **8-entry** ntdll unixlib table (roadmap W2.5). The order is the
+/// load-bearing contract — it is the `code` a PE `Nt*`/`Rtl*` stub passes to
+/// `__wine_unix_call` — and matches Wine 11.0's `enum ntdll_unix_funcs`
+/// (`dlls/ntdll/unixlib.h`), each index CONFIRMED against the pinned guest
+/// `ntdll.dll`'s `__wine_unix_call_dispatcher` call sites (the `mov edx,N`
+/// immediate): `RtlGetSystemTimePrecise` → code 7, the `__wine_dbg_write` stub
+/// → code 2, the wineserver path → code 3, etc.
+///
+/// ```text
+/// 0 load_so_dll            1 unwind_builtin_dll     2 wine_dbg_write
+/// 3 wine_server_call       4 server_fd_to_handle    5 server_handle_to_fd
+/// 6 spawnvp                7 system_time_precise
+/// ```
+///
+/// Entries ntdll init actually drives are live ([`system_time_precise`],
+/// [`wine_dbg_write`], [`wine_server_call`] routed to the object manager — a
+/// stub until W2.11); the rest are honest stubs that return a clean NTSTATUS so
+/// walking the whole table never faults (the W2.5 de-risk).
+static NTDLL_UNIXLIB: &[UnixEntry] = &[
+    load_so_dll,          // 0
+    unwind_builtin_dll,   // 1
+    wine_dbg_write,       // 2
+    wine_server_call,     // 3
+    server_fd_to_handle,  // 4
+    server_handle_to_fd,  // 5
+    spawnvp,              // 6
+    system_time_precise,  // 7
+];
 
-/// The W2.4 stand-in for ntdll unixlib entry 0. It reads a `u64` from the packed
-/// `args` block and returns it (mod 2^32) as the NTSTATUS, proving the marshalled
-/// three-arg ABI round-trips: the guest's `code`/`args` reached a Rust handler
-/// and its result flowed back to RAX. Replaced by the real entries in W2.5.
-fn ntdll_probe(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    if args == 0 {
-        return Ok(STATUS_SUCCESS);
-    }
-    Ok(mem.read_u64(args)? as u32)
+/// `unixlib_handle_t` code for `wine_server_call` (ntdll unixlib entry 3).
+/// Used by the [`crate::syscall`] `Nt*` sync handlers (W2.12) to route into the
+/// wineserver from the SSDT side, so the wire opcode lives in exactly one place.
+#[allow(dead_code)] // first consumer is the W2.12 Nt* sync handlers.
+pub(crate) const NTDLL_WINE_SERVER_CALL: u32 = 3;
+
+/// Entry 0 — `load_so_dll(params)`. On real Wine this `dlopen`s a native `.so`
+/// builtin (e.g. `winex11.drv`). exemu has no `.so`s — every builtin is native
+/// Rust registered up front via [`WinOs::register_unixlib`] — so there is
+/// nothing to load. Returning `STATUS_DLL_NOT_FOUND` is the honest answer for a
+/// `.so` that does not exist in this personality; the PE loader falls back to
+/// the PE image, which is exactly what we want.
+fn load_so_dll(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory, _args: u64) -> Result<u32> {
+    Ok(STATUS_DLL_NOT_FOUND)
 }
 
-/// Handler for an unimplemented ntdll unixlib slot (used once W2.5 installs the
-/// full table for indices with no behavior yet).
-#[allow(dead_code)] // first user is the W2.5 8-entry table.
-pub(crate) fn ntdll_unimplemented(
-    _os: &mut WinOs,
-    _cpu: &mut CpuState,
-    _mem: &mut dyn Memory,
-    _args: u64,
-) -> Result<u32> {
-    Ok(crate::syscall::STATUS_NOT_IMPLEMENTED)
+/// Entry 1 — `unwind_builtin_dll(params)`. Drives host (libunwind) DWARF unwind
+/// through a native builtin's frames during exception dispatch. exemu's builtins
+/// are Rust with no guest-visible DWARF frames to walk, so there is nothing to
+/// unwind here: report "no more frames" cleanly. (Guest PE unwind is the SEH /
+/// `.pdata` path, handled elsewhere — not this entry.)
+fn unwind_builtin_dll(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory, _args: u64) -> Result<u32> {
+    Ok(STATUS_UNSUCCESSFUL)
+}
+
+/// Entry 2 — `wine_dbg_write(params)`. The `params` block is
+/// `{ const char *str; SIZE_T len; }` (confirmed from the pinned
+/// `__wine_dbg_write` stub: it stores the caller's string pointer at `rsp+0x20`
+/// and the length at `rsp+0x28`, then passes `r8 = rsp+0x20`, `edx = 2`). Copy
+/// the bytes out of guest memory to the host trace sink and return the number of
+/// bytes written (Wine's `write()`-shaped return).
+fn wine_dbg_write(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
+    if args == 0 {
+        return Ok(0);
+    }
+    let str_ptr = mem.read_u64(args)?;
+    let len = mem.read_u64(args + 8)? as usize;
+    if str_ptr == 0 || len == 0 {
+        return Ok(0);
+    }
+    // Bound the copy so a mis-marshalled length can't allocate unboundedly.
+    let n = len.min(0x1_0000);
+    let mut buf = vec![0u8; n];
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = mem.read_u8(str_ptr + i as u64)?;
+    }
+    os.wine_dbg_sink(&buf);
+    Ok(n as u32)
+}
+
+/// Entry 3 — `wine_server_call(params)`. `params` is a pointer to the guest's
+/// `__server_request_info`; the call routes into exemu's in-process object
+/// manager (the wineserver equivalent, W2.11) and the NTSTATUS lands back in the
+/// request's `reply_header.error`. Until W2.11 lands the object manager this is
+/// a stub returning `STATUS_NOT_IMPLEMENTED`, per the W2.5 scope.
+fn wine_server_call(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
+    os.wine_server_call(args, mem)
+}
+
+/// Entry 4 — `server_fd_to_handle(params)`. Wraps a host unix fd as a server
+/// object handle (used for `NtCreateFile` of already-open fds, sockets, etc.).
+/// No host-fd passing exists in exemu's in-process model yet; report the clean
+/// "not supported here" status until the fs/section work needs it.
+fn server_fd_to_handle(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory, _args: u64) -> Result<u32> {
+    Ok(STATUS_NOT_IMPLEMENTED)
+}
+
+/// Entry 5 — `server_handle_to_fd(params)`. The inverse of entry 4: unwraps a
+/// server object handle to a host unix fd. Same in-process-model gap; honest
+/// stub until a caller (real file/socket I/O) needs it.
+fn server_handle_to_fd(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory, _args: u64) -> Result<u32> {
+    Ok(STATUS_NOT_IMPLEMENTED)
+}
+
+/// Entry 6 — `spawnvp(params)`. Wine uses this to launch a host helper process
+/// (e.g. the `wineserver` binary, or a native tool). exemu is self-contained and
+/// spawns no host processes, so this is unsupported by design.
+fn spawnvp(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory, _args: u64) -> Result<u32> {
+    Ok(STATUS_NOT_IMPLEMENTED)
+}
+
+/// Entry 7 — `system_time_precise(params)`. `params` points at a single
+/// `LONGLONG` output (confirmed from `RtlGetSystemTimePrecise`: it passes
+/// `r8 = &out`, `edx = 7`, then reads the `LONGLONG` back from `[r8]`). Write the
+/// current wall-clock time as a FILETIME (100-ns ticks since 1601), the same
+/// host clock `os/time.rs` reports, and return success.
+fn system_time_precise(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
+    if args != 0 {
+        mem.write_u64(args, crate::time::filetime_now())?;
+    }
+    Ok(STATUS_SUCCESS)
 }
 
 impl WinOs {
@@ -146,6 +246,30 @@ impl WinOs {
     /// `MemoryWineUnixFuncs` query arm.
     pub(crate) fn unixlib_handle_of(&self, module_base: u64) -> Option<u64> {
         self.unixlib_of_module.get(&module_base).copied()
+    }
+
+    /// The host trace sink for `wine_dbg_write` (ntdll unixlib entry 2). Wine's
+    /// `TRACE`/`FIXME`/`ERR` channels funnel their formatted bytes here. Emit to
+    /// host stderr when tracing is enabled; otherwise swallow them (a chatty
+    /// guest must not spam a non-trace run). The bytes are already
+    /// caller-formatted; we do not re-interpret them.
+    pub(crate) fn wine_dbg_sink(&mut self, bytes: &[u8]) {
+        if self.cfg.trace {
+            eprint!("[wine] {}", String::from_utf8_lossy(bytes));
+        }
+    }
+
+    /// Route `wine_server_call` (ntdll unixlib entry 3) into the in-process
+    /// object manager. `req` points at the guest's `__server_request_info`; the
+    /// resulting NTSTATUS is both returned (into RAX for the fast path) and, on a
+    /// real call, written into the request's `reply_header.error`.
+    ///
+    /// The object manager and the wire-struct decode land in **W2.11**; until
+    /// then this is an honest stub returning `STATUS_NOT_IMPLEMENTED` so ntdll
+    /// init walks the table without faulting. `_req`/`_mem` are already threaded
+    /// so the W2.11 change is a body-only edit.
+    pub(crate) fn wine_server_call(&mut self, _req: u64, _mem: &mut dyn Memory) -> Result<u32> {
+        Ok(STATUS_NOT_IMPLEMENTED)
     }
 
     /// The `__wine_unix_call` fast path: dispatch `code` in `unixlibs[handle]`
@@ -248,10 +372,11 @@ mod tests {
     }
 
     /// A PE DLL obtains its unixlib array via the `MemoryWineUnixFuncs` query,
-    /// then calls entry 0 through the `__wine_unix_call` fast path and gets the
-    /// Rust handler's result (the W2.4 de-risk).
+    /// then calls a live entry (7, `system_time_precise`) through the
+    /// `__wine_unix_call` fast path and gets the Rust handler's result (the
+    /// W2.4/W2.5 de-risk: query → dispatch → result round-trips).
     #[test]
-    fn query_then_call_entry0() {
+    fn query_then_call_system_time_precise() {
         let mut mem = VirtualMemory::new();
         // Scratch page for the query out-buffer + the packed args block.
         mem.map_fixed(0x2_0000, 0x1000, exemu_core::Perm::RW, "scratch").unwrap();
@@ -270,15 +395,22 @@ mod tests {
         assert_eq!(handle, expected_handle, "query returns the registered handle");
         assert_eq!(mem.read_u64(ret_len).unwrap(), 8, "return_length written");
 
-        // --- 2. __wine_unix_call(handle, 0, args) → the Rust handler result. ---
+        // --- 2. __wine_unix_call(handle, 7, &out) → the clock, exactly as
+        // RtlGetSystemTimePrecise drives it (edx=7, r8=&out LONGLONG). ---
+        let host_before = crate::time::filetime_now();
         let args = 0x2_0200;
-        mem.write_u64(args, 0x1234_5678).unwrap();
         let mut cpu = CpuState::default();
         cpu.set_reg(Reg::Rcx, handle); // handle
-        cpu.set_reg(Reg::Rdx, 0); // code 0
-        cpu.set_reg(Reg::R8, args); // args ptr
+        cpu.set_reg(Reg::Rdx, 7); // code 7 = system_time_precise
+        cpu.set_reg(Reg::R8, args); // args = &out
         let status = os.wine_unix_call(&mut cpu, &mut mem).unwrap();
-        assert_eq!(status, 0x1234_5678, "entry 0 returned its Rust-computed result");
+        let host_after = crate::time::filetime_now();
+        assert_eq!(status, STATUS_SUCCESS, "system_time_precise succeeded");
+        let precise = mem.read_u64(args).unwrap();
+        assert!(
+            (host_before..=host_after).contains(&precise),
+            "system_time_precise {precise} within host clock bracket [{host_before}, {host_after}]",
+        );
     }
 
     /// Drive `nt_query_virtual_memory` with the SSDT ABI set up: process handle
@@ -311,8 +443,51 @@ mod tests {
         let mut cpu = CpuState::default();
         // Out-of-range handle.
         assert_eq!(os.dispatch_unix_call(h + 99, 0, 0, &mut cpu, &mut mem).unwrap(), STATUS_INVALID_PARAMETER);
-        // Valid handle, out-of-range code.
+        // Valid handle, out-of-range code (table has exactly 8 entries).
+        assert_eq!(os.dispatch_unix_call(h, 8, 0, &mut cpu, &mut mem).unwrap(), STATUS_INVALID_PARAMETER);
         assert_eq!(os.dispatch_unix_call(h, 999, 0, &mut cpu, &mut mem).unwrap(), STATUS_INVALID_PARAMETER);
+    }
+
+    /// The W2.5 de-risk: ntdll init walks **all 8** unixlib entries without
+    /// faulting, and each returns a clean NTSTATUS. Live entries (2/3/7) do their
+    /// real work; the rest are honest stubs. Codes 0..8 all dispatch; code 8 is
+    /// past the end and must degrade to STATUS_INVALID_PARAMETER.
+    #[test]
+    fn all_eight_entries_walk_without_faulting() {
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x3_0000, 0x1000, exemu_core::Perm::RW, "scratch").unwrap();
+        let mut os = os64();
+        let base = 0x7f00_0000;
+        let h = os.register_ntdll_unixlib(base);
+        let mut cpu = CpuState::default();
+
+        // Args block: for wine_dbg_write (2) it's {str, len}; for
+        // system_time_precise (7) it's a LONGLONG out slot. Both fit here.
+        let msg = 0x3_0100;
+        mem.write(msg, b"hi").unwrap();
+        let dbg_args = 0x3_0200;
+        mem.write_u64(dbg_args, msg).unwrap(); // str
+        mem.write_u64(dbg_args + 8, 2).unwrap(); // len
+        let time_args = 0x3_0300;
+
+        let expected = [
+            (0u32, STATUS_DLL_NOT_FOUND, 0u64),   // load_so_dll
+            (1, STATUS_UNSUCCESSFUL, 0),          // unwind_builtin_dll
+            (2, 2, dbg_args),                     // wine_dbg_write → bytes written
+            (3, STATUS_NOT_IMPLEMENTED, 0),       // wine_server_call (stub until W2.11)
+            (4, STATUS_NOT_IMPLEMENTED, 0),       // server_fd_to_handle
+            (5, STATUS_NOT_IMPLEMENTED, 0),       // server_handle_to_fd
+            (6, STATUS_NOT_IMPLEMENTED, 0),       // spawnvp
+            (7, STATUS_SUCCESS, time_args),       // system_time_precise
+        ];
+        for (code, want, args) in expected {
+            let got = os.dispatch_unix_call(h, code, args, &mut cpu, &mut mem).unwrap();
+            assert_eq!(got, want, "entry {code} returned an unexpected NTSTATUS");
+        }
+        // Entry 7 actually wrote the clock.
+        assert!(mem.read_u64(time_args).unwrap() > 0, "system_time_precise wrote a nonzero FILETIME");
+        // Past-the-end code degrades, never faults.
+        assert_eq!(os.dispatch_unix_call(h, 8, 0, &mut cpu, &mut mem).unwrap(), STATUS_INVALID_PARAMETER);
     }
 
     /// The query rejects an unregistered base and an unknown info class.
