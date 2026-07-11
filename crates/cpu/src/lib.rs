@@ -511,3 +511,5 @@ impl RegAt for CpuState {
 mod exec;
 mod sse;
 mod x87;
+
+pub use exec::{CpuidFeature, CpuidReg};

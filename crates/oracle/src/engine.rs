@@ -308,8 +308,23 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
         if trial.skip_reg & (1 << i) != 0 {
             continue;
         }
-        if a.gpr[i] & mask != b.gpr[i] & mask {
-            return Some(format!("{} exemu={:#x} unicorn={:#x}", exemu_core::Reg::NAMES[i], a.gpr[i] & mask, b.gpr[i] & mask));
+        let (av, bv) = (a.gpr[i] & mask, b.gpr[i] & mask);
+        if trial.subset_reg & (1 << i) != 0 {
+            // Subset policy (CPUID feature words): every bit exemu advertises
+            // must also be set by the reference. exemu may report *fewer* bits
+            // (an honest subset), but a bit set in exemu yet clear in the
+            // reference is a fabricated capability — a hard divergence.
+            let extra = av & !bv;
+            if extra != 0 {
+                return Some(format!(
+                    "{} exemu={:#x} unicorn={:#x} (exemu advertises bits {:#x} the reference lacks)",
+                    exemu_core::Reg::NAMES[i], av, bv, extra
+                ));
+            }
+            continue;
+        }
+        if av != bv {
+            return Some(format!("{} exemu={:#x} unicorn={:#x}", exemu_core::Reg::NAMES[i], av, bv));
         }
     }
     let fa = a.rflags & trial.defined_flags;

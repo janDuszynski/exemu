@@ -9,6 +9,42 @@ use super::*;
 use crate::alu::{self, Shift};
 use exemu_core::cpu::flags;
 
+/// Which of the four CPUID output registers a feature bit lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuidReg {
+    Eax,
+    Ebx,
+    Ecx,
+    Edx,
+}
+
+impl CpuidReg {
+    /// Select this register's value from a `(eax, ebx, ecx, edx)` CPUID result.
+    #[inline]
+    pub fn pick(self, r: (u32, u32, u32, u32)) -> u32 {
+        match self {
+            CpuidReg::Eax => r.0,
+            CpuidReg::Ebx => r.1,
+            CpuidReg::Ecx => r.2,
+            CpuidReg::Edx => r.3,
+        }
+    }
+}
+
+/// One advertised CPUID feature bit paired with a representative instruction
+/// that exercises it. Used by the "advertised ⊆ implemented" invariant test to
+/// prove every reported capability is one the decoder actually understands.
+#[derive(Debug, Clone, Copy)]
+pub struct CpuidFeature {
+    pub leaf: u32,
+    pub sub: u32,
+    pub reg: CpuidReg,
+    pub bit: u8,
+    pub name: &'static str,
+    /// A 64-bit encoding of an instruction that uses the feature.
+    pub probe: &'static [u8],
+}
+
 impl Interpreter {
     pub(crate) fn execute_one(&mut self, mem: &mut dyn Memory) -> Result<Exit> {
         let start = self.state.rip;
@@ -856,12 +892,29 @@ impl Interpreter {
     /// SSE-family baseline we *do* support steers it onto code we can run.
     fn cpuid(&mut self) {
         let leaf = self.state.gpr_read(0, 4) as u32;
+        let subleaf = self.state.gpr_read(1, 4) as u32;
+        let (eax, ebx, ecx, edx) = Self::cpuid_leaf(leaf, subleaf);
+        self.state.gpr_write(0, 4, eax as u64);
+        self.state.gpr_write(3, 4, ebx as u64);
+        self.state.gpr_write(1, 4, ecx as u64);
+        self.state.gpr_write(2, 4, edx as u64);
+    }
+
+    /// Pure CPUID: `(leaf, subleaf) -> (EAX, EBX, ECX, EDX)`. Kept
+    /// side-effect-free so the "advertised ⊆ implemented" invariant test can
+    /// enumerate every reported feature bit and cross-check it against the
+    /// decoder's actual capability table without hand-assembling `0F A2`.
+    ///
+    /// **Honesty invariant:** every feature bit set here MUST have its
+    /// instruction(s) implemented and oracle-clean. See [`Self::CPUID_FEATURES`]
+    /// for the machine-checkable bit→instruction map that guards this.
+    pub fn cpuid_leaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
         // Brand string returned by extended leaves 0x8000_0002..=0x8000_0004.
         const BRAND: &[u8; 48] = b"exemu virtual x86-64 CPU\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
         let brand_word = |i: usize| -> u32 {
             u32::from_le_bytes([BRAND[i], BRAND[i + 1], BRAND[i + 2], BRAND[i + 3]])
         };
-        let (eax, ebx, ecx, edx) = match leaf {
+        match leaf {
             // Standard: max leaf + "GenuineIntel" so feature detection that
             // keys off the vendor takes its Intel path (all we implement is
             // Intel-compatible). Max standard leaf is 0xD (XSAVE enumeration).
@@ -903,28 +956,92 @@ impl Interpreter {
             //   ECX>=2: per-component enumeration; none beyond x87+SSE ⇒ zero.
             // The x87+SSE standard area is the 512-byte legacy region plus the
             // 64-byte XSAVE header = 576 bytes.
-            0xD => {
-                let subleaf = self.state.gpr_read(1, 4) as u32;
-                match subleaf {
-                    0 => (XCR0_SUPPORTED as u32, 576, 576, (XCR0_SUPPORTED >> 32) as u32),
-                    _ => (0, 0, 0, 0),
-                }
-            }
-            // Extended: max extended leaf.
+            0xD => match subleaf {
+                0 => (XCR0_SUPPORTED as u32, 576, 576, (XCR0_SUPPORTED >> 32) as u32),
+                _ => (0, 0, 0, 0),
+            },
+            // Extended: max extended leaf. We implement the extended feature leaf
+            // (0x8000_0001) and the three brand-string leaves, so the highest
+            // extended leaf we answer honestly is 0x8000_0004.
             0x8000_0000 => (0x8000_0004, 0, 0, 0),
-            // Extended features: LZCNT/ABM (ECX bit 5), SYSCALL (EDX bit 11)
-            // and Long Mode (EDX bit 29) — all implemented.
-            0x8000_0001 => (0u32, 0, 1 << 5, (1 << 11) | (1 << 29)),
+            // Extended features: LZCNT/ABM (ECX bit 5), SYSCALL (EDX bit 11),
+            // RDTSCP (EDX bit 27, implemented since P1.8) and Long Mode
+            // (EDX bit 29) — all implemented.
+            0x8000_0001 => (0u32, 0, 1 << 5, (1 << 11) | (1 << 27) | (1 << 29)),
             0x8000_0002 => (brand_word(0), brand_word(4), brand_word(8), brand_word(12)),
             0x8000_0003 => (brand_word(16), brand_word(20), brand_word(24), brand_word(28)),
             0x8000_0004 => (brand_word(32), brand_word(36), brand_word(40), brand_word(44)),
             _ => (0, 0, 0, 0),
-        };
-        self.state.gpr_write(0, 4, eax as u64);
-        self.state.gpr_write(3, 4, ebx as u64);
-        self.state.gpr_write(1, 4, ecx as u64);
-        self.state.gpr_write(2, 4, edx as u64);
+        }
     }
+
+    /// The machine-checkable "advertised ⊆ implemented" table.
+    ///
+    /// Every capability **feature bit** the interpreter advertises through
+    /// [`Self::cpuid_leaf`] appears here paired with a representative instruction
+    /// that exercises it. The invariant test ([`cpu/tests/cpuid.rs`]) executes
+    /// each `probe` and asserts the interpreter neither [`EmuError::Decode`]s nor
+    /// [`EmuError::Unsupported`]s it, then cross-checks that **every** advertised
+    /// feature-flag bit in the guarded words is covered by an entry — so a future
+    /// step cannot flip a CPUID bit on (SSSE3/SSE4/AVX/BMI in W1.4–W1.6) without
+    /// also landing its decoder support and adding its probe here. The words it
+    /// guards are the pure feature-flag registers: leaf 1 ECX/EDX, leaf 7.0
+    /// EBX/ECX/EDX, and leaf 0x8000_0001 ECX/EDX. (Structural fields — max-leaf,
+    /// vendor, family, XSAVE sizes, brand string — are not feature flags and are
+    /// excluded from the coverage cross-check.)
+    ///
+    /// `probe` is a **64-bit** encoding; the invariant test runs it in long mode.
+    pub const CPUID_FEATURES: &'static [CpuidFeature] = &[
+        // ---- leaf 1, EDX -----------------------------------------------------
+        // bit 0: FPU (x87). FNINIT.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 0, name: "x87", probe: &[0x9B, 0xDB, 0xE3] },
+        // bit 4: TSC. RDTSC.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 4, name: "tsc", probe: &[0x0F, 0x31] },
+        // bit 15: CMOV. CMOVE r32, r/m32.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 15, name: "cmov", probe: &[0x0F, 0x44, 0xC1] },
+        // bit 24: FXSR. FXSAVE [rax] (needs a mapped operand — the probe maps it).
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 24, name: "fxsr", probe: &[0x0F, 0xAE, 0x00] },
+        // bit 25: SSE. MOVAPS xmm0, xmm1.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 25, name: "sse", probe: &[0x0F, 0x28, 0xC1] },
+        // bit 26: SSE2. MOVAPD xmm0, xmm1 (66 0F 28).
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 26, name: "sse2", probe: &[0x66, 0x0F, 0x28, 0xC1] },
+        // ---- leaf 1, ECX -----------------------------------------------------
+        // bit 23: POPCNT. POPCNT r32, r/m32 (F3 0F B8).
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 23, name: "popcnt", probe: &[0xF3, 0x0F, 0xB8, 0xC1] },
+        // bit 26: XSAVE. XSAVE [rax] (0F AE /4) — the probe maps the operand.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 26, name: "xsave", probe: &[0x0F, 0xAE, 0x20] },
+        // bit 27: OSXSAVE. XGETBV (0F 01 D0) reads XCR0 — the OS-enabled path.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 27, name: "osxsave", probe: &[0x0F, 0x01, 0xD0] },
+        // ---- leaf 0x8000_0001, ECX ------------------------------------------
+        // bit 5: LZCNT/ABM. LZCNT r32, r/m32 (F3 0F BD).
+        CpuidFeature { leaf: 0x8000_0001, sub: 0, reg: CpuidReg::Ecx, bit: 5, name: "lzcnt", probe: &[0xF3, 0x0F, 0xBD, 0xC1] },
+        // ---- leaf 0x8000_0001, EDX ------------------------------------------
+        // bit 11: SYSCALL. (Routed to the syscall layer, not #UD — a decode of
+        // the two SYSCALL bytes must not fault at the decoder.)
+        CpuidFeature { leaf: 0x8000_0001, sub: 0, reg: CpuidReg::Edx, bit: 11, name: "syscall", probe: &[0x0F, 0x05] },
+        // bit 27: RDTSCP (0F 01 F9) — implemented since P1.8 (EDX:EAX = TSC,
+        // ECX = IA32_TSC_AUX = 0).
+        CpuidFeature { leaf: 0x8000_0001, sub: 0, reg: CpuidReg::Edx, bit: 27, name: "rdtscp", probe: &[0x0F, 0x01, 0xF9] },
+        // bit 29: Long Mode. CDQE (REX.W 98) is a 64-bit-only encoding.
+        CpuidFeature { leaf: 0x8000_0001, sub: 0, reg: CpuidReg::Edx, bit: 29, name: "long-mode", probe: &[0x48, 0x98] },
+    ];
+
+    /// The set of CPUID (leaf, sub, register) words that are **feature-flag
+    /// words** whose every advertised bit must be covered by [`Self::CPUID_FEATURES`].
+    /// Pairs with the table above so the invariant test can prove *completeness*
+    /// (no advertised bit is un-probed) as well as *soundness* (every probe
+    /// decodes). Leaf 7.0's EBX/ECX/EDX are here too: exemu advertises none, so
+    /// the "all bits covered" check is trivially satisfied and stays that way
+    /// until a future step both flips a bit and adds its probe.
+    pub const CPUID_FEATURE_WORDS: &'static [(u32, u32, CpuidReg)] = &[
+        (1, 0, CpuidReg::Ecx),
+        (1, 0, CpuidReg::Edx),
+        (7, 0, CpuidReg::Ebx),
+        (7, 0, CpuidReg::Ecx),
+        (7, 0, CpuidReg::Edx),
+        (0x8000_0001, 0, CpuidReg::Ecx),
+        (0x8000_0001, 0, CpuidReg::Edx),
+    ];
 
     /// Build the 512-byte FXSAVE / XSAVE legacy area from the current x87 + SSE
     /// state, per the Intel SDM "FXSAVE Area" layout:
