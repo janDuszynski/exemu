@@ -316,6 +316,12 @@ pub enum Exit {
     Halted,
     /// A software interrupt `int n` was raised.
     Interrupt(u8),
+    /// A native `SYSCALL` (`0F 05`) was executed. The payload is the SSDT index
+    /// (`eax` at the point of the instruction). The hardware side-effects are
+    /// already applied by the interpreter (return `rip`→`rcx`, `rflags`→`r11`,
+    /// `rip` advanced past the instruction); the OS layer's [`Hooks::syscall`]
+    /// services it. See roadmap W2.2.
+    Syscall(u32),
     /// The guest asked the OS layer to terminate with this exit code.
     ProcessExit(i32),
 }

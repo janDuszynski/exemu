@@ -1317,10 +1317,18 @@ impl Interpreter {
             return Ok(None);
         }
         match op2 {
-            // SYSCALL — surfaced as a distinguished interrupt for the OS loop.
+            // SYSCALL (0F 05) — apply the hardware side-effects here and hand
+            // the SSDT index (eax) to the OS layer's syscall seam (roadmap
+            // W2.2). Hardware: RIP of the next instruction → RCX, RFLAGS → R11,
+            // RIP ← the SYSCALL target (here: past the instruction; the OS
+            // dispatcher runs natively). Nothing is pushed to the guest stack.
             0x05 => {
-                self.state.rip = ctx.cur;
-                return Ok(Some(Exit::Interrupt(0x80)));
+                let ret_rip = ctx.cur;
+                self.state.set_reg(exemu_core::Reg::Rcx, ret_rip);
+                self.state.set_reg(exemu_core::Reg::R11, self.state.rflags);
+                self.state.rip = ret_rip;
+                let index = self.state.gpr_read(exemu_core::Reg::Rax as u8, 4) as u32;
+                return Ok(Some(Exit::Syscall(index)));
             }
             // UD2
             0x0B => return Err(EmuError::Unsupported(format!("ud2 at {start:#x}"))),
