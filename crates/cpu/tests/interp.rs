@@ -1312,3 +1312,80 @@ fn smc_rep_movs_into_code_bumps_gen_per_write() {
     assert_eq!(mem.code_generation() - gen0, 4);
     assert_eq!(mem.code_page_generation(dst) - page0, 4);
 }
+
+/// A native `SYSCALL` (`0F 05`) must route to `Hooks::syscall` carrying the
+/// SSDT index (eax), with the hardware context already applied: the return
+/// address in RCX, the flags snapshot in R11, and RIP advanced past the two
+/// SYSCALL bytes (roadmap W2.2).
+#[test]
+fn syscall_routes_to_hook_with_context() {
+    use exemu_core::hooks::Hooks;
+    use exemu_core::{CpuState, Reg, Result};
+
+    // A test dispatcher standing in for the OS syscall seam. It records the
+    // SSDT index and the RCX/R11 the interpreter set, then writes a sentinel
+    // NTSTATUS into RAX and resumes the guest (Exit::Continue) — exactly the
+    // shape the real dispatcher will use.
+    struct SyscallSpy {
+        index: Option<u32>,
+        rcx: u64,
+        r11: u64,
+    }
+    impl Hooks for SyscallSpy {
+        fn intercept(&mut self, _: u64, _: &mut CpuState, _: &mut dyn Memory) -> Result<Option<Exit>> {
+            Ok(None)
+        }
+        fn syscall(&mut self, index: u32, cpu: &mut CpuState, _: &mut dyn Memory) -> Result<Exit> {
+            self.index = Some(index);
+            self.rcx = cpu.reg(Reg::Rcx);
+            self.r11 = cpu.reg(Reg::R11);
+            cpu.set_reg(Reg::Rax, 0xC000_0001); // sentinel NTSTATUS
+            Ok(Exit::Continue)
+        }
+    }
+
+    // mov r10, rcx ; mov eax, 0x42 ; syscall ; hlt  — the canonical Wine stub
+    // shape (arg0 relayed rcx→r10, index in eax, raw 0F 05).
+    let code = [
+        0x49, 0x89, 0xCA, // mov r10, rcx
+        0xB8, 0x42, 0x00, 0x00, 0x00, // mov eax, 0x42
+        0x0F, 0x05, // syscall
+        0xF4, // hlt
+    ];
+    let syscall_rip = CODE_BASE + 8; // offset of the 0F 05 bytes
+    let ret_rip = CODE_BASE + 10; // first byte past the SYSCALL
+
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, &code).unwrap();
+
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = CODE_BASE;
+    cpu.state_mut().set_rsp(STACK_TOP);
+    // Seed a distinctive RFLAGS so the R11 snapshot is checkable.
+    cpu.state_mut().rflags |= flags::CF;
+    let flags_before = cpu.state().rflags;
+
+    let mut spy = SyscallSpy { index: None, rcx: 0, r11: 0 };
+    let mut halted = false;
+    for _ in 0..100 {
+        if let Exit::Halted = cpu.step(&mut mem, &mut spy).unwrap() {
+            halted = true;
+            break;
+        }
+    }
+    assert!(halted, "guest must reach the hlt after the syscall resumes");
+
+    assert_eq!(spy.index, Some(0x42), "hook must receive the SSDT index (eax)");
+    assert_eq!(spy.rcx, ret_rip, "SYSCALL must place the return RIP in RCX");
+    assert_eq!(spy.r11, flags_before, "SYSCALL must snapshot RFLAGS into R11");
+    assert_eq!(
+        cpu.state().reg(Reg::R10),
+        0, // rcx was 0 at entry, relayed into r10 by the stub
+        "the stub's mov r10, rcx must have executed before the syscall"
+    );
+    assert_eq!(cpu.state().rip, ret_rip, "guest resumed at RCX (the byte past the SYSCALL, i.e. the hlt)");
+    assert_eq!(cpu.state().reg(Reg::Rax), 0xC000_0001, "handler's NTSTATUS lands in RAX");
+    let _ = syscall_rip;
+}

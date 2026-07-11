@@ -485,15 +485,18 @@ impl Process {
                 Ok(Exit::Continue) => steps += 1,
                 Ok(Exit::ProcessExit(code)) => break code,
                 Ok(Exit::Halted) => break 0,
-                Ok(Exit::Interrupt(0x80)) => {
+                Ok(Exit::Interrupt(n)) => {
+                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &tail()));
+                }
+                // A native SYSCALL is serviced inside `Cpu::step` (the OS layer's
+                // syscall seam, roadmap W2.2); an unserviced one surfaces here as
+                // `Interrupt(0x80)` from the default hook, not as `Syscall`.
+                Ok(Exit::Syscall(index)) => {
                     return Err(self.fault(
-                        EmuError::Unsupported("direct SYSCALL instruction (no syscall layer emulated)".into()),
+                        EmuError::Os(format!("SYSCALL {index:#x} escaped the dispatcher")),
                         steps,
                         &tail(),
                     ));
-                }
-                Ok(Exit::Interrupt(n)) => {
-                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &tail()));
                 }
                 Err(e) => return Err(self.fault(e, steps, &tail())),
             }

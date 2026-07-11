@@ -28,6 +28,25 @@ pub trait Hooks {
         cpu: &mut CpuState,
         mem: &mut dyn Memory,
     ) -> Result<Option<Exit>>;
+
+    /// Called when the guest executes a native `SYSCALL` (`0F 05`). This is the
+    /// NT-syscall seam: Wine's PE ntdll `Nt*` stubs issue a raw `SYSCALL` whose
+    /// `eax` holds the SSDT index (`index` here); the OS layer indexes the
+    /// service table and runs the native handler (roadmap W2.2/W2.3).
+    ///
+    /// By the time this is called the interpreter has already applied the
+    /// hardware side-effects: return `rip` is in `rcx`, `rflags` is in `r11`,
+    /// and `cpu.rip` points at the instruction *after* the `SYSCALL`. The
+    /// handler reads its arguments from `r10`/`rdx`/`r8`/`r9` (+ the stack for
+    /// args 5+), writes its NTSTATUS to `rax`, and returns an [`Exit`] (normally
+    /// [`Exit::Continue`], which resumes the guest at `rcx`).
+    ///
+    /// The default surfaces the syscall unserviced so a bare CPU (with no OS)
+    /// still terminates cleanly rather than silently swallowing it.
+    fn syscall(&mut self, index: u32, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<Exit> {
+        let _ = index;
+        Ok(Exit::Interrupt(0x80))
+    }
 }
 
 /// A no-op hook, handy for tests that run raw machine code with no OS.

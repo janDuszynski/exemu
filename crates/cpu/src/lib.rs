@@ -132,7 +132,13 @@ impl Cpu for Interpreter {
         if let Some(exit) = hooks.intercept(self.state.rip, &mut self.state, mem)? {
             return Ok(exit);
         }
-        self.execute_one(mem)
+        // A native SYSCALL (0F 05) is executed by `execute_one` (which applies
+        // the hardware side-effects and reads the SSDT index) and then routed to
+        // the OS layer's syscall seam here (roadmap W2.2).
+        match self.execute_one(mem)? {
+            Exit::Syscall(index) => hooks.syscall(index, &mut self.state, mem),
+            other => Ok(other),
+        }
     }
 }
 
