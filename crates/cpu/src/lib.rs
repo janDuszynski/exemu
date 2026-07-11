@@ -332,9 +332,9 @@ impl Interpreter {
                 // override (e.g. `gs:[disp32]` for TEB / stack-probe access).
                 let disp = ctx.u32(mem)? as i32 as i64;
                 if ctx.pfx.seg == 0x65 {
-                    base = base.wrapping_add(GS_BASE);
+                    base = base.wrapping_add(self.state.gs_base);
                 } else if ctx.pfx.seg == 0x64 {
-                    base = base.wrapping_add(fs_base(ctx.bits));
+                    base = base.wrapping_add(self.fs_base(ctx.bits));
                 }
                 ctx.rm = Rm::Mem { base, disp, rip_rel: false };
                 return Ok(());
@@ -347,9 +347,9 @@ impl Interpreter {
             let rip_rel = ctx.bits == Bits::B64;
             let mut base = 0u64;
             if ctx.pfx.seg == 0x65 {
-                base = GS_BASE;
+                base = self.state.gs_base;
             } else if ctx.pfx.seg == 0x64 {
-                base = fs_base(ctx.bits);
+                base = self.fs_base(ctx.bits);
             }
             ctx.rm = Rm::Mem { base, disp, rip_rel };
             return Ok(());
@@ -369,9 +369,9 @@ impl Interpreter {
         // from a per-thread base the OS installs at reg-slot None. For the
         // common `gs:[0x60]` PEB probe the OS maps a page at GS_BASE.
         if ctx.pfx.seg == 0x65 {
-            base = base.wrapping_add(GS_BASE);
+            base = base.wrapping_add(self.state.gs_base);
         } else if ctx.pfx.seg == 0x64 {
-            base = base.wrapping_add(fs_base(ctx.bits));
+            base = base.wrapping_add(self.fs_base(ctx.bits));
         }
 
         ctx.rm = Rm::Mem { base, disp, rip_rel: false };
@@ -495,16 +495,30 @@ impl Interpreter {
 /// TEB lives at [`GS_BASE`] (`gs:[0x30]`/`gs:[0x60]`); in 32-bit mode it lives
 /// at [`FS_BASE_32`] (`fs:[0x18]`/`fs:[0x30]`), which must be a 32-bit
 /// address. The OS layer maps matching pages. All are public so it can.
-pub const GS_BASE: u64 = 0x0000_7FFF_0000_0000;
+///
+/// These are the process's **initial** bases. The `gs` base (64-bit TEB) and
+/// the 32-bit `fs` base are **per-thread** as of roadmap W2.9: they live on
+/// [`CpuState::gs_base`]/[`CpuState::fs_base`] so the scheduler saves/loads
+/// them across a context switch and each thread reads its own TEB. `GS_BASE`
+/// mirrors [`exemu_core::cpu::DEFAULT_GS_BASE`]; `FS_BASE_32` mirrors
+/// [`exemu_core::cpu::DEFAULT_FS_BASE`] (kept in sync by a debug assertion in
+/// [`Interpreter::fs_base`]). `FS_BASE` (the 64-bit `fs` base) is unused by
+/// Windows guests and stays a fixed const.
+pub const GS_BASE: u64 = exemu_core::cpu::DEFAULT_GS_BASE;
 pub const FS_BASE: u64 = 0x0000_7FFE_0000_0000;
-pub const FS_BASE_32: u64 = 0x7EFD_0000;
+pub const FS_BASE_32: u64 = exemu_core::cpu::DEFAULT_FS_BASE;
 
-/// The FS segment base for the current mode.
-#[inline]
-fn fs_base(bits: Bits) -> u64 {
-    match bits {
-        Bits::B32 => FS_BASE_32,
-        Bits::B64 => FS_BASE,
+impl Interpreter {
+    /// The FS segment base for the current mode. In 32-bit mode this is the
+    /// current thread's TEB — a per-thread value carried on
+    /// [`CpuState::fs_base`] (roadmap W2.9). In 64-bit mode `fs` is unused by
+    /// Windows guests, so it stays the fixed [`FS_BASE`] const.
+    #[inline]
+    fn fs_base(&self, bits: Bits) -> u64 {
+        match bits {
+            Bits::B32 => self.state.fs_base,
+            Bits::B64 => FS_BASE,
+        }
     }
 }
 

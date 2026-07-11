@@ -29,6 +29,55 @@ const STILL_ACTIVE: u32 = 259;
 const THREAD_STACK_SIZE: u64 = 0x0010_0000; // 1 MiB default per thread
 const TIMESLICE: u64 = 50_000; // instructions between preemptive yields
 
+/// Size of a per-thread TEB region. Matches the app's main-thread TEB region:
+/// the x64 TEB struct reaches ~0x1838 (its inline `TlsSlots[64]` sit at 0x1480,
+/// `TlsExpansionSlots` at 0x1780), and the NT-syscall dispatcher parks this
+/// thread's `syscall_frame` in the tail — 0x2000 covers both.
+const THREAD_TEB_SIZE: u64 = 0x2000;
+
+/// x64 TEB field offsets Wine's PE `ntdll` walks (public `winternl.h`/NT_TIB
+/// layout; confirmed against the pinned guest binary's `gs:`-relative reads).
+/// The fields this step seeds so a spawned thread's TEB is walkable without a
+/// fault (roadmap W2.9); the remaining ~30 fields are completed in W2.10.
+mod teb64 {
+    pub const NT_TIB_EXCEPTION_LIST: u64 = 0x000; // NtTib.ExceptionList (-1 = end)
+    pub const NT_TIB_STACK_BASE: u64 = 0x008; // NtTib.StackBase
+    pub const NT_TIB_STACK_LIMIT: u64 = 0x010; // NtTib.StackLimit
+    pub const NT_TIB_SELF: u64 = 0x030; // NtTib.Self → the TEB itself
+    pub const CLIENT_ID_PROCESS: u64 = 0x040; // ClientId.UniqueProcess
+    pub const CLIENT_ID_THREAD: u64 = 0x048; // ClientId.UniqueThread
+    pub const TLS_POINTER: u64 = 0x058; // ThreadLocalStoragePointer
+    pub const PEB: u64 = 0x060; // ProcessEnvironmentBlock
+    pub const STATIC_UNICODE_STRING: u64 = 0x0B8; // UNICODE_STRING {Len, MaxLen, +pad, Buffer}
+    pub const STATIC_UNICODE_BUFFER: u64 = 0x0C8; // WCHAR[261] backing buffer
+    pub const COUNT_OF_OWNED_CRIT_SECS: u64 = 0x6C8; // CountOfOwnedCriticalSections (ULONG)
+
+    /// `MaximumLength` of `StaticUnicodeString` — 261 WCHARs (the documented
+    /// `STATIC_UNICODE_BUFFER_LENGTH`), in bytes.
+    pub const STATIC_UNICODE_MAX_BYTES: u16 = 261 * 2;
+}
+
+/// 32-bit TEB field offsets (NT_TIB smaller-pointer layout) for the fields this
+/// step seeds. The 32-bit TEB lives behind `fs:`.
+mod teb32 {
+    pub const NT_TIB_EXCEPTION_LIST: u64 = 0x000;
+    pub const NT_TIB_STACK_BASE: u64 = 0x004;
+    pub const NT_TIB_STACK_LIMIT: u64 = 0x008;
+    pub const NT_TIB_SELF: u64 = 0x018;
+    pub const CLIENT_ID_PROCESS: u64 = 0x020;
+    pub const CLIENT_ID_THREAD: u64 = 0x024;
+    pub const TLS_POINTER: u64 = 0x02C;
+    pub const PEB: u64 = 0x030;
+    pub const STATIC_UNICODE_STRING: u64 = 0x0AC; // {Len u16, MaxLen u16, Buffer ptr}
+    pub const STATIC_UNICODE_BUFFER: u64 = 0x0B4;
+    pub const COUNT_OF_OWNED_CRIT_SECS: u64 = 0x38C;
+    pub const STATIC_UNICODE_MAX_BYTES: u16 = 261 * 2;
+}
+
+/// Fixed process id reported through `ClientId.UniqueProcess` (matches
+/// `GetCurrentProcessId`).
+const PROCESS_ID: u64 = 0x1000;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadState {
     Ready,
@@ -59,6 +108,16 @@ pub(crate) struct Thread {
     /// thread's stack, which the application maps and owns).
     pub stack_base: u64,
     pub stack_size: u64,
+    /// Base of this thread's own TEB region (the value the CPU uses as the `gs`
+    /// segment base while this thread runs, so `gs:[…]` reads *this* thread's
+    /// TEB — roadmap W2.9). The main thread reuses the app-mapped
+    /// `cfg.teb_base`; every spawned thread gets a fresh region seeded by
+    /// [`WinOs::seed_teb`]. The NT-syscall dispatcher also parks this thread's
+    /// `syscall_frame` in the tail of this region.
+    pub teb_base: u64,
+    /// Owned TEB region `[teb_base, teb_base+teb_size)` to unmap on teardown
+    /// (0 for the main thread, whose TEB the app owns).
+    pub teb_owned: u64,
     pub suspend_count: u32,
     pub wait: Option<WaitDesc>,
     tls: HashMap<u64, u64>,
@@ -88,6 +147,8 @@ impl Thread {
             exit_code: STILL_ACTIVE,
             stack_base: 0,
             stack_size: 0,
+            teb_base: 0,
+            teb_owned: 0,
             suspend_count: 0,
             wait: None,
             tls: HashMap::new(),
@@ -207,22 +268,112 @@ impl WinOs {
         self.threads.iter().position(|t| t.handle == handle && handle != 0)
     }
 
+    // ---- per-thread TEB --------------------------------------------------
+
+    /// Seed a full Wine-walkable TEB at `teb_base` for a thread with id `tid`
+    /// running over stack `[stack_base, stack_top)` (roadmap W2.9).
+    ///
+    /// Writes the fields Wine's PE `ntdll` reads off `NtCurrentTeb()` early —
+    /// `NtTib` (ExceptionList=-1 sentinel, StackBase/StackLimit, Self),
+    /// `ClientId` (process/thread ids), `ThreadLocalStoragePointer`,
+    /// `ProcessEnvironmentBlock`, and the `StaticUnicodeString` (an empty
+    /// UNICODE_STRING pointing at the inline `StaticUnicodeBuffer`) —
+    /// `CountOfOwnedCriticalSections` reads back 0 from the zero-mapped page.
+    /// The TEB region is freshly mapped RW, so ordinary permission-checked
+    /// writes reach it. The remaining ~30 TEB fields are completed in W2.10.
+    fn seed_teb(&self, mem: &mut dyn Memory, teb_base: u64, tid: u32, stack_base: u64, stack_top: u64) -> Result<()> {
+        let peb = self.cfg.peb_addr;
+        if self.cfg.is_64bit {
+            let w = |mem: &mut dyn Memory, off: u64, v: u64| mem.write_u64(teb_base + off, v);
+            w(mem, teb64::NT_TIB_EXCEPTION_LIST, u64::MAX)?; // no SEH frame yet
+            w(mem, teb64::NT_TIB_STACK_BASE, stack_top)?;
+            w(mem, teb64::NT_TIB_STACK_LIMIT, stack_base)?;
+            w(mem, teb64::NT_TIB_SELF, teb_base)?;
+            w(mem, teb64::CLIENT_ID_PROCESS, PROCESS_ID)?;
+            w(mem, teb64::CLIENT_ID_THREAD, tid as u64)?;
+            w(mem, teb64::TLS_POINTER, 0)?; // set up lazily by the CRT/ntdll
+            w(mem, teb64::PEB, peb)?;
+            // StaticUnicodeString: an empty UNICODE_STRING whose Buffer is the
+            // inline StaticUnicodeBuffer (Length 0, MaximumLength 522).
+            let len_maxlen = (teb64::STATIC_UNICODE_MAX_BYTES as u64) << 16; // Length=0 | MaxLen<<16
+            w(mem, teb64::STATIC_UNICODE_STRING, len_maxlen)?;
+            w(mem, teb64::STATIC_UNICODE_STRING + 8, teb_base + teb64::STATIC_UNICODE_BUFFER)?;
+            w(mem, teb64::COUNT_OF_OWNED_CRIT_SECS, 0)?;
+        } else {
+            let w4 = |mem: &mut dyn Memory, off: u64, v: u32| mem.write_u32(teb_base + off, v);
+            w4(mem, teb32::NT_TIB_EXCEPTION_LIST, u32::MAX)?;
+            w4(mem, teb32::NT_TIB_STACK_BASE, stack_top as u32)?;
+            w4(mem, teb32::NT_TIB_STACK_LIMIT, stack_base as u32)?;
+            w4(mem, teb32::NT_TIB_SELF, teb_base as u32)?;
+            w4(mem, teb32::CLIENT_ID_PROCESS, PROCESS_ID as u32)?;
+            w4(mem, teb32::CLIENT_ID_THREAD, tid)?;
+            w4(mem, teb32::TLS_POINTER, 0)?;
+            w4(mem, teb32::PEB, peb as u32)?;
+            let len_maxlen = (teb32::STATIC_UNICODE_MAX_BYTES as u32) << 16;
+            w4(mem, teb32::STATIC_UNICODE_STRING, len_maxlen)?;
+            w4(mem, teb32::STATIC_UNICODE_STRING + 4, (teb_base + teb32::STATIC_UNICODE_BUFFER) as u32)?;
+            w4(mem, teb32::COUNT_OF_OWNED_CRIT_SECS, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Seed the **main thread's** full Wine-walkable TEB at `cfg.teb_base`
+    /// (roadmap W2.9). The app maps the main TEB and seeds Self/PEB/StackBase/
+    /// StackLimit before the OS exists; this fills the remaining fields Wine's
+    /// ntdll walks (ExceptionList, ClientId, ThreadLocalStoragePointer,
+    /// StaticUnicodeString, CountOfOwnedCriticalSections) so a Wine thread that
+    /// reads the main thread's TEB does not fault. Idempotent with the app's
+    /// seed (it rewrites the same Self/PEB/stack values). No-op without a TEB.
+    pub fn seed_main_teb(&self, mem: &mut dyn Memory, stack_base: u64, stack_top: u64) -> Result<()> {
+        let teb = self.cfg.teb_base;
+        if teb == 0 {
+            return Ok(());
+        }
+        self.seed_teb(mem, teb, 0x1001 /* main tid */, stack_base, stack_top)
+    }
+
+    /// Allocate and seed a fresh per-thread TEB region, returning its base (the
+    /// thread's `gs`/`fs` segment base). Returns `None` if the arena is
+    /// exhausted (the caller then fails the thread creation).
+    fn new_thread_teb(&mut self, mem: &mut dyn Memory, tid: u32, stack_base: u64, stack_top: u64) -> Option<u64> {
+        let teb_base = self.map_anywhere(mem, THREAD_TEB_SIZE, Perm::RW, "thread-teb")?;
+        self.seed_teb(mem, teb_base, tid, stack_base, stack_top).ok()?;
+        Some(teb_base)
+    }
+
     // ---- the thread APIs -------------------------------------------------
 
-    /// CreateThread(lpAttr, dwStackSize, lpStart, lpParam, dwFlags, lpThreadId)
-    /// and `_beginthreadex` (same argument positions). Does not switch — the
-    /// creating thread keeps running and the new thread starts when it yields.
-    pub(crate) fn create_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
-        let req_stack = self.arg(cpu, mem, 1)?;
-        let entry = self.arg(cpu, mem, 2)?;
-        let param = self.arg(cpu, mem, 3)?;
-        let flags = self.arg(cpu, mem, 4)?;
-        let tid_out = self.arg(cpu, mem, 5)?;
-
+    /// The shared thread-spawn core behind both `CreateThread` (Win32) and
+    /// `NtCreateThreadEx` (NT). Allocates the new thread's stack **and its own
+    /// per-thread TEB** (roadmap W2.9), builds its initial register state (with
+    /// its `gs`/`fs` segment base pointing at that TEB), and enqueues it. Does
+    /// not switch — the creating thread keeps running; the new thread starts
+    /// when it yields. Returns `(handle, tid)`, or `None` if the arena is
+    /// exhausted (`last_error` set to ERROR_NOT_ENOUGH_MEMORY).
+    fn spawn_thread(
+        &mut self,
+        mem: &mut dyn Memory,
+        req_stack: u64,
+        entry: u64,
+        param: u64,
+        suspended: bool,
+    ) -> Result<Option<(u64, u32)>> {
         let stack_size = align_up(req_stack.max(THREAD_STACK_SIZE), 0x1000);
         let Some(stack_base) = self.map_anywhere(mem, stack_size, Perm::RWX, "thread-stack") else {
             self.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
-            return Ok(Outcome::Return(0));
+            return Ok(None);
+        };
+        let stack_top = stack_base + stack_size;
+
+        let tid = self.next_tid;
+        self.next_tid += 1;
+
+        // Each thread gets its own full Wine-walkable TEB; its base becomes the
+        // thread's `gs`/`fs` segment base so `gs:[…]` reads *this* thread's TEB.
+        let Some(teb_base) = self.new_thread_teb(mem, tid, stack_base, stack_top) else {
+            let _ = mem.unmap(stack_base, stack_size);
+            self.last_error = 8;
+            return Ok(None);
         };
 
         // Build the start state. Normally this is a `call entry(param)` frame
@@ -233,7 +384,10 @@ impl WinOs {
         // is the entry-seating thunk (the callbacks' drain target), and stash
         // the real `(entry, param)` to seat afterward.
         let mut st = CpuState::new();
-        let stack_top = stack_base + stack_size;
+        // Per-thread segment bases (roadmap W2.9): the scheduler carries these
+        // in the saved state, so on activation the CPU reads this thread's TEB.
+        st.gs_base = teb_base;
+        st.fs_base = teb_base;
         let exit_thunk = self.thread_exit_thunk;
         let has_tls = !self.tls_callbacks.is_empty() || !self.thread_notify_targets().is_empty();
         let mut pending_entry = None;
@@ -268,11 +422,8 @@ impl WinOs {
             st.set_rsp(sp);
         }
 
-        let tid = self.next_tid;
-        self.next_tid += 1;
         let handle = self.alloc_khandle();
         self.kobjects.insert(handle, KObject::Thread { exited: false });
-        let suspended = flags & CREATE_SUSPENDED != 0;
         self.threads.push(Thread {
             tid,
             handle,
@@ -281,6 +432,8 @@ impl WinOs {
             exit_code: STILL_ACTIVE,
             stack_base,
             stack_size,
+            teb_base,
+            teb_owned: teb_base,
             suspend_count: u32::from(suspended),
             wait: None,
             tls: HashMap::new(),
@@ -289,17 +442,39 @@ impl WinOs {
             quit_code: None,
             pending_entry,
         });
+        Ok(Some((handle, tid)))
+    }
+
+    /// CreateThread(lpAttr, dwStackSize, lpStart, lpParam, dwFlags, lpThreadId)
+    /// and `_beginthreadex` (same argument positions). Does not switch — the
+    /// creating thread keeps running and the new thread starts when it yields.
+    pub(crate) fn create_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        let req_stack = self.arg(cpu, mem, 1)?;
+        let entry = self.arg(cpu, mem, 2)?;
+        let param = self.arg(cpu, mem, 3)?;
+        let flags = self.arg(cpu, mem, 4)?;
+        let tid_out = self.arg(cpu, mem, 5)?;
+
+        let suspended = flags & CREATE_SUSPENDED != 0;
+        let Some((handle, tid)) = self.spawn_thread(mem, req_stack, entry, param, suspended)? else {
+            return Ok(Outcome::Return(0));
+        };
         if tid_out != 0 {
             mem.write_u32(tid_out, tid)?;
         }
         Ok(Outcome::Return(handle))
     }
 
-    /// Reclaim thread `i`'s owned stack region (no-op for the main thread).
+    /// Reclaim thread `i`'s owned stack **and TEB** regions (no-op for the main
+    /// thread, whose stack/TEB the app owns).
     fn free_thread_stack(&mut self, mem: &mut dyn Memory, i: usize) {
         let (base, size) = (self.threads[i].stack_base, self.threads[i].stack_size);
         if base != 0 {
             let _ = mem.unmap(base, size);
+        }
+        let teb = self.threads[i].teb_owned;
+        if teb != 0 {
+            let _ = mem.unmap(teb, THREAD_TEB_SIZE);
         }
     }
 
@@ -470,4 +645,226 @@ impl WinOs {
         self.yield_and_switch(cpu);
         Ok(Outcome::Resume)
     }
+
+    // ---- NT thread syscalls (roadmap W2.9) -------------------------------
+    //
+    // The NTSTATUS face of the P3.4 scheduler, reached via a raw guest
+    // `SYSCALL` through the W2.3 dispatcher. Args come via `syscall_arg`
+    // (arg0=R10, arg1=RDX, arg2=R8, arg3=R9, then the guest stack). Signatures
+    // are from public NT headers (winternl.h / phnt-style `NtCreateThreadEx`);
+    // no Wine `.c` was read.
+
+    /// The base of the currently-running thread's TEB (its `gs`/`fs` segment
+    /// base). Used by the syscall dispatcher to locate this thread's
+    /// `syscall_frame` and by `NtQueryInformationThread(ThreadBasicInformation)`.
+    pub(crate) fn current_thread_teb(&self) -> u64 {
+        self.threads.get(self.current).map_or(0, |t| t.teb_base)
+    }
+
+    /// Resolve an NT thread handle (a real `KObject::Thread` handle, or the
+    /// `NtCurrentThread` pseudo-handle `-2`) to a `threads` index.
+    fn nt_thread_index(&self, handle: u64) -> Option<usize> {
+        if handle == NT_CURRENT_THREAD {
+            return Some(self.current);
+        }
+        self.thread_by_handle(handle)
+    }
+
+    /// `NtCreateThreadEx(&ThreadHandle, DesiredAccess, ObjectAttributes,
+    /// ProcessHandle, StartRoutine, Argument, CreateFlags, ZeroBits,
+    /// StackSize, MaximumStackSize, AttributeList)`.
+    ///
+    /// arg0=&ThreadHandle (OUT), arg4=StartRoutine, arg5=Argument,
+    /// arg6=CreateFlags (bit0 = THREAD_CREATE_FLAGS_CREATE_SUSPENDED),
+    /// arg8=StackSize. The desired-access mask, object attributes, target
+    /// process (self only), zero-bits and attribute list are accepted and
+    /// ignored — exemu hosts a single process.
+    pub(crate) fn nt_create_thread_ex(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle_out = self.syscall_arg(cpu, mem, 0)?;
+        let entry = self.syscall_arg(cpu, mem, 4)?;
+        let param = self.syscall_arg(cpu, mem, 5)?;
+        let create_flags = self.syscall_arg(cpu, mem, 6)?;
+        let stack_size = self.syscall_arg(cpu, mem, 8)?;
+        if handle_out == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let suspended = create_flags & (CREATE_SUSPENDED_NT as u64) != 0;
+        match self.spawn_thread(mem, stack_size, entry, param, suspended)? {
+            Some((handle, _tid)) => {
+                self.write_ptr(mem, handle_out, handle)?;
+                Ok(STATUS_SUCCESS)
+            }
+            None => Ok(STATUS_NO_MEMORY),
+        }
+    }
+
+    /// `NtTerminateThread(ThreadHandle, ExitStatus)`. arg0=ThreadHandle
+    /// (`NtCurrentThread` = -2), arg1=ExitStatus. Terminating the current
+    /// thread switches to another runnable thread (or exits the process when it
+    /// was the last); the dispatcher then resumes as-is instead of returning to
+    /// the dead thread.
+    pub(crate) fn nt_terminate_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let code = self.syscall_arg(cpu, mem, 1)? as u32;
+        let Some(i) = self.nt_thread_index(handle) else {
+            return Ok(STATUS_INVALID_HANDLE);
+        };
+        self.threads[i].state = ThreadState::Terminated;
+        self.threads[i].exit_code = code;
+        let khandle = self.threads[i].handle;
+        if let Some(KObject::Thread { exited }) = self.kobjects.get_mut(&khandle) {
+            *exited = true;
+        }
+        self.free_thread_stack(mem, i);
+        if i == self.current {
+            // Switch away from the terminated thread; the dispatcher must not
+            // restore the dead thread's frame or return to it.
+            self.syscall_resume_as_is = true;
+            match self.pick_next() {
+                Some(next) => {
+                    self.activate(cpu, next);
+                }
+                None => {
+                    // Last thread: end the process. The syscall hook maps this
+                    // through, so set RAX for completeness and let the run loop
+                    // observe the process exit on the next step. Since there is
+                    // no other thread to run, park rip on the exit and rely on
+                    // the process-exit path; the dispatcher returns Continue.
+                    return Ok(code); // resume_as_is set: RAX carries the code
+                }
+            }
+        }
+        Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtSuspendThread(ThreadHandle, *PreviousSuspendCount)`.
+    /// arg0=ThreadHandle, arg1=&PreviousSuspendCount (OUT, optional).
+    pub(crate) fn nt_suspend_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let prev_out = self.syscall_arg(cpu, mem, 1)?;
+        let Some(i) = self.nt_thread_index(handle) else {
+            return Ok(STATUS_INVALID_HANDLE);
+        };
+        let prev = self.threads[i].suspend_count;
+        self.threads[i].suspend_count += 1;
+        if i != self.current && !matches!(self.threads[i].state, ThreadState::Terminated) {
+            self.threads[i].state = ThreadState::Suspended;
+        }
+        if prev_out != 0 {
+            mem.write_u32(prev_out, prev)?;
+        }
+        Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtResumeThread(ThreadHandle, *PreviousSuspendCount)`.
+    /// arg0=ThreadHandle, arg1=&PreviousSuspendCount (OUT, optional).
+    pub(crate) fn nt_resume_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let prev_out = self.syscall_arg(cpu, mem, 1)?;
+        let Some(i) = self.nt_thread_index(handle) else {
+            return Ok(STATUS_INVALID_HANDLE);
+        };
+        let prev = self.threads[i].suspend_count;
+        if prev > 0 {
+            self.threads[i].suspend_count -= 1;
+            if self.threads[i].suspend_count == 0 && self.threads[i].state == ThreadState::Suspended {
+                self.threads[i].state = ThreadState::Ready;
+            }
+        }
+        if prev_out != 0 {
+            mem.write_u32(prev_out, prev)?;
+        }
+        Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtQueryInformationThread(ThreadHandle, ThreadInformationClass,
+    /// ThreadInformation, ThreadInformationLength, *ReturnLength)`.
+    ///
+    /// Serves `ThreadBasicInformation` (class 0): a `THREAD_BASIC_INFORMATION`
+    /// `{ NTSTATUS ExitStatus; PVOID TebBaseAddress; CLIENT_ID ClientId;
+    /// KAFFINITY AffinityMask; KPRIORITY Priority; KPRIORITY BasePriority; }`.
+    /// arg0=ThreadHandle, arg1=class, arg2=buffer, arg3=length, arg4=&ReturnLength.
+    pub(crate) fn nt_query_information_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let class = self.syscall_arg(cpu, mem, 1)? as u32;
+        let buffer = self.syscall_arg(cpu, mem, 2)?;
+        let length = self.syscall_arg(cpu, mem, 3)?;
+        let return_length = self.syscall_arg(cpu, mem, 4)?;
+        if class != THREAD_BASIC_INFORMATION {
+            return Ok(STATUS_NOT_IMPLEMENTED);
+        }
+        let Some(i) = self.nt_thread_index(handle) else {
+            return Ok(STATUS_INVALID_HANDLE);
+        };
+        // THREAD_BASIC_INFORMATION is 0x30 bytes on x64, 0x1C on x86.
+        let need: u64 = if self.cfg.is_64bit { 0x30 } else { 0x1C };
+        if buffer == 0 || length < need {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let (exit_status, teb, tid) = {
+            let t = &self.threads[i];
+            let exit = if t.state == ThreadState::Terminated { t.exit_code } else { STILL_ACTIVE };
+            (exit, t.teb_base, t.tid)
+        };
+        if self.cfg.is_64bit {
+            mem.write_u32(buffer, exit_status)?; // ExitStatus (NTSTATUS, +pad)
+            mem.write_u64(buffer + 0x08, teb)?; // TebBaseAddress
+            mem.write_u64(buffer + 0x10, PROCESS_ID)?; // ClientId.UniqueProcess
+            mem.write_u64(buffer + 0x18, tid as u64)?; // ClientId.UniqueThread
+            mem.write_u64(buffer + 0x20, 1)?; // AffinityMask
+            mem.write_u32(buffer + 0x28, 0)?; // Priority
+            mem.write_u32(buffer + 0x2C, 0)?; // BasePriority
+        } else {
+            mem.write_u32(buffer, exit_status)?;
+            mem.write_u32(buffer + 0x04, teb as u32)?;
+            mem.write_u32(buffer + 0x08, PROCESS_ID as u32)?;
+            mem.write_u32(buffer + 0x0C, tid)?;
+            mem.write_u32(buffer + 0x10, 1)?;
+            mem.write_u32(buffer + 0x14, 0)?;
+            mem.write_u32(buffer + 0x18, 0)?;
+        }
+        if return_length != 0 {
+            mem.write_u32(return_length, need as u32)?;
+        }
+        Ok(STATUS_SUCCESS)
+    }
+}
+
+// ---- NT thread syscall status codes + SSDT wiring (roadmap W2.9) ----------
+
+/// `NtCurrentThread` pseudo-handle (`(HANDLE)-2`).
+const NT_CURRENT_THREAD: u64 = u64::MAX - 1;
+/// `THREAD_CREATE_FLAGS_CREATE_SUSPENDED` for `NtCreateThreadEx.CreateFlags`.
+const CREATE_SUSPENDED_NT: u32 = 0x0000_0001;
+/// `ThreadBasicInformation` `THREADINFOCLASS` value.
+const THREAD_BASIC_INFORMATION: u32 = 0;
+
+const STATUS_SUCCESS: u32 = 0x0000_0000;
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+const STATUS_INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
+const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+
+/// SSDT indices, recovered from the pinned guest `ntdll.dll` stubs' `mov eax,N`.
+pub(crate) const SSDT_NT_CREATE_THREAD_EX: u32 = 0x85;
+pub(crate) const SSDT_NT_TERMINATE_THREAD: u32 = 0x53;
+pub(crate) const SSDT_NT_SUSPEND_THREAD: u32 = 0xf5;
+pub(crate) const SSDT_NT_RESUME_THREAD: u32 = 0x52;
+pub(crate) const SSDT_NT_QUERY_INFORMATION_THREAD: u32 = 0x25;
+
+pub(crate) fn ssdt_nt_create_thread_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_create_thread_ex(cpu, mem)
+}
+pub(crate) fn ssdt_nt_terminate_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_terminate_thread(cpu, mem)
+}
+pub(crate) fn ssdt_nt_suspend_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_suspend_thread(cpu, mem)
+}
+pub(crate) fn ssdt_nt_resume_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_resume_thread(cpu, mem)
+}
+pub(crate) fn ssdt_nt_query_information_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_query_information_thread(cpu, mem)
 }

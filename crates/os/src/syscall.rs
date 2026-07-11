@@ -200,9 +200,11 @@ impl WinOs {
 
     /// Guest address of the current thread's `syscall_frame`, or `None` when
     /// there is no TEB. The frame sits in the last [`frame::SIZE`] bytes of the
-    /// TEB region so it never overlaps the TEB struct proper.
+    /// running thread's TEB region so it never overlaps the TEB struct proper.
+    /// Follows the *current thread's* TEB (roadmap W2.9): each thread parks its
+    /// frame in its own TEB, so concurrent Wine threads never share one frame.
     fn frame_base(&self) -> Option<u64> {
-        let teb = self.cfg.teb_base;
+        let teb = self.current_thread_teb();
         (teb != 0).then(|| teb + TEB_REGION_SIZE - frame::SIZE)
     }
 
@@ -333,6 +335,9 @@ impl WinOs {
         // Capture the guest RSP before any switch and publish it so `Nt*`
         // handlers read stack args (5+) relative to it via `syscall_arg`.
         self.syscall_guest_rsp = cpu.rsp();
+        // Cleared per dispatch; a handler that switches threads itself (e.g.
+        // NtTerminateThread on self) sets it to skip the restore/return below.
+        self.syscall_resume_as_is = false;
 
         // Ensure the seam itself doesn't run the host handler with DF set: the
         // guest may have left DF=1, but the native handlers assume forward
@@ -352,6 +357,15 @@ impl WinOs {
         // Phase 3: index the SSDT and run the native handler.
         let handler = self.ssdt.handler(index);
         let status = handler(self, cpu, mem)?;
+
+        // A handler that switched the running thread (e.g. NtTerminateThread on
+        // the current thread) has already installed the guest resume state — the
+        // saved frame belongs to the *terminated* thread, so restoring it would
+        // clobber the newly-activated thread. Resume exactly as the handler left
+        // things instead (roadmap W2.9).
+        if self.syscall_resume_as_is {
+            return Ok(Exit::Continue);
+        }
 
         // Phase 4: restore the non-volatile set, then return the NTSTATUS.
         self.restore_context(cpu, mem, &saved)?;
