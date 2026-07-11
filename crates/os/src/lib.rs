@@ -29,6 +29,7 @@ mod syscall;
 mod sync;
 mod thread;
 mod time;
+mod unixlib;
 mod vm;
 mod win;
 
@@ -39,6 +40,7 @@ use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Reg, Result};
 pub use api::Api;
 pub use syscall::SyscallHandler;
 pub use sync::{SignalOp, SyncKind};
+pub use unixlib::{UnixEntry, Unixlib};
 
 /// Addresses and sizes the application hands us so the emulated OS knows
 /// where its thunks, heap and process strings live.
@@ -300,6 +302,18 @@ pub struct WinOs {
     /// it via [`WinOs::syscall_arg`] while running on the switched stack.
     syscall_guest_rsp: u64,
 
+    /// Registered native unixlibs for the `__wine_unix_call` fast path (roadmap
+    /// W2.4). A PE DLL's `unixlib_handle_t` is the index into this `Vec`; the
+    /// `code` it passes indexes the selected [`unixlib::Unixlib::table`]. See
+    /// [`crate::unixlib`].
+    unixlibs: Vec<unixlib::Unixlib>,
+    /// Module base → its registered unixlib handle. Backs the
+    /// `NtQueryVirtualMemory(MemoryWineUnixFuncs)` query (roadmap W2.4).
+    unixlib_of_module: HashMap<u64, u64>,
+    /// Thunk address of the `__wine_unix_call` fast path (roadmap W2.4), lazily
+    /// allocated by [`WinOs::wine_unix_call_thunk`]; zero until first requested.
+    wine_unix_call_thunk: u64,
+
     /// When `Some`, the process is exiting: after the currently-driven callback
     /// queue (the loaded DLLs' `DLL_PROCESS_DETACH` notifications) drains and no
     /// callback frames remain, terminate the process with this code instead of
@@ -372,6 +386,9 @@ impl WinOs {
             ssdt: syscall::Ssdt::new(),
             unix_stack_top: 0,
             syscall_guest_rsp: 0,
+            unixlibs: Vec::new(),
+            unixlib_of_module: HashMap::new(),
+            wine_unix_call_thunk: 0,
             pending_process_exit: None,
         };
         // Reserve the driver thunks up front so their addresses are stable.
@@ -386,6 +403,13 @@ impl WinOs {
         os.threads.push(thread::Thread::main(0x1001));
         // Seed HKLM/HKCU with values installers commonly probe (roadmap P3.12).
         os.reg_seed();
+        // Install the NtQueryVirtualMemory SSDT slot so a raw guest `SYSCALL`
+        // can answer the `MemoryWineUnixFuncs` unixlib-handle query (roadmap
+        // W2.4). W2.6 broadens it to the other memory-info classes.
+        os.set_syscall_handler(
+            unixlib::SSDT_NT_QUERY_VIRTUAL_MEMORY,
+            unixlib::ssdt_nt_query_virtual_memory,
+        );
         os
     }
 
@@ -517,6 +541,17 @@ impl WinOs {
     /// with the code in EAX.
     pub fn exit_thunk(&mut self) -> u64 {
         self.alloc_thunk(Api::ReturnExit)
+    }
+
+    /// Address of the `__wine_unix_call` fast-path thunk (roadmap W2.4). The
+    /// loader stores this in ntdll's `__wine_unix_call_dispatcher` pointer so the
+    /// guest's indirect `call` lands on the intercepted native handler. Allocated
+    /// once; subsequent calls return the same stable address.
+    pub fn wine_unix_call_thunk(&mut self) -> u64 {
+        if self.wine_unix_call_thunk == 0 {
+            self.wine_unix_call_thunk = self.alloc_thunk(Api::WineUnixCall);
+        }
+        self.wine_unix_call_thunk
     }
 
     /// Range `[start, end)` of assigned thunk addresses, so the application
