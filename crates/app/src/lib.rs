@@ -17,6 +17,8 @@
 pub mod gui_sample;
 pub mod sample;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use exemu_core::{Cpu, EmuError, Exit, Memory, Perm, Region, Result};
 use exemu_cpu::{Bits, Interpreter, FS_BASE_32, GS_BASE};
 use exemu_loader as loader;
@@ -34,6 +36,28 @@ const PAGE: u64 = 0x1000;
 const TEB_SIZE: u64 = 0x2000;
 const ENV_SIZE: u64 = 0x1000;
 const API_SIZE: u64 = 0x0010_0000; // 1 MiB → 128k import slots
+
+/// `KUSER_SHARED_DATA` — the read-only page the kernel maps at a fixed virtual
+/// address in every process (32- and 64-bit alike). Wine's PE ntdll and the C
+/// runtime read time/tick fields directly out of it and consult the
+/// `SystemCall` selector at `+0x308` to decide between the `SYSCALL` and legacy
+/// `int 2Eh` syscall entry shapes. exemu seeds the modern 64-bit fields and
+/// sets `SystemCall` nonzero to steer the guest onto the `SYSCALL` path the
+/// dispatcher (roadmap W2.2/W2.3) will implement. Sits ~16 MiB above the 32-bit
+/// TEB/PEB (which end ~0x7EFD_3000), so there is no collision with either
+/// bitness's layout (roadmap W2.1).
+const KUSER_SHARED_DATA_BASE: u64 = 0x7ffe_0000;
+/// The synthesized syscall-dispatcher landing page, reserved one page above
+/// `KUSER_SHARED_DATA`. Native x64 Wine stubs issue a raw `SYSCALL` rather than
+/// calling this page, but wow64/ARM64EC-shaped stubs route through a fixed low
+/// page here; we reserve it now so that path has somewhere to land later.
+const KUSER_DISPATCHER_PAGE: u64 = 0x7ffe_1000;
+
+/// `KUSER_SHARED_DATA` field offsets we seed (public winnt/ntddk layout).
+const KUSER_INTERRUPT_TIME: u64 = 0x008; // KSYSTEM_TIME (Low/High/High2)
+const KUSER_SYSTEM_TIME: u64 = 0x014; // KSYSTEM_TIME (Low/High/High2)
+const KUSER_SYSTEM_CALL: u64 = 0x308; // ULONG syscall-entry selector
+const KUSER_TICK_COUNT: u64 = 0x320; // KSYSTEM_TIME TickCount
 
 /// Where the various regions live, chosen per bitness so 32-bit processes
 /// stay entirely within the low 4 GiB.
@@ -247,6 +271,11 @@ impl Process {
         write_ptr(&mut mem, lay.teb_base + lay.teb_stack_base, stack_top)?;
         write_ptr(&mut mem, lay.teb_base + lay.teb_stack_limit, lay.stack_base)?;
         write_ptr(&mut mem, lay.peb_addr + lay.peb_image_base, base)?;
+
+        // --- KUSER_SHARED_DATA @ 0x7ffe0000 + dispatcher landing page -----
+        // Fixed-address kernel page every process reads directly; also reserves
+        // the syscall-dispatcher landing page one page above it (roadmap W2.1).
+        map_kuser_shared_data(&mut mem)?;
 
         // --- Command line (ASCII + UTF-16) in the env region --------------
         mem.map(Region::new("env", lay.env_base, ENV_SIZE, Perm::RW))?;
@@ -574,6 +603,60 @@ pub fn load_and_run(pe_bytes: &[u8], cfg: RunConfig) -> Result<RunResult> {
 
 // ---- helpers ---------------------------------------------------------------
 
+/// Map `KUSER_SHARED_DATA` at its fixed virtual address and seed the modern
+/// 64-bit fields the guest reads directly, plus reserve the syscall-dispatcher
+/// landing page one page above it (roadmap W2.1).
+///
+/// The `SystemTime`/`InterruptTime`/`TickCount` fields are point-in-time
+/// snapshots taken at process load; they are not driven forward here (the
+/// clock-backed `Nt*`/Win32 time APIs remain authoritative). `SystemCall` is
+/// set nonzero so the guest selects the `SYSCALL` entry shape the dispatcher
+/// will implement, rather than the legacy `int 2Eh` path.
+fn map_kuser_shared_data(mem: &mut VirtualMemory) -> Result<()> {
+    // Two contiguous pages: KUSER_SHARED_DATA itself and the reserved
+    // dispatcher landing page directly above it.
+    mem.map(Region::new(
+        "kuser_shared_data",
+        KUSER_SHARED_DATA_BASE,
+        PAGE,
+        Perm::READ,
+    ))?;
+    mem.map(Region::new(
+        "kuser_dispatcher",
+        KUSER_DISPATCHER_PAGE,
+        PAGE,
+        Perm::RWX,
+    ))?;
+
+    // Seed the time fields as KSYSTEM_TIME triples (LowPart, High1Time,
+    // High2Time) so a guest reading either half sees a consistent value.
+    let now_100ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let system_time = (now_100ns.as_secs() + KUSER_FILETIME_EPOCH_DIFF_SECS) * 10_000_000
+        + now_100ns.subsec_nanos() as u64 / 100;
+    let write_ksystem_time = |mem: &mut VirtualMemory, off: u64, val: u64| -> Result<()> {
+        let low = (val & 0xFFFF_FFFF) as u32;
+        let high = (val >> 32) as u32;
+        mem.poke(KUSER_SHARED_DATA_BASE + off, &low.to_le_bytes())?;
+        mem.poke(KUSER_SHARED_DATA_BASE + off + 4, &high.to_le_bytes())?; // High1Time
+        mem.poke(KUSER_SHARED_DATA_BASE + off + 8, &high.to_le_bytes()) // High2Time
+    };
+    write_ksystem_time(mem, KUSER_SYSTEM_TIME, system_time)?;
+    // InterruptTime/TickCount both count from boot; we anchor them at 0 (a
+    // freshly booted system) — they advance via the clock-backed time APIs.
+    write_ksystem_time(mem, KUSER_INTERRUPT_TIME, 0)?;
+    write_ksystem_time(mem, KUSER_TICK_COUNT, 0)?;
+
+    // SystemCall selector: nonzero ⇒ altered view (steer onto the SYSCALL path).
+    mem.poke(KUSER_SHARED_DATA_BASE + KUSER_SYSTEM_CALL, &1u32.to_le_bytes())?;
+    Ok(())
+}
+
+/// Seconds between the FILETIME epoch (1601-01-01) and the Unix epoch, for
+/// converting the host clock into `KUSER_SHARED_DATA.SystemTime` units.
+const KUSER_FILETIME_EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+
 #[inline]
 fn align_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
@@ -631,4 +714,53 @@ fn build_cmdline(args: &[String]) -> String {
         .map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kuser_shared_data_fields_readable() {
+        let mut mem = VirtualMemory::new();
+        map_kuser_shared_data(&mut mem).expect("map KUSER_SHARED_DATA");
+
+        // The page is mapped at the fixed kernel address.
+        assert_eq!(KUSER_SHARED_DATA_BASE, 0x7ffe_0000);
+
+        // SystemCall @ +0x308 is nonzero: the guest picks the SYSCALL path.
+        let system_call = mem
+            .read_u32(KUSER_SHARED_DATA_BASE + KUSER_SYSTEM_CALL)
+            .expect("read SystemCall");
+        assert_ne!(system_call, 0, "SystemCall selector must be nonzero");
+
+        // SystemTime @ +0x14 was seeded from the host clock (well past the
+        // FILETIME epoch), so its high dword is nonzero.
+        let system_time_high = mem
+            .read_u32(KUSER_SHARED_DATA_BASE + KUSER_SYSTEM_TIME + 4)
+            .expect("read SystemTime.High1Time");
+        assert_ne!(system_time_high, 0, "SystemTime should be a real clock value");
+        // KSYSTEM_TIME is written as a consistent High1/High2 pair.
+        let system_time_high2 = mem
+            .read_u32(KUSER_SHARED_DATA_BASE + KUSER_SYSTEM_TIME + 8)
+            .expect("read SystemTime.High2Time");
+        assert_eq!(system_time_high, system_time_high2);
+
+        // InterruptTime @ +0x08 and TickCount @ +0x320 are readable (anchored 0).
+        assert_eq!(
+            mem.read_u32(KUSER_SHARED_DATA_BASE + KUSER_INTERRUPT_TIME)
+                .expect("read InterruptTime"),
+            0
+        );
+        assert_eq!(
+            mem.read_u32(KUSER_SHARED_DATA_BASE + KUSER_TICK_COUNT)
+                .expect("read TickCount"),
+            0
+        );
+
+        // The dispatcher landing page one page above is reserved and mapped.
+        assert_eq!(KUSER_DISPATCHER_PAGE, KUSER_SHARED_DATA_BASE + PAGE);
+        mem.read_u8(KUSER_DISPATCHER_PAGE)
+            .expect("dispatcher landing page is mapped");
+    }
 }
