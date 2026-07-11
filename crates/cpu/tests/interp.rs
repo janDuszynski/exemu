@@ -1157,3 +1157,158 @@ fn mmx_paddb_lanes() {
     };
     assert_eq!(rbx(&cpu), expect, "PADDB byte-wise wrapping add");
 }
+
+// --- self-modifying-code detection + decode-cache invalidation (W1.7) ------
+//
+// The interpreter decodes fresh every step, so SMC already produces correct
+// results (the P0.6 pin in sse.rs proves that). These pins prove the *seam*
+// the W8 JIT will consume: a write into executable memory (a) still executes
+// with the patched bytes, and (b) advances the code-generation counters so a
+// cache can invalidate. Data writes must NOT advance the counters.
+
+/// Run `code` in an RWX code region big enough to span pages, plus a stack.
+/// Returns the interpreter and the memory (so a test can read the generation
+/// counters). The generation is snapshotted *after* the initial code load so
+/// that only the program's own writes are measured.
+/// Baselines are the global code generation and the per-page generation of the
+/// two code pages, captured *after* the initial code load (loading code into an
+/// RWX region is itself a code write, so tests measure deltas from here).
+fn run_smc(code: &[u8]) -> (Interpreter, VirtualMemory, u64, [u64; 2]) {
+    let mut mem = VirtualMemory::new();
+    // Two code pages so the cross-page pin has somewhere to reach.
+    mem.map(Region::new("code", CODE_BASE, 0x4000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, code).unwrap();
+    let gen0 = mem.code_generation();
+    let page0 = [
+        mem.code_page_generation(CODE_BASE),
+        mem.code_page_generation(CODE_BASE + 0x1000),
+    ];
+
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = CODE_BASE;
+    cpu.state_mut().set_rsp(STACK_TOP);
+    let mut hooks = NoHooks;
+    for _ in 0..10_000 {
+        if let Exit::Halted = cpu.step(&mut mem, &mut hooks).unwrap() {
+            break;
+        }
+    }
+    (cpu, mem, gen0, page0)
+}
+
+#[test]
+fn smc_write_to_own_code_then_execute_takes_effect_and_bumps_gen() {
+    // Offsets from CODE_BASE:
+    //   0x00  48 C7 C0 00 00 01 00   mov rax, 0x1_0000 (CODE_BASE)
+    //   0x07  C6 40 0C 42            mov byte [rax+0x0C], 0x42
+    //   0x0B  B3 00                  mov bl, 0x00   (imm8 lives at 0x0C)
+    //   0x0D  F4                     hlt
+    // The store patches offset 0x0C — the imm8 of `mov bl` — before it runs.
+    let code = [
+        0x48, 0xC7, 0xC0, 0x00, 0x00, 0x01, 0x00, // mov rax, CODE_BASE
+        0xC6, 0x40, 0x0C, 0x42, // mov byte [rax+0x0C], 0x42
+        0xB3, 0x00, // mov bl, 0x00  (imm8 @ 0x0C, patched above)
+        0xF4, // hlt
+    ];
+    let (cpu, mem, gen0, [p0, _p1]) = run_smc(&code);
+    assert_eq!(rbx(&cpu) & 0xFF, 0x42, "patched immediate must be executed");
+    // The one self-modifying store advances the global generation by exactly 1
+    // and the writer/target page's generation by exactly 1 (measured as deltas
+    // from the post-load baseline, since loading the code itself is a code write).
+    assert_eq!(
+        mem.code_generation() - gen0,
+        1,
+        "exactly one store into executable memory happened in this run"
+    );
+    assert_eq!(
+        mem.code_page_generation(CODE_BASE) - p0,
+        1,
+        "the patched page's generation advanced once"
+    );
+}
+
+#[test]
+fn smc_cross_page_write_bumps_the_target_page_not_the_writer_page() {
+    // The writer lives in page 0 (CODE_BASE); it stores into page 1
+    // (CODE_BASE+0x1000), which is still executable. The seam must credit the
+    // *written* page, not the page the store instruction sits in.
+    let target = CODE_BASE + 0x1000 + 0x40;
+    let code = [
+        // mov rax, target
+        0x48, 0xB8,
+        target as u8, (target >> 8) as u8, (target >> 16) as u8, (target >> 24) as u8,
+        (target >> 32) as u8, (target >> 40) as u8, (target >> 48) as u8, (target >> 56) as u8,
+        0xC6, 0x00, 0x90, // mov byte [rax], 0x90 (NOP) into page 1
+        0xF4, // hlt
+    ];
+    let (_, mem, gen0, [p0, p1]) = run_smc(&code);
+    assert_eq!(mem.code_generation() - gen0, 1);
+    assert_eq!(
+        mem.code_page_generation(CODE_BASE) - p0,
+        0,
+        "the writer's own page was not written to during the run"
+    );
+    assert_eq!(
+        mem.code_page_generation(CODE_BASE + 0x1000) - p1,
+        1,
+        "the target page's generation advanced"
+    );
+    assert_eq!(mem.read_u8(target).unwrap(), 0x90, "the byte landed");
+}
+
+#[test]
+fn smc_rep_movs_into_code_bumps_gen_per_write() {
+    // REP MOVSB copying 4 bytes from a data buffer into executable memory must
+    // (a) land the bytes and (b) advance the global generation once per byte
+    // written (each MOVSB is a distinct 1-byte store into exec memory).
+    // Source buffer at CODE_BASE+0x100 (0xAA 0xBB 0xCC 0xDD), dest CODE_BASE+0x200.
+    let src = CODE_BASE + 0x100;
+    let dst = CODE_BASE + 0x200;
+    let code = [
+        // mov rsi, src
+        0x48, 0xBE, src as u8, (src >> 8) as u8, (src >> 16) as u8, (src >> 24) as u8,
+        (src >> 32) as u8, (src >> 40) as u8, (src >> 48) as u8, (src >> 56) as u8,
+        // mov rdi, dst
+        0x48, 0xBF, dst as u8, (dst >> 8) as u8, (dst >> 16) as u8, (dst >> 24) as u8,
+        (dst >> 32) as u8, (dst >> 40) as u8, (dst >> 48) as u8, (dst >> 56) as u8,
+        0x48, 0xC7, 0xC1, 0x04, 0x00, 0x00, 0x00, // mov rcx, 4
+        0xF3, 0xA4, // rep movsb
+        0xF4, // hlt
+    ];
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, 0x4000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+    mem.write(CODE_BASE, &code).unwrap();
+    // Seed the source with `poke` so it does not itself count as a code write —
+    // we want the run's own MOVSB stores to be the only measured bumps.
+    mem.poke(src, &[0xAA, 0xBB, 0xCC, 0xDD]).unwrap();
+    let gen0 = mem.code_generation();
+    let page0 = mem.code_page_generation(dst);
+
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = CODE_BASE;
+    cpu.state_mut().set_rsp(STACK_TOP);
+    let mut hooks = NoHooks;
+    for _ in 0..10_000 {
+        if let Exit::Halted = cpu.step(&mut mem, &mut hooks).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(
+        &[
+            mem.read_u8(dst).unwrap(),
+            mem.read_u8(dst + 1).unwrap(),
+            mem.read_u8(dst + 2).unwrap(),
+            mem.read_u8(dst + 3).unwrap(),
+        ],
+        &[0xAA, 0xBB, 0xCC, 0xDD],
+        "REP MOVSB must copy the bytes into code"
+    );
+    // 4 one-byte stores into exec memory → 4 generation bumps (deltas from the
+    // post-load baseline). The source read is a read, so it does not count; the
+    // poke above went through the loader path, which *does* count — but we
+    // snapshot after it, so only the MOVSB stores are measured here.
+    assert_eq!(mem.code_generation() - gen0, 4);
+    assert_eq!(mem.code_page_generation(dst) - page0, 4);
+}
