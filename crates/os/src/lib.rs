@@ -25,6 +25,7 @@ mod fs;
 mod gdi;
 mod msg;
 mod reg;
+mod syscall;
 mod sync;
 mod thread;
 mod time;
@@ -36,6 +37,7 @@ use std::collections::HashMap;
 use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Reg, Result};
 
 pub use api::Api;
+pub use syscall::SyscallHandler;
 pub use sync::{SignalOp, SyncKind};
 
 /// Addresses and sizes the application hands us so the emulated OS knows
@@ -79,6 +81,11 @@ pub struct WinConfig {
     /// pointer to the `PEB_LDR_DATA` at `peb_addr + peb_ldr_off`
     /// (`PEB.Ldr`, roadmap W0.6). Zero disables Ldr materialization.
     pub peb_addr: u64,
+    /// Guest virtual address of the current thread's TEB (behind `gs:`/`fs:`).
+    /// The NT-syscall dispatcher (roadmap W2.3) locates the per-thread
+    /// `syscall_frame` from here. Zero disables the dispatcher's in-TEB frame
+    /// (the host-side save/restore still runs).
+    pub teb_base: u64,
     /// Offset of the `Ldr` field within the PEB (0x18 for 64-bit, 0x0C for
     /// 32-bit — public winternl.h/ntdef layout).
     pub peb_ldr_off: u64,
@@ -114,6 +121,7 @@ impl Default for WinConfig {
             dll_size: 0x0800_0000, // 128 MiB
             valloc_base: 0x0000_0040_0000_0000, // 256 GiB: between stack and thunks
             peb_addr: 0,
+            teb_base: 0,
             peb_ldr_off: 0x18,
             peb_loaderlock_off: 0x110,
             image_size: 0,
@@ -279,6 +287,19 @@ pub struct WinOs {
     /// The filter installed by `SetUnhandledExceptionFilter`, or 0.
     unhandled_filter: u64,
 
+    /// The NT-syscall dispatcher's SSDT: index → native `Nt*` handler
+    /// (roadmap W2.3). Each `Nt*` group fills its slots in W2.6+; unknown
+    /// indices return `STATUS_NOT_IMPLEMENTED`. See [`crate::syscall`].
+    ssdt: syscall::Ssdt,
+    /// Guest virtual address of the dedicated "unix stack" the dispatcher
+    /// switches to while a native handler runs (roadmap W2.3), and its top
+    /// (initial RSP). Lazily allocated on first syscall; zero until then.
+    unix_stack_top: u64,
+    /// The guest RSP captured at the current NT syscall's entry, before the
+    /// unix-stack switch. `Nt*` handlers (W2.6+) read stack args 5+ relative to
+    /// it via [`WinOs::syscall_arg`] while running on the switched stack.
+    syscall_guest_rsp: u64,
+
     /// When `Some`, the process is exiting: after the currently-driven callback
     /// queue (the loaded DLLs' `DLL_PROCESS_DETACH` notifications) drains and no
     /// callback frames remain, terminate the process with this code instead of
@@ -348,6 +369,9 @@ impl WinOs {
             exc_driver: 0,
             exc_stack: Vec::new(),
             unhandled_filter: 0,
+            ssdt: syscall::Ssdt::new(),
+            unix_stack_top: 0,
+            syscall_guest_rsp: 0,
             pending_process_exit: None,
         };
         // Reserve the driver thunks up front so their addresses are stable.
@@ -876,5 +900,15 @@ impl Hooks for WinOs {
             // re-entrant guest call); just keep executing.
             api::Outcome::Resume => Ok(Some(Exit::Continue)),
         }
+    }
+
+    /// The NT-syscall dispatcher (roadmap W2.3). By the time we are called the
+    /// CPU has already applied the hardware `SYSCALL` side-effects (return
+    /// `rip`→RCX, RFLAGS→R11, `rip` past the instruction). We save the Windows
+    /// context into the TEB `syscall_frame`, switch to a unix stack, index the
+    /// SSDT, call the native `Nt*` handler, then restore the non-volatile set
+    /// and return to the guest at RCX. See [`crate::syscall`].
+    fn syscall(&mut self, index: u32, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Exit> {
+        self.dispatch_syscall(index, cpu, mem)
     }
 }
