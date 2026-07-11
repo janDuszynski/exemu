@@ -328,6 +328,7 @@ impl Process {
             dll_size: lay.dll_size,
             valloc_base: lay.valloc_base,
             peb_addr: lay.peb_addr,
+            teb_base: lay.teb_base,
             peb_ldr_off: lay.peb_ldr_off,
             peb_loaderlock_off: lay.peb_loaderlock_off,
             image_size: align_up(image.size_of_image as u64, PAGE).max(PAGE),
