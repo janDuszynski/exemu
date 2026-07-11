@@ -87,8 +87,9 @@ fn leaf0_max_leaf_and_vendor() {
 #[test]
 fn leaf1_feature_words_exact() {
     let (_eax, _ebx, ecx, edx) = cpuid(1, 0);
-    // ECX: POPCNT(23) | XSAVE(26) | OSXSAVE(27) — and nothing else.
-    assert_eq!(ecx, (1 << 23) | (1 << 26) | (1 << 27));
+    // ECX: SSSE3(9) | SSE4.1(19) | SSE4.2(20) | POPCNT(23) | XSAVE(26) |
+    // OSXSAVE(27) — and nothing else. SSSE3/SSE4.1/SSE4.2 are ON after W1.4.
+    assert_eq!(ecx, (1 << 9) | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 27));
     // EDX: FPU(0) | TSC(4) | CMOV(15) | FXSR(24) | SSE(25) | SSE2(26).
     assert_eq!(edx, 1 | (1 << 4) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 26));
     // x87 must be ON now (W1.1).
@@ -99,11 +100,10 @@ fn leaf1_feature_words_exact() {
 fn leaf1_withholds_unimplemented_bits() {
     let (_eax, _ebx, ecx, edx) = cpuid(1, 0);
     // These stay OFF until their W1 steps land — advertising any would send Wine
-    // into a decode-fault.
+    // into a decode-fault. (SSSE3/SSE4.1/SSE4.2 are ON as of W1.4; see
+    // `leaf1_feature_words_exact`. SSE3 is still off — its handful of extra ops
+    // is a separate, not-yet-implemented feature bit.)
     assert_eq!(ecx & (1 << 0), 0, "SSE3 must be OFF");
-    assert_eq!(ecx & (1 << 9), 0, "SSSE3 must be OFF (W1.4)");
-    assert_eq!(ecx & (1 << 19), 0, "SSE4.1 must be OFF (W1.4)");
-    assert_eq!(ecx & (1 << 20), 0, "SSE4.2 must be OFF (W1.4)");
     assert_eq!(ecx & (1 << 28), 0, "AVX must be OFF (W1.5)");
     assert_eq!(ecx & (1 << 12), 0, "FMA must be OFF");
     assert_eq!(ecx & (1 << 25), 0, "AES must be OFF");

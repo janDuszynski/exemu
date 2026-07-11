@@ -209,12 +209,13 @@ const ALU_MNEM: [&str; 8] = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cm
 /// memory operand or a REP string op (exercising the ModRM/SIB/disp decoder and
 /// the "touched pages" half of the oracle); the rest are register/immediate.
 pub fn build(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
-    match rng.below(6) {
+    match rng.below(7) {
         0 => build_sse(rng, bits, seed),
         1 => build_mem(rng, bits, seed),
         2 => build_x87(rng, bits, seed),
         3 => build_fxsave(rng, bits, seed),
         4 => build_cpuid(rng, bits, seed),
+        5 => build_sse4(rng, bits, seed),
         _ => build_reg(rng, bits, seed),
     }
 }
@@ -1191,6 +1192,260 @@ fn sse_shuffle(rng: &mut Rng) -> Trial {
         b.extend([0x0F, 0xC6, modrm_reg(d, s), imm]);
         Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: "shufp".into() }
     }
+}
+
+// ---- SSSE3 / SSE4.1 / SSE4.2 (three-byte 0F 38 / 0F 3A) ---------------------
+//
+// The whole packed family carries the mandatory `66` prefix; CRC32 carries `F2`.
+// Register forms (mod=3) exercise the compute paths; a subset also generate a
+// memory operand so the ModRM/SIB/disp path and RIP-independent [base+disp]
+// addressing are covered. The string-compare ops (PCMPxSTRx) sweep imm8 values
+// and rely on EAX/EDX (already seeded random) for the explicit-length forms.
+
+/// Emit a ModRM addressing a `[base+disp8]` memory operand (mod=01, no SIB),
+/// pointing `base` at the data region. Returns nothing; pushes the byte(s).
+fn push_xmm_mem(b: &mut Vec<u8>, xmm_reg: u8, base: u8, disp: i8) {
+    b.push(0x40 | ((xmm_reg & 7) << 3) | (base & 7)); // mod=01
+    b.push(disp as u8);
+}
+
+fn build_sse4(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    match rng.below(10) {
+        0 => sse4_38_packed(rng, seed),
+        1 => sse4_pmovx(rng, seed),
+        2 => sse4_ptest(rng),
+        3 => sse4_round(rng),
+        4 => sse4_blend_imm(rng),
+        5 => sse4_palignr(rng),
+        6 => sse4_extr_ins(rng, bits),
+        7 => sse4_dp_mpsad(rng),
+        8 => sse4_pcmpstr(rng, bits),
+        _ => sse4_crc32(rng, bits),
+    }
+}
+
+/// 0F 38 packed ops with no immediate (register or memory r/m).
+fn sse4_38_packed(rng: &mut Rng, seed: &mut Seed) -> Trial {
+    let (op3, name) = *rng.pick(&[
+        (0x00u8, "pshufb"),
+        (0x01, "phaddw"),
+        (0x02, "phaddd"),
+        (0x03, "phaddsw"),
+        (0x04, "pmaddubsw"),
+        (0x05, "phsubw"),
+        (0x06, "phsubd"),
+        (0x07, "phsubsw"),
+        (0x08, "psignb"),
+        (0x09, "psignw"),
+        (0x0A, "psignd"),
+        (0x0B, "pmulhrsw"),
+        (0x1C, "pabsb"),
+        (0x1D, "pabsw"),
+        (0x1E, "pabsd"),
+        (0x10, "pblendvb"),
+        (0x14, "blendvps"),
+        (0x15, "blendvpd"),
+        (0x28, "pmuldq"),
+        (0x29, "pcmpeqq"),
+        (0x2B, "packusdw"),
+        (0x37, "pcmpgtq"),
+        (0x38, "pminsb"),
+        (0x39, "pminsd"),
+        (0x3A, "pminuw"),
+        (0x3B, "pminud"),
+        (0x3C, "pmaxsb"),
+        (0x3D, "pmaxsd"),
+        (0x3E, "pmaxuw"),
+        (0x3F, "pmaxud"),
+        (0x40, "pmulld"),
+        (0x41, "phminposuw"),
+    ]);
+    let d = rng.below(8) as u8;
+    let mut b = vec![0x66, 0x0F, 0x38, op3];
+    // ~1/3 memory form for the plumbing coverage.
+    if rng.below(3) == 0 {
+        let base = *rng.pick(&MEM_BASES);
+        let disp = point_data(seed, base, rng);
+        push_xmm_mem(&mut b, d, base, disp);
+    } else {
+        let s = rng.below(8) as u8;
+        b.push(modrm_reg(d, s));
+    }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: name.into() }
+}
+
+/// PMOVSX*/PMOVZX* (0F 38 20-25 / 30-35).
+fn sse4_pmovx(rng: &mut Rng, seed: &mut Seed) -> Trial {
+    let sel = rng.below(6) as u8;
+    let zx = rng.boolean();
+    let op3 = if zx { 0x30 } else { 0x20 } + sel;
+    let d = rng.below(8) as u8;
+    let mut b = vec![0x66, 0x0F, 0x38, op3];
+    if rng.boolean() {
+        let base = *rng.pick(&MEM_BASES);
+        let disp = point_data(seed, base, rng);
+        push_xmm_mem(&mut b, d, base, disp);
+    } else {
+        let s = rng.below(8) as u8;
+        b.push(modrm_reg(d, s));
+    }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: format!("pmov{}x/{sel}", if zx { "z" } else { "s" }) }
+}
+
+/// PTEST (0F 38 17) — sets ZF/CF only.
+fn sse4_ptest(rng: &mut Rng) -> Trial {
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let b = vec![0x66, 0x0F, 0x38, 0x17, modrm_reg(d, s)];
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: CF | ZF | OF | SF | AF | PF, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: "ptest".into() }
+}
+
+/// ROUNDPS/PD/SS/SD (0F 3A 08-0B ib) with random imm8 (mode + MXCSR bit).
+fn sse4_round(rng: &mut Rng) -> Trial {
+    let op3 = 0x08u8 + rng.below(4) as u8;
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    // imm[2] uses MXCSR RC; imm[1:0] a direct mode; imm[3] suppresses precision.
+    let imm = rng.next_u32() as u8;
+    let b = vec![0x66, 0x0F, 0x3A, op3, modrm_reg(d, s), imm];
+    // Result lanes are float bit patterns; compare NaN-aware for the packed/
+    // scalar forms (ps/ss = 4-lane, pd/sd = 2-lane f64).
+    let nan = if op3 == 0x08 || op3 == 0x0A { 4 } else { 8 };
+    Trial { xmm_nan: nan, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: format!("round/{op3:#x} imm={imm:#x}") }
+}
+
+/// BLENDPS/BLENDPD/PBLENDW (0F 3A 0C-0E ib).
+fn sse4_blend_imm(rng: &mut Rng) -> Trial {
+    let op3 = 0x0Cu8 + rng.below(3) as u8;
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let imm = rng.next_u32() as u8;
+    let b = vec![0x66, 0x0F, 0x3A, op3, modrm_reg(d, s), imm];
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: format!("blend-imm/{op3:#x}") }
+}
+
+/// PALIGNR (0F 3A 0F ib).
+fn sse4_palignr(rng: &mut Rng) -> Trial {
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let imm = (rng.below(34)) as u8; // sweep 0..33 incl. >=16 and >=32 edges
+    let b = vec![0x66, 0x0F, 0x3A, 0x0F, modrm_reg(d, s), imm];
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: format!("palignr imm={imm}") }
+}
+
+/// PEXTR*/PINSR*/EXTRACTPS/INSERTPS (0F 3A 14-17 / 20-22 ib). Register forms.
+fn sse4_extr_ins(rng: &mut Rng, bits: Bits) -> Trial {
+    let rexw = bits == Bits::B64 && rng.boolean();
+    let imm = rng.next_u32() as u8;
+    match rng.below(6) {
+        // PEXTRB/W/D(/Q) → GP reg.
+        0..=2 => {
+            let op3 = [0x14u8, 0x15, 0x16][rng.below(3) as usize];
+            let (xmm, gp) = (rng.below(8) as u8, rng.below(8) as u8);
+            let mut b = vec![0x66];
+            if rexw && op3 == 0x16 {
+                b.push(0x48);
+            }
+            b.extend([0x0F, 0x3A, op3, modrm_reg(xmm, gp), imm]);
+            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: format!("pextr/{op3:#x}") }
+        }
+        // EXTRACTPS xmm → GP.
+        3 => {
+            let (xmm, gp) = (rng.below(8) as u8, rng.below(8) as u8);
+            let b = vec![0x66, 0x0F, 0x3A, 0x17, modrm_reg(xmm, gp), imm];
+            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: "extractps".into() }
+        }
+        // PINSRB/D(/Q) ← GP.
+        4 => {
+            let (op3, q) = if rng.boolean() { (0x20u8, false) } else { (0x22u8, rexw) };
+            let (xmm, gp) = (rng.below(8) as u8, rng.below(8) as u8);
+            let mut b = vec![0x66];
+            if q {
+                b.push(0x48);
+            }
+            b.extend([0x0F, 0x3A, op3, modrm_reg(xmm, gp), imm]);
+            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: format!("pinsr/{op3:#x}") }
+        }
+        // INSERTPS xmm ← xmm.
+        _ => {
+            let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+            let b = vec![0x66, 0x0F, 0x3A, 0x21, modrm_reg(d, s), imm];
+            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: "insertps".into() }
+        }
+    }
+}
+
+/// DPPS/DPPD (0F 3A 40/41 ib) and MPSADBW (0F 3A 42 ib).
+fn sse4_dp_mpsad(rng: &mut Rng) -> Trial {
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let imm = rng.next_u32() as u8;
+    match rng.below(3) {
+        0 => {
+            let b = vec![0x66, 0x0F, 0x3A, 0x40, modrm_reg(d, s), imm];
+            Trial { xmm_nan: 4, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: "dpps".into() }
+        }
+        1 => {
+            let b = vec![0x66, 0x0F, 0x3A, 0x41, modrm_reg(d, s), imm];
+            Trial { xmm_nan: 8, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: "dppd".into() }
+        }
+        _ => {
+            let b = vec![0x66, 0x0F, 0x3A, 0x42, modrm_reg(d, s), imm];
+            Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label: "mpsadbw".into() }
+        }
+    }
+}
+
+/// PCMPESTRM/I, PCMPISTRM/I (0F 3A 60-63 ib). Sweeps imm8 fully; sets ECX (…I)
+/// or XMM0 (…M) plus all flags. EAX/EDX (explicit lengths) are the seeded GPRs.
+fn sse4_pcmpstr(rng: &mut Rng, bits: Bits) -> Trial {
+    let op3 = 0x60u8 + rng.below(4) as u8;
+    let (d, s) = (rng.below(8) as u8, rng.below(8) as u8);
+    let imm = rng.next_u32() as u8;
+    // REX.W is legal but only affects the (ignored) upper bits of EAX/EDX for the
+    // explicit forms; keep the plain encoding for a stable decode across engines.
+    let _ = bits;
+    let b = vec![0x66, 0x0F, 0x3A, op3, modrm_reg(d, s), imm];
+    let index = op3 & 1 == 1;
+    // …I writes ECX (reg 1); …M writes XMM0. Both write the full flag set.
+    Trial {
+        xmm_nan: 0,
+        fpu: false,
+        fpu_approx: 0,
+        sw_mask: 0,
+        bytes: b,
+        defined_flags: CF | ZF | SF | OF | AF | PF,
+        skip_reg: 0,
+        subset_reg: 0,
+        skip_mem: Vec::new(),
+        label: format!("pcmp{}str{} imm={imm:#x}", if op3 <= 0x61 { "e" } else { "i" }, if index { "i" } else { "m" }),
+    }
+}
+
+/// CRC32 (F2 0F 38 F0/F1) — 8/16/32/64-bit source into a GP register.
+fn sse4_crc32(rng: &mut Rng, bits: Bits) -> Trial {
+    // F0 = 8-bit source; F1 = 16/32/64-bit source (66 → 16, REX.W → 64).
+    let byte_form = rng.boolean();
+    let (dst, src) = (rng.below(8) as u8, rng.below(8) as u8);
+    let mut b = vec![0xF2];
+    let mut label = String::from("crc32");
+    if byte_form {
+        b.extend([0x0F, 0x38, 0xF0, modrm_reg(dst, src)]);
+        label.push_str(" r,r/m8");
+    } else {
+        match rng.below(if bits == Bits::B64 { 3 } else { 2 }) {
+            0 => {
+                b.push(0x66);
+                b.extend([0x0F, 0x38, 0xF1, modrm_reg(dst, src)]);
+                label.push_str(" r,r/m16");
+            }
+            1 => {
+                b.extend([0x0F, 0x38, 0xF1, modrm_reg(dst, src)]);
+                label.push_str(" r,r/m32");
+            }
+            _ => {
+                b.push(0x48); // REX.W
+                b.extend([0x0F, 0x38, 0xF1, modrm_reg(dst, src)]);
+                label.push_str(" r,r/m64");
+            }
+        }
+    }
+    Trial { xmm_nan: 0, fpu: false, fpu_approx: 0, sw_mask: 0, bytes: b, defined_flags: 0, skip_reg: 0, subset_reg: 0, skip_mem: Vec::new(), label }
 }
 
 // ---- x87 FPU family ---------------------------------------------------------

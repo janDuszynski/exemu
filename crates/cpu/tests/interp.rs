@@ -378,9 +378,12 @@ fn cpuid_advertises_sse2_but_not_avx() {
     // implemented and oracle-clean (roadmap W1.2).
     assert!(ecx & (1 << 26) != 0, "XSAVE (ECX.26) must be advertised");
     assert!(ecx & (1 << 27) != 0, "OSXSAVE (ECX.27) must be advertised");
-    // Three-byte SSSE3/SSE4 escapes are not decoded, so those bits stay off.
-    assert!(ecx & (1 << 9) == 0, "SSSE3 (ECX.9) must NOT be advertised");
-    assert!(ecx & (1 << 20) == 0, "SSE4.2 (ECX.20) must NOT be advertised");
+    // The three-byte SSSE3/SSE4.1/SSE4.2 escapes are implemented and oracle-
+    // clean (roadmap W1.4), so those bits are advertised now. AVX (ECX.28)
+    // stays off until W1.5.
+    assert!(ecx & (1 << 9) != 0, "SSSE3 (ECX.9) must be advertised (W1.4)");
+    assert!(ecx & (1 << 19) != 0, "SSE4.1 (ECX.19) must be advertised (W1.4)");
+    assert!(ecx & (1 << 20) != 0, "SSE4.2 (ECX.20) must be advertised (W1.4)");
 }
 
 #[test]

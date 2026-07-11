@@ -435,3 +435,224 @@ fn psrldq_by_16_or_more_clears() {
     let (cpu, _) = run_with(&code, |cpu, _| cpu.state_mut().xmm[0] = u128::MAX);
     assert_eq!(cpu.state().xmm[0], 0);
 }
+
+// ---- SSSE3 / SSE4.1 / SSE4.2 (0F 38 / 0F 3A) — roadmap W1.4 ---------------
+//
+// PSHUFB / PALIGNR / PTEST / ROUND* / PMULLD / PCMPISTRI / CRC32 plus the three
+// exemu-vs-reference divergences the oracle flagged during bring-up (PINSRB's
+// high-byte-alias read, MPSADBW's imm[1:0]/imm[2] block-offset swap, and the
+// PHADDW in-place hazard when the source aliases the destination).
+
+fn ecx(cpu: &Interpreter) -> u64 {
+    cpu.state().reg(exemu_core::Reg::Rcx) & 0xffff_ffff
+}
+
+#[test]
+fn pshufb_selects_and_zeroes() {
+    // pshufb xmm0, xmm1. Control bytes: byte0 selects src[0], byte1 has the
+    // high bit set (→ 0), byte2 selects src[15]; the rest select src[0].
+    let code = [0x66, 0x0F, 0x38, 0x00, 0xC1, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        // src bytes: b[i] = i (so src[0]=0x00 .. src[15]=0x0F).
+        let mut src = 0u128;
+        for i in 0..16u128 {
+            src |= i << (i * 8);
+        }
+        cpu.state_mut().xmm[0] = src;
+        // control: byte0 = 0x00 (→ src[0]=0), byte1 = 0x80 (→ 0), byte2 = 0x0F
+        // (→ src[15]=0x0F), all others 0x00.
+        cpu.state_mut().xmm[1] = 0x0F << 16 | 0x80 << 8;
+    });
+    let r = cpu.state().xmm[0];
+    assert_eq!(r & 0xFF, 0x00, "byte0 = src[0]");
+    assert_eq!((r >> 8) & 0xFF, 0x00, "byte1 control high-bit → 0");
+    assert_eq!((r >> 16) & 0xFF, 0x0F, "byte2 = src[15]");
+}
+
+#[test]
+fn palignr_concatenates_and_shifts() {
+    // palignr xmm0, xmm1, 3 — concat (xmm0:xmm1), byte-shift right by 3.
+    let code = [0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x03, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = 0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA; // high (a)
+        cpu.state_mut().xmm[1] = 0x0F0E_0D0C_0B0A_0908_0706_0504_0302_0100; // low (b)
+    });
+    // low 13 bytes = b >> 24 bits; top 3 bytes = a's low 3 bytes.
+    let expect = (0x0F0E_0D0C_0B0A_0908_0706_0504_0302_0100u128 >> 24)
+        | (0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAAu128 << (128 - 24));
+    assert_eq!(cpu.state().xmm[0], expect);
+}
+
+#[test]
+fn palignr_imm_ge_32_zeroes() {
+    // palignr xmm0, xmm1, 32 → all zero.
+    let code = [0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x20, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = u128::MAX;
+        cpu.state_mut().xmm[1] = u128::MAX;
+    });
+    assert_eq!(cpu.state().xmm[0], 0);
+}
+
+#[test]
+fn ptest_sets_zf_and_cf() {
+    use exemu_core::cpu::flags;
+    // ptest xmm0, xmm1. ZF = ((xmm1 & xmm0)==0); CF = ((xmm1 & ~xmm0)==0).
+    let code = [0x66, 0x0F, 0x38, 0x17, 0xC1, 0xF4];
+    // Case: xmm0 = 0x0F.., xmm1 = 0xF0.. → AND=0 (ZF=1); ~xmm0 & xmm1 = xmm1 (CF=0).
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = 0x0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F;
+        cpu.state_mut().xmm[1] = 0xF0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0_F0F0;
+    });
+    assert!(cpu.state().flag(flags::ZF), "disjoint masks → ZF");
+    assert!(!cpu.state().flag(flags::CF), "xmm1 has bits outside xmm0 → CF clear");
+}
+
+#[test]
+fn roundsd_honors_imm_modes() {
+    // roundsd xmm0, xmm1, imm. Test floor (imm=1) of 2.7 → 2.0.
+    let code = [0x66, 0x0F, 0x3A, 0x0B, 0xC1, 0x01, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = 0;
+        cpu.state_mut().xmm[1] = 2.7f64.to_bits() as u128;
+    });
+    assert_eq!(f64_in(&cpu, 0), 2.0, "floor(2.7) = 2.0");
+}
+
+#[test]
+fn roundss_nearest_even() {
+    // roundss xmm0, xmm1, 0 (nearest-even) of 2.5 → 2.0.
+    let code = [0x66, 0x0F, 0x3A, 0x0A, 0xC1, 0x00, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = 0;
+        cpu.state_mut().xmm[1] = 2.5f32.to_bits() as u128;
+    });
+    let lane0 = f32::from_bits(cpu.state().xmm[0] as u32);
+    assert_eq!(lane0, 2.0, "round-nearest-even(2.5) = 2.0");
+}
+
+#[test]
+fn pmulld_low_dwords() {
+    // pmulld xmm0, xmm1 — 4 lanes of 32x32 keeping the low 32 bits.
+    let code = [0x66, 0x0F, 0x38, 0x40, 0xC1, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = (7u128) | (0xFFFF_FFFFu128 << 32);
+        cpu.state_mut().xmm[1] = (6u128) | (2u128 << 32);
+    });
+    let r = cpu.state().xmm[0];
+    assert_eq!(r & 0xFFFF_FFFF, 42, "7*6");
+    assert_eq!((r >> 32) & 0xFFFF_FFFF, 0xFFFF_FFFE, "0xFFFFFFFF*2 low32");
+}
+
+#[test]
+fn crc32_castagnoli_byte() {
+    // crc32 eax, cl (F2 0F 38 F0 /r) — CRC-32C of a single byte 0x00 into a
+    // seed of 0 is 0; feed 0xFF with seed 0 to get a known nonzero value.
+    let code = [0xF2, 0x0F, 0x38, 0xF0, 0xC1, 0xF4]; // crc32 eax, cl
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().gpr[0] = 0; // eax seed
+        cpu.state_mut().gpr[1] = 0xFF; // cl
+    });
+    // CRC-32C (Castagnoli) of the single byte 0xFF with an initial CRC of 0 and
+    // no final inversion is 0xAD7D5351 (independently computed reference).
+    assert_eq!(eax(&cpu), 0xAD7D_5351);
+}
+
+#[test]
+fn pcmpistri_flags_and_index() {
+    use exemu_core::cpu::flags;
+    // pcmpistri xmm0, xmm1, 0 — equal-any, unsigned bytes, implicit length,
+    // least-significant index. The classic flag trap: CF set iff any match,
+    // ECX = index of the first match (else 16).
+    // xmm0 (the "set" a) = bytes 'a','b','c', null-terminated.
+    // xmm1 (the "search" b) = 'x','b','y', null-terminated → 'b' matches at i=1.
+    let code = [0x66, 0x0F, 0x3A, 0x63, 0xC1, 0x00, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = u128::from_le_bytes(*b"abc\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        cpu.state_mut().xmm[1] = u128::from_le_bytes(*b"xby\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    });
+    assert_eq!(ecx(&cpu), 1, "first (LSB) matching position is index 1");
+    assert!(cpu.state().flag(flags::CF), "a match exists → CF");
+    assert!(cpu.state().flag(flags::ZF), "b has a null before the end → ZF");
+    assert!(cpu.state().flag(flags::SF), "a has a null before the end → SF");
+}
+
+#[test]
+fn pcmpistri_no_match_returns_16() {
+    use exemu_core::cpu::flags;
+    // No common byte → ECX = 16, CF = 0.
+    let code = [0x66, 0x0F, 0x3A, 0x63, 0xC1, 0x00, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = u128::from_le_bytes(*b"abc\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        cpu.state_mut().xmm[1] = u128::from_le_bytes(*b"xyz\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    });
+    assert_eq!(ecx(&cpu), 16, "no match → index = element count");
+    assert!(!cpu.state().flag(flags::CF), "no match → CF clear");
+}
+
+#[test]
+fn pinsrb_reads_low_byte_not_high8_alias() {
+    // pinsrb xmm7, edi, 12 (66 0F 3A 20 /r ib). Oracle divergence: reading the
+    // source as an 8-bit r/m wrongly hit the BH/DH-style high-byte alias for
+    // register indices 4..8 with no REX; PINSRB must take the *low* byte of the
+    // doubleword register (DIL), here 0xFF.
+    let code = [0x66, 0x0F, 0x3A, 0x20, 0xFF, 0x0C, 0xF4]; // reg=7(xmm7), rm=7(edi)
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[7] = 0;
+        cpu.state_mut().gpr[7] = 0x7FFF_FFFF; // edi low byte = 0xFF
+    });
+    let byte12 = (cpu.state().xmm[7] >> (12 * 8)) & 0xFF;
+    assert_eq!(byte12, 0xFF, "PINSRB inserts the register's low byte");
+}
+
+#[test]
+fn mpsadbw_block_offsets_from_imm() {
+    // mpsadbw xmm0, xmm1, imm. imm[1:0] picks the 4-byte reference block in the
+    // *source* (xmm1); imm[2] picks the window base in the *dest* (xmm0). The
+    // oracle caught these two being swapped. With imm=0 both offsets are 0, so
+    // result word0 = |a0-b0|+|a1-b1|+|a2-b2|+|a3-b3|.
+    let code = [0x66, 0x0F, 0x3A, 0x42, 0xC1, 0x00, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[0] = 0x00_00_00_00_00_00_00_00_00_00_00_00_04_03_02_01;
+        cpu.state_mut().xmm[1] = 0x00_00_00_00_00_00_00_00_00_00_00_00_08_06_04_02;
+    });
+    let word0 = cpu.state().xmm[0] & 0xFFFF;
+    // |1-2|+|2-4|+|3-6|+|4-8| = 1+2+3+4 = 10.
+    assert_eq!(word0, 10);
+}
+
+#[test]
+fn phaddw_in_place_alias_hazard() {
+    // phaddw xmm0, xmm0 — when the source aliases the destination the low half
+    // is written first, so the high half's later pairs read the freshly-written
+    // low words, NOT the original ones (matches the hardware/reference in-place
+    // behavior the oracle pinned). Words = [1,2,3,4,5,6,7,8].
+    let code = [0x66, 0x0F, 0x38, 0x01, 0xC0, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        let mut v = 0u128;
+        for i in 0..8u128 {
+            v |= (i + 1) << (i * 16);
+        }
+        cpu.state_mut().xmm[0] = v;
+    });
+    let w = |k: u32| ((cpu.state().xmm[0] >> (k * 16)) & 0xFFFF) as u64;
+    // Low half: 1+2, 3+4, 5+6, 7+8 = 3,7,11,15.
+    assert_eq!((w(0), w(1), w(2), w(3)), (3, 7, 11, 15));
+    // High half reads the live, sequentially-updated destination. After the low
+    // half d = [3,7,11,15,5,6,7,8]; then d4=d0+d1=10, d5=d2+d3=26, d6=d4+d5=36
+    // (d4/d5 already overwritten this instruction), d7=d6+d7=36+8=44.
+    assert_eq!((w(4), w(5), w(6), w(7)), (10, 26, 36, 44));
+}
+
+#[test]
+fn pmovzxbw_zero_extends_low_bytes() {
+    // pmovzxbw xmm0, xmm1 (66 0F 38 30) — low 8 bytes → 8 zero-extended words.
+    let code = [0x66, 0x0F, 0x38, 0x30, 0xC1, 0xF4];
+    let (cpu, _) = run_with(&code, |cpu, _| {
+        cpu.state_mut().xmm[1] = 0xFF_80_01_00_FF_80_01_00; // low 8 bytes
+    });
+    let r = cpu.state().xmm[0];
+    assert_eq!(r & 0xFFFF, 0x0000, "byte 0x00 → word 0");
+    assert_eq!((r >> 16) & 0xFFFF, 0x0001, "byte 0x01 → word 1");
+    assert_eq!((r >> 48) & 0xFFFF, 0x00FF, "byte 0xFF → word 0x00FF (zero-ext)");
+}

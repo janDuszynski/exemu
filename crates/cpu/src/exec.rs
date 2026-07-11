@@ -921,18 +921,22 @@ impl Interpreter {
             0x0 => (0xD, 0x756e_6547, 0x6c65_746e, 0x4965_6e69),
             // Family/model/stepping + feature flags. ECX/EDX enumerate ONLY
             // implemented features. The interpreter covers the one-byte SSE/
-            // SSE2 map plus POPCNT; the three-byte 0F 38 / 0F 3A escapes that
-            // carry SSSE3/SSE4.1/SSE4.2 are NOT decoded, so those bits are
-            // withheld (advertising them would steer the CRT into pshufb /
-            // pcmpistri / crc32 we cannot execute). AVX/XSAVE/MMX/AES: absent.
+            // SSE2 map plus POPCNT and the full three-byte 0F 38 / 0F 3A
+            // SSSE3/SSE4.1/SSE4.2 family (roadmap W1.4), all oracle-clean, so
+            // those bits are now advertised. AVX/XSAVE-compacted/MMX/AES: absent.
             0x1 => {
-                // POPCNT (ECX.23) is a discrete feature bit, valid to report
-                // without SSE4.2 (ECX.20), which we do not implement. XSAVE
-                // (ECX.26) + OSXSAVE (ECX.27) are advertised now that the full
-                // FXSAVE/XSAVE/XGETBV/XSETBV state is implemented and oracle-
-                // clean; a guest may XGETBV(XCR0) and see exactly the x87+SSE
-                // components (0x3) the interpreter can restore.
-                let ecx: u32 = (1 << 23)   // POPCNT
+                // POPCNT (ECX.23) is a discrete feature bit. SSSE3 (ECX.9),
+                // SSE4.1 (ECX.19) and SSE4.2 (ECX.20) are advertised now that the
+                // 0F 38 / 0F 3A escapes (PSHUFB…PALIGNR, PTEST, ROUND*, PMULLD,
+                // PCMPxSTRx, CRC32, …) are implemented and oracle-clean vs the
+                // differential reference. XSAVE (ECX.26) + OSXSAVE (ECX.27) are
+                // advertised because the full FXSAVE/XSAVE/XGETBV/XSETBV state is
+                // implemented; a guest may XGETBV(XCR0) and see exactly the
+                // x87+SSE components (0x3) the interpreter can restore.
+                let ecx: u32 = (1 << 9)    // SSSE3
+                    | (1 << 19)            // SSE4.1
+                    | (1 << 20)            // SSE4.2
+                    | (1 << 23)            // POPCNT
                     | (1 << 26)            // XSAVE
                     | (1 << 27); // OSXSAVE (XCR0 accessible / CR4.OSXSAVE = 1)
                 let edx: u32 = 1        // FPU (bit 0; guaranteed in long mode)
@@ -1006,6 +1010,13 @@ impl Interpreter {
         // bit 26: SSE2. MOVAPD xmm0, xmm1 (66 0F 28).
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 26, name: "sse2", probe: &[0x66, 0x0F, 0x28, 0xC1] },
         // ---- leaf 1, ECX -----------------------------------------------------
+        // bit 9: SSSE3. PSHUFB xmm0, xmm1 (66 0F 38 00).
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 9, name: "ssse3", probe: &[0x66, 0x0F, 0x38, 0x00, 0xC1] },
+        // bit 19: SSE4.1. PMULLD xmm0, xmm1 (66 0F 38 40).
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 19, name: "sse4.1", probe: &[0x66, 0x0F, 0x38, 0x40, 0xC1] },
+        // bit 20: SSE4.2. PCMPISTRI xmm0, xmm1, 0 (66 0F 3A 63 /r ib) — the
+        // string-compare family + CRC32; this probe exercises the 0F 3A escape.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 20, name: "sse4.2", probe: &[0x66, 0x0F, 0x3A, 0x63, 0xC1, 0x00] },
         // bit 23: POPCNT. POPCNT r32, r/m32 (F3 0F B8).
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 23, name: "popcnt", probe: &[0xF3, 0x0F, 0xB8, 0xC1] },
         // bit 26: XSAVE. XSAVE [rax] (0F AE /4) — the probe maps the operand.
@@ -1532,15 +1543,15 @@ impl Interpreter {
             }
 
             // ---- Three-byte 0F 38 escape --------------------------------
-            // Only MOVBE is decoded here for now; this arm is also the future
-            // home of the SSSE3 / SSE4 instructions (pshufb, pcmpistri, …),
-            // which is why CPUID withholds those feature bits until they land.
+            // MOVBE (F0/F1 without F2) is the one GP-register op here; the F2
+            // F0/F1 forms are CRC32, and the rest of the map is the SSSE3 /
+            // SSE4.1 / SSE4.2 packed family, routed to the SSE unit.
             0x38 => {
                 let op3 = ctx.u8(mem)?;
                 match op3 {
                     // MOVBE — load (F0) / store (F1) with byte reversal. Under
-                    // an F2 prefix these encode CRC32, which we do not
-                    // implement, so exclude that case.
+                    // an F2 prefix these two opcodes encode CRC32 instead, which
+                    // the SSE unit handles.
                     0xF0 | 0xF1 if ctx.pfx.rep != 0xF2 => {
                         self.read_modrm(ctx, mem)?;
                         let size = Self::opsize(ctx);
@@ -1557,13 +1568,14 @@ impl Interpreter {
                             self.write_rm(ctx, mem, size, bswap(v))?;
                         }
                     }
-                    other => {
-                        return Err(EmuError::Decode {
-                            rip: start,
-                            opcode: format!("0f 38 {other:#04x}"),
-                        });
-                    }
+                    _ => self.exec_sse_0f38(ctx, mem, op3)?,
                 }
+            }
+
+            // ---- Three-byte 0F 3A escape (SSSE3/SSE4 imm8 ops) ----------
+            0x3A => {
+                let op3 = ctx.u8(mem)?;
+                self.exec_sse_0f3a(ctx, mem, op3)?;
             }
 
             other => {
