@@ -17,13 +17,13 @@ use crate::WinOs;
 /// The `QueryPerformanceFrequency` value we report: 10 MHz, so a performance
 /// counter tick is 100 ns — matching a common Windows QPC frequency and making
 /// the counter directly convertible to/from `FILETIME` units.
-const QPC_FREQ: u64 = 10_000_000;
+pub(crate) const QPC_FREQ: u64 = 10_000_000;
 
 /// Seconds between the FILETIME epoch (1601-01-01) and the Unix epoch.
 const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
 
 /// Current wall-clock time as a Windows FILETIME (100-ns ticks since 1601).
-fn filetime_now() -> u64 {
+pub(crate) fn filetime_now() -> u64 {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     (dur.as_secs() + EPOCH_DIFF_SECS) * QPC_FREQ + dur.subsec_nanos() as u64 / 100
 }
