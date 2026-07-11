@@ -37,8 +37,11 @@ const THREAD_TEB_SIZE: u64 = 0x2000;
 
 /// x64 TEB field offsets Wine's PE `ntdll` walks (public `winternl.h`/NT_TIB
 /// layout; confirmed against the pinned guest binary's `gs:`-relative reads).
-/// The fields this step seeds so a spawned thread's TEB is walkable without a
-/// fault (roadmap W2.9); the remaining ~30 fields are completed in W2.10.
+/// The fields [`WinOs::seed_teb_64`] populates so the ~0x1838-byte 64-bit TEB is
+/// walkable without a fault (roadmap W2.9/W2.10). Every offset ntdll actually
+/// *dereferences* off `gs:[0x30]` (recovered from the pinned guest binary) is
+/// listed here; the rest of the region is zero-mapped, which satisfies the
+/// null-checks ntdll does on the fields it does not dereference.
 mod teb64 {
     pub const NT_TIB_EXCEPTION_LIST: u64 = 0x000; // NtTib.ExceptionList (-1 = end)
     pub const NT_TIB_STACK_BASE: u64 = 0x008; // NtTib.StackBase
@@ -51,6 +54,13 @@ mod teb64 {
     pub const STATIC_UNICODE_STRING: u64 = 0x0B8; // UNICODE_STRING {Len, MaxLen, +pad, Buffer}
     pub const STATIC_UNICODE_BUFFER: u64 = 0x0C8; // WCHAR[261] backing buffer
     pub const COUNT_OF_OWNED_CRIT_SECS: u64 = 0x6C8; // CountOfOwnedCriticalSections (ULONG)
+    // W2.10 completion: the pointer fields the pinned ntdll dereferences off the
+    // TEB and that must therefore hold a *valid* value (not merely read 0). The
+    // TEB region is freshly zero-mapped, so we write the ones with a meaningful
+    // non-zero value and leave the rest reading back 0 (their correct initial
+    // state — no allocated stack/expansion arrays yet).
+    pub const TLS_EXPANSION_SLOTS: u64 = 0x1780; // ThreadLocalStoragePointer expansion (0 until grown)
+    pub const DEALLOCATION_STACK: u64 = 0x1478; // NtTib-independent stack base for teardown
 
     /// `MaximumLength` of `StaticUnicodeString` — 261 WCHARs (the documented
     /// `STATIC_UNICODE_BUFFER_LENGTH`), in bytes.
@@ -71,6 +81,8 @@ mod teb32 {
     pub const STATIC_UNICODE_STRING: u64 = 0x0AC; // {Len u16, MaxLen u16, Buffer ptr}
     pub const STATIC_UNICODE_BUFFER: u64 = 0x0B4;
     pub const COUNT_OF_OWNED_CRIT_SECS: u64 = 0x38C;
+    pub const TLS_EXPANSION_SLOTS: u64 = 0x0F94; // ThreadLocalStoragePointer expansion (0 until grown)
+    pub const DEALLOCATION_STACK: u64 = 0x0E0C; // stack base for teardown
     pub const STATIC_UNICODE_MAX_BYTES: u16 = 261 * 2;
 }
 
@@ -112,7 +124,7 @@ pub(crate) struct Thread {
     /// segment base while this thread runs, so `gs:[…]` reads *this* thread's
     /// TEB — roadmap W2.9). The main thread reuses the app-mapped
     /// `cfg.teb_base`; every spawned thread gets a fresh region seeded by
-    /// [`WinOs::seed_teb`]. The NT-syscall dispatcher also parks this thread's
+    /// [`WinOs::seed_teb_64`]. The NT-syscall dispatcher also parks this thread's
     /// `syscall_frame` in the tail of this region.
     pub teb_base: u64,
     /// Owned TEB region `[teb_base, teb_base+teb_size)` to unmap on teardown
@@ -270,19 +282,31 @@ impl WinOs {
 
     // ---- per-thread TEB --------------------------------------------------
 
-    /// Seed a full Wine-walkable TEB at `teb_base` for a thread with id `tid`
-    /// running over stack `[stack_base, stack_top)` (roadmap W2.9).
+    /// Seed the complete Wine-walkable TEB at `teb_base` for a thread with id
+    /// `tid`, whose `ProcessEnvironmentBlock` is `peb`, running over stack
+    /// `[stack_base, stack_top)` (roadmap W2.9/W2.10).
     ///
-    /// Writes the fields Wine's PE `ntdll` reads off `NtCurrentTeb()` early —
+    /// Writes every field Wine's PE `ntdll` dereferences off `NtCurrentTeb()`:
     /// `NtTib` (ExceptionList=-1 sentinel, StackBase/StackLimit, Self),
     /// `ClientId` (process/thread ids), `ThreadLocalStoragePointer`,
-    /// `ProcessEnvironmentBlock`, and the `StaticUnicodeString` (an empty
-    /// UNICODE_STRING pointing at the inline `StaticUnicodeBuffer`) —
-    /// `CountOfOwnedCriticalSections` reads back 0 from the zero-mapped page.
-    /// The TEB region is freshly mapped RW, so ordinary permission-checked
-    /// writes reach it. The remaining ~30 TEB fields are completed in W2.10.
-    fn seed_teb(&self, mem: &mut dyn Memory, teb_base: u64, tid: u32, stack_base: u64, stack_top: u64) -> Result<()> {
-        let peb = self.cfg.peb_addr;
+    /// `ProcessEnvironmentBlock`, the `StaticUnicodeString` (an empty
+    /// UNICODE_STRING pointing at the inline `StaticUnicodeBuffer`),
+    /// `CountOfOwnedCriticalSections`, `DeallocationStack` (the stack base used
+    /// on teardown) and `TlsExpansionSlots` (0 until the expansion array is
+    /// grown). The TEB region is freshly mapped RW and zero-filled, so the
+    /// pointer fields not written here read back 0 — their correct initial state
+    /// — which satisfies ntdll's null-checks. `peb` is passed explicitly (rather
+    /// than read off `self.cfg`) so a caller can seed a TEB before the PEB
+    /// address is committed to the config.
+    fn seed_teb_64(
+        &self,
+        mem: &mut dyn Memory,
+        teb_base: u64,
+        tid: u32,
+        peb: u64,
+        stack_top: u64,
+        stack_base: u64,
+    ) -> Result<()> {
         if self.cfg.is_64bit {
             let w = |mem: &mut dyn Memory, off: u64, v: u64| mem.write_u64(teb_base + off, v);
             w(mem, teb64::NT_TIB_EXCEPTION_LIST, u64::MAX)?; // no SEH frame yet
@@ -299,6 +323,8 @@ impl WinOs {
             w(mem, teb64::STATIC_UNICODE_STRING, len_maxlen)?;
             w(mem, teb64::STATIC_UNICODE_STRING + 8, teb_base + teb64::STATIC_UNICODE_BUFFER)?;
             w(mem, teb64::COUNT_OF_OWNED_CRIT_SECS, 0)?;
+            w(mem, teb64::DEALLOCATION_STACK, stack_base)?;
+            w(mem, teb64::TLS_EXPANSION_SLOTS, 0)?;
         } else {
             let w4 = |mem: &mut dyn Memory, off: u64, v: u32| mem.write_u32(teb_base + off, v);
             w4(mem, teb32::NT_TIB_EXCEPTION_LIST, u32::MAX)?;
@@ -313,6 +339,8 @@ impl WinOs {
             w4(mem, teb32::STATIC_UNICODE_STRING, len_maxlen)?;
             w4(mem, teb32::STATIC_UNICODE_STRING + 4, (teb_base + teb32::STATIC_UNICODE_BUFFER) as u32)?;
             w4(mem, teb32::COUNT_OF_OWNED_CRIT_SECS, 0)?;
+            w4(mem, teb32::DEALLOCATION_STACK, stack_base as u32)?;
+            w4(mem, teb32::TLS_EXPANSION_SLOTS, 0)?;
         }
         Ok(())
     }
@@ -329,7 +357,7 @@ impl WinOs {
         if teb == 0 {
             return Ok(());
         }
-        self.seed_teb(mem, teb, 0x1001 /* main tid */, stack_base, stack_top)
+        self.seed_teb_64(mem, teb, 0x1001 /* main tid */, self.cfg.peb_addr, stack_top, stack_base)
     }
 
     /// Allocate and seed a fresh per-thread TEB region, returning its base (the
@@ -337,7 +365,7 @@ impl WinOs {
     /// exhausted (the caller then fails the thread creation).
     fn new_thread_teb(&mut self, mem: &mut dyn Memory, tid: u32, stack_base: u64, stack_top: u64) -> Option<u64> {
         let teb_base = self.map_anywhere(mem, THREAD_TEB_SIZE, Perm::RW, "thread-teb")?;
-        self.seed_teb(mem, teb_base, tid, stack_base, stack_top).ok()?;
+        self.seed_teb_64(mem, teb_base, tid, self.cfg.peb_addr, stack_top, stack_base).ok()?;
         Some(teb_base)
     }
 

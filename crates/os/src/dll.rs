@@ -563,6 +563,12 @@ impl WinOs {
         // Publish PEB.Ldr.
         self.write_ptr(mem, self.cfg.peb_addr + self.cfg.peb_ldr_off, ldr)?;
 
+        // Populate the rest of the PEB fields Wine's ntdll probes (roadmap
+        // W2.10): the OS version block, NtGlobalFlag, SessionId, BeingDebugged,
+        // and a minimal RTL_USER_PROCESS_PARAMETERS reachable via
+        // PEB.ProcessParameters. ImageBaseAddress is seeded by the app.
+        self.seed_peb(mem)?;
+
         // Seed a real PEB.LoaderLock CRITICAL_SECTION (roadmap W0.7). ntdll's
         // loader takes this lock across every module-graph mutation; a guest
         // that queries it (anti-debug, `ntdll!LdrLockLoaderLock`) must see a
@@ -603,6 +609,72 @@ impl WinOs {
             &name,
             &full,
         )?;
+        Ok(())
+    }
+
+    /// Populate the PEB fields Wine's PE `ntdll` reads beyond `Ldr` +
+    /// `ImageBaseAddress` (roadmap W2.10). The PEB is a freshly zero-mapped page,
+    /// so any field left unwritten reads back 0 (its correct default); this
+    /// writes the ones that must hold a meaningful value.
+    ///
+    /// Offsets are the published 64-/32-bit PEB layout. `NtGlobalFlag` @0xBC (64)
+    /// is confirmed from the pinned guest `ntdll.dll` (`RtlGetNtGlobalFlags`
+    /// reads `gs:[0x30]`→`[+0x60]`(PEB)→`[+0xBC]`); the OS-version block,
+    /// `SessionId` and `BeingDebugged` are the documented winternl PEB fields.
+    /// `ProcessParameters` points at a minimal `RTL_USER_PROCESS_PARAMETERS`
+    /// (public winternl.h layout) whose `ImagePathName`/`CommandLine`
+    /// UNICODE_STRINGs reach the module path and the app's UTF-16 command line.
+    fn seed_peb(&mut self, mem: &mut dyn Memory) -> Result<()> {
+        let peb = self.cfg.peb_addr;
+        let (
+            off_being_debugged,
+            off_nt_global_flag,
+            off_os_major,
+            off_os_minor,
+            off_os_build,
+            off_os_platform,
+            off_session_id,
+            off_process_params,
+        ) = if self.cfg.is_64bit {
+            (0x02u64, 0xBC, 0x118, 0x11C, 0x120, 0x124, 0x2C0, 0x20)
+        } else {
+            // 32-bit PEB: NtGlobalFlag @0x68, version block @0xA4.., SessionId
+            // @0x1D4, BeingDebugged @0x02, ProcessParameters @0x10.
+            (0x02, 0x68, 0xA4, 0xA8, 0xAC, 0xB0, 0x1D4, 0x10)
+        };
+
+        // Not being debugged (a common anti-debug read).
+        mem.write_u8(peb + off_being_debugged, 0)?;
+        // NtGlobalFlag: 0 — no ntdll debug heap / loader-snap flags set, which is
+        // what a normally-launched process sees (a nonzero value here flips ntdll
+        // into debug-heap paths a bare guest cannot satisfy).
+        mem.write_u32(peb + off_nt_global_flag, 0)?;
+        // OS version block: report Windows 10 (10.0.19045) so version gates in the
+        // guest CRT/ntdll take their modern paths. OSBuildNumber is a u16.
+        mem.write_u32(peb + off_os_major, 10)?;
+        mem.write_u32(peb + off_os_minor, 0)?;
+        mem.write_u16(peb + off_os_build, 19045)?;
+        mem.write_u32(peb + off_os_platform, 2)?; // VER_PLATFORM_WIN32_NT
+        // Session 0 (the console/services session in a single-session model).
+        mem.write_u32(peb + off_session_id, 0)?;
+
+        // Minimal RTL_USER_PROCESS_PARAMETERS. Public winternl.h layout:
+        //   64: Reserved1[16] @0x00, Reserved2[10] (PVOID) @0x10..0x60,
+        //       ImagePathName (UNICODE_STRING) @0x60, CommandLine @0x70. Size 0x80.
+        //   32: Reserved2[10] (4-byte) @0x10..0x38, ImagePathName @0x38,
+        //       CommandLine @0x40. Size 0x50.
+        let (pp_size, off_image_path, off_command_line) =
+            if self.cfg.is_64bit { (0x80u64, 0x60u64, 0x70u64) } else { (0x50, 0x38, 0x40) };
+        let pp = self.ldr_alloc(pp_size);
+        // ImagePathName ← the module path (already a "C:\\…" string).
+        let (img_buf, img_len) = self.ldr_write_wstr(mem, &self.cfg.module_path_w.clone())?;
+        self.write_unicode_string(mem, pp + off_image_path, img_buf, img_len)?;
+        // CommandLine ← the app's UTF-16 command line, if one was mapped.
+        if self.cfg.cmdline_ptr_w != 0 {
+            let cmd_len = wstr_byte_len(mem, self.cfg.cmdline_ptr_w)?;
+            self.write_unicode_string(mem, pp + off_command_line, self.cfg.cmdline_ptr_w, cmd_len)?;
+        }
+        self.write_ptr(mem, peb + off_process_params, pp)?;
         Ok(())
     }
 
@@ -800,6 +872,21 @@ fn data_export_value(cfg: &crate::WinConfig, name: &str) -> Option<u64> {
         "_wcmdln" => Some(cfg.cmdline_ptr_w),
         _ => None,
     }
+}
+
+/// Byte length (excluding the terminating NUL) of the NUL-terminated UTF-16
+/// string at `addr`, for building a `UNICODE_STRING` over an already-mapped
+/// buffer. Bounded so a missing terminator cannot loop forever (32 KiB covers
+/// the Windows MAX_PATH-based command lines the loader deals with).
+fn wstr_byte_len(mem: &dyn Memory, addr: u64) -> Result<u16> {
+    let mut units = 0u64;
+    while units < 0x4000 {
+        if mem.read_u16(addr + units * 2)? == 0 {
+            break;
+        }
+        units += 1;
+    }
+    Ok((units * 2) as u16)
 }
 
 /// Recursively search `dir` (bounded depth) for a file named `name`.
