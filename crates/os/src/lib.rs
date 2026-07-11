@@ -196,6 +196,11 @@ pub struct WinOs {
 
     /// Open guest file handles → host file objects.
     files: std::collections::HashMap<u64, fs::OpenFile>,
+    /// File handles that name a **directory** → the guest path they opened, so a
+    /// `RootDirectory`-relative `NtCreateFile` and `NtQueryDirectoryFile` (W2.8)
+    /// can resolve the directory. Populated by `NtCreateFile` when the opened
+    /// object is a directory.
+    file_dirs: std::collections::HashMap<u64, String>,
     /// Open directory-enumeration handles (FindFirstFileW / FindNextFileW).
     find_handles: std::collections::HashMap<u64, fs::FindState>,
     /// Section objects (`NtCreateSection`) by handle: Wine's PE loader creates a
@@ -361,6 +366,7 @@ impl WinOs {
             gdi: gdi::Gdi::default(),
             dll: dll::Loader::default(),
             files: std::collections::HashMap::new(),
+            file_dirs: std::collections::HashMap::new(),
             find_handles: std::collections::HashMap::new(),
             sections: HashMap::new(),
             next_handle: 0x0000_1000,
@@ -427,6 +433,18 @@ impl WinOs {
         os.set_syscall_handler(section::SSDT_NT_CREATE_SECTION, section::ssdt_nt_create_section);
         os.set_syscall_handler(section::SSDT_NT_MAP_VIEW_OF_SECTION, section::ssdt_nt_map_view_of_section);
         os.set_syscall_handler(section::SSDT_NT_UNMAP_VIEW_OF_SECTION, section::ssdt_nt_unmap_view_of_section);
+        // NT file syscalls (roadmap W2.8): the NTSTATUS/IO_STATUS_BLOCK face of
+        // the P3.9 sandbox filesystem. Indices recovered from the pinned guest
+        // ntdll stubs.
+        os.set_syscall_handler(fs::SSDT_NT_CREATE_FILE, fs::ssdt_nt_create_file);
+        os.set_syscall_handler(fs::SSDT_NT_READ_FILE, fs::ssdt_nt_read_file);
+        os.set_syscall_handler(fs::SSDT_NT_WRITE_FILE, fs::ssdt_nt_write_file);
+        os.set_syscall_handler(fs::SSDT_NT_QUERY_INFORMATION_FILE, fs::ssdt_nt_query_information_file);
+        os.set_syscall_handler(fs::SSDT_NT_QUERY_DIRECTORY_FILE, fs::ssdt_nt_query_directory_file);
+        os.set_syscall_handler(
+            fs::SSDT_NT_QUERY_VOLUME_INFORMATION_FILE,
+            fs::ssdt_nt_query_volume_information_file,
+        );
         os
     }
 
