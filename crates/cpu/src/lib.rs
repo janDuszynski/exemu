@@ -45,8 +45,8 @@ pub struct Interpreter {
     /// float→int conversions.
     mxcsr: u32,
     /// Extended-control register `XCR0` (read by `XGETBV`, written by `XSETBV`).
-    /// Only the two state components the interpreter implements are ever set:
-    /// bit 0 (x87, always 1) and bit 1 (SSE). Default 0x3.
+    /// The state components the interpreter implements: bit 0 (x87, always 1),
+    /// bit 1 (SSE) and bit 2 (AVX/YMM upper halves). Default 0x7.
     xcr0: u64,
 }
 
@@ -54,9 +54,10 @@ pub struct Interpreter {
 const MXCSR_MASK: u32 = 0x0000_FFFF;
 
 /// `XCR0` state components the interpreter implements: bit 0 = x87 (mandatory,
-/// always set), bit 1 = SSE. AVX (bit 2) and beyond are not implemented, so
-/// `XSETBV` rejects any attempt to enable them.
-const XCR0_SUPPORTED: u64 = 0b11;
+/// always set), bit 1 = SSE, bit 2 = AVX (the YMM upper halves — implemented in
+/// `vex.rs`). Beyond bit 2 (AVX-512 etc.) is not implemented, so `XSETBV`
+/// rejects any attempt to enable those.
+const XCR0_SUPPORTED: u64 = 0b111;
 
 impl Default for Interpreter {
     fn default() -> Self {
@@ -190,6 +191,10 @@ struct Ctx {
     rm: Rm,
     /// Processor mode for this instruction.
     bits: Bits,
+    /// The opcode byte captured by a VEX prefix decode (the VEX payload is
+    /// consumed before the ModRM, so the opcode is stashed here). Unused by the
+    /// legacy decode path.
+    u8_at_op: u8,
 }
 
 impl Ctx {
@@ -510,6 +515,7 @@ impl RegAt for CpuState {
 
 mod exec;
 mod sse;
+mod vex;
 mod x87;
 
 pub use exec::{CpuidFeature, CpuidReg};

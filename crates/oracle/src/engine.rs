@@ -55,24 +55,25 @@ const STS: [RegisterX86; 8] = [
     RegisterX86::ST7,
 ];
 
-/// The eight low XMM registers (all the generator uses; XMM8-15 need REX).
-const XMMS: [RegisterX86; 16] = [
-    RegisterX86::XMM0,
-    RegisterX86::XMM1,
-    RegisterX86::XMM2,
-    RegisterX86::XMM3,
-    RegisterX86::XMM4,
-    RegisterX86::XMM5,
-    RegisterX86::XMM6,
-    RegisterX86::XMM7,
-    RegisterX86::XMM8,
-    RegisterX86::XMM9,
-    RegisterX86::XMM10,
-    RegisterX86::XMM11,
-    RegisterX86::XMM12,
-    RegisterX86::XMM13,
-    RegisterX86::XMM14,
-    RegisterX86::XMM15,
+/// The 16 YMM registers (256-bit) — used only by the VEX category to diff the
+/// full AVX register file, incl. the upper 128 bits.
+const YMMS: [RegisterX86; 16] = [
+    RegisterX86::YMM0,
+    RegisterX86::YMM1,
+    RegisterX86::YMM2,
+    RegisterX86::YMM3,
+    RegisterX86::YMM4,
+    RegisterX86::YMM5,
+    RegisterX86::YMM6,
+    RegisterX86::YMM7,
+    RegisterX86::YMM8,
+    RegisterX86::YMM9,
+    RegisterX86::YMM10,
+    RegisterX86::YMM11,
+    RegisterX86::YMM12,
+    RegisterX86::YMM13,
+    RegisterX86::YMM14,
+    RegisterX86::YMM15,
 ];
 
 /// The observable result of one step.
@@ -81,6 +82,9 @@ struct Post {
     rflags: u64,
     ip: u64,
     xmm: [u128; 16],
+    /// Upper 128 bits of ymm0..ymm15 (the AVX YMM_Hi state), read out only for
+    /// the VEX category (`trial.ymm256`); zero otherwise.
+    ymm_hi: [u128; 16],
     data: Vec<u8>,
     /// x87 physical data registers (80-bit) in ST-relative order as read out
     /// from the *final* TOP, so both engines are compared register-for-register
@@ -142,6 +146,7 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         s.gpr = seed.gpr;
         s.rflags = seed.rflags;
         s.xmm = seed.xmm;
+        s.ymm_hi = seed.ymm_hi;
         s.x87.st = seed.st;
         s.x87.cw = seed.cw;
         s.x87.sw = seed.sw; // TOP=0 at seed time
@@ -156,9 +161,9 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
     let mut hooks = NoHooks;
     match cpu.step(&mut mem, &mut hooks) {
         Ok(Exit::Continue) => {
-            let (gpr, rflags, ip, xmm, sw, cw) = {
+            let (gpr, rflags, ip, xmm, ymm_hi, sw, cw) = {
                 let s = cpu.state();
-                (s.gpr, s.rflags, s.rip, s.xmm, s.x87.sw, s.x87.cw)
+                (s.gpr, s.rflags, s.rip, s.xmm, s.ymm_hi, s.x87.sw, s.x87.cw)
             };
             // Read the ST stack ST-relative to the final TOP.
             let mut st = [0u128; 8];
@@ -172,7 +177,7 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             if mem.read(gen::DATA_BASE, &mut data).is_err() {
                 return Outcome::Fault;
             }
-            Outcome::Ok(Post { gpr, rflags, ip, xmm, data, st, sw, cw })
+            Outcome::Ok(Post { gpr, rflags, ip, xmm, ymm_hi, data, st, sw, cw })
         }
         // #DE (Interrupt(0)), Halted, ProcessExit, or a memory/decode error.
         _ => Outcome::Fault,
@@ -203,10 +208,16 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             return Outcome::Fault;
         }
     }
-    // xmm8..15 exist only in 64-bit mode.
+    // xmm8..15 / ymm8..15 exist only in 64-bit mode. Seed the full 256-bit YMM
+    // register (low = xmm, high = ymm_hi) so the VEX category's upper halves are
+    // controlled; for non-VEX categories ymm_hi is zero, so this is equivalent
+    // to seeding just the XMM low half.
     let nxmm = if bits == Bits::B64 { 16 } else { 8 };
-    for (i, x) in XMMS[..nxmm].iter().enumerate() {
-        if uc.reg_write_long(*x, &seed.xmm[i].to_le_bytes()).is_err() {
+    for (i, y) in YMMS[..nxmm].iter().enumerate() {
+        let mut buf = [0u8; 32];
+        buf[..16].copy_from_slice(&seed.xmm[i].to_le_bytes());
+        buf[16..].copy_from_slice(&seed.ymm_hi[i].to_le_bytes());
+        if uc.reg_write_long(*y, &buf).is_err() {
             return Outcome::Fault;
         }
     }
@@ -245,12 +256,20 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             let rflags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
             let ip = uc.reg_read(ip_reg).unwrap_or(0);
             let mut xmm = [0u128; 16];
-            for (i, x) in XMMS[..nxmm].iter().enumerate() {
-                if let Ok(bytes) = uc.reg_read_long(*x) {
-                    if bytes.len() >= 16 {
-                        let mut a = [0u8; 16];
-                        a.copy_from_slice(&bytes[..16]);
-                        xmm[i] = u128::from_le_bytes(a);
+            let mut ymm_hi = [0u128; 16];
+            for (i, y) in YMMS[..nxmm].iter().enumerate() {
+                if let Ok(bytes) = uc.reg_read_long(*y) {
+                    if bytes.len() >= 32 {
+                        let mut lo = [0u8; 16];
+                        let mut hi = [0u8; 16];
+                        lo.copy_from_slice(&bytes[..16]);
+                        hi.copy_from_slice(&bytes[16..32]);
+                        xmm[i] = u128::from_le_bytes(lo);
+                        ymm_hi[i] = u128::from_le_bytes(hi);
+                    } else if bytes.len() >= 16 {
+                        let mut lo = [0u8; 16];
+                        lo.copy_from_slice(&bytes[..16]);
+                        xmm[i] = u128::from_le_bytes(lo);
                     }
                 }
             }
@@ -271,7 +290,7 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             }
             let sw = uc.reg_read(RegisterX86::FPSW).unwrap_or(0) as u16;
             let cw = uc.reg_read(RegisterX86::FPCW).unwrap_or(0) as u16;
-            Outcome::Ok(Post { gpr, rflags, ip, xmm, data, st, sw, cw })
+            Outcome::Ok(Post { gpr, rflags, ip, xmm, ymm_hi, data, st, sw, cw })
         }
         Err(_) => Outcome::Fault,
     }
@@ -314,7 +333,7 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
             // must also be set by the reference. exemu may report *fewer* bits
             // (an honest subset), but a bit set in exemu yet clear in the
             // reference is a fabricated capability — a hard divergence.
-            let extra = av & !bv;
+            let extra = av & !bv & !trial.subset_ignore;
             if extra != 0 {
                 return Some(format!(
                     "{} exemu={:#x} unicorn={:#x} (exemu advertises bits {:#x} the reference lacks)",
@@ -338,6 +357,21 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
     for i in 0..nxmm {
         if !xmm_eq(a.xmm[i], b.xmm[i], trial.xmm_nan) {
             return Some(format!("xmm{i} exemu={:#034x} unicorn={:#034x}", a.xmm[i], b.xmm[i]));
+        }
+        // VEX category: also diff the upper 128 bits of each YMM against the
+        // reference. Only enabled when a zero-upper-correct reference is present
+        // (this Unicorn build is not — see `Trial::ymm256`).
+        if trial.ymm256 && !xmm_eq(a.ymm_hi[i], b.ymm_hi[i], trial.xmm_nan) {
+            return Some(format!(
+                "ymm{i}[255:128] exemu={:#034x} unicorn={:#034x}",
+                a.ymm_hi[i], b.ymm_hi[i]
+            ));
+        }
+        // VEX.128 zero-upper assertion: exemu's own upper 128 bits of the
+        // destination(s) must be zero (checked against exemu, not the reference,
+        // which does not model zero-upper). `a` is always the exemu post-state.
+        if trial.assert_upper_zero & (1 << i) != 0 && a.ymm_hi[i] != 0 {
+            return Some(format!("ymm{i}[255:128] not zeroed by VEX.128: exemu={:#034x}", a.ymm_hi[i]));
         }
     }
     for (i, (x, y)) in a.data.iter().zip(b.data.iter()).enumerate() {
@@ -500,6 +534,31 @@ pub fn fuzz(cfg: &FuzzConfig) -> Summary {
         }
     }
     summary
+}
+
+/// Debug helper: reproduce one trial by (seed, index) and dump both engines'
+/// full XMM/YMM state, for diagnosing a specific VEX divergence.
+pub fn debug_index(bits: Bits, base_seed: u64, index: u64) -> String {
+    let (trial, seed) = trial_at(bits, base_seed, index);
+    let mut out = String::new();
+    out.push_str(&format!("label={} bytes={}\n", trial.label, hex(&trial.bytes)));
+    for i in 0..16 {
+        out.push_str(&format!("  seed ymm{i} = {:#034x}:{:#034x}\n", seed.ymm_hi[i], seed.xmm[i]));
+    }
+    let ex = run_exemu(bits, &trial.bytes, &seed);
+    let un = run_unicorn(bits, &trial.bytes, &seed);
+    for (name, o) in [("exemu", &ex), ("unicorn", &un)] {
+        match o {
+            Outcome::Fault => out.push_str(&format!("{name}: FAULT\n")),
+            Outcome::Ok(p) => {
+                for i in 0..16 {
+                    out.push_str(&format!("  {name} ymm{i} = {:#034x}:{:#034x}\n", p.ymm_hi[i], p.xmm[i]));
+                }
+                out.push_str(&format!("  {name} flags={:#x}\n", p.rflags & 0xffff));
+            }
+        }
+    }
+    out
 }
 
 /// Render a divergence for the terminal.

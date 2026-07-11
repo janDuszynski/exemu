@@ -88,8 +88,9 @@ fn leaf0_max_leaf_and_vendor() {
 fn leaf1_feature_words_exact() {
     let (_eax, _ebx, ecx, edx) = cpuid(1, 0);
     // ECX: SSSE3(9) | SSE4.1(19) | SSE4.2(20) | POPCNT(23) | XSAVE(26) |
-    // OSXSAVE(27) — and nothing else. SSSE3/SSE4.1/SSE4.2 are ON after W1.4.
-    assert_eq!(ecx, (1 << 9) | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 27));
+    // OSXSAVE(27) | AVX(28) — and nothing else. SSSE3/SSE4.1/SSE4.2 are ON after
+    // W1.4; AVX is ON after W1.5.
+    assert_eq!(ecx, (1 << 9) | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28));
     // EDX: FPU(0) | TSC(4) | CMOV(15) | FXSR(24) | SSE(25) | SSE2(26).
     assert_eq!(edx, 1 | (1 << 4) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 26));
     // x87 must be ON now (W1.1).
@@ -99,47 +100,48 @@ fn leaf1_feature_words_exact() {
 #[test]
 fn leaf1_withholds_unimplemented_bits() {
     let (_eax, _ebx, ecx, edx) = cpuid(1, 0);
-    // These stay OFF until their W1 steps land — advertising any would send Wine
-    // into a decode-fault. (SSSE3/SSE4.1/SSE4.2 are ON as of W1.4; see
-    // `leaf1_feature_words_exact`. SSE3 is still off — its handful of extra ops
-    // is a separate, not-yet-implemented feature bit.)
+    // These stay OFF until their steps land — advertising any would send Wine
+    // into a decode-fault. (SSSE3/SSE4.1/SSE4.2 are ON as of W1.4 and AVX as of
+    // W1.5; see `leaf1_feature_words_exact`. SSE3 is still off — its handful of
+    // extra ops is a separate, not-yet-implemented feature bit.)
     assert_eq!(ecx & (1 << 0), 0, "SSE3 must be OFF");
-    assert_eq!(ecx & (1 << 28), 0, "AVX must be OFF (W1.5)");
     assert_eq!(ecx & (1 << 12), 0, "FMA must be OFF");
     assert_eq!(ecx & (1 << 25), 0, "AES must be OFF");
     assert_eq!(edx & (1 << 23), 0, "MMX must be OFF (bare MMX unimplemented)");
 }
 
 #[test]
-fn leaf7_all_zero_no_ext_features() {
-    // exemu implements none of the structured extended features yet
-    // (no BMI1/BMI2/AVX2). Max sub-leaf is 0.
-    assert_eq!(cpuid(7, 0), (0, 0, 0, 0));
+fn leaf7_avx2_only() {
+    // Structured extended features: only AVX2 (EBX bit 5) is advertised, ON after
+    // W1.5. Max sub-leaf (EAX) is 0. No BMI1/BMI2/ADX yet.
+    let (eax, ebx, ecx, edx) = cpuid(7, 0);
+    assert_eq!(eax, 0, "max sub-leaf 0");
+    assert_eq!(ebx, 1 << 5, "only AVX2 advertised in leaf 7 EBX");
+    assert_eq!(ecx, 0);
+    assert_eq!(edx, 0);
     // Sub-leaf variation stays zero.
     assert_eq!(cpuid(7, 1), (0, 0, 0, 0));
-    let (_e, ebx, ecx, _d) = cpuid(7, 0);
+    assert_ne!(ebx & (1 << 5), 0, "AVX2 must be ON (W1.5)");
     assert_eq!(ebx & (1 << 3), 0, "BMI1 must be OFF (W1.6)");
     assert_eq!(ebx & (1 << 8), 0, "BMI2 must be OFF (W1.6)");
-    assert_eq!(ebx & (1 << 5), 0, "AVX2 must be OFF (W1.5)");
     assert_eq!(ebx & (1 << 19), 0, "ADX must be OFF (W1.6)");
-    assert_eq!(ecx, 0);
 }
 
 #[test]
 fn leafd_xsave_enumeration() {
-    // Sub-leaf 0: EAX/EDX = XCR0 valid-bit mask (x87|SSE = 0x3); EBX = size for
-    // the enabled features, ECX = max size for all supported — both 576 (512
-    // legacy + 64 header) since we support exactly x87+SSE.
+    // Sub-leaf 0: EAX/EDX = XCR0 valid-bit mask (x87|SSE|AVX = 0x7 after W1.5);
+    // EBX = size for the enabled features, ECX = max size for all supported —
+    // both 832 (512 legacy + 64 header + 256 AVX YMM_Hi component).
     let (eax, ebx, ecx, edx) = cpuid(0xD, 0);
-    assert_eq!(eax, 0x3, "XCR0 valid-bit mask = x87|SSE");
+    assert_eq!(eax, 0x7, "XCR0 valid-bit mask = x87|SSE|AVX");
     assert_eq!(edx, 0, "XCR0 high mask = 0");
-    assert_eq!(ebx, 576);
-    assert_eq!(ecx, 576);
-    assert_eq!(eax & (1 << 2), 0, "AVX (YMM) XSAVE component must be OFF (W1.5)");
+    assert_eq!(ebx, 832);
+    assert_eq!(ecx, 832);
+    assert_ne!(eax & (1 << 2), 0, "AVX (YMM) XSAVE component must be ON (W1.5)");
     // Sub-leaf 1 (XSAVEOPT/XSAVEC/XSAVES): none implemented ⇒ all zero.
     assert_eq!(cpuid(0xD, 1), (0, 0, 0, 0));
-    // Sub-leaf 2 (first extended component, AVX): absent ⇒ zero.
-    assert_eq!(cpuid(0xD, 2), (0, 0, 0, 0));
+    // Sub-leaf 2: the AVX (YMM upper-half) component — size 256 at offset 576.
+    assert_eq!(cpuid(0xD, 2), (256, 576, 0, 0));
 }
 
 #[test]
