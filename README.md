@@ -17,7 +17,7 @@ independent, testable crate behind a trait.
 
 > **Scope.** This is a from-scratch userland emulator built for clarity and
 > extensibility. It implements a broad subset of the x86/x86-64 instruction
-> set (including SSE2), ~200 Win32 functions, a host-backed sandbox
+> set (through SSE4.2), ~200 Win32 functions, a host-backed sandbox
 > filesystem, and a lightweight **window + GDI renderer** — enough to run
 > real console programs end to end and to drive real GUI apps (`--gui`)
 > interactively, both dialog-template UIs and custom `CreateWindowEx`
@@ -146,8 +146,14 @@ exemu sample <out.exe>
   (incl. `CVTDQ2PS`/`CVTPS2DQ`/`CVTTPS2DQ`), the packed-integer family —
   add/sub (incl. **saturating** `PADD/PSUB S/US`), multiply (`PMULLW`/`HW`/
   `HUW`, `PMULUDQ`, `PMADDWD`), `PAVGB/W`, `PSADBW`, `PACK*`, `PEXTRW`,
-  `MOVMSKPS/PD`, shifts, shuffles, pack/unpack — plus `LDMXCSR`/`STMXCSR`,
-  the full 512-byte `FXSAVE`/`FXRSTOR` save area, and the extended-state
+  `MOVMSKPS/PD`, shifts, shuffles, pack/unpack — plus the **SSSE3/SSE4.1/
+  SSE4.2** three-byte `0F 38`/`0F 3A` families: `PSHUFB`, `PALIGNR`, the
+  horizontal add/subtract and sign/abs ops, `PTEST`, `ROUND*` (honoring `MXCSR`
+  rounding), `PMULLD`/`PMULDQ`, the blends, `PMOVSX`/`PMOVZX`, `PEXTR*`/`PINSR*`,
+  `INSERTPS`/`EXTRACTPS`, `DPPS`/`DPPD`, `MPSADBW`, the `PCMPESTR`/`PCMPISTR`
+  string compares (full `imm8` semantics + flags), and `CRC32` — plus
+  `LDMXCSR`/`STMXCSR`, the full 512-byte `FXSAVE`/`FXRSTOR` save area, and the
+  extended-state
   `XSAVE`/`XRSTOR`/`XGETBV`/`XSETBV` (x87+SSE components) — all with faithful
   EFLAGS and cross-checked against a Unicorn differential oracle (byte-exact
   save-area diff). The **x87 FPU** is implemented too: the ST0–ST7

@@ -537,6 +537,519 @@ impl Interpreter {
         Ok(())
     }
 
+    // ---- SSSE3 / SSE4.1 / SSE4.2 (three-byte 0F 38 / 0F 3A escapes) ------
+    //
+    // These are reached from `exec_0f`'s 0x38 / 0x3A arms *after* the third
+    // opcode byte has been consumed; each handler reads its own ModRM. The
+    // mandatory prefix is `66` for the whole packed-integer/blend/round family
+    // (SSSE3 had bare-MMX forms too, but Wine's binaries are 64-bit and use the
+    // XMM forms exclusively), and `F2` for CRC32. Semantics come from the Intel
+    // SDM (vol. 2) only.
+
+    /// 0F 38 xx — SSSE3 + SSE4.1 + SSE4.2 (non-immediate) opcodes.
+    pub(crate) fn exec_sse_0f38(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, op3: u8) -> Result<()> {
+        // CRC32 (F2 0F 38 F0/F1) is the one GP-register op in this map.
+        if op3 == 0xF0 || op3 == 0xF1 {
+            return self.crc32(ctx, mem, op3);
+        }
+        self.read_modrm(ctx, mem)?;
+        let reg = ctx.reg;
+        match op3 {
+            // ---- PSHUFB (00) ----------------------------------------------
+            0x00 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, pshufb(a, b));
+            }
+            // ---- PHADD/PHSUB {W,D} and saturating W (01,02,03,05,06,07) ---
+            0x01 | 0x02 | 0x03 | 0x05 | 0x06 | 0x07 => {
+                let a = self.xmm(reg);
+                let b = self.sse_rm(ctx, mem, 16)?;
+                let esz = if op3 == 0x02 || op3 == 0x06 { 4 } else { 2 };
+                let sub = matches!(op3, 0x05..=0x07);
+                let sat = op3 == 0x03 || op3 == 0x07; // PHADDSW / PHSUBSW
+                // In-place hazard: when the source r/m is the *same* register as
+                // the destination, real hardware (and the reference) write the
+                // destination's low half first, so the high half reads the
+                // already-updated low dwords rather than the original ones.
+                let aliased = matches!(ctx.rm, Rm::Reg(i) if i == reg);
+                self.set_xmm(reg, phaddsub(a, b, esz, sub, sat, aliased));
+            }
+            // ---- PMADDUBSW (04) -------------------------------------------
+            0x04 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, pmaddubsw(a, b));
+            }
+            // ---- PSIGN{B,W,D} (08,09,0A) ----------------------------------
+            0x08..=0x0A => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                let esz = 1usize << (op3 - 0x08);
+                self.set_xmm(reg, psign(a, b, esz));
+            }
+            // ---- PMULHRSW (0B) --------------------------------------------
+            0x0B => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, pmulhrsw(a, b));
+            }
+            // ---- PABS{B,W,D} (1C,1D,1E) -----------------------------------
+            0x1C..=0x1E => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let esz = 1usize << (op3 - 0x1C);
+                self.set_xmm(reg, pabs(src, esz));
+            }
+            // ---- Variable blends PBLENDVB/BLENDVPS/BLENDVPD (10,14,15) ----
+            // Mask is the implicit XMM0 (top bit of each element selects src).
+            0x10 | 0x14 | 0x15 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                let mask = self.xmm(0);
+                let esz = match op3 {
+                    0x10 => 1, // byte
+                    0x14 => 4, // dword (ps)
+                    _ => 8,    // qword (pd)
+                };
+                self.set_xmm(reg, blend_var(a, b, mask, esz));
+            }
+            // ---- PTEST (17) — sets ZF/CF, leaves the registers alone ------
+            0x17 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                // ZF = ((dst AND src) == 0); CF = ((NOT dst AND src) == 0).
+                self.state.set_flag(flags::ZF, (b & a) == 0);
+                self.state.set_flag(flags::CF, (b & !a) == 0);
+                for f in [flags::OF, flags::SF, flags::AF, flags::PF] {
+                    self.state.set_flag(f, false);
+                }
+            }
+            // ---- PMOVSX* (20-25) / PMOVZX* (30-35): sign/zero-extend -------
+            0x20..=0x25 | 0x30..=0x35 => {
+                let sign = op3 < 0x30;
+                let sel = op3 & 0x0F; // 0..5
+                // src element size (bytes) and dst element size (bytes) per SDM:
+                //  0: b->w  1: b->d  2: b->q  3: w->d  4: w->q  5: d->q
+                let (src_sz, dst_sz) = [(1usize, 2usize), (1, 4), (1, 8), (2, 4), (2, 8), (4, 8)][sel as usize];
+                // Only the low `count*src_sz` bytes of r/m are read.
+                let count = 16 / dst_sz;
+                let src = self.sse_rm(ctx, mem, count * src_sz)?;
+                self.set_xmm(reg, pmovx(src, src_sz, dst_sz, sign));
+            }
+            // ---- PMULDQ (28) — signed 32x32->64 on even lanes -------------
+            0x28 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, pmuldq(a, b));
+            }
+            // ---- PCMPEQQ (29) / PCMPGTQ (37) — 64-bit compares ------------
+            0x29 | 0x37 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, pcmp(a, b, 8, op3 == 0x37));
+            }
+            // ---- MOVNTDQA (2A) — non-temporal aligned load ≡ MOVDQA -------
+            0x2A => {
+                let v = self.sse_rm(ctx, mem, 16)?;
+                self.set_xmm(reg, v);
+            }
+            // ---- PACKUSDW (2B) — pack signed dword → unsigned word --------
+            0x2B => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, packusdw(a, b));
+            }
+            // ---- PMIN/PMAX signed byte/dword + unsigned word/dword --------
+            // 38 PMINSB 39 PMINSD 3A PMINUW 3B PMINUD
+            // 3C PMAXSB 3D PMAXSD 3E PMAXUW 3F PMAXUD
+            0x38..=0x3F => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                let max = op3 >= 0x3C;
+                let (esz, signed) = match op3 & 0x03 {
+                    0 => (1usize, true),  // SB
+                    1 => (4usize, true),  // SD
+                    2 => (2usize, false), // UW
+                    _ => (4usize, false), // UD
+                };
+                self.set_xmm(reg, int_minmax(a, b, esz, signed, max));
+            }
+            // ---- PMULLD (40) — 32x32 keep low 32, four lanes --------------
+            0x40 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, pmulld(a, b));
+            }
+            // ---- PHMINPOSUW (41) — min unsigned word + its index ---------
+            0x41 => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                self.set_xmm(reg, phminposuw(src));
+            }
+            other => return unsupported3(0x38, other, ctx, "sse38"),
+        }
+        Ok(())
+    }
+
+    /// 0F 3A xx ib — SSSE3 + SSE4.1 + SSE4.2 immediate-8 opcodes.
+    pub(crate) fn exec_sse_0f3a(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, op3: u8) -> Result<()> {
+        self.read_modrm(ctx, mem)?;
+        // The imm8 is the last byte of every 0F 3A instruction. Reading it now
+        // (before touching a memory operand) advances `cur` to the end of the
+        // instruction, so a RIP-relative `rm_addr()` resolves correctly — the
+        // ordering the decode rules require (read ModRM, then imm, then operand).
+        let imm = ctx.u8(mem)?;
+        let reg = ctx.reg;
+        match op3 {
+            // ---- ROUNDPS/PD/SS/SD (08,09,0A,0B) — honor imm8/MXCSR --------
+            0x08..=0x0B => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let mode = self.round_mode(imm);
+                let dst = self.xmm(reg);
+                let out = match op3 {
+                    0x08 => {
+                        let mut o = 0u128;
+                        for l in 0..4 {
+                            o |= (round_f32(f32_lane(src, l), mode).to_bits() as u128) << (l * 32);
+                        }
+                        o
+                    }
+                    0x09 => {
+                        let mut o = 0u128;
+                        for l in 0..2 {
+                            o |= (round_f64(f64_lane(src, l), mode).to_bits() as u128) << (l * 64);
+                        }
+                        o
+                    }
+                    0x0A => (dst & !LOW32) | (round_f32(f32_lane(src, 0), mode).to_bits() as u128),
+                    _ => (dst & !LOW64) | (round_f64(f64_lane(src, 0), mode).to_bits() as u128),
+                };
+                self.set_xmm(reg, out);
+            }
+            // ---- BLENDPS/BLENDPD/PBLENDW (0C,0D,0E) — imm8 lane select ----
+            0x0C..=0x0E => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let dst = self.xmm(reg);
+                let esz = match op3 {
+                    0x0C => 4, // ps: 4 dword lanes, imm bits 0..3
+                    0x0D => 8, // pd: 2 qword lanes, imm bits 0..1
+                    _ => 2,    // pblendw: 8 word lanes, imm bits 0..7
+                };
+                self.set_xmm(reg, blend_imm(dst, src, imm, esz));
+            }
+            // ---- PALIGNR (0F) ---------------------------------------------
+            0x0F => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, palignr(a, b, imm));
+            }
+            // ---- PEXTRB/PEXTRW/PEXTRD/Q (14,15,16) → r/m ------------------
+            0x14..=0x16 => {
+                let src = self.xmm(reg); // reg is the XMM source
+                let (esz, cnt) = match op3 {
+                    0x14 => (1usize, 16u32),
+                    0x15 => (2usize, 8),
+                    _ => {
+                        if ctx.pfx.w() {
+                            (8usize, 2)
+                        } else {
+                            (4usize, 4)
+                        }
+                    }
+                };
+                let idx = (imm as u32) % cnt;
+                let v = ((src >> (idx * esz as u32 * 8)) & emask(esz)) as u64;
+                // PEXTRB/W zero-extend into a 32/64-bit GP reg; the memory form
+                // writes exactly `esz` bytes. PEXTRD/Q write the natural size.
+                let store_sz = match op3 {
+                    0x16 => esz as u8,
+                    _ => {
+                        if matches!(ctx.rm, Rm::Reg(_)) {
+                            // reg dst is written full-width (zero-extended)
+                            if ctx.pfx.w() {
+                                8
+                            } else {
+                                4
+                            }
+                        } else {
+                            esz as u8
+                        }
+                    }
+                };
+                self.write_rm(ctx, mem, store_sz, v)?;
+            }
+            // ---- EXTRACTPS (17) — one f32 lane → r/m32 --------------------
+            0x17 => {
+                let src = self.xmm(reg);
+                let idx = (imm as u32) & 3;
+                let v = ((src >> (idx * 32)) & LOW32) as u64;
+                let store_sz = if matches!(ctx.rm, Rm::Reg(_)) && ctx.pfx.w() { 8 } else { 4 };
+                self.write_rm(ctx, mem, store_sz, v)?;
+            }
+            // ---- PINSRB/PINSRD/Q (20,22) — r/m → xmm lane ----------------
+            0x20 | 0x22 => {
+                let (esz, cnt) = if op3 == 0x20 {
+                    (1usize, 16u32)
+                } else if ctx.pfx.w() {
+                    (8usize, 2)
+                } else {
+                    (4usize, 4)
+                };
+                // PINSRB reads a byte, but from the *doubleword* GP register (the
+                // low 8 bits — never the AH/BH/CH/DH high-byte alias) or a memory
+                // byte. Read at the doubleword width for a register source so the
+                // high-8 special case in `read_gpr` is bypassed, then mask.
+                let gp = match ctx.rm {
+                    Rm::Reg(i) => self.state.gpr_read(i, if esz == 8 { 8 } else { 4 }),
+                    Rm::Mem { .. } => mem.read_uint(ctx.rm_addr(), esz as u8)?,
+                } & (emask(esz) as u64);
+                let idx = (imm as u32) % cnt;
+                let mask = emask(esz) << (idx * esz as u32 * 8);
+                let dst = self.xmm(reg);
+                self.set_xmm(reg, (dst & !mask) | (((gp as u128) << (idx * esz as u32 * 8)) & mask));
+            }
+            // ---- INSERTPS (21) — f32 lane insert + zero mask -------------
+            0x21 => {
+                // Source dword: memory form takes a single f32 at the operand;
+                // register form takes lane imm[7:6] of the src XMM.
+                let src_dword = match ctx.rm {
+                    Rm::Reg(i) => (self.xmm(i) >> (((imm >> 6) & 3) as u32 * 32)) as u32,
+                    Rm::Mem { .. } => mem.read_u32(ctx.rm_addr())?,
+                };
+                let dst_sel = ((imm >> 4) & 3) as u32;
+                let mut dst = self.xmm(reg);
+                let lane_mask = LOW32 << (dst_sel * 32);
+                dst = (dst & !lane_mask) | (((src_dword as u128) << (dst_sel * 32)) & lane_mask);
+                // Zero mask: imm[3:0] clears the corresponding dword lanes.
+                for l in 0..4 {
+                    if (imm >> l) & 1 == 1 {
+                        dst &= !(LOW32 << (l * 32));
+                    }
+                }
+                self.set_xmm(reg, dst);
+            }
+            // ---- DPPS/DPPD (40,41) — dot product with imm8 masks ---------
+            0x40 | 0x41 => {
+                let src = self.sse_rm(ctx, mem, 16)?;
+                let dst = self.xmm(reg);
+                let out = if op3 == 0x40 { dpps(dst, src, imm) } else { dppd(dst, src, imm) };
+                self.set_xmm(reg, out);
+            }
+            // ---- MPSADBW (42) — multi sum of absolute differences --------
+            0x42 => {
+                let (a, b) = (self.xmm(reg), self.sse_rm(ctx, mem, 16)?);
+                self.set_xmm(reg, mpsadbw(a, b, imm));
+            }
+            // ---- PCMPESTRM/I, PCMPISTRM/I (60,61,62,63) ------------------
+            0x60..=0x63 => {
+                let a = self.xmm(reg);
+                let b = self.sse_rm(ctx, mem, 16)?;
+                let explicit = op3 <= 0x61; // 60/61 = explicit-length (E)
+                let index = op3 & 1 == 1; // odd = index form (…I), even = mask (…M)
+                self.pcmpstr(a, b, imm, explicit, index);
+            }
+            other => return unsupported3(0x3A, other, ctx, "sse3a"),
+        }
+        Ok(())
+    }
+
+    /// CRC32 (F2 0F 38 F0/F1) — accumulate the CRC-32C (Castagnoli) of the
+    /// source into the destination GP register.
+    fn crc32(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, op3: u8) -> Result<()> {
+        self.read_modrm(ctx, mem)?;
+        // Operand sizes: F0 → 8-bit source; F1 → 16/32/64 per prefixes.
+        let src_sz: u8 = if op3 == 0xF0 { 1 } else if ctx.pfx.p66 { 2 } else if ctx.pfx.w() { 8 } else { 4 };
+        // The destination register width is 64 with REX.W, else 32.
+        let dst_sz: u8 = if ctx.pfx.w() { 8 } else { 4 };
+        let src = self.read_rm(ctx, &*mem, src_sz)?;
+        let mut crc = self.read_reg_field(ctx, dst_sz) as u32;
+        for i in 0..src_sz {
+            let byte = (src >> (i * 8)) as u8;
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                // CRC-32C polynomial, bit-reflected form 0x82F63B78.
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            }
+        }
+        // Result is always zero-extended into the 64-bit register.
+        self.write_reg_field(ctx, dst_sz, crc as u64);
+        Ok(())
+    }
+
+    /// Map ROUND* imm8 → an effective rounding mode. imm[2]=1 means "use MXCSR
+    /// RC" (bits 13–14); otherwise imm[1:0] selects the mode directly.
+    fn round_mode(&self, imm: u8) -> u8 {
+        if imm & 0x04 != 0 {
+            ((self.mxcsr >> 13) & 3) as u8
+        } else {
+            imm & 3
+        }
+    }
+
+    /// PCMPxSTRx — the SSE4.2 string compare. Computes the imm8-selected
+    /// aggregation over two packed strings and writes either an index (ECX) or a
+    /// mask (XMM0), plus the full flag set. `explicit` = lengths in EAX/EDX
+    /// (…ESTR…); otherwise implicit null-termination (…ISTR…). `index` selects
+    /// the …I form (ECX result) vs the …M form (XMM0 result).
+    fn pcmpstr(&mut self, a: u128, b: u128, imm: u8, explicit: bool, index: bool) {
+        let elem_bytes = if imm & 1 == 0 { 1usize } else { 2 }; // 0: bytes, 1: words
+        let signed = imm & 2 != 0; // element type: 0 unsigned, 1 signed
+        let agg = (imm >> 2) & 3; // aggregation operation
+        let n = 16 / elem_bytes; // number of elements
+
+        // Valid element counts. Implicit: up to the first null element.
+        // Explicit: |EAX| (a) and |EDX| (b), saturated to n and taking abs.
+        let (len_a, len_b) = if explicit {
+            let eax = self.state.gpr_read(0, 4) as i32;
+            let edx = self.state.gpr_read(2, 4) as i32;
+            let clamp = |v: i32| -> usize { (v.unsigned_abs() as usize).min(n) };
+            (clamp(eax), clamp(edx))
+        } else {
+            (implicit_len(a, elem_bytes, n), implicit_len(b, elem_bytes, n))
+        };
+
+        // Element getter (sign-aware) as i64.
+        let get = |v: u128, i: usize| -> i64 {
+            let bits = elem_bytes * 8;
+            let raw = ((v >> (i * bits)) & emask(elem_bytes)) as u64;
+            if signed {
+                let shift = 64 - bits;
+                ((raw << shift) as i64) >> shift
+            } else {
+                raw as i64
+            }
+        };
+
+        // Build IntRes1 — the per-(b element) boolean before polarity — exactly
+        // as the SDM defines it: a raw comparison matrix BoolRes[i][j], the
+        // valid/invalid override table (which forces some entries to 0 or 1
+        // depending on the aggregation), then the per-aggregation reduction.
+        //
+        // Indices: i ranges over xmm2/b (the "second" operand), j over xmm1/a.
+        //
+        // Raw comparison for (i, j) under this aggregation:
+        //   equal-any / equal-each / equal-ordered → b[i] == a[j]
+        //   ranges (even j: a[j] <= b[i]; odd j: b[i] <= a[j])
+        let raw = |i: usize, j: usize| -> bool {
+            match agg {
+                1 => {
+                    if j & 1 == 0 {
+                        get(a, j) <= get(b, i)
+                    } else {
+                        get(b, i) <= get(a, j)
+                    }
+                }
+                _ => get(b, i) == get(a, j),
+            }
+        };
+        // Override a raw entry per validity of a[j] and b[i] (SDM table).
+        let overridden = |i: usize, j: usize| -> bool {
+            let aj = j < len_a;
+            let bi = i < len_b;
+            match agg {
+                // Equal any / ranges: any invalid operand → force false.
+                0 | 1 => {
+                    if aj && bi {
+                        raw(i, j)
+                    } else {
+                        false
+                    }
+                }
+                // Equal each: both invalid → true; one invalid → false.
+                2 => match (aj, bi) {
+                    (true, true) => raw(i, j),
+                    (false, false) => true,
+                    _ => false,
+                },
+                // Equal ordered: a[j] invalid → true; a[j] valid & b[i] invalid
+                // → false; both valid → raw.
+                _ => {
+                    if !aj {
+                        true
+                    } else if !bi {
+                        false
+                    } else {
+                        raw(i, j)
+                    }
+                }
+            }
+        };
+        let mut int_res = [false; 16];
+        for (i, slot) in int_res.iter_mut().enumerate().take(n) {
+            *slot = match agg {
+                // Equal any: OR over all j.
+                0 => (0..n).any(|j| overridden(i, j)),
+                // Ranges: OR over range pairs (2k, 2k+1) of AND of both bounds.
+                1 => {
+                    let mut hit = false;
+                    let mut k = 0;
+                    while k + 1 < n {
+                        if overridden(i, k) && overridden(i, k + 1) {
+                            hit = true;
+                        }
+                        k += 2;
+                    }
+                    hit
+                }
+                // Equal each: the diagonal entry (i, i).
+                2 => overridden(i, i),
+                // Equal ordered: AND over *all* j in 0..n of overridden(i+j, j),
+                // i.e. a starts a match at position i of b. When i+j reaches the
+                // end of b, that element is invalid — `overridden` forces false
+                // (a[j] valid) or true (a[j] invalid), so a longer `a` than the
+                // remaining window of `b` correctly fails.
+                _ => (0..n).all(|j| overridden(i + j, j)),
+            };
+        }
+
+        // Post-process per imm[5:4] (polarity) — SDM: 01 = negate every bit;
+        // 11 = negate only bits corresponding to *valid* b elements ("masked
+        // negate"); 00/10 leave IntRes1 unchanged.
+        let neg = (imm >> 4) & 3;
+        let mut res = [false; 16];
+        for i in 0..n {
+            let mut r = int_res[i];
+            match neg {
+                1 => r = !r,                              // negate all
+                3 => r = if i < len_b { !r } else { r }, // negate only valid
+                _ => {}
+            }
+            res[i] = r;
+        }
+
+        // Pack into a bitmask over the n elements.
+        let mut mask = 0u32;
+        for (i, &r) in res.iter().enumerate().take(n) {
+            if r {
+                mask |= 1 << i;
+            }
+        }
+
+        // Flags (SDM): CF = (mask != 0); ZF = (any b element invalid, i.e.
+        // len_b < n); SF = (any a element invalid); OF = res[0]; AF=PF=0.
+        self.state.set_flag(flags::CF, mask != 0);
+        self.state.set_flag(flags::ZF, len_b < n);
+        self.state.set_flag(flags::SF, len_a < n);
+        self.state.set_flag(flags::OF, res[0]);
+        self.state.set_flag(flags::AF, false);
+        self.state.set_flag(flags::PF, false);
+
+        if index {
+            // …I form → ECX. imm[6]=1 → most-significant index, else least.
+            let ecx = if mask == 0 {
+                n as u32
+            } else if imm & 0x40 != 0 {
+                31 - mask.leading_zeros()
+            } else {
+                mask.trailing_zeros()
+            };
+            self.state.gpr_write(1, 8, ecx as u64); // zero-extends ECX
+        } else {
+            // …M form → XMM0. imm[6]=0 → bit mask in the low bits; imm[6]=1 →
+            // byte/word mask (each element all-ones where set).
+            let out = if imm & 0x40 != 0 {
+                let bits = elem_bytes * 8;
+                let mut o = 0u128;
+                for (i, &r) in res.iter().enumerate().take(n) {
+                    if r {
+                        o |= emask(elem_bytes) << (i * bits);
+                    }
+                }
+                o
+            } else {
+                mask as u128
+            };
+            self.set_xmm(0, out);
+        }
+    }
+
     // ---- shared operation shapes ----------------------------------------
 
     /// `movss`/`movsd` load: a memory source zeroes the upper bits, a
@@ -1038,6 +1551,390 @@ fn shufpd(dst: u128, src: u128, imm: u8) -> u128 {
     let lo = if imm & 1 == 0 { dst & LOW64 } else { (dst >> 64) & LOW64 };
     let hi = if imm & 2 == 0 { src & LOW64 } else { (src >> 64) & LOW64 };
     lo | (hi << 64)
+}
+
+// ---- SSSE3 / SSE4 element helpers ------------------------------------------
+
+/// PSHUFB — for each of 16 dst bytes, if the control byte's high bit is set the
+/// result byte is 0, else it selects `dst_byte[control & 0x0F]`.
+fn pshufb(a: u128, b: u128) -> u128 {
+    let mut out = 0u128;
+    for i in 0..16 {
+        let ctl = ((b >> (i * 8)) & 0xFF) as u8;
+        if ctl & 0x80 == 0 {
+            let sel = (ctl & 0x0F) as u32;
+            let byte = (a >> (sel * 8)) & 0xFF;
+            out |= byte << (i * 8);
+        }
+    }
+    out
+}
+
+/// PHADD*/PHSUB* — horizontal add/subtract of adjacent `esz`-byte lanes; result
+/// takes `a`'s (SRC1 = DEST) pairs in the low half and `b`'s (SRC2 = SRC) in the
+/// high half. `sat` clamps to the signed word range (PHADDSW/PHSUBSW, word lanes
+/// only).
+///
+/// The reference (QEMU) and real hardware perform this **in place**, writing
+/// each destination lane sequentially. When the source operand aliases the
+/// destination register (`aliased`), a lane already written this instruction is
+/// read back for a later pair — so the result is *not* two independent halves.
+/// We model that exactly: a live `d[]` array is mutated lane-by-lane, and the
+/// high half reads its pairs from `d` (aliased) rather than the original source.
+fn phaddsub(a: u128, b: u128, esz: usize, sub: bool, sat: bool, aliased: bool) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz) as u64;
+    let lanes = 16 / esz;
+    let shift = 64 - bits;
+    let get = |v: u128, i: usize| -> i64 {
+        let raw = ((v >> (i * bits)) & (mask as u128)) as u64;
+        ((raw << shift) as i64) >> shift
+    };
+    let combine = |x: i64, y: i64| -> u64 {
+        let mut r = if sub { x - y } else { x + y };
+        if sat {
+            r = r.clamp(-32768, 32767);
+        }
+        (r as u64) & mask
+    };
+    // `d` is the live destination; SRC1 == d. Seed it with the original dest.
+    let mut d = [0u64; 8];
+    for (i, slot) in d.iter_mut().enumerate().take(lanes) {
+        *slot = ((a >> (i * bits)) & (mask as u128)) as u64;
+    }
+    let sext = |raw: u64| -> i64 { ((raw << shift) as i64) >> shift };
+    let half = lanes / 2;
+    // Low half: pairs of the (live) destination.
+    for k in 0..half {
+        let x = sext(d[2 * k]);
+        let y = sext(d[2 * k + 1]);
+        d[k] = combine(x, y);
+    }
+    // High half: pairs of SRC2. If aliased, SRC2 is the live `d`; otherwise the
+    // original `b`.
+    for k in 0..half {
+        let (x, y) = if aliased {
+            (sext(d[2 * k]), sext(d[2 * k + 1]))
+        } else {
+            (get(b, 2 * k), get(b, 2 * k + 1))
+        };
+        d[half + k] = combine(x, y);
+    }
+    let mut out = 0u128;
+    for (i, v) in d.iter().enumerate().take(lanes) {
+        out |= ((*v as u128) & (mask as u128)) << (i * bits);
+    }
+    out
+}
+
+/// PMADDUBSW — unsigned bytes of `a` × signed bytes of `b`, summed in adjacent
+/// pairs into 8 saturated signed word lanes.
+fn pmaddubsw(a: u128, b: u128) -> u128 {
+    let mut out = 0u128;
+    for i in 0..8 {
+        let base = i * 16;
+        let a0 = ((a >> base) & 0xFF) as u8 as i32;
+        let a1 = ((a >> (base + 8)) & 0xFF) as u8 as i32;
+        let b0 = ((b >> base) & 0xFF) as u8 as i8 as i32;
+        let b1 = ((b >> (base + 8)) & 0xFF) as u8 as i8 as i32;
+        let s = (a0 * b0 + a1 * b1).clamp(-32768, 32767);
+        out |= ((s as u16 as u128) & 0xFFFF) << base;
+    }
+    out
+}
+
+/// PSIGN{B,W,D} — negate/zero each `a` lane by the sign of the matching `b`
+/// lane: b<0 → −a, b==0 → 0, b>0 → a.
+fn psign(a: u128, b: u128, esz: usize) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let shift = 64 - bits;
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let av = ((a >> (i * bits)) & mask) as u64;
+        let bv = (((((b >> (i * bits)) & mask) as u64) << shift) as i64) >> shift;
+        let r = match bv.cmp(&0) {
+            std::cmp::Ordering::Less => av.wrapping_neg(),
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => av,
+        };
+        out |= ((r as u128) & mask) << (i * bits);
+    }
+    out
+}
+
+/// PMULHRSW — signed 16×16, take bits [30:15] of the product +1, per word lane.
+fn pmulhrsw(a: u128, b: u128) -> u128 {
+    let mut out = 0u128;
+    for i in 0..8 {
+        let x = ((a >> (i * 16)) & 0xFFFF) as u16 as i16 as i32;
+        let y = ((b >> (i * 16)) & 0xFFFF) as u16 as i16 as i32;
+        let r = ((((x * y) >> 14) + 1) >> 1) as i16;
+        out |= ((r as u16 as u128) & 0xFFFF) << (i * 16);
+    }
+    out
+}
+
+/// PABS{B,W,D} — per-lane absolute value.
+fn pabs(v: u128, esz: usize) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let shift = 64 - bits;
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let x = (((((v >> (i * bits)) & mask) as u64) << shift) as i64) >> shift;
+        out |= ((x.unsigned_abs() as u128) & mask) << (i * bits);
+    }
+    out
+}
+
+/// PBLENDVB/BLENDVPS/BLENDVPD — per-element select from `b` when the mask
+/// element's top bit is set, else from `a`.
+fn blend_var(a: u128, b: u128, mask: u128, esz: usize) -> u128 {
+    let bits = esz * 8;
+    let em = emask(esz);
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let top = (mask >> (i * bits + bits - 1)) & 1;
+        let src = if top == 1 { b } else { a };
+        out |= ((src >> (i * bits)) & em) << (i * bits);
+    }
+    out
+}
+
+/// BLENDPS/BLENDPD/PBLENDW — per-lane select from `src` where the imm bit is 1.
+fn blend_imm(dst: u128, src: u128, imm: u8, esz: usize) -> u128 {
+    let bits = esz * 8;
+    let em = emask(esz);
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let from_src = (imm >> i) & 1 == 1;
+        let v = if from_src { src } else { dst };
+        out |= ((v >> (i * bits)) & em) << (i * bits);
+    }
+    out
+}
+
+/// PMOVSX/PMOVZX — extend the low `16/dst_sz` elements of `src` from `src_sz`
+/// to `dst_sz` bytes, sign- or zero-extending.
+fn pmovx(src: u128, src_sz: usize, dst_sz: usize, sign: bool) -> u128 {
+    let sbits = src_sz * 8;
+    let dbits = dst_sz * 8;
+    let smask = emask(src_sz);
+    let dmask = emask(dst_sz);
+    let shift = 64 - sbits;
+    let count = 16 / dst_sz;
+    let mut out = 0u128;
+    for i in 0..count {
+        let raw = ((src >> (i * sbits)) & smask) as u64;
+        let ext = if sign { (((raw << shift) as i64) >> shift) as u64 } else { raw };
+        out |= ((ext as u128) & dmask) << (i * dbits);
+    }
+    out
+}
+
+/// PMULDQ — signed 32×32→64 on the two even dword lanes (0 and 2).
+fn pmuldq(a: u128, b: u128) -> u128 {
+    let a0 = (a & 0xFFFF_FFFF) as u32 as i32 as i64;
+    let b0 = (b & 0xFFFF_FFFF) as u32 as i32 as i64;
+    let a2 = ((a >> 64) & 0xFFFF_FFFF) as u32 as i32 as i64;
+    let b2 = ((b >> 64) & 0xFFFF_FFFF) as u32 as i32 as i64;
+    ((a0 * b0) as u64 as u128) | (((a2 * b2) as u64 as u128) << 64)
+}
+
+/// PACKUSDW — pack signed dwords from `a` (low) and `b` (high) into unsigned
+/// words, saturating to `[0, 0xFFFF]`.
+fn packusdw(a: u128, b: u128) -> u128 {
+    let mut out = 0u128;
+    for (half, src) in [a, b].iter().enumerate() {
+        for i in 0..4 {
+            let v = ((src >> (i * 32)) & 0xFFFF_FFFF) as u32 as i32;
+            let c = v.clamp(0, 0xFFFF) as u32 as u128;
+            out |= c << ((half * 4 + i) * 16);
+        }
+    }
+    out
+}
+
+/// PMIN/PMAX signed or unsigned, per `esz`-byte lane.
+fn int_minmax(a: u128, b: u128, esz: usize, signed: bool, max: bool) -> u128 {
+    let bits = esz * 8;
+    let mask = emask(esz);
+    let shift = 64 - bits;
+    let mut out = 0u128;
+    for i in 0..(16 / esz) {
+        let xr = ((a >> (i * bits)) & mask) as u64;
+        let yr = ((b >> (i * bits)) & mask) as u64;
+        let take_x = if signed {
+            let x = ((xr << shift) as i64) >> shift;
+            let y = ((yr << shift) as i64) >> shift;
+            if max { x > y } else { x < y }
+        } else if max {
+            xr > yr
+        } else {
+            xr < yr
+        };
+        let r = if take_x { xr } else { yr };
+        out |= ((r as u128) & mask) << (i * bits);
+    }
+    out
+}
+
+/// PMULLD — 32×32 keeping the low 32 bits, four dword lanes.
+fn pmulld(a: u128, b: u128) -> u128 {
+    let mut out = 0u128;
+    for i in 0..4 {
+        let x = ((a >> (i * 32)) & 0xFFFF_FFFF) as u32;
+        let y = ((b >> (i * 32)) & 0xFFFF_FFFF) as u32;
+        out |= ((x.wrapping_mul(y)) as u128) << (i * 32);
+    }
+    out
+}
+
+/// PHMINPOSUW — find the minimum unsigned word and its index; result word 0 =
+/// min value, word 1 = its index, words 2..7 = 0.
+fn phminposuw(src: u128) -> u128 {
+    let mut min = 0xFFFFu32;
+    let mut idx = 0u32;
+    for i in 0..8u32 {
+        let w = ((src >> (i * 16)) & 0xFFFF) as u32;
+        if w < min {
+            min = w;
+            idx = i;
+        }
+    }
+    (min as u128) | ((idx as u128) << 16)
+}
+
+/// PALIGNR — concatenate `a:b` (a high, b low) into 32 bytes and byte-shift
+/// right by `imm`, taking the low 16 bytes. imm>=32 → all zero; 16<=imm<32
+/// pulls from the high half only.
+fn palignr(a: u128, b: u128, imm: u8) -> u128 {
+    let n = imm as u32;
+    if n >= 32 {
+        return 0;
+    }
+    // 256-bit concatenation, a is the high 128, b the low 128.
+    if n == 0 {
+        return b;
+    }
+    let shift = n * 8;
+    if n < 16 {
+        // low bytes come from b>>shift, high bytes from a<<(128-shift).
+        (b >> shift) | (a << (128 - shift))
+    } else {
+        // 16..31: only a contributes, shifted down by (n-16) bytes.
+        a >> ((n - 16) * 8)
+    }
+}
+
+/// DPPS — dot product of packed single, imm[7:4] select input lanes, imm[3:0]
+/// broadcast the sum into result lanes.
+fn dpps(a: u128, b: u128, imm: u8) -> u128 {
+    let mut sum = 0f32;
+    for i in 0..4 {
+        if (imm >> (4 + i)) & 1 == 1 {
+            sum += f32_lane(a, i) * f32_lane(b, i);
+        }
+    }
+    let mut out = 0u128;
+    for i in 0..4 {
+        let v = if (imm >> i) & 1 == 1 { sum } else { 0.0 };
+        out |= (v.to_bits() as u128) << (i * 32);
+    }
+    out
+}
+
+/// DPPD — dot product of packed double, imm[5:4] select lanes, imm[1:0]
+/// broadcast the sum.
+fn dppd(a: u128, b: u128, imm: u8) -> u128 {
+    let mut sum = 0f64;
+    for i in 0..2 {
+        if (imm >> (4 + i)) & 1 == 1 {
+            sum += f64_lane(a, i) * f64_lane(b, i);
+        }
+    }
+    let mut out = 0u128;
+    for i in 0..2 {
+        let v = if (imm >> i) & 1 == 1 { sum } else { 0.0 };
+        out |= (v.to_bits() as u128) << (i * 64);
+    }
+    out
+}
+
+/// MPSADBW — eight overlapping 4-byte sums-of-absolute-differences (SDM). The
+/// second operand `b` (xmm2) provides the 4-byte reference block at offset
+/// `imm[1:0]*4`; the first operand `a` (xmm1/dest) provides the sliding window
+/// starting at `imm[2]*4`.
+fn mpsadbw(a: u128, b: u128, imm: u8) -> u128 {
+    let a_off = (((imm >> 2) & 1) * 4) as u32; // window base in xmm1 (dest)
+    let b_off = ((imm & 3) * 4) as u32; // reference block in xmm2 (src)
+    let abyte = |i: u32| ((a >> (i * 8)) & 0xFF) as i32;
+    let bbyte = |i: u32| ((b >> (i * 8)) & 0xFF) as i32;
+    let mut out = 0u128;
+    for k in 0..8u32 {
+        let mut sum = 0i32;
+        for j in 0..4u32 {
+            let av = abyte(a_off + k + j);
+            let bv = bbyte(b_off + j);
+            sum += (av - bv).abs();
+        }
+        out |= ((sum as u16 as u128) & 0xFFFF) << (k * 16);
+    }
+    out
+}
+
+/// PCMPESTR* implicit length: index of the first null (all-zero) element, else
+/// the full count `n`.
+fn implicit_len(v: u128, elem_bytes: usize, n: usize) -> usize {
+    let bits = elem_bytes * 8;
+    let mask = emask(elem_bytes);
+    for i in 0..n {
+        if (v >> (i * bits)) & mask == 0 {
+            return i;
+        }
+    }
+    n
+}
+
+/// Round an f32 per the effective rounding mode (0 nearest-even, 1 down, 2 up,
+/// 3 truncate).
+fn round_f32(x: f32, mode: u8) -> f32 {
+    match mode {
+        0 => {
+            let r = x.round_ties_even();
+            if r == 0.0 && x.is_sign_negative() { -0.0 } else { r }
+        }
+        1 => x.floor(),
+        2 => x.ceil(),
+        _ => x.trunc(),
+    }
+}
+
+/// Round an f64 per the effective rounding mode.
+fn round_f64(x: f64, mode: u8) -> f64 {
+    match mode {
+        0 => {
+            let r = x.round_ties_even();
+            if r == 0.0 && x.is_sign_negative() { -0.0 } else { r }
+        }
+        1 => x.floor(),
+        2 => x.ceil(),
+        _ => x.trunc(),
+    }
+}
+
+fn unsupported3(esc: u8, op3: u8, ctx: &Ctx, group: &str) -> Result<()> {
+    let pfx = if ctx.pfx.rep == 0xF3 {
+        "f3 "
+    } else if ctx.pfx.rep == 0xF2 {
+        "f2 "
+    } else if ctx.pfx.p66 {
+        "66 "
+    } else {
+        ""
+    };
+    Err(EmuError::Unsupported(format!("{group}: {pfx}0f {esc:02x} {op3:02x}")))
 }
 
 fn unsupported(op2: u8, ctx: &Ctx, group: &str) -> Result<()> {
