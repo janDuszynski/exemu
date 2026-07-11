@@ -17,7 +17,7 @@ independent, testable crate behind a trait.
 
 > **Scope.** This is a from-scratch userland emulator built for clarity and
 > extensibility. It implements a broad subset of the x86/x86-64 instruction
-> set (through SSE4.2), ~200 Win32 functions, a host-backed sandbox
+> set (through SSE4.2 plus AVX/AVX2), ~200 Win32 functions, a host-backed sandbox
 > filesystem, and a lightweight **window + GDI renderer** — enough to run
 > real console programs end to end and to drive real GUI apps (`--gui`)
 > interactively, both dialog-template UIs and custom `CreateWindowEx`
@@ -154,9 +154,15 @@ exemu sample <out.exe>
   string compares (full `imm8` semantics + flags), and `CRC32` — plus
   `LDMXCSR`/`STMXCSR`, the full 512-byte `FXSAVE`/`FXRSTOR` save area, and the
   extended-state
-  `XSAVE`/`XRSTOR`/`XGETBV`/`XSETBV` (x87+SSE components) — all with faithful
+  `XSAVE`/`XRSTOR`/`XGETBV`/`XSETBV` (x87+SSE+AVX components) — all with faithful
   EFLAGS and cross-checked against a Unicorn differential oracle (byte-exact
-  save-area diff). The **x87 FPU** is implemented too: the ST0–ST7
+  save-area diff). **AVX/AVX2** is implemented via the **VEX** prefixes
+  (`0xC4`/`0xC5`): a 256-bit `YMM0`–`YMM15` register file with correct VEX.128
+  zero-upper (vs legacy-SSE upper-preserve) semantics, the VEX forms of the SSE
+  surface, the AVX2 lane-wise integer ops, and the broadcast/permute/blend/
+  insert-extract family (`VPBROADCAST*`, `VPERMQ`/`VPERMD`, `VINSERTI128`/
+  `VEXTRACTI128`, `VPBLEND*`, the per-element variable shifts), plus
+  `VZEROUPPER`/`VZEROALL`. The **x87 FPU** is implemented too: the ST0–ST7
   register stack (with real 80-bit storage, so `long double` loads/stores are
   bit-exact), the control/status/tag words, `FLD`/`FST`/`FIST` and their integer
   and 80-bit forms, the arithmetic family (`FADD`/`FSUB(R)`/`FMUL`/`FDIV(R)`),
@@ -166,8 +172,8 @@ exemu sample <out.exe>
   approximations). Arithmetic uses a double-precision core; the x87 category of
   the oracle diffs the whole stack + status/control words against Unicorn.
   `CPUID` reports an honest feature set (only the instructions actually
-  implemented), so CRTs dispatch onto code paths the interpreter can execute
-  rather than into AVX it cannot.
+  implemented — through SSE4.2, AVX and AVX2), so CRTs dispatch onto code paths
+  the interpreter can execute.
 * **~200 Win32 functions** across `kernel32`/`user32`/`gdi32`/`advapi32`/
   `shell32`/`ole32`/`comctl32`: console I/O, the `Heap*`/`Global*` allocators,
   the `lstr*` string family, `CharNext`/`CharPrev`, command line, module
@@ -265,7 +271,8 @@ Complex apps will hit unimplemented calls.
 
 ### Not implemented (yet)
 
-AVX/AVX2 (VEX-encoded) instructions; native-themed / GDI+ / DirectX rendering (the
+AVX-512, FMA3, and AVX gather/mask-move instructions (AVX/AVX2 VEX-encoded ops
+*are* implemented); native-themed / GDI+ / DirectX rendering (the
 GDI is a solid-fill/text subset); **COM** object creation; **preemptive** threads
 (the scheduler is cooperative — it yields at blocking points and on a timeslice,
 not on true OS preemption); and **registry persistence to disk** (the `Reg*`

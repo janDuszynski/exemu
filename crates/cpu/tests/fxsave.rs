@@ -249,57 +249,60 @@ fn fxrstor_reexpands_abridged_ftw() {
     assert_eq!((tw >> 4) & 0b11, 0b11, "phys2 → empty");
 }
 
-/// XGETBV (0F 01 D0) reports XCR0 = 0x3 (x87 + SSE) — exactly the implemented
-/// state components; AVX (bit 2) is not advertised.
+/// XGETBV (0F 01 D0) reports XCR0 = 0x7 (x87 + SSE + AVX) — exactly the
+/// implemented state components after W1.5.
 #[test]
-fn xgetbv_reports_x87_sse_only() {
+fn xgetbv_reports_x87_sse_avx() {
     let mut m = mem();
     // xor ecx,ecx ; xgetbv  → EDX:EAX = XCR0.
     let code = [0x31, 0xC9, 0x0F, 0x01, 0xD0];
     let cpu = run_bits(&mut m, &code, 2, Bits::B64);
-    assert_eq!(cpu.state().gpr_read(0, 4), 0x3, "EAX = XCR0 low = x87|SSE");
+    assert_eq!(cpu.state().gpr_read(0, 4), 0x7, "EAX = XCR0 low = x87|SSE|AVX");
     assert_eq!(cpu.state().gpr_read(2, 4), 0x0, "EDX = XCR0 high");
-    assert_eq!(cpu.xcr0(), 0x3);
+    assert_eq!(cpu.xcr0(), 0x7);
 }
 
-/// XSETBV (0F 01 D1) may enable only implemented components; an attempt to set
-/// AVX (bit 2) is clamped away and bit 0 stays forced on.
+/// XSETBV (0F 01 D1) may enable x87|SSE|AVX (the implemented components); an
+/// attempt to set an unimplemented bit (AVX-512, bit 5) is clamped away and bit
+/// 0 stays forced on.
 #[test]
 fn xsetbv_clamps_to_implemented_and_forces_x87() {
     let mut m = mem();
-    // mov eax, 0x7 ; xor edx,edx ; xor ecx,ecx ; xsetbv  → request x87|SSE|AVX.
+    // mov eax, 0x27 ; xor edx,edx ; xor ecx,ecx ; xsetbv  → request x87|SSE|AVX
+    // plus an unimplemented bit 5.
     let code = [
-        0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+        0xB8, 0x27, 0x00, 0x00, 0x00, // mov eax, 0x27
         0x31, 0xD2, // xor edx,edx
         0x31, 0xC9, // xor ecx,ecx
         0x0F, 0x01, 0xD1, // xsetbv
     ];
     let cpu = run_bits(&mut m, &code, 4, Bits::B64);
-    assert_eq!(cpu.xcr0(), 0x3, "AVX (bit 2) rejected; x87+SSE only");
+    assert_eq!(cpu.xcr0(), 0x7, "unimplemented bit 5 rejected; x87+SSE+AVX kept");
 
     // Attempting to clear bit 0 (x87) is ignored — it is mandatory.
     let mut m2 = mem();
     let code2 = [
-        0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2 (SSE only, x87 cleared)
+        0xB8, 0x06, 0x00, 0x00, 0x00, // mov eax, 6 (SSE|AVX, x87 cleared)
         0x31, 0xD2, 0x31, 0xC9, 0x0F, 0x01, 0xD1,
     ];
     let cpu2 = run_bits(&mut m2, &code2, 4, Bits::B64);
-    assert_eq!(cpu2.xcr0(), 0x3, "bit 0 (x87) is forced on");
+    assert_eq!(cpu2.xcr0(), 0x7, "bit 0 (x87) is forced on");
 }
 
 /// CPUID leaf 0xD sub-leaf 0 enumerates exactly the implemented XSAVE state:
-/// XCR0 valid mask = 0x3 (x87+SSE) and a 576-byte area size. The honesty
-/// invariant: never advertise a component we cannot save/restore.
+/// XCR0 valid mask = 0x7 (x87+SSE+AVX) and an 832-byte area size. The honesty
+/// invariant: never advertise a component we cannot save/restore (the AVX
+/// YMM_Hi component is now saved/restored — see the VEX XSAVE tests).
 #[test]
-fn cpuid_leaf_d_enumerates_x87_sse_only() {
+fn cpuid_leaf_d_enumerates_x87_sse_avx() {
     let mut m = mem();
     // mov eax, 0xD ; xor ecx,ecx ; cpuid  → EAX = XCR0 low, EBX/ECX = size.
     let code = [0xB8, 0x0D, 0x00, 0x00, 0x00, 0x31, 0xC9, 0x0F, 0xA2];
     let cpu = run_bits(&mut m, &code, 3, Bits::B64);
-    assert_eq!(cpu.state().gpr_read(0, 4), 0x3, "XCR0 valid mask = x87|SSE");
+    assert_eq!(cpu.state().gpr_read(0, 4), 0x7, "XCR0 valid mask = x87|SSE|AVX");
     assert_eq!(cpu.state().gpr_read(2, 4), 0x0, "XCR0 high mask");
-    assert_eq!(cpu.state().gpr_read(3, 4), 576, "EBX = enabled-state area size");
-    assert_eq!(cpu.state().gpr_read(1, 4), 576, "ECX = max area size");
+    assert_eq!(cpu.state().gpr_read(3, 4), 832, "EBX = enabled-state area size");
+    assert_eq!(cpu.state().gpr_read(1, 4), 832, "ECX = max area size");
 }
 
 /// XSAVE writes the 512-byte legacy area plus an 8-byte XSTATE_BV header,

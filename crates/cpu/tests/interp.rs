@@ -360,7 +360,7 @@ fn cpuid_vendor_string_is_intel() {
 }
 
 #[test]
-fn cpuid_advertises_sse2_but_not_avx() {
+fn cpuid_advertises_sse2_ssse3_sse4_avx() {
     // mov eax,1 ; cpuid ; hlt
     let code = [
         0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
@@ -373,17 +373,17 @@ fn cpuid_advertises_sse2_but_not_avx() {
     assert!(edx & (1 << 26) != 0, "SSE2 (EDX.26) must be set");
     assert!(edx & (1 << 25) != 0, "SSE (EDX.25) must be set");
     assert!(ecx & (1 << 23) != 0, "POPCNT (ECX.23) must be set");
-    assert!(ecx & (1 << 28) == 0, "AVX (ECX.28) must NOT be advertised");
     // XSAVE + OSXSAVE are advertised now that FXSAVE/XSAVE/XGETBV/XSETBV are
     // implemented and oracle-clean (roadmap W1.2).
     assert!(ecx & (1 << 26) != 0, "XSAVE (ECX.26) must be advertised");
     assert!(ecx & (1 << 27) != 0, "OSXSAVE (ECX.27) must be advertised");
     // The three-byte SSSE3/SSE4.1/SSE4.2 escapes are implemented and oracle-
-    // clean (roadmap W1.4), so those bits are advertised now. AVX (ECX.28)
-    // stays off until W1.5.
+    // clean (roadmap W1.4), so those bits are advertised. AVX (ECX.28) is ON
+    // after the VEX decoder + YMM register file landed (roadmap W1.5).
     assert!(ecx & (1 << 9) != 0, "SSSE3 (ECX.9) must be advertised (W1.4)");
     assert!(ecx & (1 << 19) != 0, "SSE4.1 (ECX.19) must be advertised (W1.4)");
     assert!(ecx & (1 << 20) != 0, "SSE4.2 (ECX.20) must be advertised (W1.4)");
+    assert!(ecx & (1 << 28) != 0, "AVX (ECX.28) must be advertised (W1.5)");
 }
 
 #[test]

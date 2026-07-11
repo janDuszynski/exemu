@@ -54,6 +54,7 @@ impl Interpreter {
             reg: 0,
             rm: Rm::Reg(0),
             bits: self.bits,
+            u8_at_op: 0,
         };
 
         self.read_prefixes(&mut ctx, mem)?;
@@ -560,6 +561,22 @@ impl Interpreter {
             // ---- FWAIT / WAIT: no pending unmasked FP exceptions here ----
             0x9B => {}
 
+            // ---- VEX prefixes (AVX/AVX2) --------------------------------
+            // 0xC4 = 3-byte VEX, 0xC5 = 2-byte VEX. In 64-bit mode these bytes
+            // are *always* VEX (LES/LDS are invalid in long mode). In 32-bit
+            // mode they are LES/LDS unless the following byte's top two bits are
+            // 11b, exactly how a real CPU disambiguates the encoding.
+            0xC4 | 0xC5 => {
+                let two_byte = opcode == 0xC5;
+                if ctx.bits == Bits::B32 {
+                    let peek = mem.read_u8(ctx.cur)?;
+                    if peek >> 6 != 0b11 {
+                        return Err(EmuError::Unsupported(format!("LES/LDS at {start:#x}")));
+                    }
+                }
+                self.exec_vex(&mut ctx, mem, two_byte)?;
+            }
+
             // ---- Two-byte opcodes ---------------------------------------
             0x0F => {
                 let op2 = ctx.u8(mem)?;
@@ -938,7 +955,8 @@ impl Interpreter {
                     | (1 << 20)            // SSE4.2
                     | (1 << 23)            // POPCNT
                     | (1 << 26)            // XSAVE
-                    | (1 << 27); // OSXSAVE (XCR0 accessible / CR4.OSXSAVE = 1)
+                    | (1 << 27)            // OSXSAVE (XCR0 accessible / CR4.OSXSAVE = 1)
+                    | (1 << 28); // AVX (VEX-encoded 256-bit float/int — roadmap W1.5)
                 let edx: u32 = 1        // FPU (bit 0; guaranteed in long mode)
                     | (1 << 4)          // TSC
                     | (1 << 15)         // CMOV
@@ -947,10 +965,16 @@ impl Interpreter {
                     | (1 << 26); // SSE2
                 (0x0003_06c3, 0x0001_0800, ecx, edx)
             }
-            // Structured extended features. All zero: no BMI1/BMI2/AVX2/AVX-512
-            // (we have TZCNT/LZCNT but not the rest of BMI1, so we do not claim
-            // the BMI1 bit).
-            0x7 => (0, 0, 0, 0),
+            // Structured extended features. Sub-leaf 0 EBX bit 5 = AVX2 (the
+            // VEX-encoded 256-bit *integer* ops — VPADD*/VPSUB*/VPAND/VPCMP*/
+            // VPERM*/VPBROADCAST*/VPBLEND*/VINSERTI128 etc., all implemented in
+            // vex.rs and oracle-clean, roadmap W1.5). No BMI1/BMI2/AVX-512 (we
+            // have TZCNT/LZCNT but not the rest of BMI1, so the BMI1 bit stays
+            // withheld). EAX = max sub-leaf = 0; other sub-leaves are all-zero.
+            0x7 => match subleaf {
+                0 => (0, 1 << 5, 0, 0),
+                _ => (0, 0, 0, 0),
+            },
             // XSAVE feature enumeration. Sub-leaf in ECX selects the view:
             //   ECX==0: EAX/EDX = XCR0 valid-bit mask (x87+SSE = 0x3), EBX = size
             //           of the XSAVE area for the *enabled* features in XCR0,
@@ -960,8 +984,13 @@ impl Interpreter {
             //   ECX>=2: per-component enumeration; none beyond x87+SSE ⇒ zero.
             // The x87+SSE standard area is the 512-byte legacy region plus the
             // 64-byte XSAVE header = 576 bytes.
+            // With the AVX component (XCR0 bit 2) enabled, the standard XSAVE
+            // area is the 512-byte legacy region + 64-byte header + 256-byte YMM
+            // upper-half component = 832 bytes. Sub-leaf 2 enumerates the AVX
+            // component itself: EAX = size (256), EBX = offset (576).
             0xD => match subleaf {
-                0 => (XCR0_SUPPORTED as u32, 576, 576, (XCR0_SUPPORTED >> 32) as u32),
+                0 => (XCR0_SUPPORTED as u32, 832, 832, (XCR0_SUPPORTED >> 32) as u32),
+                2 => (256, 576, 0, 0),
                 _ => (0, 0, 0, 0),
             },
             // Extended: max extended leaf. We implement the extended feature leaf
@@ -1023,6 +1052,13 @@ impl Interpreter {
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 26, name: "xsave", probe: &[0x0F, 0xAE, 0x20] },
         // bit 27: OSXSAVE. XGETBV (0F 01 D0) reads XCR0 — the OS-enabled path.
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 27, name: "osxsave", probe: &[0x0F, 0x01, 0xD0] },
+        // bit 28: AVX. VXORPS xmm0, xmm0, xmm0 (VEX.128 NP 0F 57) — a VEX-encoded
+        // float op. Its decode proves the 0xC5 VEX prefix + 0F map are handled.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 28, name: "avx", probe: &[0xC5, 0xF8, 0x57, 0xC0] },
+        // ---- leaf 7.0, EBX ---------------------------------------------------
+        // bit 5: AVX2. VPADDD ymm0, ymm0, ymm0 (VEX.256 66 0F FE) — a 256-bit
+        // integer op, proving the AVX2 lane-wise integer surface decodes.
+        CpuidFeature { leaf: 7, sub: 0, reg: CpuidReg::Ebx, bit: 5, name: "avx2", probe: &[0xC5, 0xFD, 0xFE, 0xC0] },
         // ---- leaf 0x8000_0001, ECX ------------------------------------------
         // bit 5: LZCNT/ABM. LZCNT r32, r/m32 (F3 0F BD).
         CpuidFeature { leaf: 0x8000_0001, sub: 0, reg: CpuidReg::Ecx, bit: 5, name: "lzcnt", probe: &[0xF3, 0x0F, 0xBD, 0xC1] },
@@ -1169,6 +1205,35 @@ impl Interpreter {
             b.copy_from_slice(&buf[off..off + 16]);
             self.state.xmm[i] = u128::from_le_bytes(b);
         }
+    }
+
+    /// Write the AVX state component (YMM upper 128 bits, `ymm0_hi..ymm15_hi`)
+    /// to the extended XSAVE area at offset 576 — 16 bytes per register, in
+    /// register-number order. 32-bit mode saves only the eight low registers.
+    fn write_avx_component(&self, mem: &mut dyn Memory, addr: u64) -> Result<()> {
+        let n = match self.bits {
+            Bits::B64 => 16,
+            Bits::B32 => 8,
+        };
+        for i in 0..n {
+            mem.write(addr + 576 + (i as u64) * 16, &self.state.ymm_hi[i].to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Restore the AVX state component from offset 576 (inverse of
+    /// [`Self::write_avx_component`]).
+    fn read_avx_component(&mut self, mem: &dyn Memory, addr: u64) -> Result<()> {
+        let n = match self.bits {
+            Bits::B64 => 16,
+            Bits::B32 => 8,
+        };
+        for i in 0..n {
+            let mut b = [0u8; 16];
+            mem.read(addr + 576 + (i as u64) * 16, &mut b)?;
+            self.state.ymm_hi[i] = u128::from_le_bytes(b);
+        }
+        Ok(())
     }
 
     /// The requested-feature bitmap for an XSAVE/XRSTOR: `(EDX:EAX) AND XCR0`,
@@ -1343,6 +1408,16 @@ impl Interpreter {
                         // the x87+SSE FXSAVE sub-area, so both are marked in-use.
                         // XCOMP_BV (offset 520) and the reserved header bytes are
                         // left untouched, matching hardware's standard form.
+                        //
+                        // AVX component (bit 2): when requested, the YMM upper
+                        // halves are written at offset 576 (the extended state
+                        // area — 16 bytes per register). It is marked in-use in
+                        // XSTATE_BV only if any upper half is non-zero (the
+                        // "init optimization" is not modelled, so we simply
+                        // reflect whether the component was written).
+                        if rfbm & 4 != 0 {
+                            self.write_avx_component(mem, addr)?;
+                        }
                         let old_bv = mem.read_u64(addr + 512)?;
                         let new_bv = (old_bv & !rfbm) | (rfbm & XCR0_SUPPORTED);
                         mem.write_u64(addr + 512, new_bv)?;
@@ -1356,6 +1431,15 @@ impl Interpreter {
                         mem.read(addr, &mut area)?;
                         let xstate_bv = mem.read_u64(addr + 512)?;
                         self.xrstor_apply(&area, rfbm, xstate_bv, rexw);
+                        // AVX component (bit 2): restore the YMM upper halves from
+                        // offset 576 if present in XSTATE_BV, else INIT (zeroed).
+                        if rfbm & 4 != 0 {
+                            if xstate_bv & 4 != 0 {
+                                self.read_avx_component(mem, addr)?;
+                            } else {
+                                self.state.ymm_hi = [0u128; 16];
+                            }
+                        }
                     }
                     _ => {
                         return Err(EmuError::Unsupported(format!(

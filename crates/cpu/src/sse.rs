@@ -28,8 +28,8 @@ enum Sse {
     Sd,
 }
 
-const LOW64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
-const LOW32: u128 = 0xFFFF_FFFF;
+pub(crate) const LOW64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
+pub(crate) const LOW32: u128 = 0xFFFF_FFFF;
 
 /// Whether a two-byte (`0F xx`) opcode should be routed to the SSE unit.
 ///
@@ -865,7 +865,7 @@ impl Interpreter {
 
     /// Map ROUND* imm8 → an effective rounding mode. imm[2]=1 means "use MXCSR
     /// RC" (bits 13–14); otherwise imm[1:0] selects the mode directly.
-    fn round_mode(&self, imm: u8) -> u8 {
+    pub(crate) fn round_mode(&self, imm: u8) -> u8 {
         if imm & 0x04 != 0 {
             ((self.mxcsr >> 13) & 3) as u8
         } else {
@@ -1158,7 +1158,7 @@ impl Interpreter {
 
     /// Set ZF/PF/CF from a scalar float compare, clearing OF/SF/AF, exactly
     /// as `comiss`/`comisd` do (unordered → ZF=PF=CF=1).
-    fn set_compare_flags(&mut self, a: f64, b: f64) {
+    pub(crate) fn set_compare_flags(&mut self, a: f64, b: f64) {
         let s = &mut self.state;
         s.set_flag(flags::OF, false);
         s.set_flag(flags::SF, false);
@@ -1177,7 +1177,7 @@ impl Interpreter {
 
 // ---- free helpers ----------------------------------------------------------
 
-fn low_mask(n: usize) -> u128 {
+pub(crate) fn low_mask(n: usize) -> u128 {
     if n >= 16 {
         u128::MAX
     } else {
@@ -1190,7 +1190,7 @@ fn low_mask(n: usize) -> u128 {
 /// even, matching the default MXCSR mode), and yield the "integer indefinite"
 /// value (0x8000…0) when the rounded result is out of range or the input is
 /// NaN — where Rust's saturating `as` cast would instead clamp or return 0.
-fn cvt_f_to_int(f: f64, truncate: bool, size: u8) -> u64 {
+pub(crate) fn cvt_f_to_int(f: f64, truncate: bool, size: u8) -> u64 {
     let r = if truncate { f.trunc() } else { f.round_ties_even() };
     if size == 8 {
         // Valid i64 targets satisfy -2^63 <= r < 2^63 (both bounds exact f64).
@@ -1208,7 +1208,7 @@ fn cvt_f_to_int(f: f64, truncate: bool, size: u8) -> u64 {
 
 /// CVTDQ2PS — 4 packed int32 → 4 packed f32 (round-to-nearest-even, the
 /// default MXCSR mode, which Rust's `i32 as f32` cast also uses).
-fn cvtdq2ps(v: u128) -> u128 {
+pub(crate) fn cvtdq2ps(v: u128) -> u128 {
     let mut out = 0u128;
     for i in 0..4 {
         let x = ((v >> (i * 32)) & 0xFFFF_FFFF) as u32 as i32;
@@ -1219,7 +1219,7 @@ fn cvtdq2ps(v: u128) -> u128 {
 
 /// CVTPS2DQ (`truncate=false`) / CVTTPS2DQ — 4 packed f32 → 4 packed int32,
 /// with x86 rounding and integer-indefinite (0x8000_0000) on overflow/NaN.
-fn cvtps2dq(v: u128, truncate: bool) -> u128 {
+pub(crate) fn cvtps2dq(v: u128, truncate: bool) -> u128 {
     let mut out = 0u128;
     for i in 0..4 {
         let r = cvt_f_to_int(f32_lane(v, i) as f64, truncate, 4) as u32;
@@ -1228,18 +1228,18 @@ fn cvtps2dq(v: u128, truncate: bool) -> u128 {
     out
 }
 
-fn f64_lane(v: u128, lane: u32) -> f64 {
+pub(crate) fn f64_lane(v: u128, lane: u32) -> f64 {
     f64::from_bits((v >> (lane * 64)) as u64)
 }
 
-fn f32_lane(v: u128, lane: u32) -> f32 {
+pub(crate) fn f32_lane(v: u128, lane: u32) -> f32 {
     f32::from_bits((v >> (lane * 32)) as u32)
 }
 
 // ---- packed-integer element helpers ----------------------------------------
 
 /// Element mask for an `esz`-byte lane (`esz` ∈ {1,2,4,8}).
-fn emask(esz: usize) -> u128 {
+pub(crate) fn emask(esz: usize) -> u128 {
     let bits = esz * 8;
     if bits >= 128 {
         u128::MAX
@@ -1250,7 +1250,7 @@ fn emask(esz: usize) -> u128 {
 
 /// Interleave `esz`-byte elements of `a` (dst) and `b` (src), taking the low
 /// or high half — PUNPCKL*/PUNPCKH*.
-fn punpck(a: u128, b: u128, esz: usize, high: bool) -> u128 {
+pub(crate) fn punpck(a: u128, b: u128, esz: usize, high: bool) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let half = (16 / esz) / 2;
@@ -1267,7 +1267,7 @@ fn punpck(a: u128, b: u128, esz: usize, high: bool) -> u128 {
 
 /// Per-element compare: equality, or signed greater-than. Matching lanes become
 /// all-ones, others zero (PCMPEQ*/PCMPGT*).
-fn pcmp(a: u128, b: u128, esz: usize, gt: bool) -> u128 {
+pub(crate) fn pcmp(a: u128, b: u128, esz: usize, gt: bool) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let sign = 1u128 << (bits - 1);
@@ -1290,7 +1290,7 @@ fn pcmp(a: u128, b: u128, esz: usize, gt: bool) -> u128 {
 }
 
 /// Per-element wrapping add (`sub=false`) or subtract (PADD*/PSUB*).
-fn add_sub(a: u128, b: u128, esz: usize, add: bool) -> u128 {
+pub(crate) fn add_sub(a: u128, b: u128, esz: usize, add: bool) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let mut out = 0u128;
@@ -1306,7 +1306,7 @@ fn add_sub(a: u128, b: u128, esz: usize, add: bool) -> u128 {
 /// Saturating packed add/sub for byte (esz=1) or word (esz=2) lanes.
 /// Signed variants clamp to the element's signed range (PADDSB/W, PSUBSB/W);
 /// unsigned variants clamp to `[0, max]` (PADDUSB/W, PSUBUSB/W).
-fn add_sub_sat(a: u128, b: u128, esz: usize, add: bool, signed: bool) -> u128 {
+pub(crate) fn add_sub_sat(a: u128, b: u128, esz: usize, add: bool, signed: bool) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let mut out = 0u128;
@@ -1332,7 +1332,7 @@ fn add_sub_sat(a: u128, b: u128, esz: usize, add: bool, signed: bool) -> u128 {
 }
 
 /// PMULLW — 8 word lanes of 16×16, keeping the low 16 bits.
-fn pmullw(a: u128, b: u128) -> u128 {
+pub(crate) fn pmullw(a: u128, b: u128) -> u128 {
     let mut out = 0u128;
     for i in 0..8 {
         let x = ((a >> (i * 16)) & 0xFFFF) as u32;
@@ -1343,7 +1343,7 @@ fn pmullw(a: u128, b: u128) -> u128 {
 }
 
 /// PMULHW (`signed`) / PMULHUW — 8 word lanes of 16×16, keeping the high 16.
-fn pmulh(a: u128, b: u128, signed: bool) -> u128 {
+pub(crate) fn pmulh(a: u128, b: u128, signed: bool) -> u128 {
     let mut out = 0u128;
     for i in 0..8 {
         let x = ((a >> (i * 16)) & 0xFFFF) as u16;
@@ -1359,7 +1359,7 @@ fn pmulh(a: u128, b: u128, signed: bool) -> u128 {
 }
 
 /// PMULUDQ — unsigned 32×32→64 on the two even dword lanes (0 and 2).
-fn pmuludq(a: u128, b: u128) -> u128 {
+pub(crate) fn pmuludq(a: u128, b: u128) -> u128 {
     let a0 = (a & 0xFFFF_FFFF) as u64;
     let b0 = (b & 0xFFFF_FFFF) as u64;
     let a2 = ((a >> 64) & 0xFFFF_FFFF) as u64;
@@ -1368,7 +1368,7 @@ fn pmuludq(a: u128, b: u128) -> u128 {
 }
 
 /// PMADDWD — signed 16×16 products summed in adjacent pairs → 4 dwords.
-fn pmaddwd(a: u128, b: u128) -> u128 {
+pub(crate) fn pmaddwd(a: u128, b: u128) -> u128 {
     let mut out = 0u128;
     for i in 0..4 {
         let base = i * 32;
@@ -1383,7 +1383,7 @@ fn pmaddwd(a: u128, b: u128) -> u128 {
 }
 
 /// PAVGB (esz=1) / PAVGW (esz=2) — unsigned rounded average `(x+y+1)>>1`.
-fn pavg(a: u128, b: u128, esz: usize) -> u128 {
+pub(crate) fn pavg(a: u128, b: u128, esz: usize) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let mut out = 0u128;
@@ -1398,7 +1398,7 @@ fn pavg(a: u128, b: u128, esz: usize) -> u128 {
 
 /// PSADBW — sum of absolute byte differences, per 8-byte half, into the low
 /// word of each qword lane (the rest of the lane zeroed).
-fn psadbw(a: u128, b: u128) -> u128 {
+pub(crate) fn psadbw(a: u128, b: u128) -> u128 {
     let mut halves = [0u128; 2];
     for (h, acc) in halves.iter_mut().enumerate() {
         let mut sum = 0u32;
@@ -1416,7 +1416,7 @@ fn psadbw(a: u128, b: u128) -> u128 {
 /// Pack with saturation: `a`'s lanes fill the low half, `b`'s the high half.
 /// Input lanes are `esz_in` bytes read as signed; output lanes are half that
 /// width, saturated to the signed range (`signed_out`) or `[0,max]` (PACKUSWB).
-fn pack(a: u128, b: u128, esz_in: usize, signed_out: bool) -> u128 {
+pub(crate) fn pack(a: u128, b: u128, esz_in: usize, signed_out: bool) -> u128 {
     let bits_in = esz_in * 8;
     let bits_out = bits_in / 2;
     let mask_in = emask(esz_in);
@@ -1441,7 +1441,7 @@ fn pack(a: u128, b: u128, esz_in: usize, signed_out: bool) -> u128 {
 }
 
 /// Per-byte unsigned min (`max=false`) or max — PMINUB/PMAXUB.
-fn byte_minmax(a: u128, b: u128, max: bool) -> u128 {
+pub(crate) fn byte_minmax(a: u128, b: u128, max: bool) -> u128 {
     let mut out = 0u128;
     for i in 0..16 {
         let x = ((a >> (i * 8)) & 0xFF) as u8;
@@ -1453,7 +1453,7 @@ fn byte_minmax(a: u128, b: u128, max: bool) -> u128 {
 }
 
 /// The top bit of each of the 16 bytes, packed into a 16-bit mask — PMOVMSKB.
-fn pmovmskb(v: u128) -> u32 {
+pub(crate) fn pmovmskb(v: u128) -> u32 {
     let mut m = 0u32;
     for i in 0..16 {
         if (v >> (i * 8 + 7)) & 1 == 1 {
@@ -1464,7 +1464,7 @@ fn pmovmskb(v: u128) -> u32 {
 }
 
 /// Per-element right shift, logical (`arith=false`) or arithmetic — PSRL*/PSRA*.
-fn shift_r(v: u128, esz: usize, count: u64, arith: bool) -> u128 {
+pub(crate) fn shift_r(v: u128, esz: usize, count: u64, arith: bool) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let sign = 1u128 << (bits - 1);
@@ -1487,7 +1487,7 @@ fn shift_r(v: u128, esz: usize, count: u64, arith: bool) -> u128 {
 }
 
 /// Per-element logical left shift — PSLL*.
-fn shift_l(v: u128, esz: usize, count: u64) -> u128 {
+pub(crate) fn shift_l(v: u128, esz: usize, count: u64) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     if count >= bits as u64 {
@@ -1502,7 +1502,7 @@ fn shift_l(v: u128, esz: usize, count: u64) -> u128 {
 }
 
 /// Select four dwords per `imm` from a single source — PSHUFD.
-fn pshufd(src: u128, imm: u8) -> u128 {
+pub(crate) fn pshufd(src: u128, imm: u8) -> u128 {
     let mut out = 0u128;
     for i in 0..4 {
         let sel = (imm >> (i * 2)) & 3;
@@ -1513,7 +1513,7 @@ fn pshufd(src: u128, imm: u8) -> u128 {
 }
 
 /// Shuffle the low four words per `imm`, copying the high qword — PSHUFLW.
-fn pshuflw(src: u128, imm: u8) -> u128 {
+pub(crate) fn pshuflw(src: u128, imm: u8) -> u128 {
     let mut low = 0u128;
     for i in 0..4 {
         let sel = (imm >> (i * 2)) & 3;
@@ -1524,7 +1524,7 @@ fn pshuflw(src: u128, imm: u8) -> u128 {
 }
 
 /// Shuffle the high four words per `imm`, copying the low qword — PSHUFHW.
-fn pshufhw(src: u128, imm: u8) -> u128 {
+pub(crate) fn pshufhw(src: u128, imm: u8) -> u128 {
     let hi = src >> 64;
     let mut out = 0u128;
     for i in 0..4 {
@@ -1536,7 +1536,7 @@ fn pshufhw(src: u128, imm: u8) -> u128 {
 }
 
 /// SHUFPS: low two dwords from `dst`, high two from `src`, per `imm`.
-fn shufps(dst: u128, src: u128, imm: u8) -> u128 {
+pub(crate) fn shufps(dst: u128, src: u128, imm: u8) -> u128 {
     let dw = |v: u128, i: u8| (v >> (i as u32 * 32)) & LOW32;
     let mut out = 0u128;
     out |= dw(dst, imm & 3);
@@ -1547,7 +1547,7 @@ fn shufps(dst: u128, src: u128, imm: u8) -> u128 {
 }
 
 /// SHUFPD: low qword from `dst`, high qword from `src`, each per one `imm` bit.
-fn shufpd(dst: u128, src: u128, imm: u8) -> u128 {
+pub(crate) fn shufpd(dst: u128, src: u128, imm: u8) -> u128 {
     let lo = if imm & 1 == 0 { dst & LOW64 } else { (dst >> 64) & LOW64 };
     let hi = if imm & 2 == 0 { src & LOW64 } else { (src >> 64) & LOW64 };
     lo | (hi << 64)
@@ -1557,7 +1557,7 @@ fn shufpd(dst: u128, src: u128, imm: u8) -> u128 {
 
 /// PSHUFB — for each of 16 dst bytes, if the control byte's high bit is set the
 /// result byte is 0, else it selects `dst_byte[control & 0x0F]`.
-fn pshufb(a: u128, b: u128) -> u128 {
+pub(crate) fn pshufb(a: u128, b: u128) -> u128 {
     let mut out = 0u128;
     for i in 0..16 {
         let ctl = ((b >> (i * 8)) & 0xFF) as u8;
@@ -1581,7 +1581,7 @@ fn pshufb(a: u128, b: u128) -> u128 {
 /// read back for a later pair — so the result is *not* two independent halves.
 /// We model that exactly: a live `d[]` array is mutated lane-by-lane, and the
 /// high half reads its pairs from `d` (aliased) rather than the original source.
-fn phaddsub(a: u128, b: u128, esz: usize, sub: bool, sat: bool, aliased: bool) -> u128 {
+pub(crate) fn phaddsub(a: u128, b: u128, esz: usize, sub: bool, sat: bool, aliased: bool) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz) as u64;
     let lanes = 16 / esz;
@@ -1629,7 +1629,7 @@ fn phaddsub(a: u128, b: u128, esz: usize, sub: bool, sat: bool, aliased: bool) -
 
 /// PMADDUBSW — unsigned bytes of `a` × signed bytes of `b`, summed in adjacent
 /// pairs into 8 saturated signed word lanes.
-fn pmaddubsw(a: u128, b: u128) -> u128 {
+pub(crate) fn pmaddubsw(a: u128, b: u128) -> u128 {
     let mut out = 0u128;
     for i in 0..8 {
         let base = i * 16;
@@ -1645,7 +1645,7 @@ fn pmaddubsw(a: u128, b: u128) -> u128 {
 
 /// PSIGN{B,W,D} — negate/zero each `a` lane by the sign of the matching `b`
 /// lane: b<0 → −a, b==0 → 0, b>0 → a.
-fn psign(a: u128, b: u128, esz: usize) -> u128 {
+pub(crate) fn psign(a: u128, b: u128, esz: usize) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let shift = 64 - bits;
@@ -1664,7 +1664,7 @@ fn psign(a: u128, b: u128, esz: usize) -> u128 {
 }
 
 /// PMULHRSW — signed 16×16, take bits [30:15] of the product +1, per word lane.
-fn pmulhrsw(a: u128, b: u128) -> u128 {
+pub(crate) fn pmulhrsw(a: u128, b: u128) -> u128 {
     let mut out = 0u128;
     for i in 0..8 {
         let x = ((a >> (i * 16)) & 0xFFFF) as u16 as i16 as i32;
@@ -1676,7 +1676,7 @@ fn pmulhrsw(a: u128, b: u128) -> u128 {
 }
 
 /// PABS{B,W,D} — per-lane absolute value.
-fn pabs(v: u128, esz: usize) -> u128 {
+pub(crate) fn pabs(v: u128, esz: usize) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let shift = 64 - bits;
@@ -1690,7 +1690,7 @@ fn pabs(v: u128, esz: usize) -> u128 {
 
 /// PBLENDVB/BLENDVPS/BLENDVPD — per-element select from `b` when the mask
 /// element's top bit is set, else from `a`.
-fn blend_var(a: u128, b: u128, mask: u128, esz: usize) -> u128 {
+pub(crate) fn blend_var(a: u128, b: u128, mask: u128, esz: usize) -> u128 {
     let bits = esz * 8;
     let em = emask(esz);
     let mut out = 0u128;
@@ -1703,7 +1703,7 @@ fn blend_var(a: u128, b: u128, mask: u128, esz: usize) -> u128 {
 }
 
 /// BLENDPS/BLENDPD/PBLENDW — per-lane select from `src` where the imm bit is 1.
-fn blend_imm(dst: u128, src: u128, imm: u8, esz: usize) -> u128 {
+pub(crate) fn blend_imm(dst: u128, src: u128, imm: u8, esz: usize) -> u128 {
     let bits = esz * 8;
     let em = emask(esz);
     let mut out = 0u128;
@@ -1717,7 +1717,7 @@ fn blend_imm(dst: u128, src: u128, imm: u8, esz: usize) -> u128 {
 
 /// PMOVSX/PMOVZX — extend the low `16/dst_sz` elements of `src` from `src_sz`
 /// to `dst_sz` bytes, sign- or zero-extending.
-fn pmovx(src: u128, src_sz: usize, dst_sz: usize, sign: bool) -> u128 {
+pub(crate) fn pmovx(src: u128, src_sz: usize, dst_sz: usize, sign: bool) -> u128 {
     let sbits = src_sz * 8;
     let dbits = dst_sz * 8;
     let smask = emask(src_sz);
@@ -1734,7 +1734,7 @@ fn pmovx(src: u128, src_sz: usize, dst_sz: usize, sign: bool) -> u128 {
 }
 
 /// PMULDQ — signed 32×32→64 on the two even dword lanes (0 and 2).
-fn pmuldq(a: u128, b: u128) -> u128 {
+pub(crate) fn pmuldq(a: u128, b: u128) -> u128 {
     let a0 = (a & 0xFFFF_FFFF) as u32 as i32 as i64;
     let b0 = (b & 0xFFFF_FFFF) as u32 as i32 as i64;
     let a2 = ((a >> 64) & 0xFFFF_FFFF) as u32 as i32 as i64;
@@ -1744,7 +1744,7 @@ fn pmuldq(a: u128, b: u128) -> u128 {
 
 /// PACKUSDW — pack signed dwords from `a` (low) and `b` (high) into unsigned
 /// words, saturating to `[0, 0xFFFF]`.
-fn packusdw(a: u128, b: u128) -> u128 {
+pub(crate) fn packusdw(a: u128, b: u128) -> u128 {
     let mut out = 0u128;
     for (half, src) in [a, b].iter().enumerate() {
         for i in 0..4 {
@@ -1757,7 +1757,7 @@ fn packusdw(a: u128, b: u128) -> u128 {
 }
 
 /// PMIN/PMAX signed or unsigned, per `esz`-byte lane.
-fn int_minmax(a: u128, b: u128, esz: usize, signed: bool, max: bool) -> u128 {
+pub(crate) fn int_minmax(a: u128, b: u128, esz: usize, signed: bool, max: bool) -> u128 {
     let bits = esz * 8;
     let mask = emask(esz);
     let shift = 64 - bits;
@@ -1781,7 +1781,7 @@ fn int_minmax(a: u128, b: u128, esz: usize, signed: bool, max: bool) -> u128 {
 }
 
 /// PMULLD — 32×32 keeping the low 32 bits, four dword lanes.
-fn pmulld(a: u128, b: u128) -> u128 {
+pub(crate) fn pmulld(a: u128, b: u128) -> u128 {
     let mut out = 0u128;
     for i in 0..4 {
         let x = ((a >> (i * 32)) & 0xFFFF_FFFF) as u32;
@@ -1809,7 +1809,7 @@ fn phminposuw(src: u128) -> u128 {
 /// PALIGNR — concatenate `a:b` (a high, b low) into 32 bytes and byte-shift
 /// right by `imm`, taking the low 16 bytes. imm>=32 → all zero; 16<=imm<32
 /// pulls from the high half only.
-fn palignr(a: u128, b: u128, imm: u8) -> u128 {
+pub(crate) fn palignr(a: u128, b: u128, imm: u8) -> u128 {
     let n = imm as u32;
     if n >= 32 {
         return 0;
@@ -1866,7 +1866,7 @@ fn dppd(a: u128, b: u128, imm: u8) -> u128 {
 /// second operand `b` (xmm2) provides the 4-byte reference block at offset
 /// `imm[1:0]*4`; the first operand `a` (xmm1/dest) provides the sliding window
 /// starting at `imm[2]*4`.
-fn mpsadbw(a: u128, b: u128, imm: u8) -> u128 {
+pub(crate) fn mpsadbw(a: u128, b: u128, imm: u8) -> u128 {
     let a_off = (((imm >> 2) & 1) * 4) as u32; // window base in xmm1 (dest)
     let b_off = ((imm & 3) * 4) as u32; // reference block in xmm2 (src)
     let abyte = |i: u32| ((a >> (i * 8)) & 0xFF) as i32;
@@ -1899,7 +1899,7 @@ fn implicit_len(v: u128, elem_bytes: usize, n: usize) -> usize {
 
 /// Round an f32 per the effective rounding mode (0 nearest-even, 1 down, 2 up,
 /// 3 truncate).
-fn round_f32(x: f32, mode: u8) -> f32 {
+pub(crate) fn round_f32(x: f32, mode: u8) -> f32 {
     match mode {
         0 => {
             let r = x.round_ties_even();
@@ -1912,7 +1912,7 @@ fn round_f32(x: f32, mode: u8) -> f32 {
 }
 
 /// Round an f64 per the effective rounding mode.
-fn round_f64(x: f64, mode: u8) -> f64 {
+pub(crate) fn round_f64(x: f64, mode: u8) -> f64 {
     match mode {
         0 => {
             let r = x.round_ties_even();

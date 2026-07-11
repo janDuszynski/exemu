@@ -12,18 +12,24 @@ fn main() {
 #[cfg(feature = "unicorn")]
 fn main() {
     use exemu_cpu::Bits;
-    use exemu_oracle::{fuzz, render, FuzzConfig};
+    use exemu_oracle::{debug_index, fuzz, render, FuzzConfig};
 
     let argv: Vec<String> = std::env::args().collect();
     let mut bits_list = vec![Bits::B32];
     let mut count: u64 = 1_000_000;
     let mut seed: u64 = 1;
     let mut report: usize = 25;
+    let mut debug_ix: Option<u64> = None;
 
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
             "fuzz" => {}
+            "debug" => {}
+            "--index" => {
+                i += 1;
+                debug_ix = argv.get(i).and_then(|s| s.parse().ok());
+            }
             "--bits" => {
                 i += 1;
                 bits_list = match argv.get(i).map(|s| s.as_str()) {
@@ -57,6 +63,14 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    if let Some(ix) = debug_ix {
+        for bits in &bits_list {
+            println!("== debug index {ix} (seed {seed}) ==");
+            print!("{}", debug_index(*bits, seed, ix));
+        }
+        std::process::exit(0);
     }
 
     let mut total_div = 0u64;

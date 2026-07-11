@@ -124,8 +124,17 @@ impl X87 {
 pub struct CpuState {
     /// The 16 general-purpose registers, indexed by [`Reg`].
     pub gpr: [u64; 16],
-    /// The 16 128-bit SSE/SSE2 vector registers (`xmm0`..`xmm15`).
+    /// The low 128 bits of the 16 vector registers — the SSE/SSE2 `xmm0`..`xmm15`
+    /// view. On a real CPU these are the low halves of the 256-bit `ymm`
+    /// registers; [`Self::ymm_hi`] holds the upper halves. Legacy (non-VEX) SSE
+    /// writes touch only this array (upper halves preserved); VEX.128 writes
+    /// zero the corresponding [`Self::ymm_hi`] lane (see `crates/cpu/src/vex.rs`).
     pub xmm: [u128; 16],
+    /// The upper 128 bits of the 16 vector registers — `ymm0[255:128]`..
+    /// `ymm15[255:128]`. Together with [`Self::xmm`] this forms the full 256-bit
+    /// AVX register file. Legacy SSE preserves these; VEX.128 zeroes them;
+    /// VEX.256 writes them.
+    pub ymm_hi: [u128; 16],
     /// The x87 FPU register stack and its control/status/tag words.
     pub x87: X87,
     /// Instruction pointer.
@@ -145,6 +154,7 @@ impl CpuState {
         CpuState {
             gpr: [0; 16],
             xmm: [0; 16],
+            ymm_hi: [0; 16],
             x87: X87::new(),
             rip: 0,
             rflags: flags::RESERVED_ONE | flags::IF,
@@ -212,6 +222,45 @@ impl CpuState {
     pub fn gpr_write_high8(&mut self, index: u8, value: u64) {
         let slot = &mut self.gpr[index as usize & 0x3];
         *slot = (*slot & !0xff00) | ((value & 0xff) << 8);
+    }
+
+    // ---- vector (XMM/YMM) access -----------------------------------------
+
+    /// Read the low 128 bits of vector register `i` (the `xmm` view).
+    #[inline]
+    pub fn xmm(&self, i: u8) -> u128 {
+        self.xmm[i as usize & 0xf]
+    }
+
+    /// Read the high 128 bits of vector register `i` (`ymm[255:128]`).
+    #[inline]
+    pub fn ymm_hi(&self, i: u8) -> u128 {
+        self.ymm_hi[i as usize & 0xf]
+    }
+
+    /// Write the full 256-bit YMM register `i` from `(low, high)` halves.
+    #[inline]
+    pub fn set_ymm(&mut self, i: u8, low: u128, high: u128) {
+        let idx = i as usize & 0xf;
+        self.xmm[idx] = low;
+        self.ymm_hi[idx] = high;
+    }
+
+    /// Write the low 128 bits of vector register `i` and **zero** its upper
+    /// half. This is the VEX.128 destination-update rule: any VEX-encoded
+    /// instruction with a 128-bit destination clears `ymm[255:128]`.
+    #[inline]
+    pub fn set_xmm_zero_upper(&mut self, i: u8, low: u128) {
+        let idx = i as usize & 0xf;
+        self.xmm[idx] = low;
+        self.ymm_hi[idx] = 0;
+    }
+
+    /// Write the low 128 bits of vector register `i`, **preserving** its upper
+    /// half. This is the legacy-SSE destination-update rule.
+    #[inline]
+    pub fn set_xmm_keep_upper(&mut self, i: u8, low: u128) {
+        self.xmm[i as usize & 0xf] = low;
     }
 
     // ---- flags -----------------------------------------------------------

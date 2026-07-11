@@ -14,4 +14,4 @@ mod gen;
 mod rng;
 
 #[cfg(feature = "unicorn")]
-pub use engine::{fuzz, render, Divergence, FuzzConfig, Summary};
+pub use engine::{debug_index, fuzz, render, Divergence, FuzzConfig, Summary};
