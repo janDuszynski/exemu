@@ -195,4 +195,39 @@ pub trait Memory {
         let _ = addr;
         None
     }
+
+    // ---- self-modifying-code detection (the W8 JIT invalidation seam) -----
+    //
+    // The interpreter decodes fresh every step, so self-modifying code already
+    // works with no help here. A future JIT, however, will cache decoded/compiled
+    // blocks keyed by guest address and must throw a cached block away the moment
+    // the bytes underneath it change. These two counters are the seam that lets it
+    // do so cheaply: a backend bumps them whenever a write lands in *executable*
+    // memory. Test doubles inherit the no-op defaults (they hold no code the JIT
+    // would cache), so nothing changes for them.
+
+    /// A monotonic counter incremented once for every write (guest or loader
+    /// `poke`) that touches at least one byte of an executable region. A JIT can
+    /// compare a snapshot of this against the live value to answer "did *any*
+    /// executable byte change since I last checked?" in O(1). Default: `0`
+    /// (never changes → a cache built on it would simply never self-invalidate,
+    /// which is safe for a backend that stores no executable bytes).
+    fn code_generation(&self) -> u64 {
+        0
+    }
+
+    /// The generation of the executable page containing `addr` (page = 4 KiB).
+    /// Incremented every time a write lands anywhere in that page while the page
+    /// is executable. A JIT keys cached blocks by page and re-validates each
+    /// against the generation captured at compile time; a bump means "recompile".
+    /// Pages that are not (or never were) executable report `0`. Default: `0`.
+    fn code_page_generation(&self, addr: u64) -> u64 {
+        let _ = addr;
+        0
+    }
 }
+
+/// Guest page size used by the self-modifying-code generation map. 4 KiB is the
+/// x86 base page; the JIT invalidation seam ([`Memory::code_page_generation`])
+/// works at this granularity.
+pub const CODE_PAGE_SIZE: u64 = 0x1000;

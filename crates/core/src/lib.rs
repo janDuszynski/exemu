@@ -24,7 +24,7 @@ pub use cpu::{Cpu, CpuState, Exit, Reg, X87, flags};
 pub use error::{EmuError, Result};
 pub use gui::{Control, ControlKind, DialogTemplate, DrawOp, Gui, GuiEvent, NoGui};
 pub use hooks::Hooks;
-pub use memory::{Memory, Perm, Region};
+pub use memory::{Memory, Perm, Region, CODE_PAGE_SIZE};
 pub use pe::{
     ActivationContext, AssemblyIdentity, Export, Import, ImportSymbol, ManifestInfo, PeImage,
     Reloc, Section, Tls,

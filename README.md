@@ -173,7 +173,10 @@ exemu sample <out.exe>
   the oracle diffs the whole stack + status/control words against Unicorn.
   `CPUID` reports an honest feature set (only the instructions actually
   implemented — through SSE4.2, AVX and AVX2), so CRTs dispatch onto code paths
-  the interpreter can execute.
+  the interpreter can execute. **Self-modifying code** works because the
+  interpreter re-decodes every instruction from live memory; writes into
+  executable regions are tracked with per-page generation counters (the
+  invalidation seam a future JIT code cache consumes).
 * **~200 Win32 functions** across `kernel32`/`user32`/`gdi32`/`advapi32`/
   `shell32`/`ole32`/`comctl32`: console I/O, the `Heap*`/`Global*` allocators,
   the `lstr*` string family, `CharNext`/`CharPrev`, command line, module

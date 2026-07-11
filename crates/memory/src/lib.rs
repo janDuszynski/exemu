@@ -13,7 +13,9 @@
 
 #![forbid(unsafe_code)]
 
-use exemu_core::{EmuError, Memory, Perm, Region, Result};
+use std::collections::HashMap;
+
+use exemu_core::{EmuError, Memory, Perm, Region, Result, CODE_PAGE_SIZE};
 
 struct Mapped {
     region: Region,
@@ -32,11 +34,19 @@ impl Mapped {
 pub struct VirtualMemory {
     /// Regions, invariant: sorted by `region.base`, non-overlapping.
     regions: Vec<Mapped>,
+    /// Self-modifying-code detection (the W8 JIT invalidation seam — roadmap
+    /// W1.7). `code_gen` counts writes that hit executable memory; `page_gen`
+    /// maps a 4 KiB executable page to its own generation. Both are lazily
+    /// populated: a program that never writes into an executable region leaves
+    /// this map empty, so the common data-write path pays only one already-cached
+    /// permission test and a predictably-not-taken branch.
+    code_gen: u64,
+    page_gen: HashMap<u64, u64>,
 }
 
 impl VirtualMemory {
     pub fn new() -> Self {
-        VirtualMemory { regions: Vec::new() }
+        VirtualMemory::default()
     }
 
     /// Map a zero-filled region.
@@ -76,7 +86,11 @@ impl VirtualMemory {
             .checked_add(data.len())
             .filter(|&e| e as u64 <= m.region.size)
             .ok_or(EmuError::Unmapped { addr, len: data.len() })?;
+        let is_exec = m.region.perm.contains(Perm::EXEC);
         m.bytes[start..end].copy_from_slice(data);
+        if is_exec {
+            self.note_code_write(addr, data.len());
+        }
         Ok(())
     }
 
@@ -91,6 +105,25 @@ impl VirtualMemory {
     }
 
     // ---- internals -------------------------------------------------------
+
+    /// Record that `[addr, addr+len)` — which lives in an executable region —
+    /// was overwritten: bump the global code generation and the per-page
+    /// generation of every 4 KiB page the range spans. Called only from the two
+    /// write paths ([`Memory::write`], [`poke`](Self::poke)) and only after the
+    /// covering region has been confirmed executable, so it is off the hot path
+    /// for ordinary data writes.
+    #[cold]
+    #[inline(never)]
+    fn note_code_write(&mut self, addr: u64, len: usize) {
+        self.code_gen = self.code_gen.wrapping_add(1);
+        let first = addr / CODE_PAGE_SIZE;
+        // `len >= 1` here (empty writes return early before reaching us).
+        let last = (addr + (len as u64 - 1)) / CODE_PAGE_SIZE;
+        for page in first..=last {
+            let g = self.page_gen.entry(page * CODE_PAGE_SIZE).or_insert(0);
+            *g = g.wrapping_add(1);
+        }
+    }
 
     fn insert(&mut self, region: Region, bytes: Vec<u8>) -> Result<()> {
         if region.size == 0 {
@@ -181,7 +214,11 @@ impl Memory for VirtualMemory {
         }
         let (start, end) = self.locate(addr, data.len(), Perm::WRITE, "write")?;
         let m = self.find_mut(addr).expect("located above");
+        let is_exec = m.region.perm.contains(Perm::EXEC);
         m.bytes[start..end].copy_from_slice(data);
+        if is_exec {
+            self.note_code_write(addr, data.len());
+        }
         Ok(())
     }
 
@@ -218,6 +255,17 @@ impl Memory for VirtualMemory {
             .iter()
             .find(|m| m.end() > addr)
             .map(|m| (m.region.base, m.region.size, m.region.perm))
+    }
+
+    #[inline]
+    fn code_generation(&self) -> u64 {
+        self.code_gen
+    }
+
+    #[inline]
+    fn code_page_generation(&self, addr: u64) -> u64 {
+        let page = (addr / CODE_PAGE_SIZE) * CODE_PAGE_SIZE;
+        self.page_gen.get(&page).copied().unwrap_or(0)
     }
 }
 
@@ -301,5 +349,80 @@ mod tests {
         assert_eq!(base, 0x400000);
         // Above every region, the space is free.
         assert!(m.next_region(0x9000_0000).is_none());
+    }
+
+    // ---- self-modifying-code detection seam (roadmap W1.7) ----------------
+
+    /// A region that is both writable and executable (as PE sections are mapped
+    /// RWX at runtime), so writes into it register as code writes.
+    fn rwx_mem() -> VirtualMemory {
+        let mut m = VirtualMemory::new();
+        m.map(Region::new("data", 0x1000, 0x1000, Perm::RW)).unwrap();
+        m.map(Region::new("code", 0x400000, 0x4000, Perm::RWX)).unwrap();
+        m
+    }
+
+    #[test]
+    fn data_writes_never_bump_the_code_generation() {
+        let mut m = rwx_mem();
+        assert_eq!(m.code_generation(), 0);
+        // Writing into the non-executable data region is invisible to the seam.
+        m.write_u64(0x1100, 0xdead_beef).unwrap();
+        m.write_u8(0x1200, 0xff).unwrap();
+        assert_eq!(m.code_generation(), 0);
+        assert_eq!(m.code_page_generation(0x1000), 0);
+    }
+
+    #[test]
+    fn write_into_executable_region_bumps_global_and_page_gen() {
+        let mut m = rwx_mem();
+        let before = m.code_page_generation(0x400000);
+        assert_eq!((m.code_generation(), before), (0, 0));
+        m.write_u8(0x400010, 0x90).unwrap();
+        assert_eq!(m.code_generation(), 1);
+        assert_eq!(m.code_page_generation(0x400000), 1);
+        // A second write to the same page advances both counters again.
+        m.write_u8(0x400020, 0x90).unwrap();
+        assert_eq!(m.code_generation(), 2);
+        assert_eq!(m.code_page_generation(0x400000), 2);
+        // A different page in the same region tracks its own generation.
+        assert_eq!(m.code_page_generation(0x401000), 0);
+    }
+
+    #[test]
+    fn per_page_generations_are_independent() {
+        let mut m = rwx_mem();
+        m.write_u8(0x400000, 0x90).unwrap(); // page 0x400000
+        m.write_u8(0x402000, 0x90).unwrap(); // page 0x402000
+        m.write_u8(0x402008, 0x90).unwrap(); // page 0x402000 again
+        assert_eq!(m.code_page_generation(0x400000), 1);
+        assert_eq!(m.code_page_generation(0x401000), 0); // untouched page
+        assert_eq!(m.code_page_generation(0x402000), 2);
+        // The global counter is the sum of all executable writes.
+        assert_eq!(m.code_generation(), 3);
+    }
+
+    #[test]
+    fn write_spanning_a_page_boundary_bumps_both_pages() {
+        let mut m = rwx_mem();
+        // An 8-byte store straddling 0x401000: 4 bytes in page 0x400000, 4 in
+        // page 0x401000. Both pages' generations advance; the global counts once.
+        m.write_u64(0x401000 - 4, 0).unwrap();
+        assert_eq!(m.code_generation(), 1);
+        assert_eq!(m.code_page_generation(0x400ffc), 1);
+        assert_eq!(m.code_page_generation(0x401000), 1);
+    }
+
+    #[test]
+    fn loader_poke_into_code_also_bumps_the_seam() {
+        // The loader/kernel patch path (IAT fill, packer unpacking) writes through
+        // `poke`; a JIT must see those as code changes too.
+        let mut m = rwx_mem();
+        m.poke(0x400100, &[0xcc]).unwrap();
+        assert_eq!(m.code_generation(), 1);
+        assert_eq!(m.code_page_generation(0x400000), 1);
+        // Poke into pure data leaves the seam untouched.
+        m.poke(0x1000, &[0x00]).unwrap();
+        assert_eq!(m.code_generation(), 1);
     }
 }
