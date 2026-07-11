@@ -951,28 +951,30 @@ impl Interpreter {
                 // implemented; a guest may XGETBV(XCR0) and see exactly the
                 // x87+SSE components (0x3) the interpreter can restore.
                 let ecx: u32 = (1 << 9)    // SSSE3
+                    | (1 << 13)            // CMPXCHG16B (CX16) — roadmap W1.6
                     | (1 << 19)            // SSE4.1
                     | (1 << 20)            // SSE4.2
                     | (1 << 23)            // POPCNT
                     | (1 << 26)            // XSAVE
                     | (1 << 27)            // OSXSAVE (XCR0 accessible / CR4.OSXSAVE = 1)
-                    | (1 << 28); // AVX (VEX-encoded 256-bit float/int — roadmap W1.5)
+                    | (1 << 28)            // AVX (VEX-encoded 256-bit float/int — roadmap W1.5)
+                    | (1 << 29); // F16C (VCVTPH2PS/VCVTPS2PH — roadmap W1.6)
                 let edx: u32 = 1        // FPU (bit 0; guaranteed in long mode)
                     | (1 << 4)          // TSC
                     | (1 << 15)         // CMOV
+                    | (1 << 23)         // MMX (bare-form MMX + EMMS — roadmap W1.6)
                     | (1 << 24)         // FXSR
                     | (1 << 25)         // SSE
                     | (1 << 26); // SSE2
                 (0x0003_06c3, 0x0001_0800, ecx, edx)
             }
-            // Structured extended features. Sub-leaf 0 EBX bit 5 = AVX2 (the
-            // VEX-encoded 256-bit *integer* ops — VPADD*/VPSUB*/VPAND/VPCMP*/
-            // VPERM*/VPBROADCAST*/VPBLEND*/VINSERTI128 etc., all implemented in
-            // vex.rs and oracle-clean, roadmap W1.5). No BMI1/BMI2/AVX-512 (we
-            // have TZCNT/LZCNT but not the rest of BMI1, so the BMI1 bit stays
-            // withheld). EAX = max sub-leaf = 0; other sub-leaves are all-zero.
+            // Structured extended features. Sub-leaf 0 EBX enumerates: BMI1
+            // (bit 3 — ANDN/BEXTR/BLSR/BLSMSK/BLSI, roadmap W1.6), AVX2 (bit 5),
+            // BMI2 (bit 8 — MULX/PDEP/PEXT/BZHI/RORX/SARX/SHLX/SHRX, W1.6) and
+            // ADX (bit 19 — ADCX/ADOX, W1.6). All are implemented in vex.rs /
+            // exec.rs and oracle-verified. No AVX-512. EAX = max sub-leaf = 0.
             0x7 => match subleaf {
-                0 => (0, 1 << 5, 0, 0),
+                0 => (0, (1 << 3) | (1 << 5) | (1 << 8) | (1 << 19), 0, 0),
                 _ => (0, 0, 0, 0),
             },
             // XSAVE feature enumeration. Sub-leaf in ECX selects the view:
@@ -1036,11 +1038,16 @@ impl Interpreter {
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 24, name: "fxsr", probe: &[0x0F, 0xAE, 0x00] },
         // bit 25: SSE. MOVAPS xmm0, xmm1.
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 25, name: "sse", probe: &[0x0F, 0x28, 0xC1] },
+        // bit 23: MMX. PXOR mm0, mm0 (bare 0F EF, no mandatory prefix).
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 23, name: "mmx", probe: &[0x0F, 0xEF, 0xC0] },
         // bit 26: SSE2. MOVAPD xmm0, xmm1 (66 0F 28).
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Edx, bit: 26, name: "sse2", probe: &[0x66, 0x0F, 0x28, 0xC1] },
         // ---- leaf 1, ECX -----------------------------------------------------
         // bit 9: SSSE3. PSHUFB xmm0, xmm1 (66 0F 38 00).
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 9, name: "ssse3", probe: &[0x66, 0x0F, 0x38, 0x00, 0xC1] },
+        // bit 13: CMPXCHG16B (CX16). REX.W 0F C7 /1 [rax] (the probe maps [rax],
+        // aligned to 16 bytes; a mismatch just clears ZF and loads RDX:RAX).
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 13, name: "cx16", probe: &[0x48, 0x0F, 0xC7, 0x08] },
         // bit 19: SSE4.1. PMULLD xmm0, xmm1 (66 0F 38 40).
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 19, name: "sse4.1", probe: &[0x66, 0x0F, 0x38, 0x40, 0xC1] },
         // bit 20: SSE4.2. PCMPISTRI xmm0, xmm1, 0 (66 0F 3A 63 /r ib) — the
@@ -1055,10 +1062,18 @@ impl Interpreter {
         // bit 28: AVX. VXORPS xmm0, xmm0, xmm0 (VEX.128 NP 0F 57) — a VEX-encoded
         // float op. Its decode proves the 0xC5 VEX prefix + 0F map are handled.
         CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 28, name: "avx", probe: &[0xC5, 0xF8, 0x57, 0xC0] },
+        // bit 29: F16C. VCVTPH2PS xmm0, xmm1 (VEX.128.66.0F38.W0 13) — roadmap W1.6.
+        CpuidFeature { leaf: 1, sub: 0, reg: CpuidReg::Ecx, bit: 29, name: "f16c", probe: &[0xC4, 0xE2, 0x79, 0x13, 0xC1] },
         // ---- leaf 7.0, EBX ---------------------------------------------------
+        // bit 3: BMI1. ANDN eax, ebx, ecx (VEX.NDS.LZ.0F38.W0 F2) — roadmap W1.6.
+        CpuidFeature { leaf: 7, sub: 0, reg: CpuidReg::Ebx, bit: 3, name: "bmi1", probe: &[0xC4, 0xE2, 0x60, 0xF2, 0xC1] },
         // bit 5: AVX2. VPADDD ymm0, ymm0, ymm0 (VEX.256 66 0F FE) — a 256-bit
         // integer op, proving the AVX2 lane-wise integer surface decodes.
         CpuidFeature { leaf: 7, sub: 0, reg: CpuidReg::Ebx, bit: 5, name: "avx2", probe: &[0xC5, 0xFD, 0xFE, 0xC0] },
+        // bit 8: BMI2. MULX eax, ebx, ecx (VEX.NDD.LZ.F2.0F38.W0 F6) — roadmap W1.6.
+        CpuidFeature { leaf: 7, sub: 0, reg: CpuidReg::Ebx, bit: 8, name: "bmi2", probe: &[0xC4, 0xE2, 0x63, 0xF6, 0xC1] },
+        // bit 19: ADX. ADCX eax, ecx (66 0F38 F6) — roadmap W1.6.
+        CpuidFeature { leaf: 7, sub: 0, reg: CpuidReg::Ebx, bit: 19, name: "adx", probe: &[0x66, 0x0F, 0x38, 0xF6, 0xC1] },
         // ---- leaf 0x8000_0001, ECX ------------------------------------------
         // bit 5: LZCNT/ABM. LZCNT r32, r/m32 (F3 0F BD).
         CpuidFeature { leaf: 0x8000_0001, sub: 0, reg: CpuidReg::Ecx, bit: 5, name: "lzcnt", probe: &[0xF3, 0x0F, 0xBD, 0xC1] },
@@ -1280,6 +1295,21 @@ impl Interpreter {
         op2: u8,
         start: u64,
     ) -> Result<Option<Exit>> {
+        // Bare-form (no 66/F3/F2 mandatory prefix) MMX ops alias onto the x87
+        // register file — they must NOT be treated as 128-bit XMM. Route them to
+        // the MMX unit before the SSE dispatch below. (The `66`/`F3`/`F2` forms
+        // of the same opcodes are SSE and fall through to `exec_sse`.)
+        let no_mandatory = ctx.pfx.rep == 0 && !ctx.pfx.p66;
+        if no_mandatory && crate::mmx::is_mmx(op2) {
+            self.exec_mmx(ctx, mem, op2)?;
+            return Ok(None);
+        }
+        // EMMS (0F 77, no prefix): clear the x87/MMX tag word to all-empty. The
+        // `66`/VEX form of 0F 77 is VZEROUPPER/VZEROALL (handled by the VEX path).
+        if op2 == 0x77 && no_mandatory {
+            self.state.x87.emms();
+            return Ok(None);
+        }
         // The SSE/SSE2 family (two-byte opcodes with a mandatory prefix) is
         // handled by its own unit.
         if crate::sse::is_sse(op2) {
@@ -1626,6 +1656,62 @@ impl Interpreter {
                 self.write_rm(ctx, mem, size, store)?;
             }
 
+            // ---- Group 9: CMPXCHG8B / CMPXCHG16B (0F C7 /1) -------------
+            // /1 memory form: 8-byte compare-exchange (EDX:EAX vs m64, store
+            // ECX:EBX) or, with REX.W, 16-byte (RDX:RAX vs m128, store RCX:RBX).
+            // Only ZF is affected. CMPXCHG16B requires 16-byte alignment (#GP
+            // otherwise). Wine 11.0 ntdll uses CMPXCHG16B 5×.
+            0xC7 => {
+                self.read_modrm(ctx, mem)?;
+                let digit = ctx.reg & 7;
+                if digit != 1 {
+                    return Err(EmuError::Unsupported(format!("0f c7 /{digit} at {start:#x}")));
+                }
+                let addr = match ctx.rm {
+                    Rm::Mem { .. } => ctx.rm_addr(),
+                    Rm::Reg(_) => return Err(EmuError::Unsupported(format!("cmpxchg8b/16b reg-form at {start:#x}"))),
+                };
+                if ctx.pfx.w() {
+                    // CMPXCHG16B: 16-byte alignment required — #GP(0) otherwise,
+                    // surfaced as the general-protection interrupt vector.
+                    if addr & 0xF != 0 {
+                        self.state.rip = ctx.cur & self.addr_mask();
+                        return Ok(Some(Exit::Interrupt(13)));
+                    }
+                    let lo = mem.read_u64(addr)?;
+                    let hi = mem.read_u64(addr.wrapping_add(8))?;
+                    let rax = self.state.gpr_read(0, 8);
+                    let rdx = self.state.gpr_read(2, 8);
+                    if lo == rax && hi == rdx {
+                        self.state.set_flag(flags::ZF, true);
+                        let rbx = self.state.gpr_read(3, 8);
+                        let rcx = self.state.gpr_read(1, 8);
+                        mem.write_u64(addr, rbx)?;
+                        mem.write_u64(addr.wrapping_add(8), rcx)?;
+                    } else {
+                        self.state.set_flag(flags::ZF, false);
+                        self.state.gpr_write(0, 8, lo); // RAX = mem low
+                        self.state.gpr_write(2, 8, hi); // RDX = mem high
+                    }
+                } else {
+                    // CMPXCHG8B: 64-bit compare-exchange (default in 32-bit mode).
+                    let val = mem.read_u64(addr)?;
+                    let eax = self.state.gpr_read(0, 4);
+                    let edx = self.state.gpr_read(2, 4);
+                    let cmp = (edx << 32) | eax;
+                    if val == cmp {
+                        self.state.set_flag(flags::ZF, true);
+                        let ebx = self.state.gpr_read(3, 4);
+                        let ecx = self.state.gpr_read(1, 4);
+                        mem.write_u64(addr, (ecx << 32) | ebx)?;
+                    } else {
+                        self.state.set_flag(flags::ZF, false);
+                        self.state.gpr_write(0, 4, val & 0xffff_ffff); // EAX = mem[31:0]
+                        self.state.gpr_write(2, 4, val >> 32); // EDX = mem[63:32]
+                    }
+                }
+            }
+
             // ---- Three-byte 0F 38 escape --------------------------------
             // MOVBE (F0/F1 without F2) is the one GP-register op here; the F2
             // F0/F1 forms are CRC32, and the rest of the map is the SSSE3 /
@@ -1651,6 +1737,32 @@ impl Interpreter {
                             let v = self.read_reg_field(ctx, size);
                             self.write_rm(ctx, mem, size, bswap(v))?;
                         }
+                    }
+                    // ADCX (66 0F38 F6) / ADOX (F3 0F38 F6). These are the ADX
+                    // extension's flag-isolated add-with-carry ops: ADCX uses and
+                    // updates ONLY CF; ADOX uses and updates ONLY OF. Every other
+                    // status flag is left untouched — that's the whole point (two
+                    // independent carry chains for big-integer multiply). The F2
+                    // form of 0F38 F6 is MULX (VEX-only, handled in vex.rs); the
+                    // no-prefix legacy form is invalid.
+                    0xF6 if ctx.pfx.p66 || ctx.pfx.rep == 0xF3 => {
+                        self.read_modrm(ctx, mem)?;
+                        let size = if ctx.pfx.w() { 8 } else { 4 };
+                        let m = alu::mask(size);
+                        let dst = self.read_reg_field(ctx, size) & m;
+                        let src = self.read_rm(ctx, &*mem, size)? & m;
+                        let use_of = ctx.pfx.rep == 0xF3; // ADOX
+                        let carry_in = if use_of {
+                            self.state.flag(flags::OF) as u128
+                        } else {
+                            self.state.flag(flags::CF) as u128
+                        };
+                        let full = dst as u128 + src as u128 + carry_in;
+                        let res = (full as u64) & m;
+                        let carry_out = (full >> (size * 8)) & 1 != 0;
+                        self.write_reg_field(ctx, size, res);
+                        // Update only the isolated flag; preserve all others.
+                        self.state.set_flag(if use_of { flags::OF } else { flags::CF }, carry_out);
                     }
                     _ => self.exec_sse_0f38(ctx, mem, op3)?,
                 }

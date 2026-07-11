@@ -138,6 +138,29 @@ pub struct Trial {
     pub label: String,
 }
 
+impl Default for Trial {
+    /// A plain register/flag trial: bit-exact comparison, no memory/xmm/x87 diff.
+    /// Builders override only the fields they care about (bytes, defined_flags,
+    /// label, …), which keeps the newer categories readable.
+    fn default() -> Self {
+        Trial {
+            bytes: Vec::new(),
+            defined_flags: 0,
+            skip_reg: 0,
+            subset_reg: 0,
+            subset_ignore: 0,
+            xmm_nan: 0,
+            ymm256: false,
+            assert_upper_zero: 0,
+            fpu: false,
+            fpu_approx: 0,
+            sw_mask: 0,
+            skip_mem: Vec::new(),
+            label: String::new(),
+        }
+    }
+}
+
 /// Status-word TOP field (bits 11..14).
 pub const SW_TOP: u16 = 0x3800;
 /// TOP plus the comparison condition codes C0/C2/C3 (bits 8, 10, 14). C1 is
@@ -243,7 +266,7 @@ const ALU_MNEM: [&str; 8] = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cm
 /// memory operand or a REP string op (exercising the ModRM/SIB/disp decoder and
 /// the "touched pages" half of the oracle); the rest are register/immediate.
 pub fn build(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
-    match rng.below(8) {
+    match rng.below(10) {
         0 => build_sse(rng, bits, seed),
         1 => build_mem(rng, bits, seed),
         2 => build_x87(rng, bits, seed),
@@ -251,6 +274,8 @@ pub fn build(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
         4 => build_cpuid(rng, bits, seed),
         5 => build_sse4(rng, bits, seed),
         6 => build_vex(rng, bits, seed),
+        7 => build_bmi(rng, bits, seed),
+        8 => build_mmx(rng, bits, seed),
         _ => build_reg(rng, bits, seed),
     }
 }
@@ -2016,11 +2041,17 @@ fn build_cpuid(rng: &mut Rng, _bits: Bits, seed: &mut Seed) -> Trial {
         // by the VEX category, so it is excluded from the "exemu advertises a bit
         // the reference lacks" check — the Unicorn reference executes VEX but
         // never surfaces AVX in CPUID.
-        1 => (0x1, 0, R_EAX | R_EBX, R_ECX | R_EDX, 1 << 28, "cpuid.1 features"),
+        // F16C (ECX bit 29) is behaviorally verified by the VEX category's F16C
+        // conversions and pinned in cpu/tests/vex.rs; the reference does not
+        // surface it (same class as AVX), so it is excluded from the subset check.
+        1 => (0x1, 0, R_EAX | R_EBX, R_ECX | R_EDX, (1 << 28) | (1 << 29), "cpuid.1 features"),
         // Leaf 7 sub-leaf 0: EAX = max sub-leaf (exact, both 0); EBX/ECX/EDX
-        // structured-extended feature words under subset. AVX2 (EBX bit 5) is
-        // excluded for the same reason as AVX above.
-        2 => (0x7, 0, 0, R_EBX | R_ECX | R_EDX, 1 << 5, "cpuid.7.0 ext-features"),
+        // structured-extended feature words under subset. AVX2 (EBX bit 5) and
+        // ADX (EBX bit 19) are excluded: the reference executes ADCX/ADOX (the
+        // ADX category proves this) but this QEMU model does not advertise ADX,
+        // like AVX2. BMI1 (bit 3) / BMI2 (bit 8) ARE advertised by the reference,
+        // so they remain under the plain subset check.
+        2 => (0x7, 0, 0, R_EBX | R_ECX | R_EDX, (1 << 5) | (1 << 19), "cpuid.7.0 ext-features"),
         // Leaf 0xD sub-leaf 0: EAX = XCR0 valid-bit mask under subset. exemu now
         // reports x87|SSE|AVX (bit 2); the reference model reports only x87|SSE,
         // so the AVX component bit is excluded (behaviorally verified by the VEX
@@ -2478,6 +2509,406 @@ fn vex_cmp(rng: &mut Rng, bits: Bits, force3: bool) -> Trial {
     vex_prefix(&mut b, reg, vvvv, rm, 1, pp, false, force3);
     b.extend([0xC2, modrm_reg(reg, rm), imm]);
     vex_trial(b, 0, reg, format!("vcmp p{imm} {}{}", if scalar { "s" } else { "p" }, if dbl { "d" } else { "s" }))
+}
+
+// ---- BMI1 / BMI2 / ADX / CMPXCHG (roadmap W1.6) ----------------------------
+//
+// BMI/ADX are general-purpose integer ops. BMI1/BMI2 are VEX-encoded (LZ, no
+// vector state); ADCX/ADOX are legacy 66/F3 0F38. Several deliberately touch NO
+// flags (MULX/PDEP/PEXT/RORX/SARX/SHLX/SHRX) — a flag-diff trap this category
+// exercises directly. Operand width is 32-bit, plus 64-bit in long mode.
+
+/// BMI operand width. **Reference limitation:** the linked Unicorn/QEMU-TCG
+/// build ignores VEX.W for BMI GP ops in 64-bit mode — it evaluates every BMI
+/// op at 64 bits regardless of W (so a W=0 op wrongly keeps the upper 32 bits
+/// of the destination instead of zero-extending). To keep the reference honest
+/// we therefore fuzz only the width that matches the mode: 64-bit (W=1) in long
+/// mode and 32-bit in protected mode. The 32-bit-width *zero-extension* of the
+/// W=0 long-mode form is pinned separately in `cpu/tests/interp.rs`.
+fn bmi_w(_rng: &mut Rng, bits: Bits) -> u8 {
+    if bits == Bits::B64 {
+        8
+    } else {
+        4
+    }
+}
+
+fn build_bmi(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    // NOTE: ADCX/ADOX (ADX) are NOT fuzzed here — the linked Unicorn/QEMU-TCG
+    // build does not implement the ADX extension (it #UDs ADCX/ADOX and never
+    // advertises the leaf-7 EBX bit 19, exactly like it withholds AVX). So the
+    // reference cannot serve as their oracle; ADCX/ADOX are pinned exhaustively by
+    // hand-computed unit tests in cpu/tests/interp.rs instead. Same for F16C.
+    match rng.below(10) {
+        0 => bmi_andn(rng, bits),
+        1 => bmi_bextr(rng, bits, seed),
+        2 => bmi_bls(rng, bits),
+        3 => bmi_mulx(rng, bits, seed),
+        4 => bmi_pdep_pext(rng, bits),
+        5 => bmi_bzhi(rng, bits, seed),
+        6 => bmi_rorx(rng, bits),
+        7 => bmi_shx(rng, bits),
+        // CMPXCHG16B is REX.W-only (64-bit); in 32-bit mode fall back to
+        // CMPXCHG8B (which is also the default form there).
+        8 if bits == Bits::B64 => cmpxchg16b(rng, bits, seed),
+        _ => cmpxchg8b(rng, bits, seed),
+    }
+}
+
+/// ANDN reg, vvvv, r/m (VEX.NDS.LZ.0F38.Wx F2). Sets SF/ZF, clears CF/OF.
+fn bmi_andn(rng: &mut Rng, bits: Bits) -> Trial {
+    let width = bmi_w(rng, bits);
+    let n = nregs(bits);
+    let (reg, vvvv, rm) = (rng.below(n) as u8, rng.below(n) as u8, rng.below(n) as u8);
+    let mut b = Vec::new();
+    vex_prefix(&mut b, reg, vvvv, rm, 2, 0, width == 8, rng.boolean());
+    b.extend([0xF2, modrm_reg(reg, rm)]);
+    Trial { bytes: b, defined_flags: CF | ZF | SF | OF, label: format!("andn w{width}"), ..Default::default() }
+}
+
+/// BEXTR reg, r/m, vvvv (VEX.NDS.LZ.0F38.Wx F7, pp=none). Defines ZF; CF/OF=0;
+/// SF/AF/PF undefined.
+///
+/// **Reference limitation:** the SDM extracts `LEN` bits starting at `START`
+/// with `(1<<LEN)-1` widths up to the full operand, but this Unicorn/QEMU-TCG
+/// build mis-clamps `START+LEN` beyond the operand size (dropping the top bit).
+/// So the oracle constrains `START` and `LEN` to keep the extracted field inside
+/// the operand (`START+LEN <= opsize`); the over-length/over-start pass-through
+/// is pinned in `cpu/tests/interp.rs`.
+fn bmi_bextr(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let width = bmi_w(rng, bits);
+    let opbits = width as u32 * 8;
+    let n = nregs(bits);
+    let (reg, vvvv, rm) = (rng.below(n) as u8, rng.below(n) as u8, rng.below(n) as u8);
+    // Control = vvvv: start in [0, opsize], len in [0, opsize - start].
+    // Cap len at opsize-1: a full-width mask (len >= opsize) is where the linked
+    // QEMU/Unicorn build is wrong — it clamps and drops the top bit — while exemu
+    // follows the SDM (whole shifted source passes through). That SDM-correct
+    // full-width behavior is pinned in cpu/tests/interp.rs
+    // (bextr_extracts_field_and_overlength_passthrough); here we keep the fuzzer
+    // out of QEMU's buggy region so the diff stays meaningful.
+    let start = rng.below(opbits + 1);
+    let len = rng.below(opbits - start + 1).min(opbits - 1);
+    seed.gpr[vvvv as usize] = (start as u64) | ((len as u64) << 8);
+    let mut b = Vec::new();
+    vex_prefix(&mut b, reg, vvvv, rm, 2, 0, width == 8, rng.boolean());
+    b.extend([0xF7, modrm_reg(reg, rm)]);
+    // SF/AF/PF are architecturally undefined for BEXTR — diff only ZF/CF/OF.
+    Trial { bytes: b, defined_flags: ZF | CF | OF, label: format!("bextr w{width}"), ..Default::default() }
+}
+
+/// BLSR/BLSMSK/BLSI dst(vvvv), r/m (VEX.NDD.LZ.0F38.Wx F3 /reg).
+///
+/// **Reference limitation (BLSI CF):** the SDM sets BLSI's CF to `(SRC != 0)`,
+/// but this Unicorn/QEMU-TCG build reports the opposite/wrong value (a known
+/// historical QEMU BLSI CF bug). So the BLSI CF is excluded from the oracle diff
+/// and pinned in `cpu/tests/interp.rs`; BLSR/BLSMSK CF (also `(SRC==0)`) matches
+/// the reference and stays diffed. BLSMSK forces ZF=0.
+fn bmi_bls(rng: &mut Rng, bits: Bits) -> Trial {
+    let width = bmi_w(rng, bits);
+    let n = nregs(bits);
+    let digit = 1 + rng.below(3) as u8; // /1 BLSR, /2 BLSMSK, /3 BLSI
+    let (vvvv, rm) = (rng.below(n) as u8, rng.below(n) as u8);
+    let mut b = Vec::new();
+    // ModRM.reg = the /digit; ModRM.rm = source. reg-extension via R is unused.
+    vex_prefix(&mut b, digit, vvvv, rm, 2, 0, width == 8, rng.boolean());
+    b.extend([0xF3, modrm_reg(digit, rm)]);
+    let (name, flags) = match digit {
+        1 => ("blsr", CF | SF | OF | ZF),
+        2 => ("blsmsk", CF | SF | OF | ZF),
+        _ => ("blsi", SF | OF | ZF), // BLSI CF excluded (QEMU reference bug)
+    };
+    Trial { bytes: b, defined_flags: flags, label: format!("{name} w{width}"), ..Default::default() }
+}
+
+/// MULX dst_hi(reg), dst_lo(vvvv), r/m (VEX.NDD.LZ.F2.0F38.Wx F6). No flags.
+fn bmi_mulx(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let width = bmi_w(rng, bits);
+    let n = nregs(bits);
+    // Seed rDX (the implicit multiplicand) with an interesting value.
+    seed.gpr[2] = rng.operand();
+    let (reg, vvvv, rm) = (rng.below(n) as u8, rng.below(n) as u8, rng.below(n) as u8);
+    let mut b = Vec::new();
+    vex_prefix(&mut b, reg, vvvv, rm, 2, 3, width == 8, rng.boolean());
+    b.extend([0xF6, modrm_reg(reg, rm)]);
+    Trial { bytes: b, defined_flags: 0, label: format!("mulx w{width}"), ..Default::default() }
+}
+
+/// PDEP (F2) / PEXT (F3) dst, vvvv, r/m(mask) (VEX.NDS.LZ.pp.0F38.Wx F5). No flags.
+fn bmi_pdep_pext(rng: &mut Rng, bits: Bits) -> Trial {
+    let width = bmi_w(rng, bits);
+    let n = nregs(bits);
+    let pext = rng.boolean();
+    let pp = if pext { 2 } else { 3 };
+    let (reg, vvvv, rm) = (rng.below(n) as u8, rng.below(n) as u8, rng.below(n) as u8);
+    let mut b = Vec::new();
+    vex_prefix(&mut b, reg, vvvv, rm, 2, pp, width == 8, rng.boolean());
+    b.extend([0xF5, modrm_reg(reg, rm)]);
+    Trial { bytes: b, defined_flags: 0, label: format!("{} w{width}", if pext { "pext" } else { "pdep" }), ..Default::default() }
+}
+
+/// BZHI dst, r/m, vvvv (VEX.NDS.LZ.0F38.Wx F5, pp=none). Defines ZF/CF/SF; OF=0.
+///
+/// **Reference limitation:** for a control index N >= operand size the SDM leaves
+/// the source unchanged (no bits cleared, CF=1), but this Unicorn/QEMU-TCG build
+/// wrongly clamps N to opsize-1 and clears the top bit. So the oracle seeds the
+/// control index into `[0, opsize]` (both engines agree there); the N>=opsize
+/// pass-through + CF=1 behavior is pinned in `cpu/tests/interp.rs`.
+fn bmi_bzhi(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let width = bmi_w(rng, bits);
+    let n = nregs(bits);
+    let (reg, vvvv, rm) = (rng.below(n) as u8, rng.below(n) as u8, rng.below(n) as u8);
+    // Constrain the control index (vvvv low byte) to [0, opsize-2]. The SDM sets
+    // BZHI's CF as `N > opsize-1`, but this QEMU build's CF is off by one at the
+    // N == opsize-1 boundary (it reports CF=1 there); the pass-through and the
+    // exact CF boundary (N == opsize-1 → CF=0, N >= opsize → CF=1) are pinned in
+    // `cpu/tests/interp.rs`.
+    let idx = rng.below(width as u32 * 8 - 1) as u64;
+    seed.gpr[vvvv as usize] = idx;
+    let mut b = Vec::new();
+    vex_prefix(&mut b, reg, vvvv, rm, 2, 0, width == 8, rng.boolean());
+    b.extend([0xF5, modrm_reg(reg, rm)]);
+    // AF/PF undefined for BZHI — diff ZF/CF/SF/OF.
+    Trial { bytes: b, defined_flags: ZF | CF | SF | OF, label: format!("bzhi w{width}"), ..Default::default() }
+}
+
+/// RORX dst, r/m, imm8 (VEX.LZ.F2.0F3A.Wx F0 /r ib). No flags.
+fn bmi_rorx(rng: &mut Rng, bits: Bits) -> Trial {
+    let width = bmi_w(rng, bits);
+    let n = nregs(bits);
+    let (reg, rm) = (rng.below(n) as u8, rng.below(n) as u8);
+    let imm = rng.below(256) as u8;
+    let mut b = Vec::new();
+    // RORX has no vvvv (encoded as 1111).
+    vex_prefix(&mut b, reg, 0, rm, 3, 3, width == 8, rng.boolean());
+    b.extend([0xF0, modrm_reg(reg, rm), imm]);
+    Trial { bytes: b, defined_flags: 0, label: format!("rorx w{width} imm={imm}"), ..Default::default() }
+}
+
+/// SHLX (66) / SARX (F3) / SHRX (F2) dst, r/m, vvvv (VEX.LZ.pp.0F38.Wx F7). No flags.
+fn bmi_shx(rng: &mut Rng, bits: Bits) -> Trial {
+    let width = bmi_w(rng, bits);
+    let n = nregs(bits);
+    let (pp, name) = *rng.pick(&[(1u8, "shlx"), (2, "sarx"), (3, "shrx")]);
+    let (reg, vvvv, rm) = (rng.below(n) as u8, rng.below(n) as u8, rng.below(n) as u8);
+    let mut b = Vec::new();
+    vex_prefix(&mut b, reg, vvvv, rm, 2, pp, width == 8, rng.boolean());
+    b.extend([0xF7, modrm_reg(reg, rm)]);
+    Trial { bytes: b, defined_flags: 0, label: format!("{name} w{width}"), ..Default::default() }
+}
+
+/// CMPXCHG16B m128 (REX.W 0F C7 /1). Diffs ZF + RAX/RDX + the 16 memory bytes.
+/// The comparand (RDX:RAX) matches the seeded memory ~half the time (via a coin
+/// flip that copies the memory image into the registers) so both the equal and
+/// not-equal paths are exercised.
+fn cmpxchg16b(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    // 64-bit only (REX.W). Point a base register at a 16-byte-aligned slot.
+    let base = *rng.pick(&MEM_BASES);
+    // DATA_MID is 16-byte aligned (DATA_BASE + 0x800); use it directly (disp 0).
+    seed.gpr[base as usize] = DATA_MID;
+    let off = (DATA_MID - DATA_BASE) as usize;
+    // Seed 16 bytes of memory.
+    for i in 0..16 {
+        seed.data[off + i] = rng.next_u32() as u8;
+    }
+    // Half the time, make RDX:RAX equal the memory so the exchange path fires.
+    if rng.boolean() {
+        let lo = u64::from_le_bytes(seed.data[off..off + 8].try_into().unwrap());
+        let hi = u64::from_le_bytes(seed.data[off + 8..off + 16].try_into().unwrap());
+        seed.gpr[0] = lo; // RAX
+        seed.gpr[2] = hi; // RDX
+    } else {
+        seed.gpr[0] = rng.operand();
+        seed.gpr[2] = rng.operand();
+    }
+    seed.gpr[3] = rng.operand(); // RBX (store low)
+    seed.gpr[1] = rng.operand(); // RCX (store high)
+    let mut b = Vec::new();
+    b.push(0x48); // REX.W
+    b.extend([0x0F, 0xC7]);
+    // ModRM /1, mod=00, rm=base (base ∈ {ecx,ebx,esi,edi}, none needs SIB/disp32).
+    b.push((1 << 3) | (base & 7)); // mod=00, reg=/1, rm=base
+    let _ = bits;
+    Trial { bytes: b, defined_flags: ZF, label: "cmpxchg16b".into(), ..Default::default() }
+}
+
+/// CMPXCHG8B m64 (0F C7 /1, no REX.W). Diffs ZF + EAX/EDX + 8 memory bytes.
+fn cmpxchg8b(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let base = *rng.pick(&MEM_BASES);
+    seed.gpr[base as usize] = DATA_MID;
+    let off = (DATA_MID - DATA_BASE) as usize;
+    for i in 0..8 {
+        seed.data[off + i] = rng.next_u32() as u8;
+    }
+    if rng.boolean() {
+        let lo = u32::from_le_bytes(seed.data[off..off + 4].try_into().unwrap()) as u64;
+        let hi = u32::from_le_bytes(seed.data[off + 4..off + 8].try_into().unwrap()) as u64;
+        seed.gpr[0] = lo; // EAX
+        seed.gpr[2] = hi; // EDX
+    } else {
+        seed.gpr[0] = rng.operand();
+        seed.gpr[2] = rng.operand();
+    }
+    seed.gpr[3] = rng.operand(); // EBX
+    seed.gpr[1] = rng.operand(); // ECX
+    let mut b = Vec::new();
+    b.extend([0x0F, 0xC7]);
+    b.push((1 << 3) | (base & 7)); // mod=00, reg=/1, rm=base
+    let _ = bits;
+    Trial { bytes: b, defined_flags: ZF, label: "cmpxchg8b".into(), ..Default::default() }
+}
+
+// ---- bare-form MMX (roadmap W1.6) ------------------------------------------
+//
+// MMX registers alias the low 64 bits of the x87 physical stack. This category
+// seeds the eight `st` registers with MMX-shaped values (bits 64:79 = 0xFFFF,
+// tag word all-valid) and diffs the resulting register file (bit-exact 80-bit,
+// since both engines set the same exponent/sign) plus any GP destination.
+
+/// A finished MMX trial: compare the x87 register file (fpu=true) but not the
+/// status word (MMX doesn't meaningfully update TOP/condition codes here).
+fn mmx_trial(bytes: Vec<u8>, label: String) -> Trial {
+    Trial { bytes, fpu: true, sw_mask: 0, label, ..Default::default() }
+}
+
+fn build_mmx(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    // Re-seed the eight physical registers as MMX values (low 64 arbitrary, high
+    // 16 = 0xFFFF as a written MMX register looks), tag word all-valid so the
+    // reference treats them as live MMX registers.
+    for s in seed.st.iter_mut() {
+        let lo = ((rng.operand() as u128) & 0xFFFF_FFFF_FFFF_FFFF) | (0xFFFFu128 << 64);
+        *s = lo;
+    }
+    seed.tw = 0x0000; // all valid
+    match rng.below(11) {
+        0 => mmx_addsub(rng, bits),
+        1 => mmx_addsub_sat(rng, bits),
+        2 => mmx_logic(rng, bits),
+        3 => mmx_cmp(rng, bits),
+        4 => mmx_unpack(rng, bits),
+        5 => mmx_pack(rng, bits),
+        6 => mmx_mul(rng, bits),
+        7 => mmx_shift(rng, bits),
+        8 => mmx_pshufw(rng, bits),
+        9 => mmx_movd(rng, bits, seed),
+        _ => mmx_misc(rng, bits),
+    }
+}
+
+/// Pick two MMX register numbers (0..8; MMX ignores REX).
+fn mm2(rng: &mut Rng) -> (u8, u8) {
+    (rng.below(8) as u8, rng.below(8) as u8)
+}
+
+fn mmx_addsub(rng: &mut Rng, _bits: Bits) -> Trial {
+    let op = *rng.pick(&[0xFCu8, 0xFD, 0xFE, 0xF8, 0xF9, 0xFA, 0xD4, 0xFB]);
+    let (reg, rm) = mm2(rng);
+    mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx padd/sub {op:#x}"))
+}
+
+fn mmx_addsub_sat(rng: &mut Rng, _bits: Bits) -> Trial {
+    let op = *rng.pick(&[0xD8u8, 0xD9, 0xDC, 0xDD, 0xE8, 0xE9, 0xEC, 0xED]);
+    let (reg, rm) = mm2(rng);
+    mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx padds/us {op:#x}"))
+}
+
+fn mmx_logic(rng: &mut Rng, _bits: Bits) -> Trial {
+    let op = *rng.pick(&[0xDBu8, 0xDF, 0xEB, 0xEF]);
+    let (reg, rm) = mm2(rng);
+    mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx logic {op:#x}"))
+}
+
+fn mmx_cmp(rng: &mut Rng, _bits: Bits) -> Trial {
+    let op = *rng.pick(&[0x74u8, 0x75, 0x76, 0x64, 0x65, 0x66]);
+    let (reg, rm) = mm2(rng);
+    mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx pcmp {op:#x}"))
+}
+
+fn mmx_unpack(rng: &mut Rng, _bits: Bits) -> Trial {
+    let op = *rng.pick(&[0x60u8, 0x61, 0x62, 0x68, 0x69, 0x6A]);
+    let (reg, rm) = mm2(rng);
+    mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx punpck {op:#x}"))
+}
+
+fn mmx_pack(rng: &mut Rng, _bits: Bits) -> Trial {
+    let op = *rng.pick(&[0x63u8, 0x6B, 0x67]);
+    let (reg, rm) = mm2(rng);
+    mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx pack {op:#x}"))
+}
+
+fn mmx_mul(rng: &mut Rng, _bits: Bits) -> Trial {
+    let op = *rng.pick(&[0xD5u8, 0xE4, 0xE5, 0xF4, 0xF5]);
+    let (reg, rm) = mm2(rng);
+    mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx pmul {op:#x}"))
+}
+
+fn mmx_shift(rng: &mut Rng, _bits: Bits) -> Trial {
+    if rng.boolean() {
+        // shift by imm8 (groups 71/72/73).
+        let op = *rng.pick(&[0x71u8, 0x72, 0x73]);
+        let digit = *rng.pick(&[2u8, 4, 6]);
+        // 73 /4 (PSRAQ) is invalid; keep 71/72 for /4.
+        let digit = if op == 0x73 && digit == 4 { 2 } else { digit };
+        let rm = rng.below(8) as u8;
+        let imm = rng.below(72) as u8; // include over-shift counts
+        mmx_trial(vec![0x0F, op, modrm_reg(digit, rm), imm], format!("mmx shift-imm {op:#x}/{digit}"))
+    } else {
+        // shift by mm count.
+        let op = *rng.pick(&[0xD1u8, 0xD2, 0xD3, 0xE1, 0xE2, 0xF1, 0xF2, 0xF3]);
+        let (reg, rm) = mm2(rng);
+        mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx shift-mm {op:#x}"))
+    }
+}
+
+fn mmx_pshufw(rng: &mut Rng, _bits: Bits) -> Trial {
+    let (reg, rm) = mm2(rng);
+    let imm = rng.below(256) as u8;
+    mmx_trial(vec![0x0F, 0x70, modrm_reg(reg, rm), imm], format!("pshufw imm={imm}"))
+}
+
+/// MOVD/MOVQ between an MMX register and a GP register (register form). Diffs the
+/// MMX register file (fpu) and, for the store direction, the GP destination.
+fn mmx_movd(rng: &mut Rng, bits: Bits, _seed: &mut Seed) -> Trial {
+    let store = rng.boolean(); // true: MOVD r/m, mm
+    let w = bits == Bits::B64 && rng.boolean(); // REX.W → MOVQ
+    let (mm, gp) = (rng.below(8) as u8, rng.below(8) as u8);
+    let op = if store { 0x7E } else { 0x6E };
+    let mut b = Vec::new();
+    if w {
+        b.push(0x48);
+    }
+    b.extend([0x0F, op, modrm_reg(mm, gp)]); // reg=mm, rm=gp
+    mmx_trial(b, format!("{} w{}", if store { "movd r,mm" } else { "movd mm,r" }, if w { 8 } else { 4 }))
+}
+
+/// EMMS, PMOVMSKB, PMINUB/PMAXUB, PAVGB/W, PSADBW.
+fn mmx_misc(rng: &mut Rng, bits: Bits) -> Trial {
+    match rng.below(4) {
+        0 => {
+            // EMMS: clears the tag word. Both engines end with tw all-empty; the
+            // fpu diff compares the st bytes (unchanged) — still exact.
+            mmx_trial(vec![0x0F, 0x77], "emms".into())
+        }
+        1 => {
+            // PMOVMSKB r32, mm — writes a GP register (diffed normally).
+            let (gp, mm) = (rng.below(8) as u8, rng.below(8) as u8);
+            let mut b = Vec::new();
+            let _ = bits;
+            b.extend([0x0F, 0xD7, modrm_reg(gp, mm)]);
+            // GP destination + the (unchanged) MMX file.
+            Trial { bytes: b, fpu: true, sw_mask: 0, label: "pmovmskb r,mm".into(), ..Default::default() }
+        }
+        2 => {
+            let op = *rng.pick(&[0xDAu8, 0xDE]); // PMINUB / PMAXUB
+            let (reg, rm) = mm2(rng);
+            mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx pmin/max {op:#x}"))
+        }
+        _ => {
+            let op = *rng.pick(&[0xE0u8, 0xE3, 0xF6]); // PAVGB / PAVGW / PSADBW
+            let (reg, rm) = mm2(rng);
+            mmx_trial(vec![0x0F, op, modrm_reg(reg, rm)], format!("mmx pavg/psad {op:#x}"))
+        }
+    }
 }
 
 /// Build a fully random seed: interesting GPR values and random status flags.

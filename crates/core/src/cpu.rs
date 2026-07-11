@@ -117,6 +117,33 @@ impl X87 {
     pub fn phys(&self, i: u8) -> usize {
         ((self.top().wrapping_add(i)) & 7) as usize
     }
+
+    /// Read MMX register `MM(i)` — the low 64 bits of *physical* x87 register
+    /// `i` (MMX registers are **not** TOP-relative; `MMi` aliases physical
+    /// register `i` directly, per the Intel SDM).
+    #[inline]
+    pub fn mmx(&self, i: u8) -> u64 {
+        self.st[(i & 7) as usize] as u64
+    }
+
+    /// Write MMX register `MM(i)`. Per the SDM, an MMX write stores the 64-bit
+    /// value in the mantissa and sets bits 64:79 (exponent + sign) of the
+    /// aliased x87 register to all 1s, and marks the register **valid** in the
+    /// tag word. (TOP is left untouched; MMX access is physical, not relative.)
+    #[inline]
+    pub fn set_mmx(&mut self, i: u8, v: u64) {
+        let idx = (i & 7) as usize;
+        self.st[idx] = (0xFFFFu128 << 64) | (v as u128);
+        // Tag word: 2 bits per physical register, 00 = valid.
+        self.tw &= !(0b11u16 << (idx * 2));
+    }
+
+    /// `EMMS` — mark all x87/MMX registers empty (tag word = 0xFFFF). The
+    /// register contents are left unchanged.
+    #[inline]
+    pub fn emms(&mut self) {
+        self.tw = 0xFFFF;
+    }
 }
 
 /// The full architectural register file.
