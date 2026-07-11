@@ -255,6 +255,18 @@ impl WinOs {
         self.vm_allocs.insert(pos, a);
     }
 
+    /// Insert a section-view reservation (`NtMapViewOfSection`, W2.7) so the
+    /// mapped view queries as a real committed region with the section's `Type`.
+    pub(crate) fn vm_insert_view(&mut self, a: VmAlloc) {
+        self.vm_insert(a);
+    }
+
+    /// The base of the reservation that *starts exactly* at `addr`, if any — used
+    /// by `NtUnmapViewOfSection` (W2.7) to validate a view base before releasing.
+    pub(crate) fn vm_view_base(&self, addr: u64) -> Option<u64> {
+        self.vm_allocs.iter().find(|a| a.base == addr).map(|a| a.base)
+    }
+
     /// Write a `MEMORY_BASIC_INFORMATION` (32- or 64-bit layout) into guest
     /// memory and return the number of bytes written.
     #[allow(clippy::too_many_arguments)]

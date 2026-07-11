@@ -25,6 +25,7 @@ mod fs;
 mod gdi;
 mod msg;
 mod reg;
+mod section;
 mod syscall;
 mod sync;
 mod thread;
@@ -197,6 +198,10 @@ pub struct WinOs {
     files: std::collections::HashMap<u64, fs::OpenFile>,
     /// Open directory-enumeration handles (FindFirstFileW / FindNextFileW).
     find_handles: std::collections::HashMap<u64, fs::FindState>,
+    /// Section objects (`NtCreateSection`) by handle: Wine's PE loader creates a
+    /// `SEC_IMAGE` section over a DLL file, maps a view, and reads the image
+    /// back through it (roadmap W2.7). See [`crate::section`].
+    sections: HashMap<u64, section::Section>,
     next_handle: u64,
     /// Monotonic source of unique temp-file numbers.
     temp_counter: u32,
@@ -357,6 +362,7 @@ impl WinOs {
             dll: dll::Loader::default(),
             files: std::collections::HashMap::new(),
             find_handles: std::collections::HashMap::new(),
+            sections: HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,
             crt_globals: std::collections::HashMap::new(),
@@ -416,6 +422,11 @@ impl WinOs {
         os.set_syscall_handler(vm::SSDT_NT_ALLOCATE_VIRTUAL_MEMORY, vm::ssdt_nt_allocate_virtual_memory);
         os.set_syscall_handler(vm::SSDT_NT_FREE_VIRTUAL_MEMORY, vm::ssdt_nt_free_virtual_memory);
         os.set_syscall_handler(vm::SSDT_NT_PROTECT_VIRTUAL_MEMORY, vm::ssdt_nt_protect_virtual_memory);
+        // Section syscalls (roadmap W2.7): Wine's PE loader maps DLL images as
+        // SEC_IMAGE sections. Indices recovered from the pinned guest stubs.
+        os.set_syscall_handler(section::SSDT_NT_CREATE_SECTION, section::ssdt_nt_create_section);
+        os.set_syscall_handler(section::SSDT_NT_MAP_VIEW_OF_SECTION, section::ssdt_nt_map_view_of_section);
+        os.set_syscall_handler(section::SSDT_NT_UNMAP_VIEW_OF_SECTION, section::ssdt_nt_unmap_view_of_section);
         os
     }
 
