@@ -410,6 +410,12 @@ impl WinOs {
             unixlib::SSDT_NT_QUERY_VIRTUAL_MEMORY,
             unixlib::ssdt_nt_query_virtual_memory,
         );
+        // NT memory syscalls (roadmap W2.6): the NTSTATUS/IN-OUT-pointer face of
+        // the VM manager, reached via raw `SYSCALL`. Indices recovered from the
+        // pinned guest ntdll stubs.
+        os.set_syscall_handler(vm::SSDT_NT_ALLOCATE_VIRTUAL_MEMORY, vm::ssdt_nt_allocate_virtual_memory);
+        os.set_syscall_handler(vm::SSDT_NT_FREE_VIRTUAL_MEMORY, vm::ssdt_nt_free_virtual_memory);
+        os.set_syscall_handler(vm::SSDT_NT_PROTECT_VIRTUAL_MEMORY, vm::ssdt_nt_protect_virtual_memory);
         os
     }
 

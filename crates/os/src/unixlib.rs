@@ -321,16 +321,22 @@ impl WinOs {
         cpu: &mut CpuState,
         mem: &mut dyn Memory,
     ) -> Result<u32> {
-        let base_address = self.syscall_arg(cpu, mem, 1)?;
         let info_class = self.syscall_arg(cpu, mem, 2)? as u32;
+
+        // `MemoryBasicInformation` (class 0, the `VirtualQuery` payload) is
+        // served by the VM manager (roadmap W2.6); `MemoryWineUnixFuncs` (below)
+        // resolves a module's unixlib handle (roadmap W2.4). Any other class is
+        // not implemented yet.
+        match info_class {
+            MEMORY_WINE_UNIX_FUNCS => {}
+            crate::vm::MEMORY_BASIC_INFORMATION => return self.nt_query_virtual_memory_basic(cpu, mem),
+            _ => return Ok(STATUS_INVALID_PARAMETER),
+        }
+
+        let base_address = self.syscall_arg(cpu, mem, 1)?;
         let buffer = self.syscall_arg(cpu, mem, 3)?;
         let length = self.syscall_arg(cpu, mem, 4)?;
         let return_length = self.syscall_arg(cpu, mem, 5)?;
-
-        if info_class != MEMORY_WINE_UNIX_FUNCS {
-            // Other memory-info classes (MemoryBasicInformation, …) land in W2.6.
-            return Ok(STATUS_INVALID_PARAMETER);
-        }
 
         // The out buffer is a `unixlib_handle_t` (pointer-sized on the wire).
         if buffer == 0 || length < 8 {
