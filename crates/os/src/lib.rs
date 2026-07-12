@@ -477,6 +477,20 @@ impl WinOs {
             thread::SSDT_NT_QUERY_INFORMATION_THREAD,
             thread::ssdt_nt_query_information_thread,
         );
+        // NT sync syscalls (roadmap W2.12): the NTSTATUS face of the P3.6 sync
+        // objects + P3.4 scheduler (REAL blocking, not speculative WAIT_OBJECT_0).
+        // Indices recovered from the pinned guest ntdll stubs.
+        os.set_syscall_handler(sync::SSDT_NT_CREATE_EVENT, sync::ssdt_nt_create_event);
+        os.set_syscall_handler(sync::SSDT_NT_OPEN_EVENT, sync::ssdt_nt_open_event);
+        os.set_syscall_handler(sync::SSDT_NT_SET_EVENT, sync::ssdt_nt_set_event);
+        os.set_syscall_handler(sync::SSDT_NT_CREATE_MUTANT, sync::ssdt_nt_create_mutant);
+        os.set_syscall_handler(sync::SSDT_NT_CREATE_SEMAPHORE, sync::ssdt_nt_create_semaphore);
+        os.set_syscall_handler(sync::SSDT_NT_RELEASE_SEMAPHORE, sync::ssdt_nt_release_semaphore);
+        os.set_syscall_handler(sync::SSDT_NT_WAIT_FOR_SINGLE_OBJECT, sync::ssdt_nt_wait_for_single_object);
+        os.set_syscall_handler(
+            sync::SSDT_NT_WAIT_FOR_MULTIPLE_OBJECTS,
+            sync::ssdt_nt_wait_for_multiple_objects,
+        );
         os
     }
 

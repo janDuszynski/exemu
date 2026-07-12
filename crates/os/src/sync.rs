@@ -12,7 +12,7 @@
 //! `WAIT_OBJECT_0` to avoid a hang. P3.4 replaces that fallback with a real
 //! yield to another ready thread.
 
-use exemu_core::{CpuState, Memory, Result};
+use exemu_core::{CpuState, EmuError, Memory, Reg, Result};
 
 use crate::api::Outcome;
 use crate::thread::WaitDesc;
@@ -358,6 +358,335 @@ impl WinOs {
         }
     }
 
+    // ---- NT sync syscalls (roadmap W2.12) --------------------------------
+    //
+    // The NTSTATUS face of the P3.6 sync objects + the P3.4 scheduler, reached
+    // via a raw guest `SYSCALL` through the W2.3 dispatcher. Args come via
+    // [`WinOs::syscall_arg`] (arg0=R10, arg1=RDX, arg2=R8, arg3=R9, then the
+    // guest stack). Signatures are the public NT headers (winternl.h / ntifs.h /
+    // phnt-style `NtCreateEvent`/`NtWaitForMultipleObjects`); no Wine `.c` read.
+    //
+    // These reuse the *same* `kobjects`/`named_kobjects` maps the Win32 seam and
+    // the W2.11 server use, so an event created here is the same object a Win32
+    // `SetEvent` or a server `select` sees. Unlike the Win32 waits, the NT waits
+    // block for REAL (design §5.4): there is **no** speculative `WAIT_OBJECT_0`
+    // fallback — an unsatisfiable infinite wait with nobody else runnable is a
+    // genuine guest deadlock, surfaced as a fault rather than fabricated success.
+
+    /// Read an `OBJECT_ATTRIBUTES.ObjectName` as a named-object key, or `None`
+    /// for an anonymous object (NULL attributes/name or an empty name). Reuses
+    /// the fs.rs UNICODE_STRING reader and strips the NT namespace prefixes
+    /// (`\??\` etc.) plus a leading `\BaseNamedObjects\`, so an NT-created named
+    /// object and a Win32 `CreateEventW(lpName)` object meet in one namespace.
+    /// 64-bit `OBJECT_ATTRIBUTES` layout (the W2 pivot pins 64-bit ntdll):
+    /// `{ ULONG Length; HANDLE RootDirectory; PUNICODE_STRING ObjectName; … }`
+    /// — `ObjectName` at offset 0x10.
+    fn nt_object_attr_name(&self, mem: &dyn Memory, objattr: u64) -> Result<Option<String>> {
+        if objattr == 0 {
+            return Ok(None);
+        }
+        let name_ptr = mem.read_u64(objattr + 0x10)?;
+        let Some(raw) = crate::fs::read_unicode_string(mem, name_ptr) else {
+            return Ok(None);
+        };
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let stripped = crate::fs::strip_nt_prefix(&raw);
+        let name = stripped.strip_prefix("\\BaseNamedObjects\\").unwrap_or(&stripped).to_string();
+        Ok(if name.is_empty() { None } else { Some(name) })
+    }
+
+    /// `NtCreateEvent(*EventHandle, DesiredAccess, *ObjectAttributes, EventType,
+    /// BOOLEAN InitialState)`. arg0=&EventHandle (OUT), arg2=&ObjectAttributes
+    /// (optional name), arg3=EventType (`NotificationEvent`=0 → manual-reset,
+    /// `SynchronizationEvent`=1 → auto-reset), arg4=InitialState.
+    pub(crate) fn nt_create_event(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle_out = self.syscall_arg(cpu, mem, 0)?;
+        let objattr = self.syscall_arg(cpu, mem, 2)?;
+        let event_type = self.syscall_arg(cpu, mem, 3)? as u32;
+        let initial = self.syscall_arg(cpu, mem, 4)? != 0;
+        if handle_out == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let manual = event_type == NOTIFICATION_EVENT; // 0 = manual, 1 = auto
+        let name = self.nt_object_attr_name(mem, objattr)?;
+        let handle = self.make_object(SyncKind::Event, name, manual, initial, 0, 0);
+        self.write_ptr(mem, handle_out, handle)?;
+        Ok(NT_STATUS_SUCCESS)
+    }
+
+    /// `NtOpenEvent(*EventHandle, DesiredAccess, *ObjectAttributes)`. Resolves the
+    /// `ObjectAttributes.ObjectName` in the named-object namespace; a name that
+    /// names no live object → `STATUS_OBJECT_NAME_NOT_FOUND`.
+    pub(crate) fn nt_open_event(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle_out = self.syscall_arg(cpu, mem, 0)?;
+        let objattr = self.syscall_arg(cpu, mem, 2)?;
+        if handle_out == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let Some(name) = self.nt_object_attr_name(mem, objattr)? else {
+            return Ok(STATUS_INVALID_PARAMETER);
+        };
+        match self.named_kobjects.get(&name).copied() {
+            Some(handle) => {
+                self.write_ptr(mem, handle_out, handle)?;
+                Ok(NT_STATUS_SUCCESS)
+            }
+            None => Ok(STATUS_OBJECT_NAME_NOT_FOUND),
+        }
+    }
+
+    /// `NtSetEvent(EventHandle, *PreviousState)`. Signals the event; writes the
+    /// prior signaled state (0/1) through `PreviousState` when nonzero. Unknown
+    /// handle → `STATUS_INVALID_HANDLE`; wrong object kind →
+    /// `STATUS_OBJECT_TYPE_MISMATCH`.
+    pub(crate) fn nt_set_event(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let prev_ptr = self.syscall_arg(cpu, mem, 1)?;
+        let Some(obj) = self.kobjects.get_mut(&handle) else {
+            return Ok(STATUS_INVALID_HANDLE);
+        };
+        let prev = match obj {
+            KObject::Event { signaled, .. } | KObject::Timer { signaled, .. } => {
+                let was = *signaled;
+                *signaled = true;
+                was
+            }
+            _ => return Ok(STATUS_OBJECT_TYPE_MISMATCH),
+        };
+        if prev_ptr != 0 {
+            mem.write_u32(prev_ptr, prev as u32)?;
+        }
+        Ok(NT_STATUS_SUCCESS)
+    }
+
+    /// `NtCreateMutant(*MutantHandle, DesiredAccess, *ObjectAttributes, BOOLEAN
+    /// InitialOwner)`. arg0=&MutantHandle (OUT), arg2=&ObjectAttributes,
+    /// arg3=InitialOwner (the creating thread takes ownership when true).
+    pub(crate) fn nt_create_mutant(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle_out = self.syscall_arg(cpu, mem, 0)?;
+        let objattr = self.syscall_arg(cpu, mem, 2)?;
+        let initial_owner = self.syscall_arg(cpu, mem, 3)? != 0;
+        if handle_out == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let name = self.nt_object_attr_name(mem, objattr)?;
+        // `make_object`'s `signaled` seeds mutex ownership: owned → owner =
+        // current thread, recursion = 1.
+        let handle = self.make_object(SyncKind::Mutex, name, false, initial_owner, 0, 0);
+        self.write_ptr(mem, handle_out, handle)?;
+        Ok(NT_STATUS_SUCCESS)
+    }
+
+    /// `NtCreateSemaphore(*SemaphoreHandle, DesiredAccess, *ObjectAttributes,
+    /// LONG InitialCount, LONG MaximumCount)`. arg3=InitialCount, arg4=Maximum
+    /// Count. Rejects `MaximumCount < 1` or `InitialCount` outside `0..=Maximum`
+    /// with `STATUS_INVALID_PARAMETER`.
+    pub(crate) fn nt_create_semaphore(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle_out = self.syscall_arg(cpu, mem, 0)?;
+        let objattr = self.syscall_arg(cpu, mem, 2)?;
+        let initial = self.syscall_arg(cpu, mem, 3)? as i32;
+        let max = self.syscall_arg(cpu, mem, 4)? as i32;
+        if handle_out == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        if max < 1 || initial < 0 || initial > max {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let name = self.nt_object_attr_name(mem, objattr)?;
+        let handle = self.make_object(SyncKind::Semaphore, name, false, false, initial, max);
+        self.write_ptr(mem, handle_out, handle)?;
+        Ok(NT_STATUS_SUCCESS)
+    }
+
+    /// `NtReleaseSemaphore(SemaphoreHandle, LONG ReleaseCount, *PreviousCount)`.
+    /// Raises the count by `ReleaseCount`; a release that would push the count
+    /// past its maximum → `STATUS_SEMAPHORE_LIMIT_EXCEEDED` with the count left
+    /// unchanged. Writes the prior count through `PreviousCount` when nonzero
+    /// (only on success). Unknown handle → `STATUS_INVALID_HANDLE`; wrong kind →
+    /// `STATUS_OBJECT_TYPE_MISMATCH`.
+    pub(crate) fn nt_release_semaphore(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let release = self.syscall_arg(cpu, mem, 1)? as i32;
+        let prev_ptr = self.syscall_arg(cpu, mem, 2)?;
+        let Some(obj) = self.kobjects.get_mut(&handle) else {
+            return Ok(STATUS_INVALID_HANDLE);
+        };
+        let KObject::Semaphore { count, max } = obj else {
+            return Ok(STATUS_OBJECT_TYPE_MISMATCH);
+        };
+        if release < 1 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let prev = *count;
+        let bump = count.checked_add(release);
+        match bump {
+            Some(b) if *max <= 0 || b <= *max => *count = b,
+            _ => return Ok(STATUS_SEMAPHORE_LIMIT_EXCEEDED),
+        }
+        if prev_ptr != 0 {
+            mem.write_u32(prev_ptr, prev as u32)?;
+        }
+        Ok(NT_STATUS_SUCCESS)
+    }
+
+    /// `NtWaitForSingleObject(Handle, BOOLEAN Alertable, *Timeout)`. `Alertable`
+    /// is read and ignored (design §7: no APCs). `Timeout` is a `PLARGE_INTEGER`:
+    /// NULL = infinite, `*Timeout == 0` = poll, any other value = a finite wait
+    /// (blocks — no timed wakeups yet). Unknown handle → `STATUS_INVALID_HANDLE`.
+    /// Success → `STATUS_WAIT_0` (0).
+    pub(crate) fn nt_wait_for_single_object(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let _alertable = self.syscall_arg(cpu, mem, 1)?; // read & ignored (design §7)
+        let timeout_ptr = self.syscall_arg(cpu, mem, 2)?;
+        if !self.kobjects.contains_key(&handle) {
+            return Ok(STATUS_INVALID_HANDLE);
+        }
+        let timeout = self.read_nt_timeout(mem, timeout_ptr)?;
+        self.nt_wait(cpu, vec![handle], false, timeout)
+    }
+
+    /// `NtWaitForMultipleObjects(ULONG Count, *Handles, WAIT_TYPE, BOOLEAN
+    /// Alertable, *Timeout)`. `Handles` is a `Count`-long array of pointer-sized
+    /// `HANDLE`s. `WAIT_TYPE` (public winnt.h `_WAIT_TYPE`): `WaitAll`=0 →
+    /// wait-all, `WaitAny`=1 → wait-any (matches kernel32's
+    /// `WaitForMultipleObjects(bWaitAll ? WaitAll : WaitAny)`). `Count` of 0 or
+    /// `> MAXIMUM_WAIT_OBJECTS` → `STATUS_INVALID_PARAMETER`; any handle naming no
+    /// live object → `STATUS_INVALID_HANDLE`. Wait-any success →
+    /// `STATUS_WAIT_0 + index` of the satisfied handle.
+    pub(crate) fn nt_wait_for_multiple_objects(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let count = self.syscall_arg(cpu, mem, 0)? as u32;
+        let handles_ptr = self.syscall_arg(cpu, mem, 1)?;
+        let wait_type = self.syscall_arg(cpu, mem, 2)? as u32;
+        let _alertable = self.syscall_arg(cpu, mem, 3)?; // read & ignored
+        let timeout_ptr = self.syscall_arg(cpu, mem, 4)?;
+        if count == 0 || count as u64 > MAXIMUM_WAIT_OBJECTS {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let all = match wait_type {
+            WAIT_TYPE_ALL => true,
+            WAIT_TYPE_ANY => false,
+            _ => return Ok(STATUS_INVALID_PARAMETER),
+        };
+        let stride = self.handle_stride();
+        let mut handles = Vec::with_capacity(count as usize);
+        for i in 0..count as u64 {
+            let h = self.read_ptr(mem, handles_ptr + i * stride)?;
+            if !self.kobjects.contains_key(&h) {
+                return Ok(STATUS_INVALID_HANDLE);
+            }
+            handles.push(h);
+        }
+        let timeout = self.read_nt_timeout(mem, timeout_ptr)?;
+        self.nt_wait(cpu, handles, all, timeout)
+    }
+
+    /// Read a `PLARGE_INTEGER` NT wait timeout: NULL = infinite; `*p == 0` = poll
+    /// (return immediately, never block); any other value = a finite timeout.
+    /// There are no timed wakeups yet (design §7 / W2.11 `select`), so a finite
+    /// wait blocks like an infinite one — the disposition only decides the
+    /// no-runnable fallback (a finite wait times out; an infinite one deadlocks).
+    fn read_nt_timeout(&self, mem: &dyn Memory, ptr: u64) -> Result<NtTimeout> {
+        if ptr == 0 {
+            return Ok(NtTimeout::Infinite);
+        }
+        Ok(if mem.read_u64(ptr)? == 0 { NtTimeout::Poll } else { NtTimeout::Finite })
+    }
+
+    /// The shared NT wait core. Peeks the handle set (no consumption); on success
+    /// acquires it and returns `STATUS_WAIT_0` (+ the satisfied index for
+    /// wait-any). Otherwise a poll returns `STATUS_TIMEOUT`, and a blocking wait
+    /// rewinds the `SYSCALL` and switches to another runnable thread for REAL
+    /// blocking (design §5). With nobody else runnable there is no timed wakeup
+    /// to rescue it: a finite wait honestly times out; an infinite wait is a
+    /// genuine deadlock, surfaced as a fault (design §5.4 — never fabricate
+    /// success on the NT path).
+    fn nt_wait(&mut self, cpu: &mut CpuState, handles: Vec<u64>, all: bool, timeout: NtTimeout) -> Result<u32> {
+        let tid = self.current_tid;
+        if self.nt_wait_satisfiable(&handles, all, tid) {
+            return Ok(self.nt_wait_acquire(&handles, all, tid));
+        }
+        if timeout == NtTimeout::Poll {
+            return Ok(STATUS_TIMEOUT);
+        }
+        // REAL blocking. Rewind so the whole SYSCALL re-executes when we are
+        // rescheduled (the wait re-runs and now acquires). On the no-switch
+        // fallback below this rewind is invisible: the dispatcher's phase-4
+        // restore overwrites rip/rsp/rflags from the frame saved at syscall entry.
+        self.rewind_syscall(cpu);
+        let infinite = timeout == NtTimeout::Infinite;
+        let deadlock = format!(
+            "guest deadlock: NtWaitFor{} on {handles:#x?} (wait_all={all}) with an infinite timeout, \
+             but no other thread can run to signal it",
+            if handles.len() == 1 { "SingleObject" } else { "MultipleObjects" },
+        );
+        if self.block_and_switch(cpu, WaitDesc { handles, all }) {
+            // Phase 4 must not restore the abandoned frame over the switched-in
+            // thread; resume it exactly as `block_and_switch` left it (as W2.9's
+            // self-terminate does). The returned status is ignored while blocked
+            // — the blocked thread's re-run produces the real STATUS_WAIT_0.
+            self.syscall_resume_as_is = true;
+            Ok(STATUS_WAIT_0)
+        } else if infinite {
+            Err(EmuError::Os(deadlock))
+        } else {
+            Ok(STATUS_TIMEOUT)
+        }
+    }
+
+    /// Peek whether the handle set is satisfiable for `tid` without consuming.
+    fn nt_wait_satisfiable(&self, handles: &[u64], all: bool, tid: u32) -> bool {
+        let sig = |h: &u64| self.kobject_is_signaled(*h, tid);
+        if all {
+            handles.iter().all(sig)
+        } else {
+            handles.iter().any(sig)
+        }
+    }
+
+    /// Consume a *satisfiable* wait (peek first). Wait-all acquires every object
+    /// and returns `STATUS_WAIT_0`; wait-any acquires the first signaled object
+    /// and returns `STATUS_WAIT_0 + its index` (the index the caller must learn —
+    /// the W2.11 `server_acquire` does not report it, so this is the NT variant).
+    fn nt_wait_acquire(&mut self, handles: &[u64], all: bool, tid: u32) -> u32 {
+        if all {
+            for h in handles {
+                self.kobject_acquire(*h, tid);
+            }
+            STATUS_WAIT_0
+        } else {
+            for (i, h) in handles.iter().enumerate() {
+                if self.kobject_acquire(*h, tid) {
+                    return STATUS_WAIT_0 + i as u32;
+                }
+            }
+            STATUS_WAIT_0 // unreachable: the set was peeked satisfiable
+        }
+    }
+
+    /// Rewind the guest so the *entire* `SYSCALL` (`0F 05`) re-executes on the
+    /// blocked thread's next schedule (design §5). After the CPU applied the
+    /// SYSCALL side effects, RCX holds the return address just past the 2-byte
+    /// instruction and R11 holds the pre-syscall RFLAGS. Setting `rip = RCX − 2`
+    /// re-arms the instruction; `rflags ← R11` undoes the flags side effect so the
+    /// second execution re-derives the same R11 (incl. the guest's DF); `rsp ←`
+    /// the captured guest RSP steps off the dispatcher's unix stack.
+    ///
+    /// Re-execution invariant: the SSDT index (EAX, from the stub's `mov eax,N`)
+    /// and the volatile arg registers (arg0=R10, arg1=RDX, arg2=R8, arg3=R9) are
+    /// untouched by the dispatcher (it only saves/reads them and switches RSP) and
+    /// by the wait handler up to this point (`syscall_arg` only *reads* them), so
+    /// the re-executed `SYSCALL` re-reads identical arguments and re-dispatches to
+    /// this same handler — which, now that the object is signaled, acquires and
+    /// returns normally.
+    fn rewind_syscall(&self, cpu: &mut CpuState) {
+        let ret_rip = cpu.reg(Reg::Rcx);
+        cpu.rip = ret_rip.wrapping_sub(SYSCALL_INSN_LEN);
+        cpu.rflags = cpu.reg(Reg::R11);
+        cpu.set_rsp(self.syscall_guest_rsp);
+    }
+
     // ---- object-manager helpers (roadmap W2.11) --------------------------
     //
     // The wineserver equivalent ([`crate::server`]) drives the *same* KObject
@@ -408,4 +737,86 @@ impl WinOs {
     pub(crate) fn unix_call_blocked_for_test(&self) -> bool {
         self.unix_call_blocked
     }
+}
+
+// ---- NT sync syscall status codes + constants + SSDT wiring (roadmap W2.12) --
+//
+// NTSTATUS values are the public ntstatus.h definitions; the SSDT indices were
+// recovered from the pinned guest `ntdll.dll` stubs' `mov eax,N` immediate
+// (`example_exe/wine-dlls/x86_64-windows/ntdll.dll`; U9), never guessed. No Wine
+// `.c` was read.
+
+/// `STATUS_SUCCESS` — also the value `NtSetEvent`/`Nt*Create` return on success.
+const NT_STATUS_SUCCESS: u32 = 0x0000_0000;
+/// `STATUS_WAIT_0` — a satisfied wait; wait-any adds the satisfied index.
+const STATUS_WAIT_0: u32 = 0x0000_0000;
+/// `STATUS_TIMEOUT` — an unsatisfied poll (or finite wait with no wakeup).
+const STATUS_TIMEOUT: u32 = 0x0000_0102;
+const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
+const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
+const STATUS_OBJECT_TYPE_MISMATCH: u32 = 0xC000_0024;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+/// `STATUS_SEMAPHORE_LIMIT_EXCEEDED` — a release would push the count past max.
+const STATUS_SEMAPHORE_LIMIT_EXCEEDED: u32 = 0xC000_0047;
+
+/// `EVENT_TYPE::NotificationEvent` (public winternl.h) — a manual-reset event.
+/// `SynchronizationEvent` (=1) is auto-reset.
+const NOTIFICATION_EVENT: u32 = 0;
+
+/// `WAIT_TYPE::WaitAll` / `WaitAny` (public winnt.h `_WAIT_TYPE`). kernel32's
+/// `WaitForMultipleObjects` passes `bWaitAll ? WaitAll : WaitAny`.
+const WAIT_TYPE_ALL: u32 = 0;
+const WAIT_TYPE_ANY: u32 = 1;
+
+/// `MAXIMUM_WAIT_OBJECTS` (public winnt.h) — the most handles one wait carries.
+const MAXIMUM_WAIT_OBJECTS: u64 = 64;
+
+/// Length of the `SYSCALL` instruction (`0F 05`) — the rewind steps `rip` back
+/// this far so the whole instruction re-executes (design §5).
+const SYSCALL_INSN_LEN: u64 = 2;
+
+/// SSDT indices, recovered from the pinned guest `ntdll.dll` stubs' `mov eax,N`.
+pub(crate) const SSDT_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x04;
+pub(crate) const SSDT_NT_RELEASE_SEMAPHORE: u32 = 0x0a;
+pub(crate) const SSDT_NT_SET_EVENT: u32 = 0x0e;
+pub(crate) const SSDT_NT_OPEN_EVENT: u32 = 0x40;
+pub(crate) const SSDT_NT_CREATE_EVENT: u32 = 0x48;
+pub(crate) const SSDT_NT_WAIT_FOR_MULTIPLE_OBJECTS: u32 = 0x5b;
+pub(crate) const SSDT_NT_CREATE_MUTANT: u32 = 0x7e;
+pub(crate) const SSDT_NT_CREATE_SEMAPHORE: u32 = 0x83;
+
+/// The three NT wait-timeout dispositions (see [`WinOs::read_nt_timeout`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NtTimeout {
+    /// NULL `PLARGE_INTEGER` — wait forever.
+    Infinite,
+    /// `*Timeout == 0` — return immediately without blocking.
+    Poll,
+    /// Any other value — a finite timeout (blocks; no timed wakeups yet).
+    Finite,
+}
+
+pub(crate) fn ssdt_nt_create_event(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_create_event(cpu, mem)
+}
+pub(crate) fn ssdt_nt_open_event(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_open_event(cpu, mem)
+}
+pub(crate) fn ssdt_nt_set_event(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_set_event(cpu, mem)
+}
+pub(crate) fn ssdt_nt_create_mutant(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_create_mutant(cpu, mem)
+}
+pub(crate) fn ssdt_nt_create_semaphore(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_create_semaphore(cpu, mem)
+}
+pub(crate) fn ssdt_nt_release_semaphore(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_release_semaphore(cpu, mem)
+}
+pub(crate) fn ssdt_nt_wait_for_single_object(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_wait_for_single_object(cpu, mem)
+}
+pub(crate) fn ssdt_nt_wait_for_multiple_objects(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_wait_for_multiple_objects(cpu, mem)
 }
