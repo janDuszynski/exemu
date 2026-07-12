@@ -996,7 +996,7 @@ impl WinOs {
 /// Read a `UNICODE_STRING` (64-bit layout: `USHORT Length; USHORT MaximumLength;
 /// PWSTR Buffer` — Buffer at offset 8) into a `String`. `Length` is a **byte**
 /// count, not units, and the buffer is not necessarily NUL-terminated.
-fn read_unicode_string(mem: &dyn Memory, ptr: u64) -> Option<String> {
+pub(crate) fn read_unicode_string(mem: &dyn Memory, ptr: u64) -> Option<String> {
     if ptr == 0 {
         return None;
     }
@@ -1015,7 +1015,7 @@ fn read_unicode_string(mem: &dyn Memory, ptr: u64) -> Option<String> {
 
 /// Strip the DOS-device / Win32 file-namespace prefix from an NT path so the
 /// sandbox sees a plain `C:\…` drive path: `\??\`, `\\?\`, `\DosDevices\`.
-fn strip_nt_prefix(name: &str) -> String {
+pub(crate) fn strip_nt_prefix(name: &str) -> String {
     for p in ["\\??\\", "\\\\?\\", "\\DosDevices\\", "\\GLOBAL??\\"] {
         if let Some(rest) = name.strip_prefix(p) {
             return rest.to_string();
