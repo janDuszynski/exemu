@@ -26,6 +26,7 @@ mod gdi;
 mod msg;
 mod reg;
 mod section;
+mod server;
 mod syscall;
 mod sync;
 mod thread;
@@ -329,6 +330,15 @@ pub struct WinOs {
     /// Thunk address of the `__wine_unix_call` fast path (roadmap W2.4), lazily
     /// allocated by [`WinOs::wine_unix_call_thunk`]; zero until first requested.
     wine_unix_call_thunk: u64,
+    /// Set by [`WinOs::wine_server_call`] when servicing a `select` request that
+    /// blocked (the running thread was switched off via
+    /// [`WinOs::block_and_switch`], roadmap W2.11). The `__wine_unix_call` fast
+    /// path checks it to resume the switched-in thread as-is (no `ret`) instead
+    /// of returning an NTSTATUS to the now-blocked caller — the blocked thread's
+    /// `wine_server_call` re-runs when it is scheduled again and the wait is
+    /// satisfied. Cleared at the start of every unix-call dispatch and every
+    /// `wine_server_call`.
+    unix_call_blocked: bool,
 
     /// When `Some`, the process is exiting: after the currently-driven callback
     /// queue (the loaded DLLs' `DLL_PROCESS_DETACH` notifications) drains and no
@@ -408,6 +418,7 @@ impl WinOs {
             unixlibs: Vec::new(),
             unixlib_of_module: HashMap::new(),
             wine_unix_call_thunk: 0,
+            unix_call_blocked: false,
             pending_process_exit: None,
         };
         // Reserve the driver thunks up front so their addresses are stable.

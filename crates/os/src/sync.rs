@@ -119,7 +119,7 @@ impl WinOs {
     /// Create (or, for a named object that already exists, re-open) a
     /// synchronization object and return its handle. `initial` seeds the
     /// initial signaled/owned/count state per kind.
-    fn make_object(&mut self, kind: SyncKind, name: Option<String>, manual: bool, signaled: bool, count: i32, max: i32) -> u64 {
+    pub(crate) fn make_object(&mut self, kind: SyncKind, name: Option<String>, manual: bool, signaled: bool, count: i32, max: i32) -> u64 {
         if let Some(n) = &name {
             if let Some(&h) = self.named_kobjects.get(n) {
                 self.set_last_error(183); // ERROR_ALREADY_EXISTS (handle still valid)
@@ -356,5 +356,56 @@ impl WinOs {
         } else {
             Ok(Outcome::Return(WAIT_OBJECT_0))
         }
+    }
+
+    // ---- object-manager helpers (roadmap W2.11) --------------------------
+    //
+    // The wineserver equivalent ([`crate::server`]) drives the *same* KObject
+    // model these Win32 waits use, so these thin helpers expose signaled/acquire
+    // and duplicate/close by handle to it (a duplicate is a second handle onto
+    // one object in the single-process in-process model).
+
+    /// Whether the object at `handle` is signaled for `tid` right now (unknown
+    /// handle counts as signaled, matching the wait paths). Backs the server's
+    /// `select` satisfiability peek.
+    pub(crate) fn kobject_is_signaled(&self, handle: u64, tid: u32) -> bool {
+        self.kobjects.get(&handle).map_or(true, |o| o.is_signaled(tid))
+    }
+
+    /// Satisfy a wait on `handle`, consuming state (auto-reset events reset,
+    /// semaphores decrement). Returns whether it was signaled/acquired (unknown
+    /// handle counts as acquired).
+    pub(crate) fn kobject_acquire(&mut self, handle: u64, tid: u32) -> bool {
+        self.kobjects.get_mut(&handle).map_or(true, |o| o.acquire(tid))
+    }
+
+    /// Duplicate `src` into a second handle onto the *same* object (the server
+    /// `dup_handle`). Returns the new handle, or `None` if `src` is not a live
+    /// kernel object. The object stays live until every naming handle is closed.
+    pub(crate) fn dup_kobject_handle(&mut self, src: u64) -> Option<u64> {
+        let dup = match self.kobjects.get(&src)? {
+            KObject::Event { manual_reset, signaled } => KObject::Event { manual_reset: *manual_reset, signaled: *signaled },
+            KObject::Timer { manual_reset, signaled } => KObject::Timer { manual_reset: *manual_reset, signaled: *signaled },
+            KObject::Mutex { owner, recursion } => KObject::Mutex { owner: *owner, recursion: *recursion },
+            KObject::Semaphore { count, max } => KObject::Semaphore { count: *count, max: *max },
+            KObject::Thread { exited } => KObject::Thread { exited: *exited },
+        };
+        let h = self.alloc_khandle();
+        self.kobjects.insert(h, dup);
+        Some(h)
+    }
+
+    /// Test-only: whether `handle` names a signaled kernel object (from the
+    /// current thread's perspective).
+    #[cfg(test)]
+    pub(crate) fn kobject_is_signaled_for_test(&self, handle: u64) -> bool {
+        self.kobject_is_signaled(handle, self.current_tid)
+    }
+
+    /// Test-only: whether the last `wine_server_call` blocked (drove a
+    /// scheduler switch) rather than completing.
+    #[cfg(test)]
+    pub(crate) fn unix_call_blocked_for_test(&self) -> bool {
+        self.unix_call_blocked
     }
 }

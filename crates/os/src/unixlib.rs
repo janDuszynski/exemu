@@ -175,11 +175,12 @@ fn wine_dbg_write(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, arg
 
 /// Entry 3 — `wine_server_call(params)`. `params` is a pointer to the guest's
 /// `__server_request_info`; the call routes into exemu's in-process object
-/// manager (the wineserver equivalent, W2.11) and the NTSTATUS lands back in the
-/// request's `reply_header.error`. Until W2.11 lands the object manager this is
-/// a stub returning `STATUS_NOT_IMPLEMENTED`, per the W2.5 scope.
-fn wine_server_call(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    os.wine_server_call(args, mem)
+/// manager (the wineserver equivalent, [`crate::server`], W2.11) and the
+/// NTSTATUS lands back in the request's `reply_header.error`. The live
+/// [`CpuState`] is threaded through so a `select` that must wait can drive the
+/// scheduler (`block_and_switch`) for REAL cross-thread blocking.
+fn wine_server_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
+    os.wine_server_call(args, cpu, mem)
 }
 
 /// Entry 4 — `server_fd_to_handle(params)`. Wraps a host unix fd as a server
@@ -259,19 +260,6 @@ impl WinOs {
         }
     }
 
-    /// Route `wine_server_call` (ntdll unixlib entry 3) into the in-process
-    /// object manager. `req` points at the guest's `__server_request_info`; the
-    /// resulting NTSTATUS is both returned (into RAX for the fast path) and, on a
-    /// real call, written into the request's `reply_header.error`.
-    ///
-    /// The object manager and the wire-struct decode land in **W2.11**; until
-    /// then this is an honest stub returning `STATUS_NOT_IMPLEMENTED` so ntdll
-    /// init walks the table without faulting. `_req`/`_mem` are already threaded
-    /// so the W2.11 change is a body-only edit.
-    pub(crate) fn wine_server_call(&mut self, _req: u64, _mem: &mut dyn Memory) -> Result<u32> {
-        Ok(STATUS_NOT_IMPLEMENTED)
-    }
-
     /// The `__wine_unix_call` fast path: dispatch `code` in `unixlibs[handle]`
     /// with the packed `args` pointer. Returns the entry's NTSTATUS, or
     /// `STATUS_INVALID_PARAMETER` for an out-of-range handle or code (so a
@@ -284,6 +272,10 @@ impl WinOs {
         cpu: &mut CpuState,
         mem: &mut dyn Memory,
     ) -> Result<u32> {
+        // Only a `wine_server_call` select may leave this set; clear it for
+        // every dispatch so an entry that never touches it (e.g. a call made by
+        // the thread switched in after a block) cannot observe a stale value.
+        self.unix_call_blocked = false;
         let Some(entry) = self
             .unixlibs
             .get(handle as usize)
@@ -475,12 +467,16 @@ mod tests {
         mem.write_u64(dbg_args, msg).unwrap(); // str
         mem.write_u64(dbg_args + 8, 2).unwrap(); // len
         let time_args = 0x3_0300;
+        // For wine_server_call (3): a zeroed __server_request_info — opcode 0 is
+        // outside the W2.11 subset, so the live decoder (crate::server) answers
+        // the default arm's clean STATUS_NOT_IMPLEMENTED.
+        let srv_req = 0x3_0400;
 
         let expected = [
             (0u32, STATUS_DLL_NOT_FOUND, 0u64),   // load_so_dll
             (1, STATUS_UNSUCCESSFUL, 0),          // unwind_builtin_dll
             (2, 2, dbg_args),                     // wine_dbg_write → bytes written
-            (3, STATUS_NOT_IMPLEMENTED, 0),       // wine_server_call (stub until W2.11)
+            (3, STATUS_NOT_IMPLEMENTED, srv_req), // wine_server_call: unknown opcode → default arm
             (4, STATUS_NOT_IMPLEMENTED, 0),       // server_fd_to_handle
             (5, STATUS_NOT_IMPLEMENTED, 0),       // server_handle_to_fd
             (6, STATUS_NOT_IMPLEMENTED, 0),       // spawnvp

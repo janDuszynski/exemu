@@ -1549,7 +1549,15 @@ impl WinOs {
             // the intercept seam does the `ret` (see [`crate::unixlib`]).
             Api::WineUnixCall => {
                 let status = self.wine_unix_call(cpu, mem)?;
-                ret(status as u64)
+                // A `wine_server_call` select that blocked has already switched
+                // `cpu` to another thread (roadmap W2.11): resume that thread
+                // as-is — writing RAX + `ret` here would corrupt it. The blocked
+                // thread re-runs this thunk when it is scheduled again.
+                if self.unix_call_blocked {
+                    Ok(Outcome::Resume)
+                } else {
+                    ret(status as u64)
+                }
             }
             Api::SetUnhandledExceptionFilter => {
                 let old = self.unhandled_filter;
