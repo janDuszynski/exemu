@@ -107,4 +107,61 @@ impl WinOs {
         }
         Ok(Outcome::Return(0))
     }
+
+    // ---- NT time syscalls (roadmap W2.14) --------------------------------
+    //
+    // The NTSTATUS face of the same host-clock math the Win32 seam uses,
+    // reached via a raw guest `SYSCALL` through the W2.3 dispatcher. Args come
+    // via [`WinOs::syscall_arg`] (arg0=R10, arg1=RDX, …). Signatures are the
+    // public NT headers (winternl.h / ntddk.h); no Wine `.c` read.
+    //
+    // `NtGetTickCount` is deliberately absent: on x64 it is NOT a syscall — the
+    // pinned guest ntdll implements it inline by reading `KUSER_SHARED_DATA.
+    // TickCount` (`gs`-free RIP-relative load), so there is no SSDT slot to fill.
+    // Keeping that page live is the standing W2.1/W2.10 follow-up (the page is
+    // guest-read-only, so it needs a permission-bypassing host writer).
+
+    /// `NtQuerySystemTime(PLARGE_INTEGER SystemTime)` — current wall-clock time
+    /// as a FILETIME (100-ns ticks since 1601). NULL out-pointer →
+    /// STATUS_ACCESS_VIOLATION.
+    pub(crate) fn nt_query_system_time(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let ptr = self.syscall_arg(cpu, mem, 0)?;
+        if ptr == 0 {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        mem.write_u64(ptr, filetime_now())?;
+        Ok(NT_STATUS_SUCCESS)
+    }
+
+    /// `NtQueryPerformanceCounter(PLARGE_INTEGER PerformanceCounter,
+    /// PLARGE_INTEGER PerformanceFrequency OPTIONAL)` — the monotonic 100-ns
+    /// counter since process start, and (if non-NULL) the fixed QPC rate. NULL
+    /// counter → STATUS_ACCESS_VIOLATION.
+    pub(crate) fn nt_query_performance_counter(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let counter_ptr = self.syscall_arg(cpu, mem, 0)?;
+        let freq_ptr = self.syscall_arg(cpu, mem, 1)?;
+        if counter_ptr == 0 {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        mem.write_u64(counter_ptr, self.elapsed_100ns())?;
+        if freq_ptr != 0 {
+            mem.write_u64(freq_ptr, QPC_FREQ)?;
+        }
+        Ok(NT_STATUS_SUCCESS)
+    }
+}
+
+// NTSTATUS codes.
+const NT_STATUS_SUCCESS: u32 = 0x0000_0000;
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+
+// SSDT indices (pinned guest ntdll.dll `mov eax,N`).
+pub(crate) const SSDT_NT_QUERY_PERFORMANCE_COUNTER: u32 = 0x31;
+pub(crate) const SSDT_NT_QUERY_SYSTEM_TIME: u32 = 0x5a;
+
+pub(crate) fn ssdt_nt_query_system_time(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_query_system_time(cpu, mem)
+}
+pub(crate) fn ssdt_nt_query_performance_counter(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_query_performance_counter(cpu, mem)
 }
