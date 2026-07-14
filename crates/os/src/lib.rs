@@ -498,6 +498,9 @@ impl WinOs {
         os.set_syscall_handler(reg::SSDT_NT_SET_VALUE_KEY, reg::ssdt_nt_set_value_key);
         os.set_syscall_handler(reg::SSDT_NT_ENUMERATE_KEY, reg::ssdt_nt_enumerate_key);
         os.set_syscall_handler(reg::SSDT_NT_QUERY_KEY, reg::ssdt_nt_query_key);
+        // NT time syscalls (roadmap W2.14).
+        os.set_syscall_handler(time::SSDT_NT_QUERY_SYSTEM_TIME, time::ssdt_nt_query_system_time);
+        os.set_syscall_handler(time::SSDT_NT_QUERY_PERFORMANCE_COUNTER, time::ssdt_nt_query_performance_counter);
         os
     }
 
