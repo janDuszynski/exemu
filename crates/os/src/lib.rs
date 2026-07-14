@@ -491,6 +491,13 @@ impl WinOs {
             sync::SSDT_NT_WAIT_FOR_MULTIPLE_OBJECTS,
             sync::ssdt_nt_wait_for_multiple_objects,
         );
+        // NT registry syscalls (roadmap W2.13).
+        os.set_syscall_handler(reg::SSDT_NT_CREATE_KEY, reg::ssdt_nt_create_key);
+        os.set_syscall_handler(reg::SSDT_NT_OPEN_KEY, reg::ssdt_nt_open_key);
+        os.set_syscall_handler(reg::SSDT_NT_QUERY_VALUE_KEY, reg::ssdt_nt_query_value_key);
+        os.set_syscall_handler(reg::SSDT_NT_SET_VALUE_KEY, reg::ssdt_nt_set_value_key);
+        os.set_syscall_handler(reg::SSDT_NT_ENUMERATE_KEY, reg::ssdt_nt_enumerate_key);
+        os.set_syscall_handler(reg::SSDT_NT_QUERY_KEY, reg::ssdt_nt_query_key);
         os
     }
 
