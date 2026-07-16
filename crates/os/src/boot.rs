@@ -43,6 +43,25 @@ pub const RVA_LDR_INITIALIZE_THUNK: u64 = 0x155c0;
 /// thread; forwards `(EntryPoint, Arg)` through `BaseThreadInitThunk`.
 pub const RVA_RTL_USER_THREAD_START: u64 = 0x10d14;
 
+/// `__wine_unix_call_dispatcher` — the ntdll global function pointer through
+/// which every PE-side `__wine_unix_call` is issued (`call
+/// [__wine_unix_call_dispatcher]`). On real Wine the *unix* side of ntdll fills
+/// it during init; exemu maps ntdll as a standalone PE with no unix side, so the
+/// boot loader must poke [`WinOs::wine_unix_call_thunk`] here (roadmap W3.2).
+///
+/// RVA cross-checked three ways against the pinned Wine 11.0 `ntdll.dll`
+/// (ImageBase 0x170000000): (1) the data export `__wine_unix_call_dispatcher`
+/// (ordinal 1452) resolves to RVA 0x9c058; (2) `RtlGetSystemTimePrecise` @ 0x27a30
+/// ends `call *0x7460d(%rip)` → 0x27a4b + 0x7460d = 0x9c058; (3) the null-call
+/// fault site `__wine_dbg_output` @ 0x3f36f `call *0x5cce3(%rip)` → 0x3f375 +
+/// 0x5cce3 = 0x9c058. The pointer lives in ntdll's `.bss` (RVA 0x9c000..0xa0000),
+/// which falls inside the RWX DLL arena the image maps into, so it is a plain
+/// writable global. Its sibling `__wine_syscall_dispatcher` @ 0x9c050 is NOT
+/// referenced by any ntdll code (the syscall stubs take the bare `syscall` path
+/// when `KUSER_SHARED_DATA+0x308` bit0 is clear, which exemu forces), so it needs
+/// no wiring.
+pub const RVA_WINE_UNIX_CALL_DISPATCHER: u64 = 0x9c058;
+
 /// `STATUS_SUCCESS` — `NtContinue` never actually returns it to the guest (it
 /// resumes into the restored CONTEXT), but the dispatcher needs a status value.
 const STATUS_SUCCESS: u32 = 0x0000_0000;
