@@ -808,6 +808,28 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
+    /// `NtTerminateProcess(ProcessHandle, ExitStatus)`. arg0=ProcessHandle
+    /// (`NtCurrentProcess` = -1, or 0 = the current process), arg1=ExitStatus.
+    ///
+    /// Terminating the current process ends the whole run with `ExitStatus`: the
+    /// handler records the code in `pending_syscall_exit`, which the syscall
+    /// dispatcher observes to yield `Exit::ProcessExit` to the run loop (the same
+    /// termination `ExitProcess` reaches). A handle naming some *other* process is
+    /// meaningless in exemu's single-process model and is accepted as a no-op
+    /// success. This also services Wine's `loader_init` crash-cascade path, which
+    /// calls `ZwTerminateProcess` after a failed `load_dll` (roadmap W3.2).
+    pub(crate) fn nt_terminate_process(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let code = self.syscall_arg(cpu, mem, 1)? as i32;
+        // 0 or NtCurrentProcess (-1) name the current (only) process.
+        if handle == 0 || handle == u64::MAX {
+            self.pending_syscall_exit = Some(code);
+            return Ok(STATUS_SUCCESS);
+        }
+        // Any other handle: no other process exists to terminate — succeed inertly.
+        Ok(STATUS_SUCCESS)
+    }
+
     /// `NtSuspendThread(ThreadHandle, *PreviousSuspendCount)`.
     /// arg0=ThreadHandle, arg1=&PreviousSuspendCount (OUT, optional).
     pub(crate) fn nt_suspend_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
@@ -920,6 +942,9 @@ const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 /// SSDT indices, recovered from the pinned guest `ntdll.dll` stubs' `mov eax,N`.
 pub(crate) const SSDT_NT_CREATE_THREAD_EX: u32 = 0x85;
 pub(crate) const SSDT_NT_TERMINATE_THREAD: u32 = 0x53;
+/// `NtTerminateProcess` (roadmap W3.2). Index recovered from the pinned guest
+/// `ntdll.dll` stub's `mov eax,N`.
+pub(crate) const SSDT_NT_TERMINATE_PROCESS: u32 = 0x2c;
 pub(crate) const SSDT_NT_SUSPEND_THREAD: u32 = 0xf5;
 pub(crate) const SSDT_NT_RESUME_THREAD: u32 = 0x52;
 pub(crate) const SSDT_NT_QUERY_INFORMATION_THREAD: u32 = 0x25;
@@ -929,6 +954,9 @@ pub(crate) fn ssdt_nt_create_thread_ex(os: &mut WinOs, cpu: &mut CpuState, mem: 
 }
 pub(crate) fn ssdt_nt_terminate_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_terminate_thread(cpu, mem)
+}
+pub(crate) fn ssdt_nt_terminate_process(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_terminate_process(cpu, mem)
 }
 pub(crate) fn ssdt_nt_suspend_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_suspend_thread(cpu, mem)

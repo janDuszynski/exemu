@@ -357,6 +357,13 @@ pub struct WinOs {
     /// callback frames remain, terminate the process with this code instead of
     /// returning to guest code (roadmap W0.7).
     pending_process_exit: Option<i32>,
+
+    /// Set by `NtTerminateProcess` on the current process (roadmap W3.2): the
+    /// syscall dispatcher observes it after the handler returns and yields
+    /// `Exit::ProcessExit(code)` to the run loop instead of returning the
+    /// NTSTATUS to the (now-terminating) guest. Cleared at the start of every
+    /// dispatch.
+    pending_syscall_exit: Option<i32>,
 }
 
 // Sentinel handle values returned by GetStdHandle and understood by WriteFile.
@@ -432,6 +439,7 @@ impl WinOs {
             wine_unix_call_thunk: 0,
             unix_call_blocked: false,
             pending_process_exit: None,
+            pending_syscall_exit: None,
         };
         // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
@@ -479,6 +487,12 @@ impl WinOs {
             fs::SSDT_NT_QUERY_VOLUME_INFORMATION_FILE,
             fs::ssdt_nt_query_volume_information_file,
         );
+        // Guest-FS DLL search (roadmap W3.2): the file/attribute/FSCTL syscalls
+        // Wine's `loader_init` → `open_dll_file` issues to find and stat a DLL on
+        // disk before mapping it as a section. Indices from the pinned stubs.
+        os.set_syscall_handler(fs::SSDT_NT_OPEN_FILE, fs::ssdt_nt_open_file);
+        os.set_syscall_handler(fs::SSDT_NT_QUERY_ATTRIBUTES_FILE, fs::ssdt_nt_query_attributes_file);
+        os.set_syscall_handler(fs::SSDT_NT_FS_CONTROL_FILE, fs::ssdt_nt_fs_control_file);
         // NtClose (roadmap W2.16 DLL-smoke gap): the universal handle closer,
         // routed by lookup through the shared handle space (files/dirs/finds +
         // wineserver kernel objects). Index recovered from the pinned guest stub.
@@ -487,6 +501,10 @@ impl WinOs {
         // P3.4 scheduler. Indices recovered from the pinned guest ntdll stubs.
         os.set_syscall_handler(thread::SSDT_NT_CREATE_THREAD_EX, thread::ssdt_nt_create_thread_ex);
         os.set_syscall_handler(thread::SSDT_NT_TERMINATE_THREAD, thread::ssdt_nt_terminate_thread);
+        // NtTerminateProcess (roadmap W3.2): ends the whole process with the
+        // given exit status (routes through the dispatcher's Exit::ProcessExit),
+        // servicing both real termination and Wine's crash-cascade path.
+        os.set_syscall_handler(thread::SSDT_NT_TERMINATE_PROCESS, thread::ssdt_nt_terminate_process);
         os.set_syscall_handler(thread::SSDT_NT_SUSPEND_THREAD, thread::ssdt_nt_suspend_thread);
         os.set_syscall_handler(thread::SSDT_NT_RESUME_THREAD, thread::ssdt_nt_resume_thread);
         os.set_syscall_handler(
