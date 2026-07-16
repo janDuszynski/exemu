@@ -131,6 +131,11 @@ pub(crate) struct Loader {
     /// nested loader operations (a `DllMain` that itself calls `LoadLibrary`)
     /// keep the lock owned until the outermost operation completes.
     loader_lock_depth: i32,
+    /// Guest address of the seeded `API_SET_NAMESPACE` (`PEB.ApiSetMap`), or 0
+    /// until [`WinOs::seed_api_set_map`] runs on the Wine-boot path (roadmap
+    /// W3.3). The emulated corpus never seeds it (its loader never reads
+    /// `PEB.ApiSetMap`), so this stays 0 there.
+    api_set_map: u64,
 }
 
 /// The last path component, lower-cased, with a `.dll` extension ensured.
@@ -504,6 +509,10 @@ impl WinOs {
                 self.register_ntdll_unixlib(base);
             }
         }
+        // Seed PEB.ApiSetMap so Wine's loader_init → build_import_name (which
+        // reads it for every import) doesn't fault on a null pointer (W3.3).
+        // Only on this (Wine-core) path, so the emulated corpus is untouched.
+        self.seed_api_set_map(mem)?;
         Ok(ntdll_base)
     }
 
@@ -875,6 +884,47 @@ impl WinOs {
         }
         self.write_ptr(mem, peb + off_process_params, pp)?;
         Ok(())
+    }
+
+    /// Seed a valid v6 `API_SET_NAMESPACE` in guest memory and publish it at
+    /// `PEB.ApiSetMap` (x64 PEB `+0x68`, x86 PEB `+0x38` — verified from the
+    /// pinned Wine `ntdll`'s `build_import_name`: `mov rax,gs:[0x30];
+    /// mov rax,[rax+0x60]; mov rdi,[rax+0x68]`, roadmap W3.3).
+    ///
+    /// Wine's `loader_init → build_module → build_import_name` reads
+    /// `PEB.ApiSetMap` for **every** imported DLL name; an unseeded (null/
+    /// unmapped) pointer faults the loader. The four Wine core DLLs import each
+    /// other by real name (no api-set contract), so a *valid, non-null*
+    /// namespace is all the boot path needs — but we populate it (via
+    /// [`crate::apiset`], reusing the W0.5 resolver's host mappings) so a guest
+    /// exe that imports `api-ms-win-*` contracts gets the right host substituted.
+    ///
+    /// Placed on the **Wine-boot path only** (called from [`Self::load_wine_core`]),
+    /// so the emulated corpus's guest image is byte-for-byte unchanged.
+    pub(crate) fn seed_api_set_map(&mut self, mem: &mut dyn Memory) -> Result<()> {
+        if self.cfg.peb_addr == 0 {
+            return Ok(()); // no PEB (headless path with Ldr disabled)
+        }
+        // Idempotent: a second core load reuses the already-seeded namespace.
+        if self.dll.api_set_map != 0 {
+            return Ok(());
+        }
+        let ns = crate::apiset::build_populated_namespace();
+        // Carve the blob from the loader arena (top-down, same region as the
+        // PEB.Ldr structures — mapped RW on the boot path).
+        let base = self.ldr_alloc(ns.bytes.len() as u64);
+        mem.write(base, &ns.bytes)?;
+        self.dll.api_set_map = base;
+        // PEB.ApiSetMap.
+        let off = if self.cfg.is_64bit { 0x68u64 } else { 0x38 };
+        self.write_ptr(mem, self.cfg.peb_addr + off, base)?;
+        Ok(())
+    }
+
+    /// Guest address of the seeded `API_SET_NAMESPACE` (`PEB.ApiSetMap`), or 0
+    /// when it was never seeded (the emulated path). For tests/tools.
+    pub fn api_set_map(&self) -> u64 {
+        self.dll.api_set_map
     }
 
     /// Acquire the process `PEB.LoaderLock` for a loader operation, updating the

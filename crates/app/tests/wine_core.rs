@@ -344,3 +344,87 @@ fn wine_core_maps_relocates_and_dllmains() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// W3.3 part 1 — `load_wine_core` seeds a valid v6 `API_SET_NAMESPACE` and
+/// publishes it at `PEB.ApiSetMap` (x64 PEB `+0x68`). Wine's `loader_init →
+/// build_module → build_import_name` reads that pointer for every imported DLL
+/// name; before this seed it faulted after ~145 instrs on the null pointer.
+/// This asserts the pointer is non-null, in guest memory, and points at a
+/// well-formed, walkable v6 header — and that a known contract resolves to its
+/// host through it exactly as ntdll's `get_apiset_entry` would.
+#[test]
+fn wine_core_seeds_valid_apiset_map() {
+    if !Path::new(WINE_DLLS).join("ntdll.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/ntdll.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("exemu-w3_3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem) = setup(&dir);
+
+    os.load_wine_core(&mut mem).expect("load_wine_core ok").expect("the four Wine core DLLs present");
+
+    // PEB.ApiSetMap (x64 PEB +0x68) is non-null and equals the seeded base.
+    let map = mem.read_u64(PEB_ADDR + 0x68).unwrap();
+    assert_ne!(map, 0, "PEB.ApiSetMap seeded (non-null)");
+    assert_eq!(map, os.api_set_map(), "PEB.ApiSetMap == the seeded namespace base");
+    // It lives in a real mapped region (the loader arena, top of the DLL arena).
+    assert!((DLL_BASE..DLL_BASE + DLL_SIZE).contains(&map), "ApiSetMap in the DLL arena");
+
+    // Valid v6 header (self-relative offsets from `map`).
+    let version = mem.read_u32(map).unwrap();
+    let size = mem.read_u32(map + 0x04).unwrap();
+    let count = mem.read_u32(map + 0x0C).unwrap();
+    let entry_off = mem.read_u32(map + 0x10).unwrap();
+    let hash_off = mem.read_u32(map + 0x14).unwrap();
+    let hash_factor = mem.read_u32(map + 0x18).unwrap();
+    assert_eq!(version, 6, "API_SET_NAMESPACE version 6");
+    assert_eq!(hash_factor, exemu_os::HASH_FACTOR, "HashFactor matches the builder");
+    assert!(count > 0, "populated namespace has entries");
+    assert!(entry_off + count * 0x18 <= size, "entry table in-bounds");
+    assert!(hash_off + count * 0x08 <= size, "hash table in-bounds");
+
+    // Hash table is sorted ascending (ntdll binary-searches it).
+    let mut prev = 0u32;
+    for i in 0..count {
+        let h = mem.read_u32(map + hash_off as u64 + (i * 8) as u64).unwrap();
+        if i > 0 {
+            assert!(h > prev, "hash table ascending at {i}");
+        }
+        prev = h;
+    }
+
+    // Walk a known contract end-to-end the way ntdll's `get_apiset_entry` does:
+    // hash → binary-search the hash table → Index → entry → value → host DLL.
+    let resolve = |contract: &str| -> Option<String> {
+        let want = exemu_os::api_set_hash(contract, exemu_os::HASH_FACTOR);
+        let (mut lo, mut hi) = (0i64, count as i64 - 1);
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let ho = map + hash_off as u64 + (mid as u64) * 8;
+            let h = mem.read_u32(ho).unwrap();
+            match h.cmp(&want) {
+                std::cmp::Ordering::Equal => {
+                    let idx = mem.read_u32(ho + 4).unwrap();
+                    let eo = map + entry_off as u64 + (idx as u64) * 0x18;
+                    let vo = mem.read_u32(eo + 0x10).unwrap() as u64; // ValueOffset
+                    let val_off = mem.read_u32(map + vo + 0x0C).unwrap() as u64; // Value.ValueOffset
+                    let val_len = mem.read_u32(map + vo + 0x10).unwrap() as u64; // Value.ValueLength
+                    let units: Vec<u16> = (0..val_len / 2)
+                        .map(|j| mem.read_u16(map + val_off + j * 2).unwrap())
+                        .collect();
+                    return Some(String::from_utf16(&units).unwrap());
+                }
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid - 1,
+            }
+        }
+        None
+    };
+    assert_eq!(resolve("api-ms-win-crt-stdio-l1-1-0").as_deref(), Some("ucrtbase.dll"));
+    assert_eq!(resolve("api-ms-win-core-synch-l1-2-0").as_deref(), Some("kernelbase.dll"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
