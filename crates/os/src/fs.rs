@@ -66,6 +66,15 @@ impl WinOs {
     /// A drive prefix (`C:`) becomes a directory named after the letter, and
     /// backslashes become path separators; `..` components are dropped so a
     /// guest cannot escape the sandbox.
+    ///
+    /// **Wine-boot DLL search redirect (roadmap W3.2).** When `cfg.wine_dll_dir`
+    /// is set (only the `EXEMU_WINE_BOOT` path sets it) and a guest path under
+    /// `C:\windows\system32\` (case-insensitive) has no counterpart in the
+    /// sandbox, the leaf is resolved against the pinned Wine prefix instead. This
+    /// lets Wine's guest `loader_init` `NtOpenFile(\??\C:\windows\system32\
+    /// kernel32.dll)` find the real DLL on disk. The scope is tight
+    /// (`\windows\system32\` only, and only when the sandbox copy is absent) so
+    /// the emulated corpus — which never sets `wine_dll_dir` — is untouched.
     pub(crate) fn host_path(&self, guest: &str) -> Option<PathBuf> {
         if self.cfg.sandbox.is_empty() {
             return None;
@@ -79,7 +88,36 @@ impl WinOs {
                 c => out.push(c),
             }
         }
+        // If the sandbox copy is missing, fall back to the pinned Wine prefix
+        // for a `\windows\system32\<name>` guest path.
+        if !out.exists() {
+            if let Some(redirect) = self.wine_dll_redirect(guest) {
+                return Some(redirect);
+            }
+        }
         Some(out)
+    }
+
+    /// Resolve a `\windows\system32\<leaf>` guest path (case-insensitive) to its
+    /// counterpart in the pinned Wine DLL prefix (`cfg.wine_dll_dir`), or `None`
+    /// when the guest path is not under system32 or no prefix is configured. Only
+    /// the immediate `system32\<leaf>` case is handled — nested subdirectories
+    /// under system32 are deliberately not redirected (kept tight).
+    fn wine_dll_redirect(&self, guest: &str) -> Option<PathBuf> {
+        let dir = self.cfg.wine_dll_dir.as_ref()?;
+        // Normalise: strip the NT/DOS prefix and drive letter, lower-case for the
+        // marker search.
+        let cleaned = strip_nt_prefix(guest).replace('/', "\\");
+        let lower = cleaned.to_ascii_lowercase();
+        // Accept both `c:\windows\system32\` and a drive-less `\windows\system32\`.
+        let marker = "\\windows\\system32\\";
+        let pos = lower.find(marker)?;
+        let leaf = &cleaned[pos + marker.len()..];
+        // Only a bare leaf (no further separators) maps into the flat prefix.
+        if leaf.is_empty() || leaf.contains('\\') {
+            return None;
+        }
+        Some(PathBuf::from(dir).join(leaf))
     }
 
     fn alloc_handle(&mut self, f: std::fs::File) -> u64 {
@@ -599,10 +637,34 @@ pub(crate) const SSDT_NT_WRITE_FILE: u32 = 0x08;
 pub(crate) const SSDT_NT_QUERY_INFORMATION_FILE: u32 = 0x11;
 pub(crate) const SSDT_NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
 pub(crate) const SSDT_NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 0x49;
+/// `NtOpenFile` — open an EXISTING file/directory (roadmap W3.2). Index recovered
+/// from the pinned guest `ntdll.dll` stub's `mov eax,N`.
+pub(crate) const SSDT_NT_OPEN_FILE: u32 = 0x33;
+/// `NtQueryAttributesFile` — stat a named file without opening it (roadmap W3.2).
+pub(crate) const SSDT_NT_QUERY_ATTRIBUTES_FILE: u32 = 0x3d;
+/// `NtFsControlFile` — FSCTL device control (roadmap W3.2). Wine's `open_dll_file`
+/// issues the reparse-point probe (FSCTL 0x9009c) and only tests for success, so
+/// a benign non-success return is correct.
+pub(crate) const SSDT_NT_FS_CONTROL_FILE: u32 = 0x39;
 /// `NtClose` — the universal handle closer (files, dirs, find handles, and the
 /// wineserver-backed kernel objects). Index recovered from the pinned guest
 /// `ntdll.dll` stub's `mov eax,N`.
 pub(crate) const SSDT_NT_CLOSE: u32 = 0x0f;
+
+/// `STATUS_OBJECT_PATH_NOT_FOUND` — an intermediate directory in the path does
+/// not exist (a missing DLL search path yields this or OBJECT_NAME_NOT_FOUND, and
+/// Wine's `search_dll_file` treats either as "try the next path").
+const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+/// `STATUS_NOT_IMPLEMENTED` — returned for the tolerated `NtFsControlFile`
+/// reparse-probe fast path (Wine only branches on success).
+const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+
+/// `FILE_ATTRIBUTE_DIRECTORY` / `FILE_ATTRIBUTE_NORMAL` as `u32` for the NT face.
+const NT_FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const NT_FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+/// Difference in 100-ns units between the Windows FILETIME epoch (1601-01-01) and
+/// the UNIX epoch (1970-01-01).
+const FILETIME_EPOCH_DIFF: u64 = 116_444_736_000_000_000;
 
 impl WinOs {
     /// Resolve an `OBJECT_ATTRIBUTES*` to a guest Windows path (`C:\…`), applying
@@ -720,6 +782,142 @@ impl WinOs {
         mem.write_u64(handle_ptr, handle)?;
         write_iosb(mem, iosb_ptr, STATUS_SUCCESS, information)?;
         Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtOpenFile(*FileHandle, DesiredAccess, *ObjectAttributes, *IoStatusBlock,
+    /// ShareAccess, OpenOptions)` — open an EXISTING file or directory (no create,
+    /// no truncate). This is the `FILE_OPEN`-disposition slice of `NtCreateFile`
+    /// with the leaner 6-argument layout Wine's `open_dll_file` uses to probe the
+    /// DLL search path (roadmap W3.2).
+    ///
+    /// arg0=&FileHandle (OUT), arg1=DesiredAccess, arg2=&ObjectAttributes,
+    /// arg3=&IoStatusBlock, arg4=ShareAccess, arg5=OpenOptions. A missing file →
+    /// `STATUS_OBJECT_NAME_NOT_FOUND` (a missing intermediate directory →
+    /// `STATUS_OBJECT_PATH_NOT_FOUND`) so `search_dll_file` moves to the next path.
+    pub(crate) fn nt_open_file(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle_ptr = self.syscall_arg(cpu, mem, 0)?;
+        let access = self.syscall_arg(cpu, mem, 1)?;
+        let objattr = self.syscall_arg(cpu, mem, 2)?;
+        let iosb_ptr = self.syscall_arg(cpu, mem, 3)?;
+        if handle_ptr == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let Some(name) = self.nt_object_name(mem, objattr) else {
+            return Ok(STATUS_INVALID_PARAMETER);
+        };
+        let Some(path) = self.host_path(&name) else {
+            return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
+        };
+        if !path.exists() {
+            // Distinguish a missing leaf from a missing parent so a caller that
+            // walks a search path sees the same NTSTATUS Windows would return.
+            let status = match path.parent() {
+                Some(p) if !p.exists() => STATUS_OBJECT_PATH_NOT_FOUND,
+                _ => STATUS_OBJECT_NAME_NOT_FOUND,
+            };
+            return Ok(status);
+        }
+
+        // Open existing only. Request write only if the caller asked for it (a
+        // directory or a read-only host file otherwise fails a write-mode open).
+        let wants_write = access & (NT_GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        if wants_write {
+            opts.write(true);
+        }
+        let file = match opts.open(&path) {
+            Ok(f) => f,
+            // A directory (or a read-only file opened for write) may reject the
+            // OpenOptions above; fall back to a plain read-only open so a
+            // directory handle still succeeds.
+            Err(_) => match std::fs::OpenOptions::new().read(true).open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
+                }
+                Err(_) => return Ok(STATUS_OBJECT_NAME_NOT_FOUND),
+            },
+        };
+
+        let is_dir = file.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let handle = self.alloc_handle(file);
+        if is_dir {
+            self.file_dirs.insert(handle, name.clone());
+        }
+        mem.write_u64(handle_ptr, handle)?;
+        write_iosb(mem, iosb_ptr, STATUS_SUCCESS, FILE_OPENED)?;
+        Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtQueryAttributesFile(*ObjectAttributes, *FileInformation)` — stat a named
+    /// file without opening a handle (roadmap W3.2). Wine's `open_dll_file` calls
+    /// it right after `NtOpenFile` to read the file's basic attributes.
+    ///
+    /// arg0=&ObjectAttributes, arg1=&FileInformation (a `FILE_BASIC_INFORMATION`:
+    /// CreationTime/LastAccessTime/LastWriteTime/ChangeTime as FILETIMEs @0..0x20,
+    /// FileAttributes u32 @0x20, pad to 0x28). Existing → `STATUS_SUCCESS`;
+    /// missing → `STATUS_OBJECT_NAME_NOT_FOUND`.
+    pub(crate) fn nt_query_attributes_file(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+    ) -> Result<u32> {
+        let objattr = self.syscall_arg(cpu, mem, 0)?;
+        let info = self.syscall_arg(cpu, mem, 1)?;
+        let Some(name) = self.nt_object_name(mem, objattr) else {
+            return Ok(STATUS_INVALID_PARAMETER);
+        };
+        let Some(path) = self.host_path(&name) else {
+            return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
+        };
+        if info == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        // Reuse the host mtime for every FILETIME field (Wine only reads them as
+        // opaque stamps to detect a changed image), else a constant if absent.
+        let ft = meta
+            .modified()
+            .ok()
+            .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() * 10_000_000 + d.subsec_nanos() as u64 / 100 + FILETIME_EPOCH_DIFF)
+            .unwrap_or(FILETIME_EPOCH_DIFF);
+        mem.write_u64(info, ft)?; // CreationTime
+        mem.write_u64(info + 0x08, ft)?; // LastAccessTime
+        mem.write_u64(info + 0x10, ft)?; // LastWriteTime
+        mem.write_u64(info + 0x18, ft)?; // ChangeTime
+        let attrs = if meta.is_dir() { NT_FILE_ATTRIBUTE_DIRECTORY } else { NT_FILE_ATTRIBUTE_NORMAL };
+        mem.write_u32(info + 0x20, attrs)?; // FileAttributes
+        mem.write_u32(info + 0x24, 0)?; // pad
+        Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext, *IoStatusBlock,
+    /// FsControlCode, InputBuffer, InputBufferLength, OutputBuffer,
+    /// OutputBufferLength)` (roadmap W3.2). Wine's `open_dll_file` issues the
+    /// reparse-point probe (FSCTL 0x9009c) and only `test eax,eax; jne`s to skip
+    /// the reparse fast-path, so a benign non-success return is correct and
+    /// tolerated. We service the IO_STATUS_BLOCK and return `STATUS_NOT_IMPLEMENTED`.
+    ///
+    /// arg0=FileHandle, arg4=&IoStatusBlock, arg5=FsControlCode.
+    pub(crate) fn nt_fs_control_file(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+    ) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let iosb_ptr = self.syscall_arg(cpu, mem, 4)?;
+        if !self.is_file_handle(handle) {
+            return Ok(STATUS_INVALID_HANDLE);
+        }
+        // No FSCTL is actually serviced; report the (tolerated) not-implemented
+        // status both in RAX and the IO_STATUS_BLOCK so the caller's branch skips
+        // the reparse fast-path cleanly.
+        write_iosb(mem, iosb_ptr, STATUS_NOT_IMPLEMENTED, 0)?;
+        Ok(STATUS_NOT_IMPLEMENTED)
     }
 
     /// `NtClose(Handle)`. The universal object closer: routes by lookup through
@@ -1109,6 +1307,29 @@ fn write_both_dir_information(
 /// SSDT thunk for `NtCreateFile` (index 0x55).
 pub(crate) fn ssdt_nt_create_file(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_create_file(cpu, mem)
+}
+
+/// SSDT thunk for `NtOpenFile` (index 0x33).
+pub(crate) fn ssdt_nt_open_file(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_open_file(cpu, mem)
+}
+
+/// SSDT thunk for `NtQueryAttributesFile` (index 0x3d).
+pub(crate) fn ssdt_nt_query_attributes_file(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    os.nt_query_attributes_file(cpu, mem)
+}
+
+/// SSDT thunk for `NtFsControlFile` (index 0x39).
+pub(crate) fn ssdt_nt_fs_control_file(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    os.nt_fs_control_file(cpu, mem)
 }
 
 /// SSDT thunk for `NtClose` (index 0x0f).

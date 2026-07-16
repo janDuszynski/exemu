@@ -338,6 +338,9 @@ impl WinOs {
         // Cleared per dispatch; a handler that switches threads itself (e.g.
         // NtTerminateThread on self) sets it to skip the restore/return below.
         self.syscall_resume_as_is = false;
+        // Cleared per dispatch; NtTerminateProcess on the current process sets it
+        // so the dispatcher yields Exit::ProcessExit below.
+        self.pending_syscall_exit = None;
 
         // Ensure the seam itself doesn't run the host handler with DF set: the
         // guest may have left DF=1, but the native handlers assume forward
@@ -357,6 +360,13 @@ impl WinOs {
         // Phase 3: index the SSDT and run the native handler.
         let handler = self.ssdt.handler(index);
         let status = handler(self, cpu, mem)?;
+
+        // NtTerminateProcess on the current process asked to end the whole
+        // process: yield the exit code to the run loop. The guest context is
+        // being torn down, so no restore/return is performed (roadmap W3.2).
+        if let Some(code) = self.pending_syscall_exit.take() {
+            return Ok(Exit::ProcessExit(code));
+        }
 
         // A handler that switched the running thread (e.g. NtTerminateThread on
         // the current thread) has already installed the guest resume state — the

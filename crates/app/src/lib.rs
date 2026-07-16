@@ -295,6 +295,13 @@ impl Process {
         // --- Sandbox directory rooting the guest filesystem ---------------
         let sandbox = std::env::temp_dir().join("exemu-sandbox");
         let _ = std::fs::create_dir_all(&sandbox);
+        // Ensure the guest `C:\` drive root exists as a real directory so opening
+        // it as the working directory succeeds (Wine's `loader_init` opens
+        // `C:\` early; a missing dir logged "could not open working directory").
+        // The `C\windows\system32` chain gives the DLL-search redirect a real
+        // parent so a missing DLL resolves to OBJECT_NAME_NOT_FOUND (not
+        // OBJECT_PATH_NOT_FOUND), matching what Wine's search loop expects.
+        let _ = std::fs::create_dir_all(sandbox.join("C").join("windows").join("system32"));
         // Guest module path (basename only) and its sandbox location. We copy
         // the executable itself into the sandbox so a program that opens its
         // own file (e.g. a self-extracting installer reading an appended
