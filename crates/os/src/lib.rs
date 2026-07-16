@@ -467,6 +467,10 @@ impl WinOs {
             fs::SSDT_NT_QUERY_VOLUME_INFORMATION_FILE,
             fs::ssdt_nt_query_volume_information_file,
         );
+        // NtClose (roadmap W2.16 DLL-smoke gap): the universal handle closer,
+        // routed by lookup through the shared handle space (files/dirs/finds +
+        // wineserver kernel objects). Index recovered from the pinned guest stub.
+        os.set_syscall_handler(fs::SSDT_NT_CLOSE, fs::ssdt_nt_close);
         // NT thread/process syscalls (roadmap W2.9): the NTSTATUS face of the
         // P3.4 scheduler. Indices recovered from the pinned guest ntdll stubs.
         os.set_syscall_handler(thread::SSDT_NT_CREATE_THREAD_EX, thread::ssdt_nt_create_thread_ex);

@@ -319,6 +319,13 @@ The interpreter has hand-assembled unit tests (arithmetic, loops, calls,
 signed compares, division, `rep stos`, flags), and the app crate runs the
 generated `.exe` through the entire pipeline and asserts on its output.
 
+An NT-syscall **DLL-smoke** test (`crates/app/tests/dll_smoke.rs`) additionally
+loads Wine's real PE `ntdll.dll` on its own and drives its own exported `Nt*`
+stubs through the emulator's syscall dispatcher — proving a Wine-PE guest can
+allocate memory, query the clock, open+write a file (bytes land on the host),
+and create+wait an event, all via genuine `SYSCALL`s. It skips cleanly when the
+(separately obtained, non-redistributed) Wine DLL set is absent.
+
 ### Differential CPU oracle
 
 The software CPU is validated against a reference x86 (Unicorn / QEMU TCG) by
