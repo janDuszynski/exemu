@@ -484,6 +484,19 @@ impl Process {
         // opt-in but not exercised by the default corpus or the standing gates.
         if image.is_64bit {
             if let Some(ntdll_base) = os.load_wine_core(&mut mem)? {
+                // Wine keeps its per-process `__wine_debug_options` array right
+                // after the PEB (`__wine_dbg_get_channel_flags` reads
+                // `PEB+0x2000`), reached VERY early in `loader_init` via TRACE
+                // macros. The app maps the PEB as a single page, so PEB+0x2000
+                // is unmapped and the very first TRACE faults there. Map one
+                // zeroed page over PEB+0x2000: a zero default entry (empty name)
+                // means zero configured channels, so the lookup returns the
+                // default (all-off) flags without scanning — the correct
+                // behaviour with no `WINEDEBUG` set. Boot-path only (roadmap
+                // W3.3); the emulated corpus never runs this code.
+                // PEB+0x2000 (= GS_BASE+0x4000) is above the single-page PEB
+                // mapping, so it is guaranteed unmapped here.
+                mem.map(Region::new("wine-dbgopts", lay.peb_addr + 0x2000, PAGE, Perm::RW))?;
                 // Steer ntdll's stubs onto the bare `syscall` route into the
                 // W2.3 dispatcher: SystemCall selector = 0 (the app's default
                 // seed is 1, the dispatcher-page shape). Poke bypasses the

@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod apiset;
 mod boot;
 mod dll;
 mod exc;
@@ -41,6 +42,7 @@ use std::collections::HashMap;
 use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Reg, Result};
 
 pub use api::Api;
+pub use apiset::{api_set_hash, build_populated_namespace, ApiSetNamespace, HASH_FACTOR};
 pub use boot::{RVA_LDR_INITIALIZE_THUNK, RVA_RTL_USER_THREAD_START};
 pub use syscall::SyscallHandler;
 pub use sync::{SignalOp, SyncKind};
