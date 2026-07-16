@@ -1637,6 +1637,10 @@ impl Interpreter {
             }
 
             // ---- XADD ---------------------------------------------------
+            // LOCK-atomic invariant (roadmap W2.15): the memory operand is read
+            // exactly once (`read_rm`) and written exactly once (`write_rm`)
+            // with no block/yield point between, so under the cooperative
+            // scheduler `lock xadd` is one indivisible read-modify-write.
             0xC0 | 0xC1 => {
                 self.read_modrm(ctx, mem)?;
                 let size = if op2 == 0xC0 { 1 } else { Self::opsize(ctx) };
@@ -1647,6 +1651,11 @@ impl Interpreter {
                 self.write_rm(ctx, mem, size, sum)?;
             }
             // ---- CMPXCHG ------------------------------------------------
+            // LOCK-atomic invariant (roadmap W2.15): the destination is read
+            // once and written once with no intervening block/yield point, so
+            // `lock cmpxchg` is one indivisible compare-and-swap under the
+            // cooperative scheduler — the CAS-increment pin test in
+            // crates/os/tests relies on this holding for every guest thread.
             0xB0 | 0xB1 => {
                 self.read_modrm(ctx, mem)?;
                 let size = if op2 == 0xB0 { 1 } else { Self::opsize(ctx) };

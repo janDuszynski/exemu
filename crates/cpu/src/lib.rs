@@ -155,6 +155,15 @@ struct Prefixes {
     rep: u8,
     /// Segment override (0x64 = FS, 0x65 = GS), 0 if none.
     seg: u8,
+    /// 0xF0 LOCK prefix seen on this instruction. The interpreter is
+    /// single-threaded and cooperatively scheduled (guest threads switch only
+    /// at explicit block/yield points, never mid-instruction), so every
+    /// read-modify-write handler is already indivisible with respect to other
+    /// guest threads. We still *recognize and honor* the prefix instead of
+    /// silently dropping it so that (a) the atomicity contract is explicit and
+    /// (b) a future preemptive/JIT change that would break it is caught by the
+    /// pinned cross-thread LOCK CMPXCHG test in crates/os/tests.
+    lock: bool,
 }
 
 impl Prefixes {
@@ -279,7 +288,11 @@ impl Interpreter {
             match b {
                 0x66 => ctx.pfx.p66 = true,
                 0x67 => {} // address-size override: handled per-mode elsewhere
-                0xF0 => {} // LOCK: no-op for a single-threaded interpreter
+                // LOCK: record the prefix. The cooperative interpreter never
+                // switches threads mid-instruction, so the RMW handlers are
+                // already atomic; tracking the flag makes that contract explicit
+                // (see `Prefixes::lock`) rather than silently discarding 0xF0.
+                0xF0 => ctx.pfx.lock = true,
                 0xF2 | 0xF3 => ctx.pfx.rep = b,
                 0x2E | 0x36 | 0x3E | 0x26 => {} // CS/SS/DS/ES overrides: flat model
                 0x64 | 0x65 => ctx.pfx.seg = b, // FS/GS
