@@ -26,6 +26,7 @@ mod exc;
 mod fs;
 mod gdi;
 mod msg;
+mod nls;
 mod reg;
 mod section;
 mod server;
@@ -316,6 +317,13 @@ pub struct WinOs {
     /// (roadmap W2.3). Each `Nt*` group fills its slots in W2.6+; unknown
     /// indices return `STATUS_NOT_IMPLEMENTED`. See [`crate::syscall`].
     ssdt: syscall::Ssdt,
+    /// The mapped `locale.nls` view: `(base, size)`, mapped once on the first
+    /// `NtInitializeNlsFiles` and returned identically thereafter so the ntdll
+    /// `RtlGetLocaleFileMappingAddress` cache stays consistent (roadmap W3.2).
+    nls_locale_base: Option<(u64, u64)>,
+    /// Mapped `NtGetNlsSectionPtr` sections, keyed by section `type`:
+    /// `(type, base, size)`. Cached so a repeated query returns the same view.
+    nls_section_bases: Vec<(u32, u64, u64)>,
     /// Guest virtual address of the dedicated "unix stack" the dispatcher
     /// switches to while a native handler runs (roadmap W2.3), and its top
     /// (initial RSP). Lazily allocated on first syscall; zero until then.
@@ -431,6 +439,8 @@ impl WinOs {
             exc_stack: Vec::new(),
             unhandled_filter: 0,
             ssdt: syscall::Ssdt::new(),
+            nls_locale_base: None,
+            nls_section_bases: Vec::new(),
             unix_stack_top: 0,
             syscall_guest_rsp: 0,
             syscall_resume_as_is: false,
@@ -541,6 +551,13 @@ impl WinOs {
         // NT time syscalls (roadmap W2.14).
         os.set_syscall_handler(time::SSDT_NT_QUERY_SYSTEM_TIME, time::ssdt_nt_query_system_time);
         os.set_syscall_handler(time::SSDT_NT_QUERY_PERFORMANCE_COUNTER, time::ssdt_nt_query_performance_counter);
+        // NLS data syscalls (roadmap W3.2): Wine's ntdll `locale_init` /
+        // kernelbase `init_locale` ask the unix side for the unified `locale.nls`
+        // (NtInitializeNlsFiles, behind RtlGetLocaleFileMappingAddress) and the
+        // auxiliary sort/norm/codepage sections (NtGetNlsSectionPtr). Indices
+        // recovered from the pinned guest ntdll stubs. See [`crate::nls`].
+        os.set_syscall_handler(nls::SSDT_NT_INITIALIZE_NLS_FILES, nls::ssdt_nt_initialize_nls_files);
+        os.set_syscall_handler(nls::SSDT_NT_GET_NLS_SECTION_PTR, nls::ssdt_nt_get_nls_section_ptr);
         // Process bootstrap (roadmap W3.1): NtContinue is the handoff the
         // LdrInitializeThunk → signal_start_thread → ZwContinue boot sequence
         // ends in. Index recovered from the pinned guest ntdll stub (`ZwContinue`
