@@ -470,9 +470,15 @@ impl WinOs {
         os.set_syscall_handler(vm::SSDT_NT_ALLOCATE_VIRTUAL_MEMORY, vm::ssdt_nt_allocate_virtual_memory);
         os.set_syscall_handler(vm::SSDT_NT_FREE_VIRTUAL_MEMORY, vm::ssdt_nt_free_virtual_memory);
         os.set_syscall_handler(vm::SSDT_NT_PROTECT_VIRTUAL_MEMORY, vm::ssdt_nt_protect_virtual_memory);
-        // Section syscalls (roadmap W2.7): Wine's PE loader maps DLL images as
-        // SEC_IMAGE sections. Indices recovered from the pinned guest stubs.
+        // Section syscalls (roadmap W2.7 / W3.2): Wine's PE loader maps DLL
+        // images as SEC_IMAGE sections — NtCreateSection(SEC_IMAGE) parses the
+        // PE + stores its RVA layout, NtQuerySection(SectionImageInformation)
+        // answers the image sanity-check, NtMapViewOfSection lays the sections
+        // out un-relocated. Indices recovered from the pinned guest stubs
+        // (`ZwQuerySection` @ RVA 0xf350 `mov eax,0x51`; free, no collision with
+        // `NtResumeThread` 0x52).
         os.set_syscall_handler(section::SSDT_NT_CREATE_SECTION, section::ssdt_nt_create_section);
+        os.set_syscall_handler(section::SSDT_NT_QUERY_SECTION, section::ssdt_nt_query_section);
         os.set_syscall_handler(section::SSDT_NT_MAP_VIEW_OF_SECTION, section::ssdt_nt_map_view_of_section);
         os.set_syscall_handler(section::SSDT_NT_UNMAP_VIEW_OF_SECTION, section::ssdt_nt_unmap_view_of_section);
         // NT file syscalls (roadmap W2.8): the NTSTATUS/IO_STATUS_BLOCK face of
