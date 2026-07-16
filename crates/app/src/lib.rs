@@ -157,6 +157,13 @@ pub struct RunConfig {
     /// applies its base relocations (`.reloc`) with the resulting load delta.
     /// The image must carry a relocation table for a non-preferred base to work.
     pub load_base: Option<u64>,
+    /// Boot the real Wine PE DLL set (ntdll/kernel32/kernelbase/ucrtbase) from
+    /// this directory instead of the emulated-DLL thunks, handing off through
+    /// `LdrInitializeThunk` (roadmap W3). `None` keeps the emulated path. Takes
+    /// precedence over the `EXEMU_WINE_BOOT`/`EXEMU_WINE_DLLS` env opt-in, so a
+    /// caller (e.g. the W3 gate test) can request the Wine boot hermetically
+    /// without touching process-global env vars.
+    pub wine_boot_dir: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -170,6 +177,7 @@ impl Default for RunConfig {
             max_steps: 2_000_000_000,
             gui: false,
             load_base: None,
+            wine_boot_dir: None,
         }
     }
 }
@@ -343,7 +351,14 @@ impl Process {
         // DLL directory defaults to the pinned prefix but is overridable via
         // `EXEMU_WINE_DLLS`; `wine_dll_dir` stays `None` unless the opt-in is set
         // AND the directory exists, so `load_wine_core` only ever runs on request.
-        let wine_dll_dir = if std::env::var_os("EXEMU_WINE_BOOT").is_some() {
+        let wine_dll_dir = if let Some(dir) = cfg.wine_boot_dir.clone() {
+            // Explicit request (e.g. the W3 gate test) — hermetic, no env vars.
+            if std::path::Path::new(&dir).is_dir() {
+                Some(dir)
+            } else {
+                None
+            }
+        } else if std::env::var_os("EXEMU_WINE_BOOT").is_some() {
             let dir = std::env::var("EXEMU_WINE_DLLS")
                 .unwrap_or_else(|_| "example_exe/wine-dlls/x86_64-windows".to_string());
             if std::path::Path::new(&dir).is_dir() {

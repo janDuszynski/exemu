@@ -326,6 +326,19 @@ allocate memory, query the clock, open+write a file (bytes land on the host),
 and create+wait an event, all via genuine `SYSCALL`s. It skips cleanly when the
 (separately obtained, non-redistributed) Wine DLL set is absent.
 
+**Running on Wine's real PE core (experimental, opt-in).** A **console `.exe`
+runs to completion on Wine's own PE `ntdll` → `kernelbase` → `kernel32` →
+`ucrtbase`**, running natively on the software CPU. With the Wine DLL set present
+and the boot enabled (`RunConfig.wine_boot_dir`, or `EXEMU_WINE_BOOT=1` on the
+CLI), the emulator maps ntdll + the exe, hands off through
+`LdrInitializeThunk`, and Wine's own loader loads the rest as real image
+sections, relocates them, and runs their `DllMain`s. The program's `WriteFile`
+then runs Wine's kernel32 → `NtWriteFile` → the emulator's console bridge → host
+stdout, and it exits 0 — none of the emulator's hand-written Win32 stubs are
+used. The `crates/app/tests/wine_gate.rs` gate pins this end to end. GUI programs
+are not there yet: they reach Wine's `win32u`/GDI syscall layer, which is the
+next phase.
+
 ### Differential CPU oracle
 
 The software CPU is validated against a reference x86 (Unicorn / QEMU TCG) by
