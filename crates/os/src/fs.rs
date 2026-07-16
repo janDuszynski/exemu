@@ -599,6 +599,10 @@ pub(crate) const SSDT_NT_WRITE_FILE: u32 = 0x08;
 pub(crate) const SSDT_NT_QUERY_INFORMATION_FILE: u32 = 0x11;
 pub(crate) const SSDT_NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
 pub(crate) const SSDT_NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 0x49;
+/// `NtClose` — the universal handle closer (files, dirs, find handles, and the
+/// wineserver-backed kernel objects). Index recovered from the pinned guest
+/// `ntdll.dll` stub's `mov eax,N`.
+pub(crate) const SSDT_NT_CLOSE: u32 = 0x0f;
 
 impl WinOs {
     /// Resolve an `OBJECT_ATTRIBUTES*` to a guest Windows path (`C:\…`), applying
@@ -716,6 +720,25 @@ impl WinOs {
         mem.write_u64(handle_ptr, handle)?;
         write_iosb(mem, iosb_ptr, STATUS_SUCCESS, information)?;
         Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtClose(Handle)`. The universal object closer: routes by lookup through
+    /// [`WinOs::close_handle`], which reclaims files, open directories, find
+    /// handles, and the wineserver-backed kernel objects (events, mutants,
+    /// semaphores) that share the one monotonic handle space. A handle that
+    /// names no live object → `STATUS_INVALID_HANDLE` (not a fault). The
+    /// pseudo-handles `NtCurrentProcess` (-1) / `NtCurrentThread` (-2) are
+    /// accepted as no-ops (Windows returns SUCCESS for them).
+    pub(crate) fn nt_close(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        if handle == u64::MAX || handle == u64::MAX - 1 {
+            return Ok(STATUS_SUCCESS);
+        }
+        if self.close_handle(handle) {
+            Ok(STATUS_SUCCESS)
+        } else {
+            Ok(STATUS_INVALID_HANDLE)
+        }
     }
 
     /// `NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, *IoStatusBlock,
@@ -1086,6 +1109,11 @@ fn write_both_dir_information(
 /// SSDT thunk for `NtCreateFile` (index 0x55).
 pub(crate) fn ssdt_nt_create_file(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_create_file(cpu, mem)
+}
+
+/// SSDT thunk for `NtClose` (index 0x0f).
+pub(crate) fn ssdt_nt_close(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_close(cpu, mem)
 }
 
 /// SSDT thunk for `NtReadFile` (index 0x06).
