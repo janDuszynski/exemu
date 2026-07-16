@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod boot;
 mod dll;
 mod exc;
 mod fs;
@@ -505,6 +506,11 @@ impl WinOs {
         // NT time syscalls (roadmap W2.14).
         os.set_syscall_handler(time::SSDT_NT_QUERY_SYSTEM_TIME, time::ssdt_nt_query_system_time);
         os.set_syscall_handler(time::SSDT_NT_QUERY_PERFORMANCE_COUNTER, time::ssdt_nt_query_performance_counter);
+        // Process bootstrap (roadmap W3.1): NtContinue is the handoff the
+        // LdrInitializeThunk → signal_start_thread → ZwContinue boot sequence
+        // ends in. Index recovered from the pinned guest ntdll stub (`ZwContinue`
+        // @ RVA 0xf190, `mov eax,0x43`). See [`crate::boot`].
+        os.set_syscall_handler(boot::SSDT_NT_CONTINUE, boot::ssdt_nt_continue);
         os
     }
 
