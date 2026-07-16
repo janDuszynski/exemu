@@ -62,6 +62,20 @@ impl WinOs {
         self.files.contains_key(&handle)
     }
 
+    /// Whether `handle` is one of the three standard-stream sentinels seeded
+    /// into `RTL_USER_PROCESS_PARAMETERS` (StdInput/StdOutput/StdError). These
+    /// are the same small constants the emulated corpus's `GetStdHandle` returns
+    /// (`HANDLE_STDIN`=0x0C / `HANDLE_STDOUT`=0x10 / `HANDLE_STDERR`=0x14), which
+    /// sit far below `next_handle`'s 0x1000 base — so they never collide with a
+    /// real file/kernel handle. Under the Wine boot, kernelbase's `GetStdHandle`
+    /// hands these raw values back to the CRT, which drives `NtWriteFile` /
+    /// `NtReadFile` / `NtQueryVolumeInformationFile` on them (roadmap W3.4).
+    pub(crate) fn is_std_handle(&self, handle: u64) -> bool {
+        handle == crate::HANDLE_STDIN
+            || handle == crate::HANDLE_STDOUT
+            || handle == crate::HANDLE_STDERR
+    }
+
     /// Translate a guest Windows path into a host path under the sandbox.
     /// A drive prefix (`C:`) becomes a directory named after the letter, and
     /// backslashes become path separators; `..` components are dropped so a
@@ -630,6 +644,13 @@ const FILE_END_OF_FILE_INFORMATION: u32 = 20; // returns std info shape for size
 const FILE_FS_SIZE_INFORMATION: u32 = 3;
 const FILE_FS_DEVICE_INFORMATION: u32 = 4;
 
+/// `FILE_DEVICE_NAMED_PIPE` — the DeviceType `GetFileType` maps to
+/// `FILE_TYPE_PIPE`. Reported for the std-stream sentinels so the CRT's
+/// `_isatty` stays FALSE and it drives `NtWriteFile` rather than ConDrv's
+/// `WriteConsoleW` (roadmap W3.4). A FILE_DEVICE_CONSOLE-class value would
+/// instead map to `FILE_TYPE_CHAR` and take the (unserviced) ConDrv path.
+const FILE_DEVICE_NAMED_PIPE: u32 = 0x11;
+
 /// SSDT indices, recovered from the pinned guest `ntdll.dll` stubs' `mov eax,N`.
 pub(crate) const SSDT_NT_CREATE_FILE: u32 = 0x55;
 pub(crate) const SSDT_NT_READ_FILE: u32 = 0x06;
@@ -932,6 +953,11 @@ impl WinOs {
         if handle == u64::MAX || handle == u64::MAX - 1 {
             return Ok(STATUS_SUCCESS);
         }
+        // The std-stream sentinels (roadmap W3.4) are persistent, not tracked in
+        // any object table; closing one is a benign success (never INVALID_HANDLE).
+        if self.is_std_handle(handle) {
+            return Ok(STATUS_SUCCESS);
+        }
         if self.close_handle(handle) {
             Ok(STATUS_SUCCESS)
         } else {
@@ -948,6 +974,14 @@ impl WinOs {
         let buffer = self.syscall_arg(cpu, mem, 5)?;
         let length = self.syscall_arg(cpu, mem, 6)?;
         let offset_ptr = self.syscall_arg(cpu, mem, 7)?;
+        // Std-in path (roadmap W3.4). Reading the standard-input sentinel reports
+        // end-of-file (no bytes transferred). This satisfies the console-hello
+        // gate — which writes but never reads stdin — and is the correct answer
+        // for a non-interactive (piped, empty) stdin: the CRT sees EOF and stops.
+        if self.is_std_handle(handle) {
+            write_iosb(mem, iosb_ptr, STATUS_END_OF_FILE, 0)?;
+            return Ok(STATUS_END_OF_FILE);
+        }
         if !self.is_file_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
@@ -983,6 +1017,21 @@ impl WinOs {
         let buffer = self.syscall_arg(cpu, mem, 5)?;
         let length = self.syscall_arg(cpu, mem, 6)?;
         let offset_ptr = self.syscall_arg(cpu, mem, 7)?;
+        // Console/stdio path (roadmap W3.4). When the CRT's `_isatty` is FALSE
+        // (see `nt_query_volume_information_file`, which reports a non-console
+        // device type for std handles), ucrtbase's `_write` falls through to
+        // kernelbase `WriteFile`, which calls `NtWriteFile` with the raw
+        // std-out/std-err handle unchanged. Route those bytes to the capture+echo
+        // sink (`captured_stdout`/`captured_stderr`) and report the full count.
+        if self.is_std_handle(handle) {
+            let mut data = vec![0u8; length as usize];
+            if length != 0 {
+                mem.read(buffer, &mut data)?;
+            }
+            self.emit(handle == crate::HANDLE_STDERR, &data);
+            write_iosb(mem, iosb_ptr, STATUS_SUCCESS, length)?;
+            return Ok(STATUS_SUCCESS);
+        }
         if !self.is_file_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
@@ -1022,6 +1071,35 @@ impl WinOs {
         let info = self.syscall_arg(cpu, mem, 2)?;
         let length = self.syscall_arg(cpu, mem, 3)?;
         let class = self.syscall_arg(cpu, mem, 4)? as u32;
+        // Std-stream sentinels (roadmap W3.4). The CRT may probe these before
+        // writing; answer as an empty, position-0 pipe. Handled before the
+        // `is_file_handle` guard so a std handle is never rejected as invalid.
+        if self.is_std_handle(handle) {
+            return match class {
+                FILE_STANDARD_INFORMATION => {
+                    if length < 0x18 {
+                        return Ok(STATUS_BUFFER_TOO_SMALL);
+                    }
+                    let zero = [0u8; 0x18];
+                    mem.write(info, &zero)?; // AllocationSize/EndOfFile = 0
+                    mem.write_u32(info + 0x10, 1)?; // NumberOfLinks
+                    write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 0x18)?;
+                    Ok(STATUS_SUCCESS)
+                }
+                FILE_POSITION_INFORMATION => {
+                    if length < 8 {
+                        return Ok(STATUS_BUFFER_TOO_SMALL);
+                    }
+                    mem.write_u64(info, 0)?; // CurrentByteOffset
+                    write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 8)?;
+                    Ok(STATUS_SUCCESS)
+                }
+                _ => {
+                    write_iosb(mem, iosb_ptr, STATUS_INVALID_PARAMETER, 0)?;
+                    Ok(STATUS_INVALID_PARAMETER)
+                }
+            };
+        }
         if !self.is_file_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
@@ -1085,6 +1163,30 @@ impl WinOs {
         let info = self.syscall_arg(cpu, mem, 2)?;
         let length = self.syscall_arg(cpu, mem, 3)?;
         let class = self.syscall_arg(cpu, mem, 4)? as u32;
+        // Std-stream sentinels (roadmap W3.4). `GetFileType` reads DeviceType
+        // from `FILE_FS_DEVICE_INFORMATION`: a FILE_DEVICE_CONSOLE-class value
+        // maps to FILE_TYPE_CHAR and flips the CRT's `_isatty` TRUE (→ the ConDrv
+        // `WriteConsoleW` path, which exemu deliberately does NOT service). Report
+        // FILE_DEVICE_NAMED_PIPE (0x11 → FILE_TYPE_PIPE) so `_isatty` stays FALSE
+        // and the CRT takes the `WriteFile`→`NtWriteFile` stdio path instead.
+        // Handled before the `is_file_handle` guard so a std handle is accepted.
+        if self.is_std_handle(handle) {
+            return match class {
+                FILE_FS_DEVICE_INFORMATION => {
+                    if length < 8 {
+                        return Ok(STATUS_BUFFER_TOO_SMALL);
+                    }
+                    mem.write_u32(info, FILE_DEVICE_NAMED_PIPE)?; // 0x11 → non-console
+                    mem.write_u32(info + 4, 0)?;
+                    write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 8)?;
+                    Ok(STATUS_SUCCESS)
+                }
+                _ => {
+                    write_iosb(mem, iosb_ptr, STATUS_INVALID_PARAMETER, 0)?;
+                    Ok(STATUS_INVALID_PARAMETER)
+                }
+            };
+        }
         if !self.is_file_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
