@@ -16,6 +16,7 @@ exemu-loader = { workspace = true }
 [dev-dependencies]
 exemu-cpu = { workspace = true }
 exemu-memory = { workspace = true }
+exemu-loader = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

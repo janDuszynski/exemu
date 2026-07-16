@@ -22,6 +22,7 @@ const TEB_SIZE: u64 = 0x2000;
 
 // SSDT indices recovered from the pinned guest ntdll.dll stubs' `mov eax,N`.
 const NT_CREATE_SECTION: u32 = 0x4a;
+const NT_QUERY_SECTION: u32 = 0x51;
 const NT_MAP_VIEW: u32 = 0x28;
 const NT_UNMAP_VIEW: u32 = 0x2a;
 const NT_QUERY: u32 = 0x23;
@@ -233,6 +234,153 @@ fn map_bad_section_handle_rejected() {
         &[0xDEAD_BEEF, 0xFFFF_FFFF_FFFF_FFFF, base_ptr, 0, 0, 0, size_ptr, 1, 0, 0x02],
     );
     assert_eq!(st, 0xC000_0008, "unknown section handle → STATUS_INVALID_HANDLE");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- W3.2 real SEC_IMAGE image sections ------------------------------------
+
+/// The pinned Wine kernel32.dll (a real PE image). Absent in a checkout without
+/// the `example_exe/wine-dlls/` prefix — the image-section tests skip-guard on it
+/// so they never break such a checkout (like `dll_smoke`/`ntdll_decode_sweep`).
+const KERNEL32: &str = "../../example_exe/wine-dlls/x86_64-windows/kernel32.dll";
+
+const SECTION_IMAGE_INFORMATION: u64 = 1;
+
+/// Create a `SEC_IMAGE` section over the real kernel32.dll and drive
+/// `NtQuerySection(SectionImageInformation)` + image-mode `NtMapViewOfSection`
+/// through the interpreter/dispatcher, asserting the W3.2 invariants:
+///  - the query reports `Machine == 0x8664`, `TransferAddress == base+entry`,
+///    and nonzero stack sizes;
+///  - the map lays valid PE headers at the returned base, a known section's raw
+///    bytes at `base + rva`, a zero-filled tail;
+///  - the image is **NOT relocated** — a section's bytes equal the file's raw
+///    bytes byte-for-byte even though the view base differs from the preferred
+///    `ImageBase` (a relocated copy would differ at every fixup site).
+#[test]
+fn sec_image_kernel32_query_and_map_unrelocated() {
+    let kpath = std::path::Path::new(KERNEL32);
+    if !kpath.exists() {
+        eprintln!("skipping: pinned kernel32.dll not present ({KERNEL32})");
+        return;
+    }
+    let bytes = std::fs::read(kpath).unwrap();
+    // Parse the same PE independently to derive the expected fields + a known
+    // section to check against.
+    let pe = exemu_loader::parse(&bytes).expect("kernel32.dll parses as PE");
+    let preferred_base = pe.image_base;
+    let expected_transfer = preferred_base + pe.entry_rva as u64;
+    // Pick the first section with real initialized data whose raw len < virtual
+    // size (so it also has a zero-fill tail we can check) — falling back to any
+    // section with data.
+    let known = pe
+        .sections
+        .iter()
+        .find(|s| !s.data.is_empty() && (s.data.len() as u32) < s.virtual_size)
+        .or_else(|| pe.sections.iter().find(|s| !s.data.is_empty()))
+        .expect("kernel32 has an initialized section");
+    let known_rva = known.rva;
+    let known_data = known.data.clone();
+    let known_vsize = known.virtual_size;
+
+    // Stage kernel32 as C:\fake32.dll in the sandbox so CreateFileW can open it.
+    let dir = std::env::temp_dir().join(format!("exemu-w3_2-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(dir.join("C"));
+    std::fs::write(dir.join("C").join("fake32.dll"), &bytes).unwrap();
+    let (mut os, mut mem) = setup(&dir);
+
+    let handle = open_via_createfile(&mut os, &mut mem, "C:\\fake32.dll");
+    assert_ne!(handle, 0xFFFF_FFFF, "CreateFileW opened kernel32");
+
+    // NtCreateSection(&sh, 0, NULL, NULL, PAGE_READONLY, SEC_IMAGE, file).
+    let sh_ptr = SCRATCH;
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_CREATE_SECTION,
+        &[sh_ptr, 0, 0, 0, PAGE_READONLY, SEC_IMAGE, handle],
+    );
+    assert_eq!(st, STATUS_SUCCESS, "NtCreateSection(SEC_IMAGE) over kernel32");
+    let section = mem.read_u64(sh_ptr).unwrap();
+    assert_ne!(section, 0);
+
+    // NtQuerySection(section, SectionImageInformation, &info, 0x40, &retlen).
+    let info = SCRATCH + 0x200;
+    let retlen = SCRATCH + 0x40;
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_QUERY_SECTION,
+        &[section, SECTION_IMAGE_INFORMATION, info, 0x40, retlen],
+    );
+    assert_eq!(st, STATUS_SUCCESS, "NtQuerySection(SectionImageInformation)");
+    assert_eq!(mem.read_u64(retlen).unwrap(), 0x40, "ReturnLength = sizeof(SECTION_IMAGE_INFORMATION)");
+    assert_eq!(mem.read_u64(info).unwrap(), expected_transfer, "TransferAddress = image_base + entry_rva");
+    assert_ne!(mem.read_u64(info + 0x10).unwrap(), 0, "MaximumStackSize nonzero");
+    assert_ne!(mem.read_u64(info + 0x18).unwrap(), 0, "CommittedStackSize nonzero");
+    assert_eq!(mem.read_u16(info + 0x30).unwrap(), 0x8664, "Machine = AMD64");
+    assert_eq!(mem.read_u8(info + 0x32).unwrap(), 1, "ImageContainsCode");
+    assert_eq!(mem.read_u8(info + 0x33).unwrap() & 1, 0, "ImageFlags bit0 clear");
+
+    // A too-small buffer → STATUS_INFO_LENGTH_MISMATCH, ReturnLength set.
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_QUERY_SECTION,
+        &[section, SECTION_IMAGE_INFORMATION, info, 0x10, retlen],
+    );
+    assert_eq!(st, 0xC000_0004, "buffer-too-small → STATUS_INFO_LENGTH_MISMATCH");
+    assert_eq!(mem.read_u64(retlen).unwrap(), 0x40, "ReturnLength still 0x40");
+
+    // NtMapViewOfSection(section, proc, &base=0, 0, 0, NULL, &viewsize=0, 1, 0, RO).
+    let base_ptr = SCRATCH + 0x10;
+    let size_ptr = SCRATCH + 0x18;
+    mem.write_u64(base_ptr, 0).unwrap(); // NULL → kernel picks the base
+    mem.write_u64(size_ptr, 0).unwrap();
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_MAP_VIEW,
+        &[section, 0xFFFF_FFFF_FFFF_FFFF, base_ptr, 0, 0, 0, size_ptr, 1, 0, PAGE_READONLY],
+    );
+    assert_eq!(st, STATUS_SUCCESS, "image-mode NtMapViewOfSection");
+    let base = mem.read_u64(base_ptr).unwrap();
+    assert_ne!(base, 0, "a view base was written back");
+    assert_eq!(base & 0xFFFF, 0, "view base is 64 KiB aligned");
+    assert_ne!(base, preferred_base, "view base differs from preferred ImageBase (proves the relocation-invariant test is meaningful)");
+    let view_size = mem.read_u64(size_ptr).unwrap();
+    assert_eq!(view_size, pe.size_of_image as u64, "*ViewSize = SizeOfImage");
+
+    // 1) Valid PE headers at base: MZ @base, PE\0\0 @ base+e_lfanew.
+    assert_eq!(&read_bytes(&mem, base, 2), b"MZ", "MZ magic at the image base");
+    let e_lfanew = mem.read_u32(base + 0x3C).unwrap() as u64;
+    assert_eq!(&read_bytes(&mem, base + e_lfanew, 4), b"PE\0\0", "PE\\0\\0 at base+e_lfanew");
+
+    // 2) A known section's raw bytes land at base + rva, UN-RELOCATED: they equal
+    //    the file's raw bytes byte-for-byte. Because the view base differs from
+    //    the preferred ImageBase, a relocated copy would have altered every DIR64
+    //    fixup site inside this range; exact equality proves no relocation was
+    //    applied here (the guest's build_module does it later).
+    let mapped = read_bytes(&mem, base + known_rva as u64, known_data.len());
+    assert_eq!(mapped, known_data, "section bytes at base+rva equal the file's raw bytes (un-relocated)");
+
+    // 3) Zero-fill tail: past the raw data up to VirtualSize is zero.
+    if (known_data.len() as u32) < known_vsize {
+        let tail_off = base + known_rva as u64 + known_data.len() as u64;
+        assert_eq!(mem.read_u8(tail_off).unwrap(), 0, "section tail past raw data is zero-filled");
+    }
+
+    // 4) The view queries as MEM_IMAGE.
+    let mbi = SCRATCH + 0x300;
+    let ret_ptr = SCRATCH + 0x38;
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_QUERY,
+        &[0xFFFF_FFFF_FFFF_FFFF, base, MEMORY_BASIC_INFORMATION, mbi, 0x30, ret_ptr],
+    );
+    assert_eq!(st, STATUS_SUCCESS);
+    assert_eq!(mem.read_u32(mbi + 0x28).unwrap(), MEM_IMAGE, "MBI.Type = MEM_IMAGE");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
