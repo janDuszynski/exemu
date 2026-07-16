@@ -27,6 +27,14 @@ const NT_WRITE_FILE: u32 = 0x08;
 const NT_QUERY_INFORMATION_FILE: u32 = 0x11;
 const NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
 const NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 0x49;
+const NT_CLOSE: u32 = 0x0f;
+
+// The std-stream sentinels seeded into RTL_USER_PROCESS_PARAMETERS
+// (StdInput@0x20 / StdOutput@0x28 / StdError@0x30), which kernelbase's
+// GetStdHandle returns raw to the CRT (roadmap W3.4).
+const HANDLE_STDIN: u64 = 0x0C;
+const HANDLE_STDOUT: u64 = 0x10;
+const HANDLE_STDERR: u64 = 0x14;
 
 const STATUS_SUCCESS: u64 = 0;
 const STATUS_END_OF_FILE: u64 = 0xC000_0011;
@@ -337,6 +345,105 @@ fn nt_query_volume_and_bad_handle() {
         &[0xDEAD_BEEF, iosb_ptr, info_ptr, 0x18, FILE_STANDARD_INFORMATION],
     );
     assert_eq!(st, STATUS_INVALID_HANDLE, "bad handle → STATUS_INVALID_HANDLE");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The W3.4 console bridge: the std-stream sentinels that GetStdHandle hands the
+/// CRT drive host stdio through the *stdio* (NtWriteFile) path, not ConDrv.
+///
+/// This exercises the exact chain a Wine-hosted console `main` takes once its CRT
+/// has decided `_isatty` is FALSE: `GetStdHandle` → raw std handle → `WriteFile`
+/// → `NtWriteFile` on that handle. We assert the bytes reach the capture sink
+/// (`captured_stdout`/`captured_stderr`), that the IO_STATUS_BLOCK reports the
+/// full count, that `NtQueryVolumeInformationFile(FILE_FS_DEVICE_INFORMATION)`
+/// reports a *non-console* device type (0x11 → FILE_TYPE_PIPE, the invariant that
+/// keeps `_isatty` FALSE), that reading std-in reports EOF, and that closing a
+/// std handle is a benign success.
+#[test]
+fn nt_std_handles_bridge_to_host_stdio() {
+    let dir = std::env::temp_dir().join(format!("exemu-w3_4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem) = setup(&dir);
+
+    let iosb_ptr = SCRATCH + 0x10;
+    let info_ptr = SCRATCH + 0x40;
+    let data_ptr = SCRATCH + 0x300;
+
+    // GetStdHandle-equivalent: seed a ProcessParameters block and read the
+    // StdOutput field (PP+0x28) — the raw value GetStdHandle would return.
+    let pp = SCRATCH + 0x800;
+    mem.write_u64(pp + 0x20, HANDLE_STDIN).unwrap();
+    mem.write_u64(pp + 0x28, HANDLE_STDOUT).unwrap();
+    mem.write_u64(pp + 0x30, HANDLE_STDERR).unwrap();
+    let std_out = mem.read_u64(pp + 0x28).unwrap();
+    let std_err = mem.read_u64(pp + 0x30).unwrap();
+    let std_in = mem.read_u64(pp + 0x20).unwrap();
+    assert_eq!(std_out, HANDLE_STDOUT, "GetStdHandle(STD_OUTPUT) == the seeded sentinel");
+
+    // --- NtWriteFile(std_out, "hello\n") → captured_stdout, IOSB.Information=6. ---
+    let payload = b"hello\n";
+    mem.write(data_ptr, payload).unwrap();
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_WRITE_FILE,
+        &[std_out, 0, 0, 0, iosb_ptr, data_ptr, payload.len() as u64, 0, 0],
+    );
+    assert_eq!(st, STATUS_SUCCESS, "NtWriteFile(std_out) succeeds");
+    assert_eq!(mem.read_u32(iosb_ptr).unwrap() as u64, STATUS_SUCCESS, "IOSB.Status");
+    assert_eq!(mem.read_u64(iosb_ptr + 8).unwrap(), payload.len() as u64, "IOSB.Information = 6");
+    assert_eq!(os.captured_stdout(), payload, "bytes landed on captured stdout");
+    assert_eq!(os.captured_stderr(), b"", "nothing on stderr yet");
+
+    // --- A std-err write routes to captured_stderr. ---
+    let err_payload = b"oops\n";
+    mem.write(data_ptr, err_payload).unwrap();
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_WRITE_FILE,
+        &[std_err, 0, 0, 0, iosb_ptr, data_ptr, err_payload.len() as u64, 0, 0],
+    );
+    assert_eq!(st, STATUS_SUCCESS, "NtWriteFile(std_err) succeeds");
+    assert_eq!(os.captured_stderr(), err_payload, "bytes landed on captured stderr");
+    assert_eq!(os.captured_stdout(), payload, "stdout unchanged by the stderr write");
+
+    // --- The _isatty-FALSE invariant: FILE_FS_DEVICE_INFORMATION on a std handle
+    //     reports a NON-console device type (0x11 → FILE_TYPE_PIPE). ---
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_QUERY_VOLUME_INFORMATION_FILE,
+        &[std_out, iosb_ptr, info_ptr, 8, FILE_FS_DEVICE_INFORMATION],
+    );
+    assert_eq!(st, STATUS_SUCCESS, "NtQueryVolumeInformationFile(device) on std handle");
+    assert_eq!(mem.read_u32(info_ptr).unwrap(), 0x11, "DeviceType = FILE_DEVICE_NAMED_PIPE (non-console)");
+
+    // --- NtQueryInformationFile(FILE_STANDARD_INFORMATION) on a std handle is a
+    //     benign "empty pipe" answer (not INVALID_HANDLE). ---
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_QUERY_INFORMATION_FILE,
+        &[std_out, iosb_ptr, info_ptr, 0x18, FILE_STANDARD_INFORMATION],
+    );
+    assert_eq!(st, STATUS_SUCCESS, "NtQueryInformationFile(standard) on std handle");
+    assert_eq!(mem.read_u64(info_ptr + 8).unwrap(), 0, "EndOfFile = 0 (empty stream)");
+
+    // --- Reading std-in reports end-of-file (the console-hello gate never reads). ---
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_READ_FILE,
+        &[std_in, 0, 0, 0, iosb_ptr, data_ptr, 64, 0, 0],
+    );
+    assert_eq!(st, STATUS_END_OF_FILE, "NtReadFile(std_in) → STATUS_END_OF_FILE");
+
+    // --- Closing a std handle is a benign success (never INVALID_HANDLE). ---
+    let st = syscall(&mut os, &mut mem, NT_CLOSE, &[std_out]);
+    assert_eq!(st, STATUS_SUCCESS, "NtClose(std_out) is a benign success");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

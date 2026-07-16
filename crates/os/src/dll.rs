@@ -938,9 +938,18 @@ impl WinOs {
         // so RtlNormalizeProcessParams must treat them as already-normalized.
         mem.write_u32(pp + 0x08, 0x1)?;
         // DebugFlags @0x0C, ConsoleFlags @0x18: 0 (default).
-        // ConsoleHandle @0x10, StandardInput @0x20, StandardOutput @0x28,
-        // StandardError @0x30: left 0 (the real console is wired in W3.4; a null
-        // std handle is the correct "not yet a console process" value here).
+        // ConsoleHandle @0x10: 0 — there is no ConDrv console object (correct;
+        // it keeps GetConsoleMode/console-attach probes returning "no console").
+        // StandardInput @0x20 / StandardOutput @0x28 / StandardError @0x30: the
+        // std-stream sentinels fs.rs recognises (roadmap W3.4). kernelbase's
+        // GetStdHandle is a pure PEB→ProcessParameters walk that returns these
+        // raw, so seeding them here is what makes GetStdHandle hand the CRT a
+        // usable handle; NtWriteFile/NtReadFile/NtQueryVolumeInformationFile then
+        // route them to host stdio. These small constants (0x0C/0x10/0x14) sit
+        // far below the file-arena's 0x1000 handle base — no collision.
+        mem.write_u64(pp + 0x20, crate::HANDLE_STDIN)?;
+        mem.write_u64(pp + 0x28, crate::HANDLE_STDOUT)?;
+        mem.write_u64(pp + 0x30, crate::HANDLE_STDERR)?;
 
         // CurrentDirectory.DosPath @0x38 (UNICODE_STRING, Handle @0x48): a real
         // "C:\" so RtlSetCurrentDirectory_U (reads Buffer @0x40) can parse it.
