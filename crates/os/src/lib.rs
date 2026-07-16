@@ -45,6 +45,7 @@ use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Reg, Result};
 pub use api::Api;
 pub use apiset::{api_set_hash, build_populated_namespace, ApiSetNamespace, HASH_FACTOR};
 pub use boot::{RVA_LDR_INITIALIZE_THUNK, RVA_RTL_USER_THREAD_START, RVA_WINE_UNIX_CALL_DISPATCHER};
+pub use exc::RVA_KI_USER_EXCEPTION_DISPATCHER;
 pub use syscall::SyscallHandler;
 pub use sync::{SignalOp, SyncKind};
 pub use unixlib::{UnixEntry, Unixlib};

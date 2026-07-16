@@ -16,6 +16,16 @@ use exemu_core::{CpuState, Memory, Result};
 /// reserve on the stack and what `RtlCaptureContext` fills.
 pub(crate) const CONTEXT_SIZE: u64 = 0x4d0;
 
+/// `KiUserExceptionDispatcher` — ntdll's user-mode entry the kernel transfers a
+/// hardware/software exception to (roadmap W3.3). The prologue reads its two
+/// arguments straight off the stack it is entered on: `mov rdx, rsp`
+/// (ContextRecord) and `lea rcx, [rsp+0x4F0]` (ExceptionRecord), i.e. it is
+/// entered with **RSP pointing at the CONTEXT** and **no return address pushed**,
+/// then tail-calls `RtlDispatchException`. Recovered from the pinned Wine 11.0
+/// `ntdll.dll` disassembly (permitted guest analysis); cross-checked BY NAME at
+/// the wire site when the symbol is exported (roadmap W3.3).
+pub const RVA_KI_USER_EXCEPTION_DISPATCHER: u64 = 0x10a30;
+
 // ---- EXCEPTION_RECORD (x64) -------------------------------------------------
 
 /// `sizeof(EXCEPTION_RECORD)` — header (0x20) + 15 information slots.
@@ -481,6 +491,67 @@ impl WinOs {
         );
         // Windows returns the exception code as the process exit code.
         Ok(Outcome::Exit(code as i32))
+    }
+
+    /// Deliver a hardware/software CPU fault to the guest the way the NT kernel
+    /// does (roadmap W3.3): build the `KiUserExceptionDispatcher` stack frame on
+    /// the guest stack and seat the CPU on ntdll's dispatcher, so Wine's own
+    /// `RtlDispatchException` (real guest code, walking .pdata/.xdata) runs. A
+    /// handled exception returns through `NtContinue` (the CONTEXT this builds is
+    /// exactly what `nt_continue` consumes); an unhandled one runs off to
+    /// `NtTerminateProcess`.
+    ///
+    /// `cpu.rip` must already hold the *reported* faulting RIP the CONTEXT should
+    /// carry (for `#BP` the caller advances it past the `int3`; see the run-loop
+    /// classifier). The stack layout, from `new_rsp = (old_rsp - 0x5C0) & !0xF`:
+    ///
+    /// ```text
+    ///   +0x000  CONTEXT              (0x4D0)  write_context(cpu)  — RSP the dispatcher reads
+    ///   +0x4D0  CONTEXT_EX           (0x18)   zero-filled (never inspected)
+    ///   +0x4F0  EXCEPTION_RECORD     (0x98)   code / address / info
+    ///   +0x590  machine frame        (0x28)   RIP / CS=0x33 / RFLAGS / OldRSP / SS=0x2B
+    /// ```
+    ///
+    /// No return address is pushed: the dispatcher expects `RSP → CONTEXT` and
+    /// does `mov rdx,rsp; lea rcx,[rsp+0x4F0]`.
+    pub fn deliver_hw_exception(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+        ntdll_base: u64,
+        code: u32,
+        address: u64,
+        info: &[u64],
+    ) -> Result<()> {
+        let old_rsp = cpu.rsp();
+        let new_rsp = (old_rsp - 0x5C0) & !0xF;
+        let fault_rip = cpu.rip;
+        let rflags = cpu.rflags;
+
+        // CONTEXT @ +0x000 — snapshot the faulting register file (cpu.rip is the
+        // reported faulting RIP; write_context lays Rsp@+0x98 = old_rsp,
+        // Rip@+0xf8 = fault_rip).
+        write_context(mem, new_rsp, cpu)?;
+
+        // CONTEXT_EX @ +0x4D0 (0x18): zeroed — the dispatcher never reads it.
+        for i in 0..3u64 {
+            mem.write_u64(new_rsp + 0x4D0 + i * 8, 0)?;
+        }
+
+        // EXCEPTION_RECORD @ +0x4F0: ExceptionFlags = 0 (search phase).
+        write_exception_record(mem, new_rsp + 0x4F0, code, 0, address, info)?;
+
+        // Machine frame @ +0x590 — the trap frame the kernel synthesizes.
+        mem.write_u64(new_rsp + 0x590, fault_rip)?; // RIP
+        mem.write_u64(new_rsp + 0x598, 0x33)?; // CS (user 64-bit)
+        mem.write_u64(new_rsp + 0x5A0, rflags)?; // RFLAGS
+        mem.write_u64(new_rsp + 0x5A8, old_rsp)?; // OldRSP (== new_rsp + 0x5A8)
+        mem.write_u64(new_rsp + 0x5B0, 0x2B)?; // SS (user data)
+
+        // Seat the CPU on the dispatcher with RSP → CONTEXT, no return address.
+        cpu.set_rsp(new_rsp);
+        cpu.rip = ntdll_base + RVA_KI_USER_EXCEPTION_DISPATCHER;
+        Ok(())
     }
 
     /// Allocate the five guest buffers a dispatch needs (record, orig/work/
