@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Reg, Result};
 
 pub use api::Api;
+pub use boot::{RVA_LDR_INITIALIZE_THUNK, RVA_RTL_USER_THREAD_START};
 pub use syscall::SyscallHandler;
 pub use sync::{SignalOp, SyncKind};
 pub use unixlib::{UnixEntry, Unixlib};
@@ -106,6 +107,13 @@ pub struct WinConfig {
     pub image_entry: u64,
     /// The main image's DLL/base name (e.g. `program.exe`), for its Ldr entry.
     pub image_name: String,
+    /// Host directory holding the pinned Wine PE DLL set
+    /// (`ntdll.dll`/`kernelbase.dll`/`kernel32.dll`/`ucrtbase.dll`, …). When
+    /// `Some` and the files exist, [`WinOs::load_wine_core`] maps those four as
+    /// **real guest images** (relocated + inter-bound to real code) instead of
+    /// the emulated-thunk stand-ins (roadmap W3.2). `None` (the default) keeps
+    /// every binary on the existing emulated-DLL path, byte-for-byte.
+    pub wine_dll_dir: Option<String>,
 }
 
 impl Default for WinConfig {
@@ -132,6 +140,7 @@ impl Default for WinConfig {
             image_size: 0,
             image_entry: 0,
             image_name: String::new(),
+            wine_dll_dir: None,
         }
     }
 }
