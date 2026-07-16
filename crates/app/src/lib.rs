@@ -186,6 +186,14 @@ pub struct RunResult {
 }
 
 /// A loaded, ready-to-run process.
+/// The source of a run-loop exception the W3.3 bridge classifies: either a CPU
+/// interrupt vector (`Exit::Interrupt(n)` — #DE=0, #BP=3) or a structured
+/// [`EmuError`] (an access violation from a memory fault).
+enum ExcSource<'a> {
+    Interrupt(u8),
+    Error(&'a EmuError),
+}
+
 pub struct Process {
     mem: VirtualMemory,
     cpu: Interpreter,
@@ -196,6 +204,14 @@ pub struct Process {
     /// Image base, kept for virtual unwinding in the fault reporter (the
     /// unwind table itself is owned by the OS layer — see `os.unwind_table`).
     image_base: u64,
+    /// Nesting depth of the hardware→software exception bridge (roadmap W3.3):
+    /// how many guest faults are currently being dispatched through
+    /// `KiUserExceptionDispatcher` without an intervening `NtContinue`. A fault
+    /// that occurs while already inside the dispatcher (a corrupt/double fault)
+    /// must NOT be re-delivered forever — past a small bound the bridge gives up
+    /// and falls through to the fault reporter. Reset to 0 whenever `NtContinue`
+    /// resumes the guest (a handled exception).
+    exc_depth: u32,
 }
 
 impl Process {
@@ -537,6 +553,7 @@ impl Process {
             entry: image.entry_va(),
             max_steps: cfg.max_steps,
             image_base: base,
+            exc_depth: 0,
         })
     }
 
@@ -576,13 +593,30 @@ impl Process {
                 recent.pop_front();
             }
 
+            let step_rip = self.cpu.state().rip;
             let outcome = self.cpu.step(&mut self.mem, &mut self.os);
             let tail = || recent.iter().copied().collect::<Vec<_>>();
             match outcome {
-                Ok(Exit::Continue) => steps += 1,
+                Ok(Exit::Continue) => {
+                    steps += 1;
+                    // Guest made forward progress off the exception-dispatcher
+                    // entry — a subsequent, unrelated fault is a fresh delivery.
+                    // (A tight fault-at-entry loop never reaches here off-entry,
+                    // so its depth climbs to the bail-out bound; W3.3.)
+                    if self.exc_depth != 0 && !self.at_exc_dispatcher(step_rip) {
+                        self.exc_depth = 0;
+                    }
+                }
                 Ok(Exit::ProcessExit(code)) => break code,
                 Ok(Exit::Halted) => break 0,
                 Ok(Exit::Interrupt(n)) => {
+                    // Hardware→software exception bridge (roadmap W3.3): on the
+                    // Wine-boot path a bridgeable CPU exception (#DE/#BP) becomes
+                    // a guest EXCEPTION_RECORD delivered via
+                    // KiUserExceptionDispatcher instead of terminating here.
+                    if self.try_deliver_hw_exception(ExcSource::Interrupt(n))? {
+                        continue;
+                    }
                     return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &tail()));
                 }
                 // A native SYSCALL is serviced inside `Cpu::step` (the OS layer's
@@ -595,7 +629,12 @@ impl Process {
                         &tail(),
                     ));
                 }
-                Err(e) => return Err(self.fault(e, steps, &tail())),
+                Err(e) => {
+                    if self.try_deliver_hw_exception(ExcSource::Error(&e))? {
+                        continue;
+                    }
+                    return Err(self.fault(e, steps, &tail()));
+                }
             }
         };
 
@@ -606,6 +645,86 @@ impl Process {
             stderr: self.os.captured_stderr().to_vec(),
             sandbox: self.sandbox.clone(),
         })
+    }
+
+    /// Is `rip` the `KiUserExceptionDispatcher` entry of the loaded Wine ntdll?
+    /// Used by the W3.3 recursion guard to tell "still faulting at the dispatcher
+    /// entry" (an infinite re-delivery loop) from real forward progress.
+    fn at_exc_dispatcher(&self, rip: u64) -> bool {
+        self.os
+            .module_base("ntdll.dll")
+            .is_some_and(|b| rip == b + exemu_os::RVA_KI_USER_EXCEPTION_DISPATCHER)
+    }
+
+    /// The hardware→software exception bridge (roadmap W3.3). If `src` is a
+    /// bridgeable CPU exception *and* the Wine core is mapped (so a guest
+    /// `RtlDispatchException` exists to run), build the `KiUserExceptionDispatcher`
+    /// frame and seat the CPU on it, returning `Ok(true)` — the caller `continue`s
+    /// the run loop and the guest dispatches the exception, resuming through
+    /// `NtContinue` if handled. Returns `Ok(false)` when the exception should keep
+    /// the existing fault-reporter path (no Wine core / non-bridgeable source /
+    /// recursion bound hit).
+    fn try_deliver_hw_exception(&mut self, src: ExcSource<'_>) -> Result<bool> {
+        // Guard: only on the Wine-boot path (real ntdll mapped). The emulated
+        // corpus keeps its fault reporter, unchanged.
+        let Some(ntdll_base) = self.os.module_base("ntdll.dll") else {
+            return Ok(false);
+        };
+        // Recursion guard: a fault while already dispatching (esp. a repeated
+        // fault at the dispatcher entry) must not re-deliver forever.
+        const MAX_EXC_DEPTH: u32 = 8;
+        if self.exc_depth >= MAX_EXC_DEPTH {
+            return Ok(false);
+        }
+
+        // Classify into (ExceptionCode, ExceptionAddress, ExceptionInformation).
+        // Only genuine CPU exceptions bridge; decoder/OS gaps stay on the fault
+        // reporter so they surface as real emulator bugs.
+        let cpu = self.cpu.state();
+        let (code, address, info): (u32, u64, Vec<u64>) = match src {
+            // #DE — integer divide error (div_op divisor==0 / signed overflow).
+            ExcSource::Interrupt(0) => (0xC000_0094, cpu.rip, Vec::new()),
+            // #BP — int3 (0xCC). Windows reports the address *after* the byte and
+            // the delivered CONTEXT.Rip is fault+1; the interpreter left rip AT
+            // the 0xCC (unlike `int n`/0xCD, which advances), so bump it.
+            ExcSource::Interrupt(3) => (0x8000_0003, cpu.rip.wrapping_add(1), Vec::new()),
+            // Access violation. info = [rw, faulting-address]; rw: 0=read, 1=write,
+            // 8=execute (DEP). Unmapped carries no access kind → default read.
+            ExcSource::Error(e) => match e.cause() {
+                EmuError::Permission { addr, needed } => {
+                    let rw = match *needed {
+                        "write" => 1u64,
+                        "execute" => 8u64,
+                        _ => 0u64,
+                    };
+                    (0xC000_0005, *addr, vec![rw, *addr])
+                }
+                EmuError::Unmapped { addr, .. } => (0xC000_0005, *addr, vec![0, *addr]),
+                // Decoder gaps (Decode/Unsupported, incl. UD2), OS-service and
+                // other errors are NOT masked as guest #UD/exceptions.
+                _ => return Ok(false),
+            },
+            // Any other interrupt vector (int n, #GP synthesis, …) isn't bridged.
+            ExcSource::Interrupt(_) => return Ok(false),
+        };
+
+        // For #BP the reported/CONTEXT Rip is fault+1: advance the live rip so
+        // write_context captures it (address already computed as rip+1 above).
+        if let ExcSource::Interrupt(3) = src {
+            let rip = self.cpu.state().rip;
+            self.cpu.state_mut().rip = rip.wrapping_add(1);
+        }
+
+        self.os.deliver_hw_exception(
+            self.cpu.state_mut(),
+            &mut self.mem,
+            ntdll_base,
+            code,
+            address,
+            &info,
+        )?;
+        self.exc_depth += 1;
+        Ok(true)
     }
 
     /// Wrap a fault with a diagnostic snapshot: the faulting instruction
