@@ -117,6 +117,92 @@ fn peb_field_walk_populates_every_probed_offset() {
     assert_eq!(read_wstr(&mem, cmd_buf), "program.exe arg1");
 }
 
+/// Structural check of the full `RTL_USER_PROCESS_PARAMETERS` (roadmap W3.6):
+/// the fields the pinned Wine `init_user_process_params` reads deep in the
+/// struct must be present, correctly sized, and internally consistent — the
+/// 0x80-byte stub faulted the boot at `+0x3f0`, so assert the whole header
+/// (>= 0x410), Flags NORMALIZED, valid Buffer pointers, a double-null Environment
+/// with a matching EnvironmentSize, and zeroed tail fields.
+#[test]
+fn process_parameters_is_full_and_wine_readable() {
+    let (mem,) = setup();
+    let peb = PEB_BASE;
+    let pp = mem.read_u64(peb + 0x20).unwrap();
+    assert_ne!(pp, 0, "PEB.ProcessParameters must be published");
+
+    // MaximumLength @0x00 / Length @0x04 cover the full verified 0x410 header.
+    let max_len = mem.read_u32(pp).unwrap();
+    let length = mem.read_u32(pp + 0x04).unwrap();
+    assert!(max_len >= 0x410, "MaximumLength {max_len:#x} must span the full header");
+    assert!(length >= 0x410, "Length {length:#x} must span the full header");
+
+    // Flags @0x08 has NORMALIZED (0x1): our Buffer pointers are ABSOLUTE, so
+    // RtlNormalizeProcessParams (which early-returns when NORMALIZED is set)
+    // leaves them untouched.
+    assert_eq!(mem.read_u32(pp + 0x08).unwrap() & 0x1, 0x1, "Flags must be NORMALIZED");
+
+    // Each of the four leading UNICODE_STRINGs the loader copies points at a
+    // valid, non-null Buffer: CurrentDirectory 0x38, DllPath 0x50,
+    // ImagePathName 0x60, CommandLine 0x70.
+    let read_us = |off: u64| -> (u16, u64) {
+        (mem.read_u16(pp + off).unwrap(), mem.read_u64(pp + off + 8).unwrap())
+    };
+    let (cd_len, cd_buf) = read_us(0x38);
+    assert!(cd_buf != 0 && cd_len > 0, "CurrentDirectory must have a buffer");
+    assert_eq!(read_wstr(&mem, cd_buf), "C:\\");
+    let (_, dll_buf) = read_us(0x50);
+    assert!(dll_buf != 0, "DllPath must have a buffer");
+    assert_eq!(read_wstr(&mem, dll_buf), "C:\\windows\\system32");
+    let (img_len, img_buf) = read_us(0x60);
+    assert!(img_buf != 0 && img_len > 0);
+    assert_eq!(read_wstr(&mem, img_buf), "C:\\program.exe");
+    let (cmd_len, cmd_buf) = read_us(0x70);
+    assert!(cmd_buf != 0 && cmd_len > 0);
+    assert_eq!(read_wstr(&mem, cmd_buf), "program.exe arg1");
+
+    // WindowTitle 0xb0, DesktopInfo 0xc0, ShellInfo 0xd0, RuntimeData 0xe0 are
+    // valid empty UNICODE_STRINGs (Length 0, a readable NUL Buffer). Offsets
+    // VERIFIED from init_user_process_params (leaq 0xb0/0xc0/0xd0/0xe0(%rbx)).
+    for off in [0xb0u64, 0xc0, 0xd0, 0xe0] {
+        let (len, buf) = read_us(off);
+        assert_eq!(len, 0, "field @{off:#x} is an empty string");
+        assert_ne!(buf, 0, "field @{off:#x} still needs a valid (NUL) buffer");
+        assert_eq!(mem.read_u16(buf).unwrap(), 0, "empty buffer is NUL-terminated");
+    }
+
+    // Environment @0x80 is non-null, EnvironmentSize @0x3f0 (VERIFIED offset —
+    // the boot's former 5743-instr fault) matches the block, and the block ends
+    // in a double-NUL (name=value\0…\0\0 UTF-16).
+    let env = mem.read_u64(pp + 0x80).unwrap();
+    assert_ne!(env, 0, "Environment must be non-null");
+    let env_size = mem.read_u64(pp + 0x3f0).unwrap();
+    assert!(env_size >= 4, "EnvironmentSize {env_size:#x} covers at least the terminator");
+    assert_eq!(env_size % 2, 0, "UTF-16 environment size is even");
+    // Last two UTF-16 units of the block are both NUL (block terminator + the
+    // final entry's own NUL).
+    let last = env + env_size - 2;
+    assert_eq!(mem.read_u16(last).unwrap(), 0, "block ends in NUL");
+    assert_eq!(mem.read_u16(last - 2).unwrap(), 0, "double-NUL terminated");
+    // A known variable resolves in the block (SystemRoot=…), proving it's a real
+    // name=value list rather than an empty stub.
+    let mut blob = Vec::new();
+    let mut i = 0u64;
+    while i < env_size - 2 {
+        blob.push(mem.read_u16(env + i).unwrap());
+        i += 2;
+    }
+    let text = String::from_utf16(&blob).unwrap();
+    assert!(text.contains("SystemRoot=C:\\Windows"), "env carries real variables");
+
+    // The scalar at +0x408 (read by init_user_process_params) is inside the
+    // allocation and reads back its zero default.
+    assert_eq!(mem.read_u32(pp + 0x408).unwrap(), 0);
+    // The full HeapPartitionName region (0x3e8..0x408) the design mis-labeled is
+    // zeroed (EnvironmentSize @0x3f0 aside, which we asserted above).
+    assert_eq!(mem.read_u64(pp + 0x3e8).unwrap(), 0);
+    assert_eq!(mem.read_u32(pp + 0x3f8).unwrap(), 0);
+}
+
 #[test]
 fn teb_field_walk_populates_every_dereferenced_offset() {
     let (mem,) = setup();

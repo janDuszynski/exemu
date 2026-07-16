@@ -428,3 +428,48 @@ fn wine_core_seeds_valid_apiset_map() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// W3.6 — `PEB.ProcessParameters` (x64 PEB `+0x20`) points at a **full**
+/// `RTL_USER_PROCESS_PARAMETERS` (>= 0x410, Flags NORMALIZED, a readable
+/// CommandLine, an Environment + matching EnvironmentSize @0x3f0). The prior
+/// 0x80-byte stub faulted Wine's `init_user_process_params` at `+0x3f0` after
+/// 5743 boot instructions; this proves the deep-read fields are now present.
+/// `init_ldr` (run in `setup`) builds it, so this needs no live boot.
+#[test]
+fn wine_core_seeds_full_process_parameters() {
+    if !Path::new(WINE_DLLS).join("ntdll.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/ntdll.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("exemu-w3_6-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem) = setup(&dir);
+    os.load_wine_core(&mut mem).expect("load_wine_core ok").expect("the four Wine core DLLs present");
+
+    // PEB.ProcessParameters (x64 PEB +0x20) is non-null and full-sized.
+    let pp = mem.read_u64(PEB_ADDR + 0x20).unwrap();
+    assert_ne!(pp, 0, "PEB.ProcessParameters seeded");
+    assert!((DLL_BASE..DLL_BASE + DLL_SIZE).contains(&pp), "PP in the loader arena");
+    assert!(mem.read_u32(pp).unwrap() >= 0x410, "MaximumLength spans the full header");
+    assert_eq!(mem.read_u32(pp + 0x08).unwrap() & 0x1, 0x1, "Flags NORMALIZED");
+
+    // CommandLine @0x70 (UNICODE_STRING) points at the mapped UTF-16 command line.
+    let cmd_len = mem.read_u16(pp + 0x70).unwrap();
+    let cmd_buf = mem.read_u64(pp + 0x70 + 8).unwrap();
+    assert!(cmd_len > 0 && cmd_buf != 0, "CommandLine populated");
+    let units: Vec<u16> =
+        (0..cmd_len as u64 / 2).map(|i| mem.read_u16(cmd_buf + i * 2).unwrap()).collect();
+    assert_eq!(String::from_utf16(&units).unwrap(), "C:\\program.exe");
+
+    // Environment @0x80 + EnvironmentSize @0x3f0 (the former fault offset) agree,
+    // and the block is double-NUL terminated.
+    let env = mem.read_u64(pp + 0x80).unwrap();
+    let env_size = mem.read_u64(pp + 0x3f0).unwrap();
+    assert_ne!(env, 0, "Environment non-null");
+    assert!(env_size >= 4, "EnvironmentSize covers the terminator");
+    assert_eq!(mem.read_u16(env + env_size - 2).unwrap(), 0, "env ends in NUL");
+    assert_eq!(mem.read_u16(env + env_size - 4).unwrap(), 0, "env double-NUL terminated");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

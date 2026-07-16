@@ -829,9 +829,10 @@ impl WinOs {
     /// is confirmed from the pinned guest `ntdll.dll` (`RtlGetNtGlobalFlags`
     /// reads `gs:[0x30]`→`[+0x60]`(PEB)→`[+0xBC]`); the OS-version block,
     /// `SessionId` and `BeingDebugged` are the documented winternl PEB fields.
-    /// `ProcessParameters` points at a minimal `RTL_USER_PROCESS_PARAMETERS`
-    /// (public winternl.h layout) whose `ImagePathName`/`CommandLine`
-    /// UNICODE_STRINGs reach the module path and the app's UTF-16 command line.
+    /// `ProcessParameters` points at a full `RTL_USER_PROCESS_PARAMETERS` built
+    /// by [`Self::build_process_parameters`] (verified against the pinned Wine
+    /// ntdll) — ImagePathName/CommandLine/CurrentDirectory/DllPath UNICODE_STRINGs,
+    /// a real Environment block + EnvironmentSize, Flags=NORMALIZED.
     fn seed_peb(&mut self, mem: &mut dyn Memory) -> Result<()> {
         let peb = self.cfg.peb_addr;
         let (
@@ -866,24 +867,147 @@ impl WinOs {
         // Session 0 (the console/services session in a single-session model).
         mem.write_u32(peb + off_session_id, 0)?;
 
-        // Minimal RTL_USER_PROCESS_PARAMETERS. Public winternl.h layout:
-        //   64: Reserved1[16] @0x00, Reserved2[10] (PVOID) @0x10..0x60,
-        //       ImagePathName (UNICODE_STRING) @0x60, CommandLine @0x70. Size 0x80.
-        //   32: Reserved2[10] (4-byte) @0x10..0x38, ImagePathName @0x38,
-        //       CommandLine @0x40. Size 0x50.
-        let (pp_size, off_image_path, off_command_line) =
-            if self.cfg.is_64bit { (0x80u64, 0x60u64, 0x70u64) } else { (0x50, 0x38, 0x40) };
-        let pp = self.ldr_alloc(pp_size);
-        // ImagePathName ← the module path (already a "C:\\…" string).
-        let (img_buf, img_len) = self.ldr_write_wstr(mem, &self.cfg.module_path_w.clone())?;
-        self.write_unicode_string(mem, pp + off_image_path, img_buf, img_len)?;
-        // CommandLine ← the app's UTF-16 command line, if one was mapped.
-        if self.cfg.cmdline_ptr_w != 0 {
-            let cmd_len = wstr_byte_len(mem, self.cfg.cmdline_ptr_w)?;
-            self.write_unicode_string(mem, pp + off_command_line, self.cfg.cmdline_ptr_w, cmd_len)?;
-        }
+        // A full RTL_USER_PROCESS_PARAMETERS, pointed at by PEB.ProcessParameters.
+        let pp = self.build_process_parameters(mem)?;
         self.write_ptr(mem, peb + off_process_params, pp)?;
         Ok(())
+    }
+
+    /// Build a full, correctly-sized `RTL_USER_PROCESS_PARAMETERS` in the loader
+    /// arena and return its guest address (roadmap W3.6).
+    ///
+    /// **Layout is VERIFIED against the pinned Wine 11.0 `ntdll.dll`** (ImageBase
+    /// 0x170000000), not merely the public winternl.h stub:
+    ///   * `init_user_process_params` @ RVA 0x51d30 reads `EnvironmentSize` at
+    ///     **`+0x3f0`** (u64, `movq 0x3f0(%rdx),%rsi`), the `Environment` pointer
+    ///     at **`+0x80`**, and a scalar at **`+0x408`** (u32) — these three are the
+    ///     deep reads that faulted the earlier 0x80-byte stub (the boot's 5743-instr
+    ///     blocker was the `+0x3f0` read; the design's guess that this was
+    ///     `HeapPartitionName.Buffer` was WRONG — it is `EnvironmentSize`).
+    ///   * `alloc_process_params` @ RVA 0x433c0 lays the buffer area at **`+0x410`**
+    ///     (`leaq 0x410(%rax),%rcx`) — so the header is exactly **0x410 bytes** —
+    ///     and writes `EnvironmentSize` to `+0x3f0`, `Flags` NORMALIZED=1 to `+0x08`.
+    ///   * `RtlNormalizeProcessParams` @ RVA 0x2dce0 de-normalizes the `.Buffer`
+    ///     fields at **0x40,0x58,0x68,0x78,0xb8,0xc8,0xd8,0xe8** *only when
+    ///     `Flags & NORMALIZED(0x1)` is clear* (it early-returns otherwise). We set
+    ///     **NORMALIZED and store ABSOLUTE Buffer pointers**, so normalization is a
+    ///     no-op and every buffer stays valid — matching a live process.
+    ///
+    /// The x86 header offsets are the public 32-bit layout (half-width scalars,
+    /// UNICODE_STRINGs at 0x24/0x30/0x38/0x40, Environment @0x48, size 0x290); the
+    /// Wine-boot path is x64-only, so the 32-bit shape is used only by the
+    /// emulated corpus, whose CRT reads just ImagePathName/CommandLine.
+    fn build_process_parameters(&mut self, mem: &mut dyn Memory) -> Result<u64> {
+        if self.cfg.is_64bit {
+            self.build_process_parameters_64(mem)
+        } else {
+            self.build_process_parameters_32(mem)
+        }
+    }
+
+    fn build_process_parameters_64(&mut self, mem: &mut dyn Memory) -> Result<u64> {
+        // Total size: the 0x410-byte header (verified) plus a small tail so the
+        // `+0x408` scalar and any incidental reads land inside the allocation.
+        const PP_SIZE: u64 = 0x420;
+        let pp = self.ldr_alloc(PP_SIZE);
+        // The arena is bump-allocated (never guaranteed zero on reuse); zero the
+        // whole block so every unset tail field — HeapPartitionName region,
+        // RedirectionDllName, threadpool masks, EnvironmentVersion — reads 0.
+        let zero = [0u8; PP_SIZE as usize];
+        mem.write(pp, &zero)?;
+
+        // MaximumLength @0x00 / Length @0x04: the header size (public convention;
+        // the guest re-derives them when it re-allocs, so exact values are inert).
+        mem.write_u32(pp, PP_SIZE as u32)?;
+        mem.write_u32(pp + 0x04, PP_SIZE as u32)?;
+        // Flags @0x08 = NORMALIZED (0x1): our Buffer pointers below are ABSOLUTE,
+        // so RtlNormalizeProcessParams must treat them as already-normalized.
+        mem.write_u32(pp + 0x08, 0x1)?;
+        // DebugFlags @0x0C, ConsoleFlags @0x18: 0 (default).
+        // ConsoleHandle @0x10, StandardInput @0x20, StandardOutput @0x28,
+        // StandardError @0x30: left 0 (the real console is wired in W3.4; a null
+        // std handle is the correct "not yet a console process" value here).
+
+        // CurrentDirectory.DosPath @0x38 (UNICODE_STRING, Handle @0x48): a real
+        // "C:\" so RtlSetCurrentDirectory_U (reads Buffer @0x40) can parse it.
+        let (cd_buf, cd_len) = self.ldr_write_wstr(mem, "C:\\")?;
+        self.write_unicode_string(mem, pp + 0x38, cd_buf, cd_len)?;
+        // DllPath @0x50: the system search path.
+        let (dll_buf, dll_len) = self.ldr_write_wstr(mem, "C:\\windows\\system32")?;
+        self.write_unicode_string(mem, pp + 0x50, dll_buf, dll_len)?;
+        // ImagePathName @0x60 ← the module path ("C:\\…").
+        let (img_buf, img_len) = self.ldr_write_wstr(mem, &self.cfg.module_path_w.clone())?;
+        self.write_unicode_string(mem, pp + 0x60, img_buf, img_len)?;
+        // CommandLine @0x70 ← the app's UTF-16 command line, or the module path.
+        if self.cfg.cmdline_ptr_w != 0 {
+            let cmd_len = wstr_byte_len(mem, self.cfg.cmdline_ptr_w)?;
+            self.write_unicode_string(mem, pp + 0x70, self.cfg.cmdline_ptr_w, cmd_len)?;
+        } else {
+            self.write_unicode_string(mem, pp + 0x70, img_buf, img_len)?;
+        }
+
+        // Environment @0x80 + EnvironmentSize @0x3f0: a valid UTF-16
+        // `name=value\0…\0\0` block. init_user_process_params memcpy's exactly
+        // EnvironmentSize bytes from Environment, so the two must agree.
+        let (env_buf, env_bytes) = self.write_env_block(mem)?;
+        self.write_ptr(mem, pp + 0x80, env_buf)?;
+        mem.write_u64(pp + 0x3f0, env_bytes)?;
+
+        // WindowTitle @0xb0, DesktopInfo @0xc0, ShellInfo @0xd0, RuntimeData @0xe0:
+        // short but valid empty UNICODE_STRINGs (Length 0, a NUL Buffer) so the
+        // loader's copy of them is well-formed. **These offsets are VERIFIED from
+        // init_user_process_params @ 0x51d30, which passes `leaq 0xb0/0xc0/0xd0/
+        // 0xe0(%rbx)` to alloc_process_params — the design's 0xc8/0xd8/0xe8 were
+        // the *Buffer* fields (struct+8), not the struct starts.** A UNICODE_STRING
+        // mis-placed at 0xc8 would overwrite DesktopInfo@0xc0's Buffer and make the
+        // loader memcpy from a garbage source (the 0x20000 fault seen mid-bringup).
+        let (empty_buf, _) = self.ldr_write_wstr(mem, "")?;
+        for off in [0xb0u64, 0xc0, 0xd0, 0xe0] {
+            self.write_unicode_string(mem, pp + off, empty_buf, 0)?;
+        }
+        // +0x408 scalar: 0 (EnvironmentVersion / a flag — read but its value is
+        // simply copied forward; 0 is the launched-process default).
+        Ok(pp)
+    }
+
+    fn build_process_parameters_32(&mut self, mem: &mut dyn Memory) -> Result<u64> {
+        // 32-bit RTL_USER_PROCESS_PARAMETERS (public layout): scalars at half
+        // width, UNICODE_STRINGs at CurrentDirectory 0x24, DllPath 0x30,
+        // ImagePathName 0x38, CommandLine 0x40, Environment @0x48. Only the
+        // emulated corpus uses this (the Wine-boot path is x64); its CRT reads
+        // only ImagePathName + CommandLine, so a zero-filled 0x290-byte block
+        // with those two populated is sufficient and correctly sized.
+        const PP_SIZE: u64 = 0x290;
+        let pp = self.ldr_alloc(PP_SIZE);
+        let zero = [0u8; PP_SIZE as usize];
+        mem.write(pp, &zero)?;
+        mem.write_u32(pp, PP_SIZE as u32)?; // MaximumLength
+        mem.write_u32(pp + 0x04, PP_SIZE as u32)?; // Length
+        mem.write_u32(pp + 0x08, 0x1)?; // Flags = NORMALIZED
+        let (img_buf, img_len) = self.ldr_write_wstr(mem, &self.cfg.module_path_w.clone())?;
+        self.write_unicode_string(mem, pp + 0x38, img_buf, img_len)?;
+        if self.cfg.cmdline_ptr_w != 0 {
+            let cmd_len = wstr_byte_len(mem, self.cfg.cmdline_ptr_w)?;
+            self.write_unicode_string(mem, pp + 0x40, self.cfg.cmdline_ptr_w, cmd_len)?;
+        } else {
+            self.write_unicode_string(mem, pp + 0x40, img_buf, img_len)?;
+        }
+        let (env_buf, _env_bytes) = self.write_env_block(mem)?;
+        self.write_ptr(mem, pp + 0x48, env_buf)?;
+        Ok(pp)
+    }
+
+    /// Write the process environment (`name=value\0…\0\0`, UTF-16) into the loader
+    /// arena from `self.env`. Returns (buffer address, byte length including the
+    /// double-NUL terminator) — the exact size `init_user_process_params` copies.
+    fn write_env_block(&mut self, mem: &mut dyn Memory) -> Result<(u64, u64)> {
+        let units = self.env_block_utf16();
+        let byte_len = (units.len() * 2) as u64;
+        let addr = self.ldr_alloc(byte_len.max(2));
+        for (i, u) in units.iter().enumerate() {
+            mem.write_u16(addr + (i * 2) as u64, *u)?;
+        }
+        Ok((addr, byte_len))
     }
 
     /// Seed a valid v6 `API_SET_NAMESPACE` in guest memory and publish it at
