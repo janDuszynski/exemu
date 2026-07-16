@@ -517,3 +517,47 @@ fn wine_core_wires_unix_call_dispatcher() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Boot-progress (W3.x) — `seed_main_teb` seeds `TEB.ActivationContextStackPointer`
+/// (TEB +0x2c8) with an inline, empty `ACTIVATION_CONTEXT_STACK`. Wine's ntdll
+/// dereferences this in its SxS lookup (`RtlFindActivationContextSectionString`
+/// @ RVA 0x24180: `mov rax,gs:[0x30]; mov rax,[rax+0x2c8]; mov rcx,[rax]`) — a
+/// null pointer there faults on `mov rcx,[rax]` (the 60818-instr boot blocker).
+/// This proves the pointer is non-null, sits inside the mapped TEB region clear
+/// of the `syscall_frame` tail, and that its `ActiveFrame` (@0x00) reads 0 so the
+/// lookup takes its "no active frame → process default" branch.
+#[test]
+fn wine_core_seeds_activation_context_stack() {
+    let dir = std::env::temp_dir().join(format!("exemu-actctx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A minimal harness (no Wine DLLs needed — the seed is independent of them):
+    // just the TEB region + a WinOs whose `seed_main_teb` writes the stack.
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("teb", TEB_BASE, TEB_SIZE, Perm::RW)).unwrap();
+    mem.map(Region::new("peb", PEB_ADDR & !0xfff, 0x1000, Perm::RW)).unwrap();
+    let os = WinOs::new(WinConfig {
+        is_64bit: true,
+        peb_addr: PEB_ADDR,
+        teb_base: TEB_BASE,
+        sandbox: dir.to_string_lossy().into_owned(),
+        ..WinConfig::default()
+    });
+    os.seed_main_teb(&mut mem, STACK_BASE, STACK_BASE + STACK_SIZE).unwrap();
+
+    // TEB+0x2c8 → an ACTIVATION_CONTEXT_STACK inside the mapped TEB region.
+    let actx = mem.read_u64(TEB_BASE + 0x2c8).unwrap();
+    assert_ne!(actx, 0, "ActivationContextStackPointer seeded (the boot blocker)");
+    assert_eq!(actx, TEB_BASE + 0x1900, "stack laid inline in the TEB region gap");
+    // Must clear the syscall_frame parked in the tail (0x2000 - 0x140 = 0x1ec0).
+    assert!(actx + 0x28 <= TEB_BASE + (0x2000 - 0x140), "clear of the syscall_frame tail");
+
+    // ActiveFrame (@0x00) is 0 → the "no active frame" branch (RtlFind*/RtlFree*
+    // both short-circuit); FrameListCache LIST_ENTRY (@0x08) is self-referential.
+    assert_eq!(mem.read_u64(actx).unwrap(), 0, "ActiveFrame empty");
+    assert_eq!(mem.read_u64(actx + 0x08).unwrap(), actx + 0x08, "FrameListCache.Flink → self");
+    assert_eq!(mem.read_u64(actx + 0x10).unwrap(), actx + 0x08, "FrameListCache.Blink → self");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

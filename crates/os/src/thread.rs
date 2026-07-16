@@ -62,6 +62,29 @@ mod teb64 {
     pub const TLS_EXPANSION_SLOTS: u64 = 0x1780; // ThreadLocalStoragePointer expansion (0 until grown)
     pub const DEALLOCATION_STACK: u64 = 0x1478; // NtTib-independent stack base for teardown
 
+    /// `TEB.ActivationContextStackPointer` (a `PACTIVATION_CONTEXT_STACK`). Wine's
+    /// ntdll dereferences this in the SxS / activation-context lookup
+    /// (`RtlFindActivationContextSectionString` @ RVA 0x24180:
+    /// `mov rax,gs:[0x30]; mov rax,[rax+0x2c8]; mov rcx,[rax]`) — it must point at
+    /// a real (empty) `ACTIVATION_CONTEXT_STACK`, not read back 0.
+    pub const ACTIVATION_CONTEXT_STACK_POINTER: u64 = 0x2c8;
+
+    /// Offset (inside the mapped 0x2000 TEB region, in the gap between the last
+    /// real TEB field at ~0x1838 and the NT-syscall `syscall_frame` parked at
+    /// `0x2000 - 0x140 = 0x1ec0`) where [`WinOs::seed_teb_64`] lays an inline,
+    /// per-thread `ACTIVATION_CONTEXT_STACK` and points
+    /// [`ACTIVATION_CONTEXT_STACK_POINTER`] at it. Self-contained in the TEB
+    /// region so every thread (main + spawned) gets its own, no arena needed.
+    pub const ACTIVATION_CONTEXT_STACK: u64 = 0x1900;
+
+    /// Size of the x64 `ACTIVATION_CONTEXT_STACK` struct (recovered from the
+    /// pinned ntdll: `ActiveFrame` PVOID @0x00, `FrameListCache` LIST_ENTRY @0x08,
+    /// `Flags` ULONG @0x18, `NextCookieSequenceNumber` ULONG @0x1c, `StackId`
+    /// ULONG @0x20 → 0x28 rounded). `ActiveFrame = 0` (empty stack) makes every
+    /// read path — `RtlFindActivationContextSectionString`,
+    /// `RtlFreeActivationContextStack` — take its "no active frame" branch.
+    pub const ACTIVATION_CONTEXT_STACK_SIZE: u64 = 0x28;
+
     /// `MaximumLength` of `StaticUnicodeString` — 261 WCHARs (the documented
     /// `STATIC_UNICODE_BUFFER_LENGTH`), in bytes.
     pub const STATIC_UNICODE_MAX_BYTES: u16 = 261 * 2;
@@ -85,6 +108,16 @@ mod teb32 {
     pub const DEALLOCATION_STACK: u64 = 0x0E0C; // stack base for teardown
     pub const STATIC_UNICODE_MAX_BYTES: u16 = 261 * 2;
 }
+
+/// Compile-time invariant: the inline `ACTIVATION_CONTEXT_STACK` seeded into the
+/// TEB region must not run into the NT-syscall `syscall_frame` parked in the tail
+/// of the 0x2000 TEB region (the last 0x140 bytes, i.e. from `0x2000 - 0x140 =
+/// 0x1ec0`).
+const _: () = assert!(
+    teb64::ACTIVATION_CONTEXT_STACK + teb64::ACTIVATION_CONTEXT_STACK_SIZE
+        <= THREAD_TEB_SIZE - 0x140,
+    "ACTIVATION_CONTEXT_STACK collides with the syscall_frame tail"
+);
 
 /// Fixed process id reported through `ClientId.UniqueProcess` (matches
 /// `GetCurrentProcessId`).
@@ -325,6 +358,16 @@ impl WinOs {
             w(mem, teb64::COUNT_OF_OWNED_CRIT_SECS, 0)?;
             w(mem, teb64::DEALLOCATION_STACK, stack_base)?;
             w(mem, teb64::TLS_EXPANSION_SLOTS, 0)?;
+            // ActivationContextStackPointer: point at an inline, empty
+            // ACTIVATION_CONTEXT_STACK laid in the TEB region's dead gap. The
+            // region is zero-mapped, so ActiveFrame(@0x00)/Flags/StackId already
+            // read 0 (the empty-stack initial state ntdll's SxS lookup expects);
+            // the FrameListCache LIST_ENTRY (@0x08) is made self-referential to
+            // match a live process's initial thread activation-context stack.
+            let actx = teb_base + teb64::ACTIVATION_CONTEXT_STACK;
+            w(mem, teb64::ACTIVATION_CONTEXT_STACK_POINTER, actx)?;
+            w(mem, teb64::ACTIVATION_CONTEXT_STACK + 0x08, actx + 0x08)?; // FrameListCache.Flink → self
+            w(mem, teb64::ACTIVATION_CONTEXT_STACK + 0x10, actx + 0x08)?; // FrameListCache.Blink → self
         } else {
             let w4 = |mem: &mut dyn Memory, off: u64, v: u32| mem.write_u32(teb_base + off, v);
             w4(mem, teb32::NT_TIB_EXCEPTION_LIST, u32::MAX)?;
