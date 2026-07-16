@@ -507,6 +507,20 @@ impl WinOs {
                 // Wire ntdll's unixlib so the `__wine_unix_call` fast path and
                 // the `MemoryWineUnixFuncs` query resolve to it (roadmap W2.4/W2.5).
                 self.register_ntdll_unixlib(base);
+                // Plug the `__wine_unix_call_dispatcher` global. exemu maps ntdll
+                // as a standalone PE with no unix side, so this pointer (which
+                // Wine's unix loader would fill) is null; every PE-side
+                // `__wine_unix_call` — including the very early debug-output path
+                // (`__wine_dbg_write`) reached in `loader_init` — does
+                // `call [__wine_unix_call_dispatcher]`, faulting on a null call.
+                // Point it at the intercepted fast-path thunk so those calls land
+                // on `WinOs::wine_unix_call` (roadmap W3.2 follow-up to W2.4).
+                let thunk = self.wine_unix_call_thunk();
+                let ptr_size = if self.cfg.is_64bit { 8 } else { 4 };
+                mem.write(
+                    base + crate::RVA_WINE_UNIX_CALL_DISPATCHER,
+                    &thunk.to_le_bytes()[..ptr_size],
+                )?;
             }
         }
         // Seed PEB.ApiSetMap so Wine's loader_init → build_import_name (which

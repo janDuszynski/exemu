@@ -473,3 +473,47 @@ fn wine_core_seeds_full_process_parameters() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// W3.2 follow-up (W2.4) — `load_wine_core` wires ntdll's
+/// `__wine_unix_call_dispatcher` global (RVA 0x9c058) to the intercepted
+/// `__wine_unix_call` fast-path thunk. Wine maps ntdll with no unix side, so
+/// this pointer would be null and every PE-side `call
+/// [__wine_unix_call_dispatcher]` (the very first is `__wine_dbg_write` in
+/// `loader_init`'s TRACE path) faults on a null call — the boot blocker at
+/// ntdll RVA 0x3f375. This proves the global now reads back the thunk address.
+#[test]
+fn wine_core_wires_unix_call_dispatcher() {
+    if !Path::new(WINE_DLLS).join("ntdll.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/ntdll.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("exemu-w3_2disp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem) = setup(&dir);
+
+    let ntdll_base =
+        os.load_wine_core(&mut mem).expect("load_wine_core ok").expect("the four Wine core DLLs present");
+
+    // The dispatcher global at ntdll_base + 0x9c058 holds the fast-path thunk,
+    // not null. `wine_unix_call_thunk()` is idempotent, so this is the exact
+    // pointer the guest's indirect call will land on.
+    let disp = ntdll_base + exemu_os::RVA_WINE_UNIX_CALL_DISPATCHER;
+    let wired = mem.read_u64(disp).unwrap();
+    assert_ne!(wired, 0, "__wine_unix_call_dispatcher no longer null (the boot blocker)");
+    assert_eq!(wired, os.wine_unix_call_thunk(), "dispatcher global == the __wine_unix_call thunk");
+
+    // Cross-check the RVA independently against ntdll's own data export table:
+    // the loader wired the same address the guest's disassembly resolves to.
+    if let Some(export_va) = os.ntdll_export("__wine_unix_call_dispatcher") {
+        assert_eq!(export_va, disp, "wired RVA == ntdll's __wine_unix_call_dispatcher export");
+    }
+
+    // Its sibling __wine_syscall_dispatcher (0x9c050) is NOT wired (ntdll's
+    // syscall stubs take the bare `syscall` path; no code reads this pointer) —
+    // it stays zero, confirming we only touched the one global that needs it.
+    let syscall_disp = mem.read_u64(ntdll_base + 0x9c050).unwrap();
+    assert_eq!(syscall_disp, 0, "__wine_syscall_dispatcher left null (unused by ntdll)");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
