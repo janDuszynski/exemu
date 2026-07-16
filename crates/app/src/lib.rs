@@ -484,19 +484,11 @@ impl Process {
         // opt-in but not exercised by the default corpus or the standing gates.
         if image.is_64bit {
             if let Some(ntdll_base) = os.load_wine_core(&mut mem)? {
-                // Wine keeps its per-process `__wine_debug_options` array right
-                // after the PEB (`__wine_dbg_get_channel_flags` reads
-                // `PEB+0x2000`), reached VERY early in `loader_init` via TRACE
-                // macros. The app maps the PEB as a single page, so PEB+0x2000
-                // is unmapped and the very first TRACE faults there. Map one
-                // zeroed page over PEB+0x2000: a zero default entry (empty name)
-                // means zero configured channels, so the lookup returns the
-                // default (all-off) flags without scanning — the correct
-                // behaviour with no `WINEDEBUG` set. Boot-path only (roadmap
-                // W3.3); the emulated corpus never runs this code.
-                // PEB+0x2000 (= GS_BASE+0x4000) is above the single-page PEB
-                // mapping, so it is guaranteed unmapped here.
-                mem.map(Region::new("wine-dbgopts", lay.peb_addr + 0x2000, PAGE, Perm::RW))?;
+                // Wine reaches its debug scratch regions VERY early in
+                // `loader_init` via TRACE macros. Seed them as zeroed pages so
+                // TRACE is a safe no-op (boot-path only; the emulated corpus
+                // never runs this code).
+                map_wine_debug_pages(&mut mem, lay.teb_base, lay.peb_addr)?;
                 // Steer ntdll's stubs onto the bare `syscall` route into the
                 // W2.3 dispatcher: SystemCall selector = 0 (the app's default
                 // seed is 1, the dispatcher-page shape). Poke bypasses the
@@ -754,6 +746,36 @@ fn map_kuser_shared_data(mem: &mut VirtualMemory) -> Result<()> {
     Ok(())
 }
 
+/// Map the zeroed scratch pages Wine's ntdll touches through its debug (TRACE)
+/// machinery during `loader_init`, so those reads/writes don't fault. Only used
+/// on the `EXEMU_WINE_BOOT` path; the emulated corpus never runs this.
+///
+/// Both regions are fixed offsets Wine hard-codes (confirmed from the pinned
+/// `ntdll.dll` disassembly), and both sit in the currently-unmapped gap between
+/// the single-page PEB (at `teb_base + 0x2000`) and the DLL arena:
+///
+/// - **`TEB + 0x3000`** — `__wine_dbg_strdup` (RVA 0x3f3c0) keeps a per-thread
+///   debug-string ring buffer here: a `u32` write position at `TEB+0x3000` and
+///   the ring bytes from `TEB+0x3008`, both bounded to `0x3fc`. A zeroed page
+///   (position 0, empty ring) is a valid empty starting state.
+/// - **`PEB + 0x2000`** — `__wine_dbg_get_channel_flags` reads the per-process
+///   `__wine_debug_options` array here. A zero default entry (empty name) means
+///   zero configured channels, so the lookup returns the default (all-off) flags
+///   — the correct behaviour with no `WINEDEBUG` set.
+///
+/// Per-thread note: the `TEB+0x3000` ring is relative to *each* thread's TEB.
+/// This seeds the main thread; spawned Wine threads (NtCreateThreadEx) need the
+/// same page relative to their own TEB — a follow-up for when the Wine boot
+/// spawns threads (the boot is single-threaded through `loader_init` today).
+fn map_wine_debug_pages(mem: &mut VirtualMemory, teb_base: u64, peb_addr: u64) -> Result<()> {
+    // TEB+0x3000 ring lands in [teb_base+0x3000, teb_base+0x4000); with the PEB
+    // one page at teb_base+0x2000 and the dbgopts page at peb_addr+0x2000 (=
+    // teb_base+0x4000), this gap is guaranteed unmapped.
+    mem.map(Region::new("wine-dbgstr", teb_base + 0x3000, PAGE, Perm::RW))?;
+    mem.map(Region::new("wine-dbgopts", peb_addr + 0x2000, PAGE, Perm::RW))?;
+    Ok(())
+}
+
 /// Seconds between the FILETIME epoch (1601-01-01) and the Unix epoch, for
 /// converting the host clock into `KUSER_SHARED_DATA.SystemTime` units.
 const KUSER_FILETIME_EPOCH_DIFF_SECS: u64 = 11_644_473_600;
@@ -863,5 +885,36 @@ mod tests {
         assert_eq!(KUSER_DISPATCHER_PAGE, KUSER_SHARED_DATA_BASE + PAGE);
         mem.read_u8(KUSER_DISPATCHER_PAGE)
             .expect("dispatcher landing page is mapped");
+    }
+
+    #[test]
+    fn wine_debug_pages_are_mapped_and_writable() {
+        // Real 64-bit layout: TEB at GS_BASE, PEB one page above at +0x2000.
+        let teb_base = GS_BASE;
+        let peb_addr = GS_BASE + 0x2000;
+        let mut mem = VirtualMemory::new();
+        // Both maps must succeed without overlapping each other (VirtualMemory
+        // rejects overlapping regions), proving the gap layout holds.
+        map_wine_debug_pages(&mut mem, teb_base, peb_addr).expect("map wine debug pages");
+
+        // The debug-string ring: a u32 position counter at TEB+0x3000 and ring
+        // bytes from TEB+0x3008 — exactly what __wine_dbg_strdup reads/writes.
+        mem.poke(teb_base + 0x3000, &7u32.to_le_bytes())
+            .expect("write ring position");
+        assert_eq!(
+            mem.read_u32(teb_base + 0x3000).expect("read ring position"),
+            7
+        );
+        mem.poke(teb_base + 0x3008, b"x").expect("write ring byte");
+        // The far end of the ring (bounded to 0x3fc from +0x3008) is still in-page.
+        mem.read_u8(teb_base + 0x3008 + 0x3fc)
+            .expect("ring tail is mapped");
+
+        // The __wine_debug_options page at PEB+0x2000 defaults to all zero.
+        assert_eq!(
+            mem.read_u32(peb_addr + 0x2000)
+                .expect("read debug-options page"),
+            0
+        );
     }
 }
