@@ -487,7 +487,11 @@ impl WinOs {
         let name_ptr = self.syscall_arg(cpu, mem, 1)?;
         let ty = self.syscall_arg(cpu, mem, 3)? as u32;
         let data_ptr = self.syscall_arg(cpu, mem, 4)?;
-        let data_size = self.syscall_arg(cpu, mem, 5)? as usize;
+        // `DataSize` is a `ULONG` (32-bit): the caller stores it with a 32-bit
+        // `mov`, leaving the upper 32 bits of the stack slot undefined. Reading
+        // the whole 8-byte slot picks up that garbage (observed on the Wine boot:
+        // a real size of 0xC arriving as 0x1_0000000C), so mask to 32 bits.
+        let data_size = (self.syscall_arg(cpu, mem, 5)? as u32) as usize;
         let Some(path) = self.reg_resolve(hkey) else {
             return Ok(STATUS_INVALID_HANDLE);
         };

@@ -145,12 +145,17 @@ impl WinOs {
         arg: u64,
         stack_top: u64,
     ) -> Result<Option<u64>> {
-        // Scratch CONTEXT in the heap arena (stable for the life of the boot;
-        // RtlUserThreadStart re-establishes its own frame from Rsp).
-        let ctx = self.heap_alloc(exc::CONTEXT_SIZE);
-        if ctx == 0 {
-            return Ok(None);
-        }
+        // The CONTEXT must live on the **guest stack**, near the top: Wine's
+        // Unix loader leaves the fresh-thread CONTEXT there, and
+        // `signal_start_thread` (ntdll RVA 0x10d2c) treats `&CONTEXT` as a stack
+        // pointer — it zeroes the 0xf000 bytes below `(&CONTEXT & ~0xfff)` (the
+        // rest of the fresh stack) before `ZwContinue`. A heap-arena CONTEXT
+        // would make that `rep stosq` run off the bottom of the arena and fault
+        // (observed on the Wine boot). Parking it at `stack_top - CONTEXT_SIZE`
+        // keeps both the CONTEXT and the zeroed span inside the mapped stack
+        // (the zeroed span `[ctxpage-0xf000, ctxpage)` ends *below* the CONTEXT,
+        // so the record itself survives to be read by `ZwContinue`).
+        let ctx = (stack_top - exc::CONTEXT_SIZE) & !0xf;
 
         // A CONTEXT positioned for RtlUserThreadStart(entry, arg). Start from a
         // clean state so every field marshals a defined value, then set the
@@ -159,14 +164,23 @@ impl WinOs {
         boot.rip = ntdll_base + RVA_RTL_USER_THREAD_START;
         boot.set_reg(Reg::Rcx, entry); // RtlUserThreadStart arg0 = EntryPoint
         boot.set_reg(Reg::Rdx, arg); // RtlUserThreadStart arg1 = Arg
-        // 16-byte aligned, one shadow-space below the top, as a `call` would
-        // leave it before RtlUserThreadStart's own `sub rsp,0x28`.
-        boot.set_rsp(stack_top & !0xf);
+        // Run RtlUserThreadStart on the stack *below* the CONTEXT record (the
+        // record is dead once `ZwContinue` loads it). 16-byte aligned with a
+        // shadow gap, as a `call` would leave it before RtlUserThreadStart's own
+        // `sub rsp,0x28`.
+        boot.set_rsp((ctx - 0x100) & !0xf);
         exc::write_context(mem, ctx, &boot)?;
 
         // Seat the initial thread at LdrInitializeThunk with RCX = &CONTEXT.
+        // `LdrInitializeThunk` (and the deep `loader_init` call chain under it)
+        // runs on the stack *below* the CONTEXT record — exactly as Wine's Unix
+        // loader leaves it, with the CONTEXT parked near the stack top and RSP
+        // set beneath it. Seat the live RSP below the CONTEXT (with a shadow gap)
+        // so loader_init's frames never grow up into and clobber the record
+        // before `signal_start_thread`/`ZwContinue` reads it back.
         cpu.rip = ntdll_base + RVA_LDR_INITIALIZE_THUNK;
         cpu.set_reg(Reg::Rcx, ctx);
+        cpu.set_rsp((ctx - 0x100) & !0xf);
         Ok(Some(ctx))
     }
 }
@@ -194,6 +208,9 @@ mod tests {
         mem.map(exemu_core::Region::new("teb", TEB, 0x2000, exemu_core::Perm::RW)).unwrap();
         mem.map(exemu_core::Region::new("heap", HEAP, 0x10000, exemu_core::Perm::RW)).unwrap();
         mem.map(exemu_core::Region::new("scratch", 0x5000_0000, 0x4000, exemu_core::Perm::RW)).unwrap();
+        // The bootstrap CONTEXT lives on the guest stack near `STACK_TOP`; map a
+        // stack region below it so the builder can write the record there.
+        mem.map(exemu_core::Region::new("stack", STACK_TOP - 0x10000, 0x10000, exemu_core::Perm::RW)).unwrap();
         let os = WinOs::new(WinConfig {
             is_64bit: true,
             echo: false,
