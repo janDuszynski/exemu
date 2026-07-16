@@ -311,6 +311,27 @@ impl Process {
         }
         let _ = std::fs::write(&host_exe, pe_bytes);
 
+        // --- Wine-boot opt-in (roadmap W3.2) ------------------------------
+        // `EXEMU_WINE_BOOT` selects the experimental path that boots the real
+        // Wine PE core (ntdll→kernelbase→kernel32→ucrtbase) as guest images and
+        // hands off through `LdrInitializeThunk`, instead of the emulated-DLL
+        // thunks. Off by default so the corpus is byte-for-byte unaffected while
+        // the boot path (W3.3 exc bridge, W3.4 console) is still being built. The
+        // DLL directory defaults to the pinned prefix but is overridable via
+        // `EXEMU_WINE_DLLS`; `wine_dll_dir` stays `None` unless the opt-in is set
+        // AND the directory exists, so `load_wine_core` only ever runs on request.
+        let wine_dll_dir = if std::env::var_os("EXEMU_WINE_BOOT").is_some() {
+            let dir = std::env::var("EXEMU_WINE_DLLS")
+                .unwrap_or_else(|_| "example_exe/wine-dlls/x86_64-windows".to_string());
+            if std::path::Path::new(&dir).is_dir() {
+                Some(dir)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // --- The OS layer and import resolution ---------------------------
         let mut os = WinOs::new(WinConfig {
             api_base: lay.api_base,
@@ -334,6 +355,7 @@ impl Process {
             image_size: align_up(image.size_of_image as u64, PAGE).max(PAGE),
             image_entry: image.entry_va(),
             image_name: module_name.clone(),
+            wine_dll_dir,
         });
 
         // Map the thunk region as real read/write memory. Function imports
@@ -443,6 +465,57 @@ impl Process {
         // `DLL_PROCESS_ATTACH` before the entry point (roadmap W0.3); otherwise
         // this is just `rip = entry`.
         os.start_process(cpu.state_mut(), &mut mem, image.entry_va())?;
+
+        // --- Wine PE core boot (roadmap W3.2, opt-in) ---------------------
+        // When `EXEMU_WINE_BOOT` gated `wine_dll_dir` on above, map the four Wine
+        // core DLLs as real guest images (relocated + inter-bound), then re-seat
+        // the initial thread at ntdll's `LdrInitializeThunk` with a CONTEXT for
+        // `RtlUserThreadStart(entry, 0)` — Wine's own loader_init then loads the
+        // rest and runs the DllMains before reaching the exe entry. This
+        // OVERRIDES the `start_process` seating above. When `wine_dll_dir` is
+        // `None` (the default / files absent), `load_wine_core` returns `None`
+        // and every binary keeps the emulated-DLL path, unchanged.
+        //
+        // NOTE (deferred, W3.3+): the LdrInitializeThunk handoff drives Wine's
+        // loader_init, which needs the hardware→software exception bridge (W3.3)
+        // and the console stdio bridge (W3.4) to boot to a console main. W3.2
+        // proves the *load* (map+relocate+inter-bind+Ldr+fault-free DllMains via
+        // the intermediate test); the handoff is wired here behind the same
+        // opt-in but not exercised by the default corpus or the standing gates.
+        if image.is_64bit {
+            if let Some(ntdll_base) = os.load_wine_core(&mut mem)? {
+                // Steer ntdll's stubs onto the bare `syscall` route into the
+                // W2.3 dispatcher: SystemCall selector = 0 (the app's default
+                // seed is 1, the dispatcher-page shape). Poke bypasses the
+                // READ-only perm on KUSER_SHARED_DATA.
+                mem.poke(
+                    KUSER_SHARED_DATA_BASE + KUSER_SYSTEM_CALL,
+                    &0u32.to_le_bytes(),
+                )?;
+                // Cross-check the LdrInitializeThunk entry BY NAME from ntdll's
+                // parsed export table against the RVA `bootstrap_via_ldr_init`
+                // seats (W3.1's `RVA_LDR_INITIALIZE_THUNK`), so a pinned-binary
+                // RVA drift is caught loudly rather than seating a wrong rip.
+                if let Some(ldr_init_va) = os.ntdll_export("LdrInitializeThunk") {
+                    let seated = ntdll_base + exemu_os::RVA_LDR_INITIALIZE_THUNK;
+                    if ldr_init_va != seated {
+                        return Err(EmuError::Os(format!(
+                            "ntdll LdrInitializeThunk export {ldr_init_va:#x} != \
+                             bootstrap-seated {seated:#x} (pinned-binary RVA drift)"
+                        )));
+                    }
+                }
+                let entry = image.entry_va();
+                os.bootstrap_via_ldr_init(
+                    cpu.state_mut(),
+                    &mut mem,
+                    ntdll_base,
+                    entry,
+                    0, // Arg: none for a process's initial thread
+                    stack_top,
+                )?;
+            }
+        }
 
         Ok(Process {
             mem,
