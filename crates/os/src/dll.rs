@@ -451,92 +451,105 @@ impl WinOs {
         Ok(Some(base))
     }
 
-    /// Load the pinned Wine PE core set (`ntdll → kernelbase → kernel32 →
-    /// ucrtbase`) as **real guest images** from `cfg.wine_dll_dir`, returning
-    /// the mapped `ntdll` base (or `None` when the directory or any of the four
-    /// files is absent — the caller then keeps the emulated-DLL path).
+    /// Pre-map **ntdll only** — the running image that Wine's `loader_init`
+    /// never re-maps — as a **real guest image** from `cfg.wine_dll_dir`,
+    /// returning the mapped `ntdll` base (or `None` when the directory or any of
+    /// the pinned core files is absent — the caller then keeps the emulated-DLL
+    /// path).
+    ///
+    /// **Trim to ntdll-self (roadmap W3.2, phase iv).** Earlier this pre-mapped
+    /// the whole core set (`ntdll → kernelbase → kernel32 → ucrtbase`) into the
+    /// DLL arena. The W3 gate proved that superfluous: once `LdrInitializeThunk`
+    /// runs, Wine's own `loader_init` / `build_module` loads kernelbase, kernel32
+    /// and ucrtbase **itself** from the prefix as real `SEC_IMAGE` sections (at
+    /// its `map_anywhere` arena) and re-binds the exe's imports to *its* kernel32.
+    /// exemu pre-mapping them too was dead weight that also produced **duplicate
+    /// `PEB.Ldr` entries** (exemu's pre-inserted copies + Wine's `build_module`
+    /// copies). So we pre-map only **ntdll** — the running image, which Wine's
+    /// `build_ntdll_module` discovers in place via `ZwQueryVirtualMemory` and
+    /// never re-maps — plus the exe (threaded by [`Self::init_ldr`]). After the
+    /// trim `PEB.Ldr` holds ntdll + exe (from exemu) and kernelbase/kernel32/
+    /// ucrtbase (from Wine), with no duplicates.
     ///
     /// Unlike [`Self::load_library`], this deliberately **suppresses the
-    /// `EMULATED` short-circuit**: ntdll/kernelbase/kernel32 are on the emulated
-    /// list (their functions are otherwise serviced by API thunks), so a normal
-    /// `LoadLibrary` of them returns a synthetic handle and never maps bytes.
-    /// Here we map the real bytes and record each module in `by_name`/`exports`
-    /// *before* loading the next, so the moment ntdll+kernelbase are present,
-    /// [`Self::resolve_import_addr`] (via [`GuestModules`]) resolves kernel32's
-    /// imports of them to real export addresses — the emulated intercept is
-    /// bypassed structurally, not by editing the `EMULATED` list. Loading
-    /// strictly in dependency order (verified from the real import tables:
-    /// ntdll imports nothing; kernelbase→ntdll; kernel32→kernelbase+ntdll;
-    /// ucrtbase→kernel32+ntdll) guarantees every IAT slot binds to already-mapped
-    /// predecessor code (roadmap W3.2).
+    /// `EMULATED` short-circuit** for ntdll: ntdll is on the emulated list (its
+    /// functions are otherwise serviced by API thunks), so a normal
+    /// `LoadLibrary` of it returns a synthetic handle and never maps bytes. Here
+    /// we map the real bytes and record it in `by_name`/`exports` — the emulated
+    /// intercept is bypassed structurally, not by editing the `EMULATED` list.
+    ///
+    /// The presence of the full pinned set is still **required** (guarded below):
+    /// Wine reads kernelbase/kernel32/ucrtbase from the same prefix directory
+    /// during `loader_init`, so a partial prefix must fall back to the emulated
+    /// path rather than half-boot Wine.
     ///
     /// After ntdll maps, its unixlib is registered against its real base so the
-    /// `__wine_unix_call` / `MemoryWineUnixFuncs` path finds it. Each module's
-    /// `DllMain` is queued in `pending_dllmain` (leaves-first) but **not driven
-    /// here** — on the boot path Wine's own `loader_init` (reached once
-    /// `LdrInitializeThunk` runs) drives them under the loader lock; the caller
-    /// may drain them via [`Self::run_pending_dllmains`] in the intermediate test.
+    /// `__wine_unix_call` / `MemoryWineUnixFuncs` path finds it. ntdll's own
+    /// `DllMain` is queued in `pending_dllmain` but **not driven here** — on the
+    /// boot path Wine's own `loader_init` (reached once `LdrInitializeThunk`
+    /// runs) drives it under the loader lock; the caller may drain it via
+    /// [`Self::run_pending_dllmains`] in the intermediate test.
     pub fn load_wine_core(&mut self, mem: &mut dyn Memory) -> Result<Option<u64>> {
         let Some(dir) = self.cfg.wine_dll_dir.clone() else {
             return Ok(None);
         };
         let dir = std::path::PathBuf::from(dir);
-        // The four, strictly in dependency (leaves-first) order.
+        // Guard: only take this path when the full pinned core set is present,
+        // even though we now pre-map only ntdll — Wine loads the other three from
+        // this prefix during loader_init, so a partial prefix must fall back to
+        // the emulated path rather than half-boot Wine.
         const CORE: [&str; 4] = ["ntdll.dll", "kernelbase.dll", "kernel32.dll", "ucrtbase.dll"];
-        // Guard: only take this path when all four files are actually present,
-        // so a partial prefix never half-loads the core set.
-        let paths: Vec<std::path::PathBuf> = CORE.iter().map(|n| dir.join(n)).collect();
-        if paths.iter().any(|p| !p.is_file()) {
+        if CORE.iter().any(|n| !dir.join(n).is_file()) {
             return Ok(None);
         }
 
         self.dll.pending_dllmain.clear();
-        let mut ntdll_base = None;
-        for (name, host) in CORE.iter().zip(paths.iter()) {
-            // Already mapped (an earlier core load, or a plugin) → reuse.
-            let base = if let Some(&b) = self.dll.by_name.get(*name) {
-                b
-            } else {
-                match self.load_core_image(mem, host, name)? {
-                    Some(b) => b,
-                    None => return Ok(None), // a malformed image aborts the whole set
-                }
-            };
-            if *name == "ntdll.dll" {
-                ntdll_base = Some(base);
-                // Wire ntdll's unixlib so the `__wine_unix_call` fast path and
-                // the `MemoryWineUnixFuncs` query resolve to it (roadmap W2.4/W2.5).
-                self.register_ntdll_unixlib(base);
-                // Plug the `__wine_unix_call_dispatcher` global. exemu maps ntdll
-                // as a standalone PE with no unix side, so this pointer (which
-                // Wine's unix loader would fill) is null; every PE-side
-                // `__wine_unix_call` — including the very early debug-output path
-                // (`__wine_dbg_write`) reached in `loader_init` — does
-                // `call [__wine_unix_call_dispatcher]`, faulting on a null call.
-                // Point it at the intercepted fast-path thunk so those calls land
-                // on `WinOs::wine_unix_call` (roadmap W3.2 follow-up to W2.4).
-                let thunk = self.wine_unix_call_thunk();
-                let ptr_size = if self.cfg.is_64bit { 8 } else { 4 };
-                mem.write(
-                    base + crate::RVA_WINE_UNIX_CALL_DISPATCHER,
-                    &thunk.to_le_bytes()[..ptr_size],
-                )?;
+        // Pre-map ntdll ONLY (the running image; Wine's build_ntdll_module
+        // discovers it in place and never re-maps it). kernelbase/kernel32/
+        // ucrtbase are loaded by Wine's own loader_init.
+        let ntdll_host = dir.join("ntdll.dll");
+        let base = if let Some(&b) = self.dll.by_name.get("ntdll.dll") {
+            b // already mapped (a prior core load) → reuse
+        } else {
+            match self.load_core_image(mem, &ntdll_host, "ntdll.dll")? {
+                Some(b) => b,
+                None => return Ok(None), // a malformed image aborts the boot
             }
-        }
+        };
+        // Wire ntdll's unixlib so the `__wine_unix_call` fast path and the
+        // `MemoryWineUnixFuncs` query resolve to it (roadmap W2.4/W2.5).
+        self.register_ntdll_unixlib(base);
+        // Plug the `__wine_unix_call_dispatcher` global. exemu maps ntdll as a
+        // standalone PE with no unix side, so this pointer (which Wine's unix
+        // loader would fill) is null; every PE-side `__wine_unix_call` —
+        // including the very early debug-output path (`__wine_dbg_write`)
+        // reached in `loader_init` — does `call [__wine_unix_call_dispatcher]`,
+        // faulting on a null call. Point it at the intercepted fast-path thunk
+        // so those calls land on `WinOs::wine_unix_call` (roadmap W3.2 follow-up
+        // to W2.4).
+        let thunk = self.wine_unix_call_thunk();
+        let ptr_size = if self.cfg.is_64bit { 8 } else { 4 };
+        mem.write(
+            base + crate::RVA_WINE_UNIX_CALL_DISPATCHER,
+            &thunk.to_le_bytes()[..ptr_size],
+        )?;
+
         // Seed PEB.ApiSetMap so Wine's loader_init → build_import_name (which
         // reads it for every import) doesn't fault on a null pointer (W3.3).
         // Only on this (Wine-core) path, so the emulated corpus is untouched.
         self.seed_api_set_map(mem)?;
-        Ok(ntdll_base)
+        Ok(Some(base))
     }
 
-    /// Map + relocate + inter-bind + Ldr-thread one Wine-core PE from an explicit
-    /// host path, recording it as a real module. Unlike [`Self::load_plugin`] this
-    /// does **not** recurse into dependencies (the caller drives the core set in
-    /// dependency order) and does **not** consult `EMULATED` (the whole point of
-    /// the Wine-core path). Its imports bind via [`Self::resolve_import_addr`], so
-    /// any predecessor already recorded in `by_name`/`exports` resolves to real
-    /// code and the rest fall back to thunks (roadmap W3.2).
+    /// Map + relocate + bind + Ldr-thread one Wine-core PE from an explicit host
+    /// path, recording it as a real module. Post-trim (roadmap W3.2 phase iv)
+    /// [`Self::load_wine_core`] drives this for **ntdll only** — the running
+    /// image Wine never re-maps. Unlike [`Self::load_plugin`] this does **not**
+    /// recurse into dependencies and does **not** consult `EMULATED` (the whole
+    /// point of the Wine-core path). Its imports bind via
+    /// [`Self::resolve_import_addr`] — for ntdll (which imports nothing) this is
+    /// a no-op; the general fall-back to thunks stays for any predecessor not yet
+    /// a real image (roadmap W3.2).
     fn load_core_image(
         &mut self,
         mem: &mut dyn Memory,

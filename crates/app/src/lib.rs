@@ -505,14 +505,16 @@ impl Process {
         os.start_process(cpu.state_mut(), &mut mem, image.entry_va())?;
 
         // --- Wine PE core boot (roadmap W3.2, opt-in) ---------------------
-        // When `EXEMU_WINE_BOOT` gated `wine_dll_dir` on above, map the four Wine
-        // core DLLs as real guest images (relocated + inter-bound), then re-seat
-        // the initial thread at ntdll's `LdrInitializeThunk` with a CONTEXT for
-        // `RtlUserThreadStart(entry, 0)` — Wine's own loader_init then loads the
-        // rest and runs the DllMains before reaching the exe entry. This
-        // OVERRIDES the `start_process` seating above. When `wine_dll_dir` is
-        // `None` (the default / files absent), `load_wine_core` returns `None`
-        // and every binary keeps the emulated-DLL path, unchanged.
+        // When `EXEMU_WINE_BOOT` gated `wine_dll_dir` on above, pre-map **ntdll
+        // only** as a real guest image (the running image Wine never re-maps),
+        // then re-seat the initial thread at ntdll's `LdrInitializeThunk` with a
+        // CONTEXT for `RtlUserThreadStart(entry, 0)` — Wine's own loader_init
+        // then loads kernelbase/kernel32/ucrtbase itself from the same prefix and
+        // runs the DllMains before reaching the exe entry (phase iv trim: exemu
+        // no longer double-maps those three). This OVERRIDES the `start_process`
+        // seating above. When `wine_dll_dir` is `None` (the default / files
+        // absent), `load_wine_core` returns `None` and every binary keeps the
+        // emulated-DLL path, unchanged.
         //
         // NOTE (deferred, W3.3+): the LdrInitializeThunk handoff drives Wine's
         // loader_init, which needs the hardware→software exception bridge (W3.3)
