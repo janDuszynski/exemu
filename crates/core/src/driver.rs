@@ -1,15 +1,22 @@
-//! The display-driver abstraction (W4.2).
+//! The display-driver abstraction (W4.2 / W4.3).
 //!
 //! The domain only knows that *some* backend can be told about window lifecycle
-//! events — create, destroy, show, resize, title change. The concrete driver
-//! (a real AppKit/Metal window or a headless recorder) lives in `exemu-gui`; the
-//! OS layer calls through [`UserDriver`] so it stays free of any windowing
-//! dependency.
+//! events — create, destroy, show, resize, title change — and surface/present
+//! operations. The concrete driver (a real AppKit/Metal window or a headless
+//! recorder) lives in `exemu-gui`; the OS layer calls through [`UserDriver`] so
+//! it stays free of any windowing dependency.
 //!
 //! This is the Rust-native moral equivalent of Wine's `user_driver_funcs` vtable.
 //! All marshalling from guest pointers happens in the win32k handler **before**
 //! calling the driver; the driver itself only sees plain Rust types and is
 //! testable without a running guest.
+//!
+//! ## Surface / present (W4.3)
+//!
+//! The win32k present path reads the DIB pixel buffer out of guest memory and
+//! hands a plain `&[u8]` to [`UserDriver::flush_surface`]. The driver never
+//! touches guest memory — all guest-pointer work is done in the handler before
+//! the call crosses this boundary.
 
 /// Parameters for a window creation call, mirroring the flat arguments that
 /// `NtUserCreateWindowEx` receives from user32's `CreateWindowExW` wrapper.
@@ -107,6 +114,36 @@ pub trait UserDriver: Send {
     /// native window title if one is visible.
     fn set_window_text(&mut self, hwnd: u32, text: &str) {
         let _ = (hwnd, text);
+    }
+
+    /// Allocate a per-HWND backing surface of the given pixel dimensions (W4.3).
+    ///
+    /// `w` and `h` are in pixels. The surface format is top-down BGRA32 with
+    /// `stride = w * 4`, matching the Windows GDI DIB layout. Replaces any
+    /// existing surface for `hwnd`. The window management side-effect (native
+    /// window resize) is covered by [`window_pos_changed`]; this call is
+    /// exclusively about surface storage.
+    ///
+    /// Called by the win32k `NtGdiCreateDIBSection` handler after the DIB
+    /// backing store has been mapped into guest memory.
+    fn create_window_surface(&mut self, hwnd: u32, w: u32, h: u32) {
+        let _ = (hwnd, w, h);
+    }
+
+    /// Present a rendered frame for `hwnd` (W4.3).
+    ///
+    /// `pixels` is a top-down BGRA32 slice of exactly `w * h * 4` bytes
+    /// (`stride = w * 4`) that the win32k handler has already read out of guest
+    /// memory. The driver never touches guest memory — all marshalling is done
+    /// before this call.
+    ///
+    /// For the `OffscreenPresenter` this writes a PNG to the configured output
+    /// directory (or just increments the frame counter when no directory is set).
+    /// For the live Cocoa path (W4.4) it uploads the texture and presents.
+    ///
+    /// Called by the win32k `NtUserEndPaint` handler (the present point).
+    fn flush_surface(&mut self, hwnd: u32, pixels: &[u8], w: u32, h: u32) {
+        let _ = (hwnd, pixels, w, h);
     }
 }
 

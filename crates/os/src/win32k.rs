@@ -23,7 +23,7 @@
 //! `SYSCALL`, which the emulated corpus never issues — the legacy `Gui` path in
 //! `crate::win`/`crate::gdi` is untouched.
 
-use exemu_core::{CpuState, Memory, Result, WindowParams};
+use exemu_core::{CpuState, Memory, Perm, Result, WindowParams};
 
 use crate::api::read_wstr;
 use crate::WinOs;
@@ -57,6 +57,46 @@ const NT_USER_END_PAINT: u32 = 0x13bc;
 const NT_USER_GET_MESSAGE: u32 = 0x141b;
 const NT_USER_PEEK_MESSAGE: u32 = 0x14ca;
 const NT_USER_POST_QUIT_MESSAGE: u32 = 0x14d1;
+
+// --- NtGdi* indices (the win32u.dll `mov eax,IDX` immediates; spot-verified
+//     against the pinned build's stubs — see the W4.3 static gdi32 contract).
+//     gdi32!TextOutW→ExtTextOutW lowers to NtGdiExtTextOutW; gdi32!Rectangle
+//     tail-calls NtGdiRectangle directly. Both carry the 0x1000 table bit.
+const NT_GDI_EXT_TEXT_OUT_W: u32 = 0x11c9;
+const NT_GDI_RECTANGLE: u32 = 0x1259;
+
+// --- GDI shared handle-table contract (recovered from gdi32.dll disasm) -------
+// gdi32's user-mode HDC decode (`get_gdi_client_ptr` @ RVA 0x455f0) reads the
+// per-process handle-table base from PEB+0xF8 (via TEB gs:[0x30]+0x60→+0xF8),
+// indexes `entry = base + (hdc & 0xFFFF) * 24`, then requires:
+//   * byte[entry+0xE]  (type)       != 0
+//   * word[entry+0xC]  (generation) == (hdc >> 16) & 0xFFFF   (only when the
+//     handle's high 16 bits are non-zero — which they always are for a DC,
+//     since the type prefilter demands bit 16 set)
+//   * ptr [entry+0x10] (client obj) → a user-mode DC object whose
+//       dword[+0x04] == 0, qword[+0xA8] == 0 (no open path),
+//       qword[+0xB8] == 0 (no batch)  →  the direct-syscall fast path.
+// We publish a real table + one minimal DC object per HDC so gdi32 stops
+// short-circuiting draws to ERROR_INVALID_HANDLE and actually issues the
+// NtGdi* syscalls this module services.
+const GDI_PEB_TABLE_PTR_OFF: u64 = 0xF8;
+const GDI_ENTRY_SIZE: u64 = 24;
+const GDI_ENTRY_GENERATION_OFF: u64 = 0xC;
+const GDI_ENTRY_TYPE_OFF: u64 = 0xE;
+const GDI_ENTRY_OBJECT_OFF: u64 = 0x10;
+/// Number of 24-byte slots in the published handle table. Only a handful of DCs
+/// are ever live in the gate, but a full page's worth costs nothing.
+const GDI_TABLE_SLOTS: u64 = 128;
+/// Non-zero type byte written at entry+0xE (any non-zero value passes the
+/// `byte[entry+0xE] != 0` gate; `LO_TYPE_DC`-shaped for readability).
+const GDI_ENTRY_TYPE_DC: u8 = 0x01;
+/// The `(hdc & 0x1F0000) == 0x10000` type prefilter forces bit 16 set, so every
+/// DC handle's high 16 bits are `0x0001`; the generation word must match.
+const HDC_TYPE_BITS: u32 = 0x0001_0000;
+const HDC_GENERATION: u16 = 0x0001;
+/// Size of one minimal user-mode DC object (only offsets +4/+0xA8/+0xB8 are read
+/// by gdi32; round up to cover them with slack).
+const GDI_DC_OBJECT_SIZE: u64 = 0x100;
 
 /// The base of the Windows `RegisterClass` atom range (0xC000–0xFFFF).
 const CLASS_ATOM_BASE: u16 = 0xC000;
@@ -103,6 +143,27 @@ struct Window {
     ex_style: u32,
     parent: u32,
     shown: bool,
+    /// The per-window backing surface (W4.3), allocated lazily on the first
+    /// GetDC/BeginPaint. Top-down BGRA32, guest-mapped so gdi32's PE code and
+    /// the presenter share one allocation.
+    surface: Option<Surface>,
+}
+
+/// A per-window backing surface (W4.3): a guest-mapped top-down BGRA32 DIB the
+/// win32k GDI handlers paint into and the driver presents. `base` is the guest
+/// virtual address of the first pixel; `stride = w * 4`.
+#[derive(Clone, Copy)]
+struct Surface {
+    base: u64,
+    w: u32,
+    h: u32,
+}
+
+/// A device context bound to a window (W4.3). Every HDC handed back by
+/// GetDC/GetDCEx/BeginPaint records the hwnd it draws into so the NtGdi paint
+/// handlers can resolve `hdc → hwnd → surface`.
+struct Dc {
+    hwnd: u32,
 }
 
 /// win32k unix-backend state (roadmap W4.1/W4.2): the client PFN table, the
@@ -118,6 +179,19 @@ pub(crate) struct Win32kState {
     classes: Vec<(u16, Class)>,
     /// Live windows, keyed by HWND.
     windows: Vec<(u32, Window)>,
+    /// Live device contexts, keyed by HDC. Binds each HDC to its window +
+    /// handle-table slot for the GDI paint path (W4.3).
+    dcs: Vec<(u32, Dc)>,
+    /// Guest base of the GDI shared handle table (published at PEB+0xF8), or 0
+    /// before the first HDC is allocated. Lazily mapped by `ensure_gdi_table`.
+    gdi_table_base: u64,
+    /// Next free 24-byte slot index in the handle table. Slot 0 is reserved
+    /// (a zero index would make `hdc & 0xFFFF == 0`, indistinguishable from a
+    /// null handle), so allocation starts at 1.
+    gdi_next_slot: u64,
+    /// Guest base of the DC-object arena (one `GDI_DC_OBJECT_SIZE` block per
+    /// slot); the handle-table entry at +0x10 points into this.
+    gdi_dc_arena: u64,
 }
 
 impl Win32kState {
@@ -130,6 +204,14 @@ impl Win32kState {
 
     fn window_mut(&mut self, hwnd: u32) -> Option<&mut Window> {
         self.windows.iter_mut().find(|(h, _)| *h == hwnd).map(|(_, w)| w)
+    }
+
+    fn window(&self, hwnd: u32) -> Option<&Window> {
+        self.windows.iter().find(|(h, _)| *h == hwnd).map(|(_, w)| w)
+    }
+
+    fn dc(&self, hdc: u32) -> Option<&Dc> {
+        self.dcs.iter().find(|(h, _)| *h == hdc).map(|(_, d)| d)
     }
 }
 
@@ -167,6 +249,9 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_GET_MESSAGE, nt_user_get_message);
     os.set_win32k_handler(NT_USER_PEEK_MESSAGE, nt_user_peek_message);
     os.set_win32k_handler(NT_USER_POST_QUIT_MESSAGE, nt_user_post_quit_message);
+    // NtGdi paint path (W4.3): rasterize into the per-window surface.
+    os.set_win32k_handler(NT_GDI_EXT_TEXT_OUT_W, nt_gdi_ext_text_out_w);
+    os.set_win32k_handler(NT_GDI_RECTANGLE, nt_gdi_rectangle);
 }
 
 /// Allocate a fresh nonzero handle (HWND/HDC) from the shared handle space. The
@@ -339,6 +424,7 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
             ex_style,
             parent,
             shown: false,
+            surface: None,
         },
     ));
 
@@ -485,35 +571,203 @@ fn nt_user_internal_get_window_text(
     Ok(n as u32)
 }
 
-/// `NtUserGetDC`/`GetDCEx` → a fresh HDC handle. The backing surface is W4.3.
-fn nt_user_get_dc(os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
-    Ok(alloc_handle(os))
+// ============================ W4.3: GDI surface + DC =========================
+
+/// Client-area extent (cx, cy) of a window, floored to at least 1×1 so the
+/// surface is always allocatable. The stored `rect` is `[x, y, cx, cy]`.
+fn client_size(w: &Window) -> (u32, u32) {
+    let cx = w.rect[2].max(1) as u32;
+    let cy = w.rect[3].max(1) as u32;
+    (cx, cy)
 }
 
-/// `NtUserReleaseDC` → 1 (released).
-fn nt_user_release_dc(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
+/// Lazily map the GDI shared handle table + DC-object arena and publish the
+/// table base at PEB+0xF8, so gdi32's user-mode HDC decode
+/// (`get_gdi_client_ptr`) can walk it. Idempotent — later calls are no-ops.
+///
+/// Returns `false` (and leaves the table unpublished) if the guest memory map
+/// is exhausted or the PEB is unmapped; callers then fall back to bare handles,
+/// which gdi32 rejects gracefully (ERROR_INVALID_HANDLE) rather than faulting.
+fn ensure_gdi_table(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
+    if os.win32k_state.gdi_table_base != 0 {
+        return true;
+    }
+    let peb = os.cfg.peb_addr;
+    if peb == 0 {
+        return false;
+    }
+    let table_size = GDI_TABLE_SLOTS * GDI_ENTRY_SIZE;
+    let Some(table) = os.map_anywhere(mem, table_size, Perm::RW, "gdi-handle-table") else {
+        return false;
+    };
+    let arena_size = GDI_TABLE_SLOTS * GDI_DC_OBJECT_SIZE;
+    let Some(arena) = os.map_anywhere(mem, arena_size, Perm::RW, "gdi-dc-arena") else {
+        return false;
+    };
+    // Publish the table base where gdi32 reads it (PEB+0xF8). map_anywhere
+    // zero-fills, so every entry's type byte starts 0 (invalid) — exactly what
+    // gdi32 wants for an unallocated slot.
+    if mem.write_u64(peb + GDI_PEB_TABLE_PTR_OFF, table).is_err() {
+        return false;
+    }
+    os.win32k_state.gdi_table_base = table;
+    os.win32k_state.gdi_dc_arena = arena;
+    os.win32k_state.gdi_next_slot = 1; // slot 0 reserved (index 0 == null)
+    true
+}
+
+/// Allocate a GDI-formatted HDC bound to `hwnd`: claim a table slot, fill its
+/// 24-byte entry (type/generation/object-pointer) so gdi32's `get_gdi_client_ptr`
+/// accepts it, and zero the DC object (offsets +4/+0xA8/+0xB8 = 0 → the direct
+/// syscall fast path). Returns 0 if the table could not be published or the
+/// slots are exhausted.
+fn alloc_dc(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<u32> {
+    if !ensure_gdi_table(os, mem) {
+        return Ok(0);
+    }
+    let slot = os.win32k_state.gdi_next_slot;
+    if slot >= GDI_TABLE_SLOTS {
+        return Ok(0);
+    }
+    os.win32k_state.gdi_next_slot += 1;
+
+    let entry = os.win32k_state.gdi_table_base + slot * GDI_ENTRY_SIZE;
+    let obj = os.win32k_state.gdi_dc_arena + slot * GDI_DC_OBJECT_SIZE;
+    // Zero the DC object: dword[+4]==0, qword[+0xA8]==0, qword[+0xB8]==0 select
+    // gdi32's direct-syscall fast path (no batch, no open path).
+    for off in (0..GDI_DC_OBJECT_SIZE).step_by(8) {
+        mem.write_u64(obj + off, 0)?;
+    }
+    // Handle-table entry: generation (word @+0xC) must equal (hdc>>16); type
+    // byte (@+0xE) must be non-zero; object pointer (@+0x10).
+    mem.write_u16(entry + GDI_ENTRY_GENERATION_OFF, HDC_GENERATION)?;
+    mem.write_u8(entry + GDI_ENTRY_TYPE_OFF, GDI_ENTRY_TYPE_DC)?;
+    mem.write_u64(entry + GDI_ENTRY_OBJECT_OFF, obj)?;
+
+    // hdc: low 16 = slot index; high 16 = generation, which also carries the
+    // 0x0001 DC type bit the `(hdc & 0x1F0000) == 0x10000` prefilter demands
+    // (HDC_TYPE_BITS == HDC_GENERATION << 16, so one word satisfies both gates).
+    debug_assert_eq!((HDC_GENERATION as u32) << 16, HDC_TYPE_BITS);
+    let hdc = ((HDC_GENERATION as u32) << 16) | (slot as u32 & 0xFFFF);
+    os.win32k_state.dcs.push((hdc, Dc { hwnd }));
+    Ok(hdc)
+}
+
+/// Ensure `hwnd`'s backing surface exists (lazy on first GetDC/BeginPaint):
+/// map a guest-addressable top-down BGRA32 DIB (`w*h*4`, stride `w*4`),
+/// initialize it to opaque white, store it on the window, and notify the
+/// driver. Idempotent. Returns the surface, or `None` if the window is unknown
+/// or the map fails.
+fn ensure_surface(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Option<Surface> {
+    let w = os.win32k_state.window(hwnd)?;
+    if let Some(s) = w.surface {
+        return Some(s);
+    }
+    let (cx, cy) = client_size(w);
+    let bytes = (cx as u64) * (cy as u64) * 4;
+    let base = os.map_anywhere(mem, bytes, Perm::RW, "window-surface")?;
+    // Opaque white (0xFFFFFFFF) so drawn text/frame is measurable against it.
+    for off in (0..bytes).step_by(4) {
+        mem.write_u32(base + off, 0xFFFF_FFFF).ok()?;
+    }
+    let surface = Surface { base, w: cx, h: cy };
+    if let Some(w) = os.win32k_state.window_mut(hwnd) {
+        w.surface = Some(surface);
+    }
+    os.driver.create_window_surface(hwnd, cx, cy);
+    Some(surface)
+}
+
+/// Read `hwnd`'s surface pixels out of guest memory and present them through
+/// the driver (`flush_surface`). Fire-and-forget; a missing surface is a no-op.
+fn present_surface(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<()> {
+    let Some(surface) = os.win32k_state.window(hwnd).and_then(|w| w.surface) else {
+        return Ok(());
+    };
+    let len = (surface.w as usize) * (surface.h as usize) * 4;
+    let mut pixels = vec![0u8; len];
+    for (i, b) in pixels.iter_mut().enumerate() {
+        *b = mem.read_u8(surface.base + i as u64)?;
+    }
+    os.driver.flush_surface(hwnd, &pixels, surface.w, surface.h);
+    Ok(())
+}
+
+/// `NtUserGetDC`/`GetDCEx` → a GDI-formatted HDC bound to arg0's window, with
+/// its backing surface lazily allocated. arg0 is the hwnd (0 → the desktop; we
+/// bind the DC to the first live window in that case, matching the gate's
+/// single-window shape). Returns 0 when no window can back the DC.
+fn nt_user_get_dc(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd_arg = os.syscall_arg(cpu, mem, 0)? as u32;
+    let hwnd = resolve_dc_hwnd(os, hwnd_arg);
+    if hwnd == 0 {
+        return Ok(0);
+    }
+    if ensure_surface(os, mem, hwnd).is_none() {
+        return Ok(0);
+    }
+    alloc_dc(os, mem, hwnd)
+}
+
+/// Resolve the window an HDC should bind to. A real hwnd is used directly; a
+/// NULL hwnd (GetDC(NULL) = the screen DC) binds to the single live top-level
+/// window so the gate's `GetDC(hwnd)`/`GetDC(NULL)` both land on a surface.
+fn resolve_dc_hwnd(os: &WinOs, hwnd_arg: u32) -> u32 {
+    if hwnd_arg != 0 && os.win32k_state.window(hwnd_arg).is_some() {
+        return hwnd_arg;
+    }
+    os.win32k_state.windows.first().map(|(h, _)| *h).unwrap_or(0)
+}
+
+/// `NtUserReleaseDC(hwnd, hdc)` → present the surface (the guest is done
+/// drawing into it) and drop the DC binding. Returns 1 (released).
+fn nt_user_release_dc(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 1)? as u32;
+    if let Some(hwnd) = os.win32k_state.dc(hdc).map(|d| d.hwnd) {
+        present_surface(os, mem, hwnd)?;
+    }
+    os.win32k_state.dcs.retain(|(h, _)| *h != hdc);
     Ok(1)
 }
 
-/// `NtUserBeginPaint(hwnd, *PAINTSTRUCT)` → allocate an HDC, write a minimal
-/// PAINTSTRUCT (hdc, fErase=FALSE, empty rcPaint), return the HDC. Real update
-/// regions arrive with the surface in W4.3.
+/// `NtUserBeginPaint(hwnd, *PAINTSTRUCT)` → allocate a GDI-formatted HDC bound
+/// to the window (with its surface), write the PAINTSTRUCT (hdc, fErase=FALSE,
+/// rcPaint = the full client rect), and return the HDC. Returns 0 (no paint
+/// possible) when the window is unknown.
 fn nt_user_begin_paint(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
     let ps = os.syscall_arg(cpu, mem, 1)?;
-    let hdc = alloc_handle(os);
+    if os.win32k_state.window(hwnd).is_none() {
+        return Ok(0);
+    }
+    let surface = ensure_surface(os, mem, hwnd);
+    let hdc = alloc_dc(os, mem, hwnd)?;
     if ps != 0 {
         // PAINTSTRUCT { HDC hdc @0; BOOL fErase @8; RECT rcPaint @0xC (l,t,r,b) }.
         mem.write_u64(ps, hdc as u64)?;
         mem.write_u32(ps + 8, 0)?;
-        for off in (0xC..0x1C).step_by(4) {
-            mem.write_u32(ps + off, 0)?;
-        }
+        // rcPaint = the full client rect (0,0,cx,cy) — the whole window is dirty.
+        let (cx, cy) = surface.map(|s| (s.w as i32, s.h as i32)).unwrap_or((0, 0));
+        mem.write_u32(ps + 0xC, 0)?; // left
+        mem.write_u32(ps + 0x10, 0)?; // top
+        mem.write_u32(ps + 0x14, cx as u32)?; // right
+        mem.write_u32(ps + 0x18, cy as u32)?; // bottom
     }
     Ok(hdc)
 }
 
-/// `NtUserEndPaint` → 1. The present/blit arrives with the surface in W4.3.
-fn nt_user_end_paint(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
+/// `NtUserEndPaint(hwnd, *PAINTSTRUCT)` → present the surface and drop the paint
+/// HDC (read from the PAINTSTRUCT's hdc field). Returns 1.
+fn nt_user_end_paint(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let ps = os.syscall_arg(cpu, mem, 1)?;
+    if os.win32k_state.window(hwnd).is_some() {
+        present_surface(os, mem, hwnd)?;
+    }
+    if ps != 0 {
+        let hdc = mem.read_u64(ps)? as u32;
+        os.win32k_state.dcs.retain(|(h, _)| *h != hdc);
+    }
     Ok(1)
 }
 
@@ -536,4 +790,111 @@ fn nt_user_post_quit_message(
     _mem: &mut dyn Memory,
 ) -> Result<u32> {
     Ok(0)
+}
+
+// ============================ W4.3: NtGdi paint handlers =====================
+
+/// Opaque-black pixel (BGRA32, `0xFF000000`) — text + rectangle frame draw in
+/// black on the white surface.
+const BGRA_BLACK: u32 = 0xFF00_0000;
+
+/// Resolve `hdc → hwnd → surface` for a paint handler. Returns `None` (the
+/// honest "unbound HDC" failure) when the HDC was never issued by this module
+/// or its window has no surface.
+fn dc_surface(os: &WinOs, hdc: u32) -> Option<(u32, Surface)> {
+    let hwnd = os.win32k_state.dc(hdc)?.hwnd;
+    let surface = os.win32k_state.window(hwnd)?.surface?;
+    Some((hwnd, surface))
+}
+
+/// Write one BGRA32 pixel into a surface, clipped to its bounds. `x`/`y` in
+/// client-area pixels (top-down).
+fn put_pixel(mem: &mut dyn Memory, s: &Surface, x: i32, y: i32, bgra: u32) -> Result<()> {
+    if x < 0 || y < 0 || x >= s.w as i32 || y >= s.h as i32 {
+        return Ok(());
+    }
+    let off = (y as u64 * s.w as u64 + x as u64) * 4;
+    mem.write_u32(s.base + off, bgra)
+}
+
+/// Rasterize one UTF-16 code unit as an 8×8 `font8x8` glyph at `(x, y)`, top-
+/// left origin, in `bgra`, clipped to the surface. Non-representable units draw
+/// nothing (a blank cell), matching a metric-only stub font.
+fn draw_glyph(mem: &mut dyn Memory, s: &Surface, ch: char, x: i32, y: i32, bgra: u32) -> Result<()> {
+    use font8x8::UnicodeFonts;
+    if let Some(rows) = font8x8::BASIC_FONTS.get(ch) {
+        for (ry, bits) in rows.iter().enumerate() {
+            for rx in 0..8i32 {
+                if bits & (1 << rx) != 0 {
+                    put_pixel(mem, s, x + rx, y + ry as i32, bgra)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `NtGdiExtTextOutW(hdc, x, y, flags, RECT* rect, WCHAR* str, UINT count,
+/// INT* dx, DWORD reserved)` — the syscall gdi32!TextOutW→ExtTextOutW lowers to
+/// (recovered ABI; args 0..3 in R10/RDX/R8/R9, args 4+ on the guest stack).
+///
+/// Renders `count` UTF-16 units of `str` with the stub 8×8 font (black on the
+/// white surface, 8px advance per cell), clipped to surface bounds. Returns 1
+/// (TRUE) on a bound HDC, 0 (FALSE) when the HDC is not one of ours.
+fn nt_gdi_ext_text_out_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let x = os.syscall_arg(cpu, mem, 1)? as i32;
+    let y = os.syscall_arg(cpu, mem, 2)? as i32;
+    let str_ptr = os.syscall_arg(cpu, mem, 5)?;
+    let count = os.syscall_arg(cpu, mem, 6)? as u32;
+
+    let Some((_hwnd, surface)) = dc_surface(os, hdc) else {
+        return Ok(0);
+    };
+
+    // Read `count` WCHARs and rasterize left-to-right at a fixed 8px advance
+    // (metric-only stub; proportional metrics + the CoreText path are W4.8).
+    let mut cx = x;
+    for i in 0..count {
+        let unit = mem.read_u16(str_ptr + i as u64 * 2)?;
+        let ch = char::from_u32(unit as u32).unwrap_or('\u{FFFD}');
+        draw_glyph(mem, &surface, ch, cx, y, BGRA_BLACK)?;
+        cx += 8;
+    }
+    Ok(1)
+}
+
+/// `NtGdiRectangle(hdc, left, top, right, bottom)` — the syscall gdi32!Rectangle
+/// tail-calls directly (recovered ABI: hdc/left/top/right in R10/RDX/R8/R9,
+/// bottom the 5th stack arg).
+///
+/// Draws a 1px black frame (no fill — the stub uses the DC's implicit hollow
+/// brush / null-fill fast path), clipped to the surface. `right`/`bottom` are
+/// exclusive per the Win32 `Rectangle` contract, so the frame's far edges sit
+/// at `right-1`/`bottom-1`. Returns 1 (TRUE) on a bound HDC, else 0.
+fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let left = os.syscall_arg(cpu, mem, 1)? as i32;
+    let top = os.syscall_arg(cpu, mem, 2)? as i32;
+    let right = os.syscall_arg(cpu, mem, 3)? as i32;
+    let bottom = os.syscall_arg(cpu, mem, 4)? as i32;
+
+    let Some((_hwnd, surface)) = dc_surface(os, hdc) else {
+        return Ok(0);
+    };
+    if right <= left || bottom <= top {
+        return Ok(1); // degenerate rect: nothing to draw, still success.
+    }
+    let (x0, y0, x1, y1) = (left, top, right - 1, bottom - 1);
+    // Top + bottom edges.
+    for x in x0..=x1 {
+        put_pixel(mem, &surface, x, y0, BGRA_BLACK)?;
+        put_pixel(mem, &surface, x, y1, BGRA_BLACK)?;
+    }
+    // Left + right edges.
+    for y in y0..=y1 {
+        put_pixel(mem, &surface, x0, y, BGRA_BLACK)?;
+        put_pixel(mem, &surface, x1, y, BGRA_BLACK)?;
+    }
+    Ok(1)
 }

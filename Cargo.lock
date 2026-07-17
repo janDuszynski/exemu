@@ -221,6 +221,7 @@ dependencies = [
  "exemu-cpu",
  "exemu-loader",
  "exemu-memory",
+ "font8x8",
 ]
 
 [[package]]

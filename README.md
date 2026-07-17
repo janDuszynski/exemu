@@ -344,8 +344,13 @@ now cross Wine's `win32u` syscall layer too: a generated Win32 sample runs its
 through Wine's **real `user32`/`gdi32`**, with the emulator's win32k backend
 marshalling the actual class/title/geometry into real window objects and pushing
 create/show/resize/destroy through a native display-driver seam
-(`crates/app/tests/gui_gate.rs`). Nothing is rendered on screen yet — the
-backing surface, presenter, and native event pump are the next steps.
+(`crates/app/tests/gui_gate.rs`). And the first pixels are real: the emulator
+publishes the GDI shared handle table Wine's `gdi32` demands (at `PEB+0xF8`),
+gives every window a guest-mapped BGRA backing surface, and services the
+`NtGdiExtTextOutW`/`NtGdiRectangle` syscalls `gdi32` lowers `TextOutW`/
+`Rectangle` into — so the sample's first frame (text + rectangle, drawn by
+Wine's real GDI stack) renders headlessly to PNG. An on-screen native window
+and the event pump are the next steps.
 
 ### Differential CPU oracle
 

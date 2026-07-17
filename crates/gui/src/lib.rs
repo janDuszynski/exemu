@@ -527,6 +527,21 @@ impl OffscreenPresenter {
         OffscreenPresenter { dir, frame_count: 0 }
     }
 
+    /// Build a presenter with an explicit output directory, bypassing the
+    /// `EXEMU_GUI_SHOT` environment variable.
+    ///
+    /// Pass `None` to get count-only (no PNG) mode regardless of the
+    /// environment. Pass `Some(dir)` to direct PNG output to `dir` without
+    /// setting an env var — useful for tests that want deterministic paths.
+    pub fn with_dir(dir: Option<impl Into<PathBuf>>) -> Self {
+        let dir = dir.map(|d| {
+            let p = d.into();
+            let _ = std::fs::create_dir_all(&p);
+            p
+        });
+        OffscreenPresenter { dir, frame_count: 0 }
+    }
+
     /// Total frames flushed (useful for assertions in tests).
     pub fn frame_count(&self) -> u64 {
         self.frame_count
@@ -563,6 +578,14 @@ impl Presenter for OffscreenPresenter {
 /// The gate test for W4.2 injects a [`RecordingDriver`], runs a headless
 /// guest up to `CreateWindowEx` + `ShowWindow`, and asserts that the expected
 /// calls appear in the log (in order, or as a set — the test's choice).
+///
+/// W4.3 adds [`CreateWindowSurface`] and [`FlushSurface`]; the pixel buffer is
+/// *not* stored — only the dimensions and a cheap "something was drawn" count
+/// (`non_blank`) are recorded so gate tests can assert without holding large
+/// allocations in the log.
+///
+/// [`CreateWindowSurface`]: DriverCall::CreateWindowSurface
+/// [`FlushSurface`]: DriverCall::FlushSurface
 #[derive(Debug, Clone)]
 pub enum DriverCall {
     CreateWindow { hwnd: u32, params: WindowParams },
@@ -573,6 +596,14 @@ pub enum DriverCall {
     SetParent { hwnd: u32, parent: u32 },
     SetWindowRgn { hwnd: u32, rgn_hwnd: u32 },
     SetWindowText { hwnd: u32, text: String },
+    /// A backing surface was allocated for `hwnd` at the given dimensions (W4.3).
+    CreateWindowSurface { hwnd: u32, w: u32, h: u32 },
+    /// A frame was presented for `hwnd` (W4.3).
+    ///
+    /// `non_blank` counts pixels in the flushed buffer whose BGR bytes are not
+    /// all equal to the first pixel's BGR value — a cheap signal that *something
+    /// was drawn* beyond a solid fill. The pixel buffer itself is not stored.
+    FlushSurface { hwnd: u32, w: u32, h: u32, non_blank: u32 },
 }
 
 /// A [`UserDriver`] that records every call into a shared log.
@@ -587,14 +618,31 @@ pub enum DriverCall {
 /// // … run …
 /// assert!(log.lock().unwrap().iter().any(|c| matches!(c, DriverCall::ShowWindow { .. })));
 /// ```
+///
+/// For tests that need both recording *and* actual presentation (e.g. to
+/// capture golden PNGs while verifying call sequences), wrap an inner driver
+/// with [`RecordingDriver::with_inner`]: every call is logged first, then
+/// forwarded to the inner driver.
 pub struct RecordingDriver {
     log: Arc<Mutex<Vec<DriverCall>>>,
+    /// Optional inner driver that every call is forwarded to after recording.
+    inner: Option<Box<dyn UserDriver>>,
 }
 
 impl RecordingDriver {
     /// Construct a recording driver backed by the given shared log.
     pub fn new(log: Arc<Mutex<Vec<DriverCall>>>) -> Self {
-        RecordingDriver { log }
+        RecordingDriver { log, inner: None }
+    }
+
+    /// Construct a recording driver that also forwards every call to `inner`
+    /// after recording it.
+    ///
+    /// This is the minimal composition that satisfies tests needing both a
+    /// call log and a real presentation (e.g. PNG output). The inner driver
+    /// is notified with identical arguments after the log entry is appended.
+    pub fn with_inner(log: Arc<Mutex<Vec<DriverCall>>>, inner: Box<dyn UserDriver>) -> Self {
+        RecordingDriver { log, inner: Some(inner) }
     }
 
     /// Push one call record, silently discarding any poisoning.
@@ -605,36 +653,149 @@ impl RecordingDriver {
     }
 }
 
+/// Count pixels in `pixels` (BGRA32, `w * h * 4` bytes) whose BGR bytes are
+/// not all equal to the first pixel's BGR value.
+///
+/// This is a cheap "something was drawn" heuristic: a solid fill returns 0;
+/// any variation in colour returns a positive count. The alpha channel is
+/// ignored because Windows GDI DIBs typically leave it at 0xFF regardless.
+fn count_non_blank(pixels: &[u8], w: u32, h: u32) -> u32 {
+    let n = (w as usize) * (h as usize);
+    if n == 0 || pixels.len() < n * 4 {
+        return 0;
+    }
+    // Reference: first pixel's BGR (bytes 0, 1, 2).
+    let (b0, g0, r0) = (pixels[0], pixels[1], pixels[2]);
+    let mut count = 0u32;
+    for i in 1..n {
+        let off = i * 4;
+        if pixels[off] != b0 || pixels[off + 1] != g0 || pixels[off + 2] != r0 {
+            count += 1;
+        }
+    }
+    count
+}
+
 impl UserDriver for RecordingDriver {
     fn create_window(&mut self, hwnd: u32, params: &WindowParams) {
         self.push(DriverCall::CreateWindow { hwnd, params: params.clone() });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.create_window(hwnd, params);
+        }
     }
 
     fn destroy_window(&mut self, hwnd: u32) {
         self.push(DriverCall::DestroyWindow { hwnd });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.destroy_window(hwnd);
+        }
     }
 
     fn window_pos_changing(&mut self, hwnd: u32) {
         self.push(DriverCall::WindowPosChanging { hwnd });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.window_pos_changing(hwnd);
+        }
     }
 
     fn window_pos_changed(&mut self, hwnd: u32, rect: [i32; 4]) {
         self.push(DriverCall::WindowPosChanged { hwnd, rect });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.window_pos_changed(hwnd, rect);
+        }
     }
 
     fn show_window(&mut self, hwnd: u32, cmd: i32) {
         self.push(DriverCall::ShowWindow { hwnd, cmd });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.show_window(hwnd, cmd);
+        }
     }
 
     fn set_parent(&mut self, hwnd: u32, parent: u32) {
         self.push(DriverCall::SetParent { hwnd, parent });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_parent(hwnd, parent);
+        }
     }
 
     fn set_window_rgn(&mut self, hwnd: u32, rgn_hwnd: u32) {
         self.push(DriverCall::SetWindowRgn { hwnd, rgn_hwnd });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_window_rgn(hwnd, rgn_hwnd);
+        }
     }
 
     fn set_window_text(&mut self, hwnd: u32, text: &str) {
         self.push(DriverCall::SetWindowText { hwnd, text: text.to_string() });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_window_text(hwnd, text);
+        }
+    }
+
+    fn create_window_surface(&mut self, hwnd: u32, w: u32, h: u32) {
+        self.push(DriverCall::CreateWindowSurface { hwnd, w, h });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.create_window_surface(hwnd, w, h);
+        }
+    }
+
+    fn flush_surface(&mut self, hwnd: u32, pixels: &[u8], w: u32, h: u32) {
+        let non_blank = count_non_blank(pixels, w, h);
+        self.push(DriverCall::FlushSurface { hwnd, w, h, non_blank });
+        if let Some(inner) = self.inner.as_mut() {
+            inner.flush_surface(hwnd, pixels, w, h);
+        }
+    }
+}
+
+// ============================ W4.3: PresenterDriver ==========================
+
+/// A [`UserDriver`] that delegates surface/present calls to a [`Presenter`]
+/// (W4.3).
+///
+/// Window-management calls (`create_window`, `show_window`, etc.) are no-ops
+/// in this adapter — the `PresenterDriver` only handles the surface half.
+/// Compose it with another driver (e.g. a future `CocoaDriver`) or use it
+/// standalone for the headless path where window management is not needed.
+///
+/// ```rust,ignore
+/// let presenter = OffscreenPresenter::with_dir(Some("/tmp/frames"));
+/// let driver = PresenterDriver::new(presenter);
+/// cfg.driver = Some(Box::new(driver));
+/// ```
+pub struct PresenterDriver<P: Presenter> {
+    presenter: P,
+}
+
+impl<P: Presenter> PresenterDriver<P> {
+    /// Wrap `presenter` in a [`UserDriver`] adapter.
+    pub fn new(presenter: P) -> Self {
+        PresenterDriver { presenter }
+    }
+
+    /// Borrow the inner presenter (e.g. to read `frame_count` after a run).
+    pub fn presenter(&self) -> &P {
+        &self.presenter
+    }
+
+    /// Consume the adapter and return the inner presenter.
+    pub fn into_presenter(self) -> P {
+        self.presenter
+    }
+}
+
+impl<P: Presenter + Send> UserDriver for PresenterDriver<P> {
+    /// Release the presenter's backing surface when the window is destroyed.
+    fn destroy_window(&mut self, hwnd: u32) {
+        self.presenter.destroy_surface(hwnd);
+    }
+
+    fn create_window_surface(&mut self, hwnd: u32, w: u32, h: u32) {
+        self.presenter.create_surface(hwnd, w, h);
+    }
+
+    fn flush_surface(&mut self, hwnd: u32, pixels: &[u8], w: u32, h: u32) {
+        self.presenter.flush(hwnd, pixels, w, h);
     }
 }

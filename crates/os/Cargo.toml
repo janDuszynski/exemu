@@ -12,6 +12,10 @@ description = "Emulated Windows environment: API thunks and kernel32 implementat
 exemu-core = { workspace = true }
 exemu-cpu = { workspace = true }
 exemu-loader = { workspace = true }
+# Stub 8×8 bitmap font for the win32k GDI paint path (W4.3): NtGdiExtTextOutW
+# rasterizes ASCII glyphs into the per-window surface. A metric-only stub until
+# the CoreText-backed glyph path (W4.8).
+font8x8 = "0.3"
 
 [dev-dependencies]
 exemu-cpu = { workspace = true }
