@@ -98,8 +98,11 @@ mod teb {
     pub const CLIENT_ID_THREAD: u64 = 0x048;
     pub const TLS_POINTER: u64 = 0x058;
     pub const PEB: u64 = 0x060;
-    pub const STATIC_UNICODE_STRING: u64 = 0x0B8;
-    pub const STATIC_UNICODE_BUFFER: u64 = 0x0C8;
+    // The offset Wine's kernelbase `file_name_AtoW` reads as `gs:[0x30]+0x1258`
+    // (roadmap W3.7): the `*A` file APIs fail before `NtCreateFile` if this is
+    // wrong and MaximumLength reads back 0.
+    pub const STATIC_UNICODE_STRING: u64 = 0x1258;
+    pub const STATIC_UNICODE_BUFFER: u64 = 0x1268;
     pub const COUNT_OF_OWNED_CRIT_SECS: u64 = 0x6C8;
 }
 

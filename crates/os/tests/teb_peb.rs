@@ -221,10 +221,14 @@ fn teb_field_walk_populates_every_dereferenced_offset() {
     assert_eq!(mem.read_u64(TEB_BASE + 0x58).unwrap(), 0);
     // ProcessEnvironmentBlock @0x60 → the PEB.
     assert_eq!(mem.read_u64(TEB_BASE + 0x60).unwrap(), PEB_BASE);
-    // StaticUnicodeString @0xB8: Length 0, MaxLength 522, Buffer → inline buffer.
-    assert_eq!(mem.read_u16(TEB_BASE + 0xB8).unwrap(), 0); // Length
-    assert_eq!(mem.read_u16(TEB_BASE + 0xBA).unwrap(), 261 * 2); // MaximumLength
-    assert_eq!(mem.read_u64(TEB_BASE + 0xB8 + 8).unwrap(), TEB_BASE + 0xC8);
+    // StaticUnicodeString @0x1258 (the offset Wine's kernelbase `file_name_AtoW`
+    // reads as `gs:[0x30]+0x1258`): Length 0, MaxLength 522, Buffer → inline
+    // buffer @0x1268. Getting this offset wrong leaves MaxLength 0, so
+    // `RtlAnsiStringToUnicodeString` overflows and every `*A` file API fails
+    // before `NtCreateFile` (roadmap W3.7).
+    assert_eq!(mem.read_u16(TEB_BASE + 0x1258).unwrap(), 0); // Length
+    assert_eq!(mem.read_u16(TEB_BASE + 0x125A).unwrap(), 261 * 2); // MaximumLength
+    assert_eq!(mem.read_u64(TEB_BASE + 0x1258 + 8).unwrap(), TEB_BASE + 0x1268);
     // CountOfOwnedCriticalSections @0x6C8 = 0.
     assert_eq!(mem.read_u32(TEB_BASE + 0x6C8).unwrap(), 0);
     // DeallocationStack @0x1478 = the stack base (used on teardown).

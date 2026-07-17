@@ -51,8 +51,16 @@ mod teb64 {
     pub const CLIENT_ID_THREAD: u64 = 0x048; // ClientId.UniqueThread
     pub const TLS_POINTER: u64 = 0x058; // ThreadLocalStoragePointer
     pub const PEB: u64 = 0x060; // ProcessEnvironmentBlock
-    pub const STATIC_UNICODE_STRING: u64 = 0x0B8; // UNICODE_STRING {Len, MaxLen, +pad, Buffer}
-    pub const STATIC_UNICODE_BUFFER: u64 = 0x0C8; // WCHAR[261] backing buffer
+    // StaticUnicodeString/Buffer offsets are Wine-build-specific: the pinned
+    // `kernelbase.dll` `file_name_AtoW` reads them off the TEB as `gs:[0x30]+0x1258`
+    // (`RtlAnsiStringToUnicodeString(&TEB->StaticUnicodeString, ...)` then returns
+    // `[+8]` = Buffer). Wine's PE TEB places StaticUnicodeString at 0x1258 (not
+    // the stock-Windows 0x538); the 0xB8/0xC8 here were the 32-bit-ish offsets and
+    // left the real field zeroed, so `RtlAnsiStringToUnicodeString` overflowed a
+    // 0-length buffer → `file_name_AtoW` returned NULL → every `*A` file API
+    // (`CreateFileA`, …) failed *before* reaching `NtCreateFile` (roadmap W3.7).
+    pub const STATIC_UNICODE_STRING: u64 = 0x1258; // UNICODE_STRING {Len, MaxLen, +pad, Buffer}
+    pub const STATIC_UNICODE_BUFFER: u64 = 0x1268; // WCHAR[261] backing buffer
     pub const COUNT_OF_OWNED_CRIT_SECS: u64 = 0x6C8; // CountOfOwnedCriticalSections (ULONG)
     // W2.10 completion: the pointer fields the pinned ntdll dereferences off the
     // TEB and that must therefore hold a *valid* value (not merely read 0). The

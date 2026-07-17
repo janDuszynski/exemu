@@ -335,7 +335,10 @@ CLI), the emulator maps ntdll + the exe, hands off through
 sections, relocates them, and runs their `DllMain`s. The program's `WriteFile`
 then runs Wine's kernel32 → `NtWriteFile` → the emulator's console bridge → host
 stdout, and it exits 0 — none of the emulator's hand-written Win32 stubs are
-used. The `crates/app/tests/wine_gate.rs` gate pins this end to end. GUI programs
+used. The `crates/app/tests/wine_gate.rs` gate pins this end to end — including a
+program that drives a full **file-I/O round-trip** (`CreateFileA` → `WriteFile` →
+`ReadFile`) through Wine's kernel32 onto the host filesystem and then propagates a
+**non-zero exit code** (`ExitProcess(42)` → Wine's `NtTerminateProcess`). GUI programs
 are not there yet: they reach Wine's `win32u`/GDI syscall layer, which is the
 next phase.
 

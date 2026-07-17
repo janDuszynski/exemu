@@ -84,3 +84,92 @@ fn console_hello_runs_on_wine_pe_kernel32() {
         emulated.steps
     );
 }
+
+/// Broadened W3 gate (roadmap W3.7): a console `.exe` drives a full **file-I/O
+/// round-trip** — `CreateFileA`/`WriteFile`/`CloseHandle` then
+/// `CreateFileA`/`ReadFile`/`CloseHandle` — through Wine's real kernel32, then
+/// exits with a **distinct non-zero code** proving exit-code propagation.
+///
+/// On the Wine-boot path the program's `CreateFileA` runs Wine's
+/// kernelbase `CreateFileA` → `file_name_AtoW` (which reads the TEB
+/// `StaticUnicodeString`) → `CreateFileW` → `NtCreateFile`, its `WriteFile`/
+/// `ReadFile` run Wine's kernel32 → `NtWriteFile`/`NtReadFile`, and its
+/// `ExitProcess(42)` runs Wine's kernel32 → `NtTerminateProcess(42)`. The bytes
+/// actually land on the host under `<sandbox>/C/wine-gate.txt`, the read-back
+/// matches, and the process exits 42 — end to end through Wine's PE core.
+///
+/// (No clean 64-bit console corpus binary exercises file I/O — tcc is 32-bit and
+/// the rest GUI — so the proof binary is exemu's own generated sample.)
+#[test]
+fn console_fileio_roundtrips_and_propagates_exit_code_on_wine() {
+    if !Path::new(WINE_DLLS).join("ntdll.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/ntdll.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let exe = sample::build_console_fileio();
+
+    // Control — the EMULATED path runs the same program (exemu's own kernel32
+    // thunks service CreateFileA/WriteFile/ReadFile/…) in a handful of
+    // instructions, proving the program itself is trivial: the round-trip
+    // succeeds and it exits with the distinct code 42.
+    let emulated = load_and_run(
+        &exe,
+        RunConfig {
+            echo: false,
+            ..RunConfig::default()
+        },
+    )
+    .expect("emulated run");
+    assert_eq!(emulated.exit_code, 42, "emulated exit code (round-trip matched)");
+    assert!(
+        String::from_utf8_lossy(&emulated.stdout).contains("OK"),
+        "emulated stdout: {:?}",
+        String::from_utf8_lossy(&emulated.stdout)
+    );
+    assert!(
+        emulated.steps < 5000,
+        "emulated path is trivial, was {} steps",
+        emulated.steps
+    );
+
+    // The GATE — boot Wine's real PE core and run the same file-I/O program on it.
+    let wine = load_and_run(
+        &exe,
+        RunConfig {
+            echo: false,
+            max_steps: 20_000_000,
+            wine_boot_dir: Some(WINE_DLLS.to_string()),
+            ..RunConfig::default()
+        },
+    )
+    .expect("wine-boot run");
+
+    // Exit-code propagation: ExitProcess(42) → Wine kernel32 → NtTerminateProcess.
+    assert_eq!(
+        wine.exit_code, 42,
+        "non-zero exit code propagated through Wine's ExitProcess → NtTerminateProcess"
+    );
+    // stdout "OK" means CreateFileA + WriteFile + ReadFile all worked through Wine.
+    assert!(
+        String::from_utf8_lossy(&wine.stdout).contains("OK"),
+        "file-I/O round-trip reported OK through Wine's kernel32: {:?}",
+        String::from_utf8_lossy(&wine.stdout)
+    );
+    // The bytes actually landed on the host: read <sandbox>/C/wine-gate.txt.
+    let host_file = Path::new(&wine.sandbox).join("C").join("wine-gate.txt");
+    let bytes = std::fs::read(&host_file)
+        .unwrap_or_else(|e| panic!("host file {host_file:?} should exist: {e}"));
+    assert_eq!(
+        bytes,
+        sample::FILEIO_PAYLOAD,
+        "the payload Wine's NtWriteFile committed to disk"
+    );
+    // The full Wine PE boot ran (orders of magnitude more than the emulated path).
+    assert!(
+        wine.steps > 100_000,
+        "the full Wine PE core booted ({} steps vs {} emulated)",
+        wine.steps,
+        emulated.steps
+    );
+}
