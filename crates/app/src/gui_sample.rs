@@ -1,8 +1,16 @@
 //! Generates a tiny but real **GUI** PE: it registers a window class, creates
-//! a custom (non-dialog) window, runs a message loop, and paints its client
-//! area with the emulated GDI (a framed rectangle + two lines of text). It is
-//! the counterpart to [`crate::sample`], exercising the `CreateWindowEx` +
-//! GDI path rather than a console.
+//! a custom (non-dialog) window, shows it, paints its client area with the
+//! emulated GDI (a framed rectangle + a line of text via a direct
+//! GetDC→TextOutW→Rectangle→ReleaseDC), then runs a message loop. It is the
+//! counterpart to [`crate::sample`], exercising the `CreateWindowEx` + GDI
+//! surface/present path rather than a console.
+//!
+//! The direct paint after `ShowWindow` is the honest W4.3 gate: WM_PAINT
+//! delivery through the kernel WndProc callback is W4.6, so the `WM_PAINT` arm
+//! of `wndproc` below is present but never reached in this build (the message
+//! loop's `GetMessage` returns `WM_QUIT` immediately). The direct sequence
+//! drives the same GDI calls into the real per-window backing surface so the
+//! present pipeline is fully exercised.
 //!
 //! The code is hand-assembled x86-64 with a small local assembler (`Asm`) so
 //! branch targets and RIP-relative references stay correct.
@@ -98,6 +106,8 @@ fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
                 "BeginPaint",
                 "EndPaint",
                 "PostQuitMessage",
+                "GetDC",
+                "ReleaseDC",
             ],
         ),
         ("gdi32.dll", vec!["TextOutW", "Rectangle"]),
@@ -263,6 +273,36 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.mov_reg_reg(RCX, RAX);
     a.mov32(RDX, 5); // SW_SHOW
     a.call_iat(r.slot("ShowWindow"));
+
+    // ---- direct paint (W4.3) ----------------------------------------------
+    // The WndProc paint code below only runs on a WM_PAINT the message loop
+    // never delivers in this build (GetMessage returns WM_QUIT immediately;
+    // callback delivery is W4.6). To exercise the *surface/present* pipeline
+    // now, paint the client area directly here: GetDC → TextOutW → Rectangle →
+    // ReleaseDC. hwnd is live in RBX; the WNDCLASS scratch at [rsp+0x60] is free
+    // after RegisterClassW so it stashes the hdc; [rsp+0x20] is the 5th-arg home
+    // slot for the count/bottom.
+    a.mov_reg_reg(RCX, RBX); // hwnd
+    a.call_iat(r.slot("GetDC"));
+    a.mov_at_rsp_reg(0x60, RAX); // save hdc
+    // TextOutW(hdc, 12, 12, line1, wlen(PAINT_LINE1))
+    a.mov_reg_reg(RCX, RAX);
+    a.mov32(RDX, 12);
+    a.mov32(R8, 12);
+    a.lea_rip(R9, r.line1);
+    a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE1) as i32);
+    a.call_iat(r.slot("TextOutW"));
+    // Rectangle(hdc, 8, 8, 200, 60)
+    a.mov_reg_at_rsp(RCX, 0x60);
+    a.mov32(RDX, 8);
+    a.mov32(R8, 8);
+    a.mov32(R9, 200);
+    a.mov_at_rsp_imm(0x20, 60);
+    a.call_iat(r.slot("Rectangle"));
+    // ReleaseDC(hwnd, hdc) — the present point for the direct paint.
+    a.mov_reg_reg(RCX, RBX);
+    a.mov_reg_at_rsp(RDX, 0x60);
+    a.call_iat(r.slot("ReleaseDC"));
 
     a.label("loop");
     a.lea_rsp(RCX, 0xB0); // &msg
