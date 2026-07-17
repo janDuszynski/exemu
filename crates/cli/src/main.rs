@@ -151,7 +151,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     if let Some(m) = max_steps {
         cfg.max_steps = m;
     }
-    let proc = Process::load(&bytes, &cfg).map_err(|e| e.to_string())?;
+    let proc = Process::load(&bytes, &mut cfg).map_err(|e| e.to_string())?;
     // The guest filesystem lives here regardless of how the run ends.
     let sandbox = std::env::temp_dir().join("exemu-sandbox");
     let run = proc.run();

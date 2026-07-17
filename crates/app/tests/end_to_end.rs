@@ -86,7 +86,7 @@ fn gui_sample_runs_to_a_clean_exit() {
 #[test]
 fn entry_point_is_in_text_section() {
     let bytes = sample::build();
-    let proc = Process::load(&bytes, &silent_cfg()).expect("load");
+    let proc = Process::load(&bytes, &mut silent_cfg()).expect("load");
     // Image base 0x140000000 + .text RVA 0x1000.
     assert_eq!(proc.entry(), 0x1_4000_1000);
 }

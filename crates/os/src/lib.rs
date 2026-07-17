@@ -194,6 +194,11 @@ pub struct WinOs {
 
     /// The windowing backend (NoGui = headless auto-drive).
     gui: Box<dyn exemu_core::Gui>,
+    /// The W4.2 display driver (NoDriver = headless/emulated-corpus default).
+    /// win32k handlers call through this to create, show, and destroy native
+    /// windows; the concrete impl is injected by the application layer, mirroring
+    /// `set_gui` (roadmap W4.2).
+    driver: Box<dyn exemu_core::UserDriver>,
     /// Dialog templates parsed from the image, by resource id.
     dialogs: std::collections::HashMap<u32, exemu_core::DialogTemplate>,
     /// The active dialog's procedure and window handle (when a real window is
@@ -413,6 +418,7 @@ impl WinOs {
             controls: std::collections::HashMap::new(),
             msg_pumps: 8,
             gui: Box::new(exemu_core::NoGui),
+            driver: Box::new(exemu_core::NoDriver),
             dialogs: std::collections::HashMap::new(),
             dlgproc: 0,
             dialog_hwnd: 0,
@@ -666,6 +672,17 @@ impl WinOs {
     ) {
         self.gui = gui;
         self.dialogs = dialogs;
+    }
+
+    /// Install a W4.2 display driver. win32k handlers call through the driver
+    /// for every window-lifecycle event (create, destroy, show, resize, title).
+    ///
+    /// The default is [`exemu_core::NoDriver`] (all-no-ops), which is correct
+    /// for the emulated-corpus path and for headless test runs. The application
+    /// layer injects a real driver (e.g. `RecordingDriver` for tests, or a
+    /// future `CocoaDriver` for live windows) before running the guest.
+    pub fn set_driver(&mut self, d: Box<dyn exemu_core::UserDriver>) {
+        self.driver = d;
     }
 
     /// Whether a real (non-headless) window backend is installed and showing.

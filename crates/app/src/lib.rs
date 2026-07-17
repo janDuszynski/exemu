@@ -147,6 +147,12 @@ pub struct RunConfig {
     pub echo: bool,
     /// Log unimplemented API calls.
     pub trace: bool,
+    /// Optional W4.2 display driver to inject before the guest starts running.
+    /// `None` keeps the default [`exemu_core::NoDriver`] (all-no-ops), which is
+    /// correct for console and emulated-corpus runs. Gate tests inject a
+    /// [`exemu_gui::RecordingDriver`] here; future CLI code injects the Cocoa
+    /// driver when `--gui` is combined with `--wine-boot`.
+    pub driver: Option<Box<dyn exemu_core::UserDriver>>,
     /// Safety cap on executed instructions (0 = unlimited).
     pub max_steps: u64,
     /// Render dialogs in a real window and let the user drive them, instead
@@ -178,6 +184,7 @@ impl Default for RunConfig {
             gui: false,
             load_base: None,
             wine_boot_dir: None,
+            driver: None,
         }
     }
 }
@@ -224,7 +231,12 @@ pub struct Process {
 
 impl Process {
     /// Parse and lay out `pe_bytes` into a runnable process.
-    pub fn load(pe_bytes: &[u8], cfg: &RunConfig) -> Result<Process> {
+    ///
+    /// `cfg` is taken by mutable reference so the optional
+    /// [`RunConfig::driver`] slot can be moved out (a `Box<dyn …>` cannot be
+    /// cloned). All other fields are read-only; callers that do not use the
+    /// driver slot are unaffected.
+    pub fn load(pe_bytes: &[u8], cfg: &mut RunConfig) -> Result<Process> {
         let mut image = loader::parse(pe_bytes)?;
         let mut mem = VirtualMemory::new();
 
@@ -480,6 +492,13 @@ impl Process {
                 None => Box::new(exemu_gui::MinifbGui::new()),
             };
             os.set_gui(gui, dialogs);
+        }
+
+        // --- Optional W4.2 display driver ---------------------------------
+        // Injected by tests (RecordingDriver) or future CLI code (CocoaDriver).
+        // Default is NoDriver (all-no-ops), correct for the emulated path.
+        if let Some(d) = cfg.driver.take() {
+            os.set_driver(d);
         }
 
         // --- Initial CPU state --------------------------------------------
@@ -834,7 +853,8 @@ impl Process {
 
 /// Convenience: load and run in one call.
 pub fn load_and_run(pe_bytes: &[u8], cfg: RunConfig) -> Result<RunResult> {
-    Process::load(pe_bytes, &cfg)?.run()
+    let mut cfg = cfg;
+    Process::load(pe_bytes, &mut cfg)?.run()
 }
 
 // ---- helpers ---------------------------------------------------------------

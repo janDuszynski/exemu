@@ -46,7 +46,7 @@ fn tls_index_is_published_and_template_copied() {
     let bytes = sample::build_with_tls();
     let image = exemu_loader::parse(&bytes).unwrap();
     let tls = image.tls.clone().unwrap();
-    let proc = Process::load(&bytes, &silent_cfg()).expect("load");
+    let proc = Process::load(&bytes, &mut silent_cfg()).expect("load");
     // Index slot holds 0 (the first allocated TLS index).
     let idx = proc.peek_u32(tls.address_of_index).expect("index slot mapped");
     assert_eq!(idx, 0, "loader should publish TLS index 0 at AddressOfIndex");
