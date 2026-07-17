@@ -43,10 +43,23 @@ use crate::WinOs;
 /// (each `Nt*` group fills its slots in W2.6+). Public ntstatus value.
 pub(crate) const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 
-/// Number of SSDT slots. Wine's native x64 ntdll exposes a few hundred `Nt*`
-/// services; 0x400 comfortably covers the index range without depending on the
-/// exact count (open item U9).
+/// Number of ntdll SSDT slots. Wine's native x64 ntdll exposes a few hundred
+/// `Nt*` services; 0x400 comfortably covers the index range without depending
+/// on the exact count (open item U9).
 const SSDT_LEN: usize = 0x400;
+
+/// Number of win32k (USER/GDI) SSDT slots. win32u's stubs use indices
+/// 0x1084–0x1601; after masking off the `0x1000` table selector the *effective*
+/// index runs 0x84–0x601, so 0x700 slots comfortably cover it (roadmap W4.1).
+const WIN32K_LEN: usize = 0x700;
+
+/// The table selector bit in an SSDT index: the win32k (USER/GDI) table is
+/// selected when it is set (win32u indices 0x1084–0x1601 all carry it), the
+/// ntdll table otherwise (no ntdll index reaches 0x1000). This is Windows' own
+/// USER/GDI table selector, reused here as the routing discriminator so the
+/// existing raw-`SYSCALL` CPU path delivers both tables with no CPU change
+/// (roadmap W4.1). See [`WinOs::dispatch_syscall`].
+pub(crate) const WIN32K_TABLE_BIT: u32 = 0x1000;
 
 /// Bytes reserved for the dispatcher's dedicated unix stack. A native handler
 /// runs on the host, so this only has to be large enough for any guest memory
@@ -78,9 +91,19 @@ pub(crate) struct Ssdt {
 }
 
 impl Ssdt {
+    /// The ntdll service table (index → `Nt*` handler), [`SSDT_LEN`] slots.
     pub(crate) fn new() -> Self {
         Ssdt {
             handlers: vec![Ssdt::unimplemented as Handler; SSDT_LEN],
+        }
+    }
+
+    /// The win32k (USER/GDI) service table, [`WIN32K_LEN`] slots, indexed by the
+    /// *masked* index (`index & !WIN32K_TABLE_BIT`). Slots default to the same
+    /// `unimplemented` stub until [`crate::win32k`] installs the W4.1 skeleton.
+    pub(crate) fn new_win32k() -> Self {
+        Ssdt {
+            handlers: vec![Ssdt::unimplemented as Handler; WIN32K_LEN],
         }
     }
 
@@ -318,6 +341,16 @@ impl WinOs {
         self.ssdt.set(index, handler);
     }
 
+    /// Install a native handler at a **win32k** (USER/GDI) SSDT index (roadmap
+    /// W4.1). The index is the raw win32u immediate (0x1084–0x1601, carrying the
+    /// [`WIN32K_TABLE_BIT`]); the table stores it masked, exactly as
+    /// [`WinOs::dispatch_syscall`] looks it up. The `crate::win32k` module's
+    /// [`crate::win32k::register`] uses this to claim its skeleton slots; the
+    /// same entry point the win32k routing test drives an index through.
+    pub fn set_win32k_handler(&mut self, index: u32, handler: SyscallHandler) {
+        self.win32k.set(index & !WIN32K_TABLE_BIT, handler);
+    }
+
     /// Test-only: publish the guest RSP a native `Nt*` handler reads stack args
     /// relative to, without driving a full `SYSCALL` through the interpreter.
     #[cfg(test)]
@@ -348,6 +381,18 @@ impl WinOs {
         // (from the saved R11), so clearing it here is invisible to the guest.
         cpu.rflags &= !flags::DF;
 
+        // Table split (roadmap W4.1): the win32k (USER/GDI) table is selected by
+        // the `0x1000` bit — win32u's stubs use 0x1084–0x1601, ntdll's stay
+        // below 0x1000 — indexed by the masked index. Both tables share the
+        // identical save-context / unix-stack / restore seam below; only the
+        // handler lookup differs. Resolved *before* the frame save so the switch
+        // is untouched.
+        let handler = if index & WIN32K_TABLE_BIT != 0 {
+            self.win32k.handler(index & !WIN32K_TABLE_BIT)
+        } else {
+            self.ssdt.handler(index)
+        };
+
         // Phase 1: save the non-volatile context.
         let saved = self.save_context(cpu, mem)?;
 
@@ -357,8 +402,7 @@ impl WinOs {
             cpu.set_rsp(unix_top);
         }
 
-        // Phase 3: index the SSDT and run the native handler.
-        let handler = self.ssdt.handler(index);
+        // Phase 3: run the native handler resolved from the selected table.
         let status = handler(self, cpu, mem)?;
 
         // NtTerminateProcess on the current process asked to end the whole

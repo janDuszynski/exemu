@@ -37,6 +37,7 @@ mod time;
 mod unixlib;
 mod vm;
 mod win;
+mod win32k;
 
 use std::collections::HashMap;
 
@@ -319,6 +320,16 @@ pub struct WinOs {
     /// (roadmap W2.3). Each `Nt*` group fills its slots in W2.6+; unknown
     /// indices return `STATUS_NOT_IMPLEMENTED`. See [`crate::syscall`].
     ssdt: syscall::Ssdt,
+    /// The win32k (USER/GDI) SSDT: index → native `NtUser*`/`NtGdi*` handler
+    /// (roadmap W4.1), selected when a syscall index carries the `0x1000` table
+    /// bit (win32u's stubs, 0x1084–0x1601). The W4.1 skeleton fills the
+    /// load-bearing slots; every other index falls to an honest stub. See
+    /// [`crate::win32k`].
+    win32k: syscall::Ssdt,
+    /// The win32k unix-backend state (roadmap W4.1): the recorded client-PFN
+    /// table pointer, the window-class registry, and the HWND/HDC handle
+    /// bookkeeping the skeleton hands back. See [`crate::win32k::Win32kState`].
+    win32k_state: win32k::Win32kState,
     /// The mapped `locale.nls` view: `(base, size)`, mapped once on the first
     /// `NtInitializeNlsFiles` and returned identically thereafter so the ntdll
     /// `RtlGetLocaleFileMappingAddress` cache stays consistent (roadmap W3.2).
@@ -441,6 +452,8 @@ impl WinOs {
             exc_stack: Vec::new(),
             unhandled_filter: 0,
             ssdt: syscall::Ssdt::new(),
+            win32k: syscall::Ssdt::new_win32k(),
+            win32k_state: win32k::Win32kState::default(),
             nls_locale_base: None,
             nls_section_bases: Vec::new(),
             unix_stack_top: 0,
@@ -565,6 +578,13 @@ impl WinOs {
         // ends in. Index recovered from the pinned guest ntdll stub (`ZwContinue`
         // @ RVA 0xf190, `mov eax,0x43`). See [`crate::boot`].
         os.set_syscall_handler(boot::SSDT_NT_CONTINUE, boot::ssdt_nt_continue);
+        // win32k (USER/GDI) skeleton (roadmap W4.1): the second SSDT table,
+        // reached only via a guest win32u `SYSCALL` (index carries the `0x1000`
+        // bit). The emulated corpus never issues these, so registering them is
+        // inherently corpus-safe; the win32k table gives Wine's user32/gdi32 PE
+        // code valid-but-inert return values so it stops null-dereferencing the
+        // `NtUser*`/`NtGdi*` results. See [`crate::win32k`].
+        win32k::register(&mut os);
         os
     }
 
