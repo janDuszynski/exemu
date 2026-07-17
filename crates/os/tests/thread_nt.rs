@@ -178,6 +178,20 @@ fn nt_create_thread_reads_full_teb() {
         "StaticUnicodeString.Buffer → inline StaticUnicodeBuffer"
     );
     assert_eq!(mem.read_u32(teb_base + teb::COUNT_OF_OWNED_CRIT_SECS).unwrap(), 0, "CountOfOwnedCriticalSections");
+
+    // The per-thread Wine debug-string ring at TEB+0x3000 (a u32 write position
+    // + ring bytes from +0x3008, bounded 0x3fc — `__wine_dbg_strdup` @ ntdll RVA
+    // 0x3f3c0). A spawned thread's TEB region is 0x4000, so this is mapped and
+    // zero-initialised, and a Wine thread that emits a TRACE won't fault here.
+    assert_eq!(
+        mem.read_u32(teb_base + 0x3000).unwrap(),
+        0,
+        "debug-string ring write-position is zero-initialised"
+    );
+    mem.write_u32(teb_base + 0x3000, 7).expect("debug ring position is writable");
+    assert_eq!(mem.read_u32(teb_base + 0x3000).unwrap(), 7);
+    mem.read_u8(teb_base + 0x3008 + 0x3fc)
+        .expect("the whole debug-string ring (through +0x3fc) is mapped");
 }
 
 /// De-risk 2: each thread reads its OWN TEB through `gs:`. The spawned thread's

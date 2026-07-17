@@ -29,11 +29,22 @@ const STILL_ACTIVE: u32 = 259;
 const THREAD_STACK_SIZE: u64 = 0x0010_0000; // 1 MiB default per thread
 const TIMESLICE: u64 = 50_000; // instructions between preemptive yields
 
-/// Size of a per-thread TEB region. Matches the app's main-thread TEB region:
-/// the x64 TEB struct reaches ~0x1838 (its inline `TlsSlots[64]` sit at 0x1480,
-/// `TlsExpansionSlots` at 0x1780), and the NT-syscall dispatcher parks this
-/// thread's `syscall_frame` in the tail — 0x2000 covers both.
-const THREAD_TEB_SIZE: u64 = 0x2000;
+/// Size of a per-thread TEB region. The x64 TEB struct reaches ~0x1838 (its
+/// inline `TlsSlots[64]` sit at 0x1480, `TlsExpansionSlots` at 0x1780); the
+/// NT-syscall dispatcher parks this thread's `syscall_frame` in the tail of the
+/// first 0x2000 (at `TEB_REGION_SIZE - frame::SIZE = 0x1ec0`, a fixed offset —
+/// see `syscall::TEB_REGION_SIZE`), and the empty `ACTIVATION_CONTEXT_STACK`
+/// sits inline at 0x1900.
+///
+/// **0x4000, not 0x2000:** Wine's ntdll keeps a per-thread debug-string ring at
+/// **`TEB+0x3000`** (a `u32` write position + ring bytes from `TEB+0x3008`,
+/// bounded 0x3fc — `__wine_dbg_strdup` @ ntdll RVA 0x3f3c0). The app maps the
+/// *main* thread's ring as a separate page (its TEB abuts the PEB at +0x2000, so
+/// its region can't grow), but a **spawned** thread has no PEB adjacency, so its
+/// ring lives inline in the region — hence 0x4000 so `map_anywhere` zero-fills
+/// `TEB+0x3000..` for every Wine thread that emits a TRACE. (The frame stays at
+/// +0x1ec0 regardless: `frame_base` uses the fixed `TEB_REGION_SIZE`, not this.)
+const THREAD_TEB_SIZE: u64 = 0x4000;
 
 /// x64 TEB field offsets Wine's PE `ntdll` walks (public `winternl.h`/NT_TIB
 /// layout; confirmed against the pinned guest binary's `gs:`-relative reads).
