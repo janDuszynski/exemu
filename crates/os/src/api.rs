@@ -195,7 +195,7 @@ pub enum Api {
     FakeHandle { sym: String, argc: u32 },
 
     // --- Filesystem (host-backed sandbox) ---------------------------------
-    CreateFileW,
+    CreateFile { wide: bool },
     ReadFileApi,
     CloseHandle,
     /// `wide` selects LPCWSTR (W) vs LPCSTR (A) marshalling; these file APIs are
@@ -521,7 +521,8 @@ impl Api {
             "lstrcmpiW" | "lstrcmpiA" => Api::LstrcmpiW,
 
             // Filesystem.
-            "CreateFileW" => Api::CreateFileW,
+            "CreateFileW" => Api::CreateFile { wide: true },
+            "CreateFileA" => Api::CreateFile { wide: false },
             "ReadFile" => Api::ReadFileApi,
             "CloseHandle" => Api::CloseHandle,
             "CreateDirectoryW" => Api::CreateDirectory { wide: true },
@@ -931,7 +932,7 @@ impl Api {
             Api::GetModuleFileNameW => 3,
             Api::SetFilePointerApi | Api::GetTempFileNameW => 4,
             Api::ReadFileApi => 5,
-            Api::CreateFileW => 7,
+            Api::CreateFile { .. } => 7,
             // Custom windows + GDI.
             Api::RegisterClassApi { .. } | Api::CreateSolidBrushApi | Api::GetStockObjectApi
             | Api::DispatchMessageApi | Api::CreateFontApi | Api::SaveDCApi => 1,
@@ -1082,7 +1083,7 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "RegSetValueExW" | "ShellExecuteW" | "FindFirstFileExW" => 6,
 
         // --- 7 args ---
-        "CreateFileW" | "SetWindowPos" | "SendMessageTimeoutW" | "TrackPopupMenu"
+        "CreateFileW" | "CreateFileA" | "SetWindowPos" | "SendMessageTimeoutW" | "TrackPopupMenu"
         | "RegGetValueW"
         // QueryActCtxW(dwFlags, hActCtx, pvSubInstance, ulInfoClass,
         //              pvBuffer, cbBuffer, lpcbWrittenOrRequired) — 7 args.
@@ -2625,8 +2626,8 @@ impl WinOs {
             }
 
             // --- Filesystem -------------------------------------------------
-            Api::CreateFileW => {
-                let name = read_wstr(mem, self.arg(cpu, mem, 0)?)?;
+            Api::CreateFile { wide } => {
+                let name = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 let access = self.arg(cpu, mem, 1)?;
                 let disposition = self.arg(cpu, mem, 4)?;
                 ret(self.create_file(&name, access, disposition))

@@ -972,7 +972,10 @@ impl WinOs {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let iosb_ptr = self.syscall_arg(cpu, mem, 4)?;
         let buffer = self.syscall_arg(cpu, mem, 5)?;
-        let length = self.syscall_arg(cpu, mem, 6)?;
+        // `Length` is a `ULONG` (32-bit): the caller may pass it in a 64-bit
+        // register/stack slot with dirty upper bits (Wine's `WriteFile`/`ReadFile`
+        // shims write only the low 32), so mask to avoid a giant bogus length.
+        let length = self.syscall_arg(cpu, mem, 6)? & 0xFFFF_FFFF;
         let offset_ptr = self.syscall_arg(cpu, mem, 7)?;
         // Std-in path (roadmap W3.4). Reading the standard-input sentinel reports
         // end-of-file (no bytes transferred). This satisfies the console-hello
@@ -1015,7 +1018,9 @@ impl WinOs {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let iosb_ptr = self.syscall_arg(cpu, mem, 4)?;
         let buffer = self.syscall_arg(cpu, mem, 5)?;
-        let length = self.syscall_arg(cpu, mem, 6)?;
+        // `Length` is a `ULONG` (32-bit): mask the caller-supplied value so dirty
+        // upper 32 bits (Wine's shims write only the low dword) don't inflate it.
+        let length = self.syscall_arg(cpu, mem, 6)? & 0xFFFF_FFFF;
         let offset_ptr = self.syscall_arg(cpu, mem, 7)?;
         // Console/stdio path (roadmap W3.4). When the CRT's `_isatty` is FALSE
         // (see `nt_query_volume_information_file`, which reports a non-console
