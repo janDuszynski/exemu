@@ -7,13 +7,24 @@
 //!
 //! Both share [`render::Renderer`]; they differ only in where pixels go and
 //! where input comes from.
+//!
+//! W4.2 additions (driver/presenter split):
+//!
+//! * [`Presenter`] — the surface/present half of a display driver.
+//! * [`OffscreenPresenter`] — writes BGRA frames to PNG files under
+//!   `EXEMU_GUI_SHOT` when set, otherwise just counts frames; runs on the
+//!   interpreter thread, no AppKit.
+//! * [`RecordingDriver`] — implements [`exemu_core::UserDriver`] and records
+//!   every call into a shared log for gate tests.
 
 mod render;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use exemu_core::gui::{ControlKind, DialogTemplate, Gui, GuiEvent};
+use exemu_core::{UserDriver, WindowParams};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 use render::Renderer;
@@ -449,5 +460,181 @@ impl Gui for OffscreenGui {
     fn close(&mut self) {
         self.open = false;
         self.tpl = None;
+    }
+}
+
+// ============================ W4.2: Presenter trait ==========================
+
+/// The surface/present half of a display driver (W4.2).
+///
+/// A [`Presenter`] owns per-HWND backing stores and knows how to flush pixels
+/// from them to the screen (or to a file, for the headless path). The window
+/// management half is covered by [`exemu_core::UserDriver`].
+///
+/// Only the surface operations needed for `OffscreenPresenter` are specified
+/// here; W4.3 grows the trait as the live Cocoa path is added.
+pub trait Presenter: Send {
+    /// Allocate a backing surface for `hwnd` of the given pixel dimensions.
+    ///
+    /// The surface is top-down BGRA32 (`stride = width * 4`), matching the
+    /// DIB format Windows GDI writes into. Replaces any existing surface for
+    /// `hwnd`.
+    fn create_surface(&mut self, hwnd: u32, width: u32, height: u32) {
+        let _ = (hwnd, width, height);
+    }
+
+    /// Release the backing surface for `hwnd`.
+    fn destroy_surface(&mut self, hwnd: u32) {
+        let _ = hwnd;
+    }
+
+    /// Flush `pixels` (top-down BGRA32, `width * height * 4` bytes) to the
+    /// presentation target for `hwnd`.
+    ///
+    /// For `OffscreenPresenter` this writes a PNG to the configured output
+    /// directory (or increments the frame counter when no directory is set).
+    /// For the live Cocoa path (W4.4) it uploads the texture and presents.
+    fn flush(&mut self, hwnd: u32, pixels: &[u8], width: u32, height: u32) {
+        let _ = (hwnd, pixels, width, height);
+    }
+}
+
+// ============================ W4.2: OffscreenPresenter =======================
+
+/// A headless presenter that writes each flushed frame to a PNG file under the
+/// directory named by `EXEMU_GUI_SHOT`, or just counts frames when the variable
+/// is not set.
+///
+/// Runs entirely on the interpreter thread — no AppKit, no channels. This is
+/// the de-risk path for W4.1–W4.3 and the standing CI golden-frame gate
+/// (W4.10).
+pub struct OffscreenPresenter {
+    /// Output directory (from `EXEMU_GUI_SHOT`), or `None` for count-only mode.
+    dir: Option<PathBuf>,
+    /// Total frames flushed across all HWNDs since construction.
+    frame_count: u64,
+}
+
+impl OffscreenPresenter {
+    /// Build a presenter. If `EXEMU_GUI_SHOT` names a directory, PNGs are
+    /// written there; otherwise every `flush` just increments `frame_count`.
+    pub fn new() -> Self {
+        let dir = std::env::var_os("EXEMU_GUI_SHOT").map(|v| {
+            let p = PathBuf::from(v);
+            let _ = std::fs::create_dir_all(&p);
+            p
+        });
+        OffscreenPresenter { dir, frame_count: 0 }
+    }
+
+    /// Total frames flushed (useful for assertions in tests).
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
+    }
+}
+
+impl Default for OffscreenPresenter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Presenter for OffscreenPresenter {
+    fn flush(&mut self, hwnd: u32, pixels: &[u8], width: u32, height: u32) {
+        self.frame_count += 1;
+        let Some(dir) = &self.dir else { return };
+        let path = dir.join(format!("hwnd{hwnd:08x}-frame{:04}.png", self.frame_count));
+        if let Ok(file) = std::fs::File::create(&path) {
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            if let Ok(mut w) = enc.write_header() {
+                let _ = w.write_image_data(pixels);
+            }
+            eprintln!("[exemu-gui] presenter: wrote {}", path.display());
+        }
+    }
+}
+
+// ============================ W4.2: RecordingDriver ==========================
+
+/// A single recorded call to the [`UserDriver`] interface.
+///
+/// The gate test for W4.2 injects a [`RecordingDriver`], runs a headless
+/// guest up to `CreateWindowEx` + `ShowWindow`, and asserts that the expected
+/// calls appear in the log (in order, or as a set — the test's choice).
+#[derive(Debug, Clone)]
+pub enum DriverCall {
+    CreateWindow { hwnd: u32, params: WindowParams },
+    DestroyWindow { hwnd: u32 },
+    WindowPosChanging { hwnd: u32 },
+    WindowPosChanged { hwnd: u32, rect: [i32; 4] },
+    ShowWindow { hwnd: u32, cmd: i32 },
+    SetParent { hwnd: u32, parent: u32 },
+    SetWindowRgn { hwnd: u32, rgn_hwnd: u32 },
+    SetWindowText { hwnd: u32, text: String },
+}
+
+/// A [`UserDriver`] that records every call into a shared log.
+///
+/// Clone the [`Arc`] before injecting to keep a handle for post-run
+/// assertions:
+///
+/// ```rust,ignore
+/// let log = Arc::new(Mutex::new(Vec::new()));
+/// let driver = RecordingDriver::new(Arc::clone(&log));
+/// cfg.driver = Some(Box::new(driver));
+/// // … run …
+/// assert!(log.lock().unwrap().iter().any(|c| matches!(c, DriverCall::ShowWindow { .. })));
+/// ```
+pub struct RecordingDriver {
+    log: Arc<Mutex<Vec<DriverCall>>>,
+}
+
+impl RecordingDriver {
+    /// Construct a recording driver backed by the given shared log.
+    pub fn new(log: Arc<Mutex<Vec<DriverCall>>>) -> Self {
+        RecordingDriver { log }
+    }
+
+    /// Push one call record, silently discarding any poisoning.
+    fn push(&self, call: DriverCall) {
+        if let Ok(mut guard) = self.log.lock() {
+            guard.push(call);
+        }
+    }
+}
+
+impl UserDriver for RecordingDriver {
+    fn create_window(&mut self, hwnd: u32, params: &WindowParams) {
+        self.push(DriverCall::CreateWindow { hwnd, params: params.clone() });
+    }
+
+    fn destroy_window(&mut self, hwnd: u32) {
+        self.push(DriverCall::DestroyWindow { hwnd });
+    }
+
+    fn window_pos_changing(&mut self, hwnd: u32) {
+        self.push(DriverCall::WindowPosChanging { hwnd });
+    }
+
+    fn window_pos_changed(&mut self, hwnd: u32, rect: [i32; 4]) {
+        self.push(DriverCall::WindowPosChanged { hwnd, rect });
+    }
+
+    fn show_window(&mut self, hwnd: u32, cmd: i32) {
+        self.push(DriverCall::ShowWindow { hwnd, cmd });
+    }
+
+    fn set_parent(&mut self, hwnd: u32, parent: u32) {
+        self.push(DriverCall::SetParent { hwnd, parent });
+    }
+
+    fn set_window_rgn(&mut self, hwnd: u32, rgn_hwnd: u32) {
+        self.push(DriverCall::SetWindowRgn { hwnd, rgn_hwnd });
+    }
+
+    fn set_window_text(&mut self, hwnd: u32, text: &str) {
+        self.push(DriverCall::SetWindowText { hwnd, text: text.to_string() });
     }
 }

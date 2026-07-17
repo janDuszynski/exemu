@@ -339,8 +339,13 @@ used. The `crates/app/tests/wine_gate.rs` gate pins this end to end — includin
 program that drives a full **file-I/O round-trip** (`CreateFileA` → `WriteFile` →
 `ReadFile`) through Wine's kernel32 onto the host filesystem and then propagates a
 **non-zero exit code** (`ExitProcess(42)` → Wine's `NtTerminateProcess`). GUI programs
-are not there yet: they reach Wine's `win32u`/GDI syscall layer, which is the
-next phase.
+now cross Wine's `win32u` syscall layer too: a generated Win32 sample runs its
+`RegisterClass` → `CreateWindowEx` → `ShowWindow` → message loop to a clean exit
+through Wine's **real `user32`/`gdi32`**, with the emulator's win32k backend
+marshalling the actual class/title/geometry into real window objects and pushing
+create/show/resize/destroy through a native display-driver seam
+(`crates/app/tests/gui_gate.rs`). Nothing is rendered on screen yet — the
+backing surface, presenter, and native event pump are the next steps.
 
 ### Differential CPU oracle
 
