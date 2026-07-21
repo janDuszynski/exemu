@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -47,7 +48,7 @@ use objc2_metal::{
 };
 use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer};
 
-use exemu_core::UserDriver;
+use exemu_core::{UserDriver, WindowParams};
 
 use crate::{bgra_to_rgba, Presenter};
 
@@ -264,6 +265,30 @@ pub fn metal_bgra_roundtrip(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ============================ interp → main channel =========================
+
+/// A window-lifecycle command sent from the interpreter thread (where the
+/// win32k handlers run) to the main thread (which owns AppKit). This is the
+/// `Send` half of the W4.5 split: [`CocoaPresenter`] emits these as a guest
+/// drives windows; the main-thread window host (W4.5b) applies them to
+/// [`CocoaWindow`]s. Every variant is plain data — no AppKit/Metal handle
+/// crosses the channel.
+#[derive(Debug, Clone)]
+pub enum WindowCommand {
+    /// A top-level window was created at `(x, y)` with a `w × h` window rect.
+    Create { hwnd: u32, x: i32, y: i32, w: u32, h: u32, title: String },
+    /// The window's title bar text changed.
+    SetTitle { hwnd: u32, title: String },
+    /// `ShowWindow(hwnd, cmd)` — `cmd` is the `SW_*` constant.
+    Show { hwnd: u32, cmd: i32 },
+    /// The window moved/resized to `rect` = `[x, y, cx, cy]`.
+    Pos { hwnd: u32, rect: [i32; 4] },
+    /// Present one top-down BGRA8 frame (`stride = w*4`) — fire-and-forget.
+    Present { hwnd: u32, w: u32, h: u32, bgra: Vec<u8> },
+    /// The window was destroyed; the host should drop its `CocoaWindow`.
+    Destroy { hwnd: u32 },
+}
+
 // ============================ CocoaPresenter (Send) =========================
 
 /// One retained frame: RGBA8, tightly packed, plus its dimensions.
@@ -285,6 +310,10 @@ pub struct CocoaPresenter {
     dir: Option<PathBuf>,
     frame_count: u64,
     last: HashMap<u32, Frame>,
+    /// When set (the live W4.5 path), window-lifecycle calls are forwarded to
+    /// the main-thread window host as [`WindowCommand`]s instead of, or in
+    /// addition to, the headless PNG/last-frame behaviour.
+    tx: Option<Sender<WindowCommand>>,
 }
 
 impl CocoaPresenter {
@@ -296,7 +325,14 @@ impl CocoaPresenter {
             let _ = std::fs::create_dir_all(&p);
             p
         });
-        CocoaPresenter { dir, frame_count: 0, last: HashMap::new() }
+        CocoaPresenter { dir, frame_count: 0, last: HashMap::new(), tx: None }
+    }
+
+    /// Build a presenter that forwards every window-lifecycle event to a
+    /// main-thread window host over `tx` (the W4.5 live path). No PNGs are
+    /// written; the last RGBA frame is still retained for inspection.
+    pub fn with_channel(tx: Sender<WindowCommand>) -> Self {
+        CocoaPresenter { dir: None, frame_count: 0, last: HashMap::new(), tx: Some(tx) }
     }
 
     /// Total frames flushed across all HWNDs.
@@ -307,6 +343,14 @@ impl CocoaPresenter {
     /// The last presented frame for `hwnd` as `(rgba, w, h)`, if any.
     pub fn last_rgba(&self, hwnd: u32) -> Option<(&[u8], u32, u32)> {
         self.last.get(&hwnd).map(|f| (f.rgba.as_slice(), f.w, f.h))
+    }
+
+    /// Forward a command to the main-thread host, ignoring a dropped receiver
+    /// (the window host having gone away just means "nothing to draw to").
+    fn send(&self, cmd: WindowCommand) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(cmd);
+        }
     }
 }
 
@@ -336,11 +380,48 @@ impl Presenter for CocoaPresenter {
     }
 }
 
-/// Adapt a [`CocoaPresenter`] to a full [`UserDriver`] (surface half only), so
-/// it can be dropped into `RunConfig.driver` exactly like `PresenterDriver`.
+/// Adapt a [`CocoaPresenter`] to a full [`UserDriver`]. Headless (no channel):
+/// only the surface half matters — `flush_surface` writes a PNG / retains the
+/// frame. Live (with a channel): every window-lifecycle call is forwarded to
+/// the main-thread host as a [`WindowCommand`].
 impl UserDriver for CocoaPresenter {
+    fn create_window(&mut self, hwnd: u32, params: &WindowParams) {
+        self.send(WindowCommand::Create {
+            hwnd,
+            x: params.x,
+            y: params.y,
+            w: params.cx.max(0) as u32,
+            h: params.cy.max(0) as u32,
+            title: params.title.clone(),
+        });
+    }
+
+    fn destroy_window(&mut self, hwnd: u32) {
+        self.send(WindowCommand::Destroy { hwnd });
+    }
+
+    fn window_pos_changed(&mut self, hwnd: u32, rect: [i32; 4]) {
+        self.send(WindowCommand::Pos { hwnd, rect });
+    }
+
+    fn show_window(&mut self, hwnd: u32, cmd: i32) {
+        self.send(WindowCommand::Show { hwnd, cmd });
+    }
+
+    fn set_window_text(&mut self, hwnd: u32, text: &str) {
+        self.send(WindowCommand::SetTitle { hwnd, title: text.to_string() });
+    }
+
     fn flush_surface(&mut self, hwnd: u32, pixels: &[u8], w: u32, h: u32) {
-        <Self as Presenter>::flush(self, hwnd, pixels, w, h);
+        if self.tx.is_some() {
+            // Live path: hand the pixels to the main thread; fire-and-forget.
+            self.frame_count += 1;
+            self.send(WindowCommand::Present { hwnd, w, h, bgra: pixels.to_vec() });
+            self.last.insert(hwnd, Frame { w, h, rgba: bgra_to_rgba(pixels) });
+        } else {
+            // Headless: Presenter::flush writes the PNG and bumps frame_count.
+            <Self as Presenter>::flush(self, hwnd, pixels, w, h);
+        }
     }
 }
 
@@ -395,6 +476,54 @@ mod tests {
         assert_eq!(cocoa.last_rgba(1).unwrap().0, bgra_to_rgba(&bgra).as_slice());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn channel_presenter_emits_the_window_command_stream() {
+        use crate::UserDriver;
+        use exemu_core::WindowParams;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut p = CocoaPresenter::with_channel(tx);
+
+        let params = WindowParams {
+            class_atom: 0xC001,
+            class_name: String::new(),
+            title: "hello".into(),
+            x: 120,
+            y: 130,
+            cx: 480,
+            cy: 260,
+            style: 0,
+            ex_style: 0,
+            parent: 0,
+        };
+        p.create_window(7, &params);
+        p.set_window_text(7, "world");
+        p.show_window(7, 5); // SW_SHOW
+        p.window_pos_changed(7, [120, 130, 480, 260]);
+        let (bgra, w, h) = test_frame();
+        p.flush_surface(7, &bgra, w, h);
+        p.destroy_window(7);
+
+        // The live path still retains the last frame (as RGBA) for inspection.
+        assert_eq!(p.last_rgba(7).unwrap().0, bgra_to_rgba(&bgra).as_slice());
+        drop(p); // close the sender so the receiver iterator terminates
+
+        let cmds: Vec<_> = rx.iter().collect();
+        assert!(matches!(
+            cmds[0],
+            WindowCommand::Create { hwnd: 7, x: 120, y: 130, w: 480, h: 260, .. }
+        ));
+        assert!(matches!(&cmds[1], WindowCommand::SetTitle { hwnd: 7, title } if title == "world"));
+        assert!(matches!(cmds[2], WindowCommand::Show { hwnd: 7, cmd: 5 }));
+        assert!(matches!(cmds[3], WindowCommand::Pos { hwnd: 7, rect: [120, 130, 480, 260] }));
+        match &cmds[4] {
+            WindowCommand::Present { hwnd: 7, w: 2, h: 2, bgra } => assert_eq!(bgra, &test_frame().0),
+            other => panic!("expected Present, got {other:?}"),
+        }
+        assert!(matches!(cmds[5], WindowCommand::Destroy { hwnd: 7 }));
+        assert_eq!(cmds.len(), 6);
     }
 
     #[test]
