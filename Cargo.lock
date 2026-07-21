@@ -183,6 +183,7 @@ version = "0.0.4"
 dependencies = [
  "exemu-app",
  "exemu-core",
+ "exemu-gui",
  "exemu-loader",
 ]
 

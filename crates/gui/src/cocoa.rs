@@ -39,7 +39,7 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSView, NSWindow,
     NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSDate, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize,
@@ -184,6 +184,31 @@ impl CocoaWindow {
     pub fn window(&self) -> &NSWindow {
         &self.window
     }
+
+    /// Run the current thread's run loop for `seconds`, letting the window
+    /// draw and process events. A stand-in for the W4.5 `NSApplication::run`
+    /// bridge — enough for the `cocoa-demo` runner to keep a window on screen.
+    pub fn pump(&self, seconds: f64) {
+        let until = NSDate::dateWithTimeIntervalSinceNow(seconds);
+        NSRunLoop::currentRunLoop().runUntilDate(&until);
+    }
+}
+
+/// Open a live window, blit `bgra` (top-down BGRA8, `stride = w*4`) into it, and
+/// keep it on screen for `hold_secs`, re-presenting as the run loop ticks. The
+/// manual "window appears" runner for W4.4 (`exemu cocoa-demo`).
+///
+/// Errors when there is no main thread / no Metal device (headless), so the CLI
+/// prints a clean message instead of silently doing nothing.
+pub fn run_demo(w: u32, h: u32, title: &str, bgra: &[u8], hold_secs: f64) -> Result<(), String> {
+    let mut win = CocoaWindow::open(w, h, title)
+        .ok_or("cannot open a Cocoa window (not the main thread, or no Metal device)")?;
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs_f64() < hold_secs.max(0.1) {
+        win.present(bgra, w, h);
+        win.pump(0.05);
+    }
+    Ok(())
 }
 
 // ============================ metal round-trip ==============================

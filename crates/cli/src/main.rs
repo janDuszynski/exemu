@@ -37,6 +37,7 @@ fn run(args: Vec<String>) -> Result<u8, String> {
         Some("opcodes") => cmd_opcodes(it.as_slice()),
         Some("sample") => cmd_sample(it.as_slice()),
         Some("gui-sample") => cmd_gui_sample(it.as_slice()),
+        Some("cocoa-demo") => cmd_cocoa_demo(it.as_slice()),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_help();
             Ok(0)
@@ -59,6 +60,7 @@ USAGE:\n\
     exemu opcodes [--telemetry <path>] [--clear]\n\
     exemu sample <out.exe>\n\
     exemu gui-sample <out.exe>\n\
+    exemu cocoa-demo [--size WxH] [--hold SECS]\n\
 \n\
 COMMANDS:\n\
     run        Load and execute a PE64 executable\n\
@@ -66,6 +68,8 @@ COMMANDS:\n\
     opcodes    Rank unimplemented opcodes that blocked past runs (most-wanted)\n\
     sample     Generate a console demo .exe (Hello World via kernel32)\n\
     gui-sample Generate a GUI demo .exe (a real window; run with --gui)\n\
+    cocoa-demo Open a live macOS NSWindow/Metal window showing a test frame\n\
+               through the W4.4 CocoaPresenter blit path (macOS only)\n\
 \n\
 RUN OPTIONS:\n\
     --trace         Log calls to unimplemented Windows APIs\n\
@@ -457,4 +461,78 @@ fn cmd_gui_sample(rest: &[String]) -> Result<u8, String> {
         bytes.len()
     );
     Ok(0)
+}
+
+/// `cocoa-demo [--size WxH] [--hold SECS]` — open a live macOS window and blit a
+/// BGRA test frame through the W4.4 `CocoaPresenter`/Metal path. The manual
+/// "window appears" check for W4.4 (the interpreter-driven path is W4.5).
+fn cmd_cocoa_demo(rest: &[String]) -> Result<u8, String> {
+    let mut w = 480u32;
+    let mut h = 320u32;
+    let mut hold = 3.0f64;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--size" => {
+                i += 1;
+                let v = rest.get(i).ok_or("--size needs a WxH value")?;
+                let (ws, hs) = v.split_once('x').ok_or("--size must look like 640x480")?;
+                w = ws.parse().map_err(|_| "bad --size width")?;
+                h = hs.parse().map_err(|_| "bad --size height")?;
+            }
+            "--hold" => {
+                i += 1;
+                hold = rest
+                    .get(i)
+                    .ok_or("--hold needs a value in seconds")?
+                    .parse()
+                    .map_err(|_| "bad --hold value")?;
+            }
+            other => return Err(format!("cocoa-demo: unexpected argument '{other}'")),
+        }
+        i += 1;
+    }
+    let w = w.clamp(64, 4096);
+    let h = h.clamp(64, 4096);
+    let bgra = demo_pattern(w, h);
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("[exemu] opening a {w}x{h} Cocoa/Metal window for {hold:.1}s — close it or wait…");
+        exemu_gui::cocoa_demo(w, h, "exemu — cocoa-demo (W4.4)", &bgra, hold)?;
+        println!("[exemu] cocoa-demo done");
+        Ok(0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&bgra, hold);
+        Err("cocoa-demo is macOS-only (the Cocoa/Metal display presenter)".into())
+    }
+}
+
+/// A top-down BGRA8 test frame (`stride = w*4`): a blue→red horizontal gradient,
+/// a white border, and a green square. The colours are chosen so any B/R channel
+/// mistake in the blit is immediately visible.
+fn demo_pattern(w: u32, h: u32) -> Vec<u8> {
+    let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let o = ((y * w + x) * 4) as usize;
+            let border = x < 2 || y < 2 || x + 2 >= w || y + 2 >= h;
+            let green_sq = x >= w / 4 && x < w / 2 && y >= h / 4 && y < h / 2;
+            let (b, g, r) = if border {
+                (255u8, 255u8, 255u8)
+            } else if green_sq {
+                (0, 200, 0)
+            } else {
+                let r = (x * 255 / w) as u8;
+                (255 - r, 0, r)
+            };
+            px[o] = b;
+            px[o + 1] = g;
+            px[o + 2] = r;
+            px[o + 3] = 255;
+        }
+    }
+    px
 }
