@@ -186,13 +186,24 @@ impl CocoaWindow {
         &self.window
     }
 
-    /// Run the current thread's run loop for `seconds`, letting the window
-    /// draw and process events. A stand-in for the W4.5 `NSApplication::run`
-    /// bridge — enough for the `cocoa-demo` runner to keep a window on screen.
-    pub fn pump(&self, seconds: f64) {
-        let until = NSDate::dateWithTimeIntervalSinceNow(seconds);
-        NSRunLoop::currentRunLoop().runUntilDate(&until);
+    /// Update the window's title-bar text.
+    pub fn set_title(&self, title: &str) {
+        self.window.setTitle(&NSString::from_str(title));
     }
+
+    /// Run the current thread's run loop for `seconds`, letting the window draw
+    /// and process events.
+    pub fn pump(&self, seconds: f64) {
+        pump_runloop(seconds);
+    }
+}
+
+/// Run the current thread's run loop for `seconds` (must be the main thread).
+/// The single place the AppKit run loop is ticked — used by the `cocoa-demo`
+/// runner and by [`run_live`]'s window host.
+fn pump_runloop(seconds: f64) {
+    let until = NSDate::dateWithTimeIntervalSinceNow(seconds);
+    NSRunLoop::currentRunLoop().runUntilDate(&until);
 }
 
 /// Open a live window, blit `bgra` (top-down BGRA8, `stride = w*4`) into it, and
@@ -210,6 +221,88 @@ pub fn run_demo(w: u32, h: u32, title: &str, bgra: &[u8], hold_secs: f64) -> Res
         win.pump(0.05);
     }
     Ok(())
+}
+
+// ============================ main → window host ============================
+
+/// The main-thread consumer of [`WindowCommand`]s: it owns one [`CocoaWindow`]
+/// per guest HWND and applies each command as it arrives. **Main-thread only**
+/// (holds `CocoaWindow`s). This is the receiving half of the W4.5 split; the
+/// interpreter thread produces commands via [`CocoaPresenter::with_channel`].
+#[derive(Default)]
+pub struct WindowHost {
+    windows: HashMap<u32, CocoaWindow>,
+}
+
+impl WindowHost {
+    /// A host owning no windows yet.
+    pub fn new() -> Self {
+        WindowHost::default()
+    }
+
+    /// True once every window has been destroyed (nothing left to keep alive).
+    pub fn is_empty(&self) -> bool {
+        self.windows.is_empty()
+    }
+
+    /// Ensure a window exists for `hwnd`, opening one of `w × h` if not.
+    fn ensure(&mut self, hwnd: u32, w: u32, h: u32, title: &str) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.windows.entry(hwnd) {
+            if let Some(win) = CocoaWindow::open(w.max(1), h.max(1), title) {
+                slot.insert(win);
+            }
+        }
+    }
+
+    /// Apply one command to the live windows.
+    pub fn apply(&mut self, cmd: WindowCommand) {
+        match cmd {
+            WindowCommand::Create { hwnd, w, h, ref title, .. } => self.ensure(hwnd, w, h, title),
+            WindowCommand::SetTitle { hwnd, ref title } => {
+                if let Some(win) = self.windows.get(&hwnd) {
+                    win.set_title(title);
+                }
+            }
+            // The window is ordered front on open; explicit resize/reposition is
+            // W4.7. Show/Pos are accepted and inert for now.
+            WindowCommand::Show { .. } | WindowCommand::Pos { .. } => {}
+            WindowCommand::Present { hwnd, w, h, bgra } => {
+                self.ensure(hwnd, w, h, "exemu");
+                if let Some(win) = self.windows.get_mut(&hwnd) {
+                    win.present(&bgra, w, h);
+                }
+            }
+            WindowCommand::Destroy { hwnd } => {
+                self.windows.remove(&hwnd);
+            }
+        }
+    }
+}
+
+/// The main-thread window host loop (roadmap W4.5). Drain `rx`, applying each
+/// [`WindowCommand`] to native windows, and tick the AppKit run loop between
+/// polls so windows draw and stay responsive. Returns when the sender is
+/// dropped (the interpreter thread finished) **and** any remaining windows have
+/// been shown for up to `linger_secs`.
+///
+/// MUST be called on the main thread; `CocoaWindow::open` yields `None`
+/// otherwise and the host quietly draws nothing.
+pub fn run_live(rx: std::sync::mpsc::Receiver<WindowCommand>, linger_secs: f64) {
+    use std::sync::mpsc::TryRecvError;
+
+    let mut host = WindowHost::new();
+    loop {
+        match rx.try_recv() {
+            Ok(cmd) => host.apply(cmd),
+            Err(TryRecvError::Empty) => pump_runloop(0.01),
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    // The guest has exited; keep its window(s) visible briefly.
+    let start = std::time::Instant::now();
+    while !host.is_empty() && start.elapsed().as_secs_f64() < linger_secs {
+        pump_runloop(0.02);
+    }
 }
 
 // ============================ metal round-trip ==============================
