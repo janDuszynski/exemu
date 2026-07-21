@@ -365,12 +365,14 @@ byte at parity with the headless PNG path. And it is wired to *guest* windows:
 `exemu run --gui --wine-boot <dir> <app.exe>` runs the interpreter on a spawned
 thread while the main thread owns AppKit, so the window a Wine-hosted guest opens
 with `CreateWindowEx` appears as a native `NSWindow` and shows what the guest
-paints — no deadlock, the guest's console still exits cleanly. What's left to make
-it *stay* interactive: the window currently closes when the guest's message loop
-returns (there is no input yet), so a blocking, cooperatively-yielding message
-pump and the native input event channel (mouse/keyboard → the guest's `WndProc`)
-are the next steps. `exemu cocoa-demo` still opens the same presenter directly
-with a test frame.
+paints — no deadlock. And the window now **stays live**: the guest blocks in its
+message loop (`GetMessage` parks the interpreter thread on a native input channel
+instead of busy-spinning), the window stays on screen, and closing it delivers a
+`WM_QUIT` so the guest exits cleanly. What's left to make it fully interactive:
+mouse/keyboard events (`NSEvent` → the guest's message queue) and the
+kernel-callback path that dispatches them into the guest's `WndProc` (so it
+repaints on demand) — the next steps (W4.6). `exemu cocoa-demo` still opens the
+same presenter directly with a test frame.
 
 ### Differential CPU oracle
 

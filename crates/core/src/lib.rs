@@ -22,7 +22,7 @@ pub mod telemetry;
 pub mod unwind;
 
 pub use cpu::{Cpu, CpuState, Exit, Reg, X87, flags};
-pub use driver::{NoDriver, UserDriver, WindowParams};
+pub use driver::{InputEvent, NoDriver, UserDriver, WindowParams};
 pub use error::{EmuError, Result};
 pub use gui::{Control, ControlKind, DialogTemplate, DrawOp, Gui, GuiEvent, NoGui};
 pub use hooks::Hooks;

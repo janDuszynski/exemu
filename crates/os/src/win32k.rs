@@ -771,11 +771,30 @@ fn nt_user_end_paint(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
     Ok(1)
 }
 
-/// `NtUserGetMessage` → 0 (the WM_QUIT path), so the guest message loop
-/// (`while (GetMessage(...))`) exits cleanly. The real native-event pump is
-/// W4.5 — until then a GUI guest reaches its loop, gets no messages, and exits.
-fn nt_user_get_message(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
-    Ok(0)
+/// `NtUserGetMessage(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax)`.
+///
+/// Headless / console / emulated-corpus runs (no input channel attached) keep
+/// the W4.1 behaviour: return 0 = `WM_QUIT` at once, so a GUI guest's
+/// `while (GetMessage(...))` loop exits immediately.
+///
+/// On the live Cocoa path (roadmap W4.5c) an input channel is attached: deliver
+/// a queued message or `WM_QUIT`, otherwise **park the interpreter thread** on
+/// native input until one arrives. The window stays live (no busy-spin) until
+/// the user closes it (close → `WM_QUIT`).
+fn nt_user_get_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    if !os.has_input() {
+        return Ok(0);
+    }
+    let lp = os.syscall_arg(cpu, mem, 0)?; // lpMsg
+    loop {
+        os.drain_input();
+        if let Some(m) = os.msg_next() {
+            os.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
+            // GetMessage returns 0 only for WM_QUIT (stop the loop).
+            return Ok(if m.message == crate::msg::WM_QUIT { 0 } else { 1 });
+        }
+        os.wait_for_input(std::time::Duration::from_millis(50));
+    }
 }
 
 /// `NtUserPeekMessage` → 0 (no message available).

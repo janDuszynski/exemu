@@ -153,3 +153,18 @@ pub trait UserDriver: Send {
 pub struct NoDriver;
 
 impl UserDriver for NoDriver {}
+
+/// An input event delivered from the native windowing host (main thread) to the
+/// interpreter thread's message pump (roadmap W4.5c/W4.6).
+///
+/// This is the reverse direction of [`UserDriver`]: the host produces these as
+/// the user interacts with a native window; the win32k `NtUserGetMessage`
+/// handler drains them into the guest's message queue so a Wine-hosted GUI stays
+/// live. Only window-close is modelled for now; mouse/keyboard follow in W4.6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputEvent {
+    /// The user asked to close the window (the red close button / Cmd-W). The
+    /// pump turns this into a `WM_QUIT`, so the guest's message loop exits
+    /// cleanly.
+    Close,
+}
