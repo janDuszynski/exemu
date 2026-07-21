@@ -357,14 +357,20 @@ publishes the GDI shared handle table Wine's `gdi32` demands (at `PEB+0xF8`),
 gives every window a guest-mapped BGRA backing surface, and services the
 `NtGdiExtTextOutW`/`NtGdiRectangle` syscalls `gdi32` lowers `TextOutW`/
 `Rectangle` into — so the sample's first frame (text + rectangle, drawn by
-Wine's real GDI stack) renders headlessly to PNG. Those pixels now have a live
-destination: a from-scratch macOS presenter (`crates/gui/src/cocoa.rs`, `objc2`)
-gives each top-level window an **NSWindow + CAMetalLayer** and blits the BGRA
-surface into it via Metal — a real GPU round-trip verified pixel-lossless, byte-
-for-byte at parity with the headless PNG path, and runnable today with
-`exemu cocoa-demo`. Wiring that presenter to a *guest* window (the main-thread
-NSApplication runloop vs. interpreter-thread split) and the input event pump are
-the next steps.
+Wine's real GDI stack) renders headlessly to PNG. Those pixels now reach a real
+window: a from-scratch macOS presenter (`crates/gui/src/cocoa.rs`, `objc2`) gives
+each top-level window an **NSWindow + CAMetalLayer** and blits the BGRA surface
+into it via Metal — a real GPU round-trip verified pixel-lossless and byte-for-
+byte at parity with the headless PNG path. And it is wired to *guest* windows:
+`exemu run --gui --wine-boot <dir> <app.exe>` runs the interpreter on a spawned
+thread while the main thread owns AppKit, so the window a Wine-hosted guest opens
+with `CreateWindowEx` appears as a native `NSWindow` and shows what the guest
+paints — no deadlock, the guest's console still exits cleanly. What's left to make
+it *stay* interactive: the window currently closes when the guest's message loop
+returns (there is no input yet), so a blocking, cooperatively-yielding message
+pump and the native input event channel (mouse/keyboard → the guest's `WndProc`)
+are the next steps. `exemu cocoa-demo` still opens the same presenter directly
+with a test frame.
 
 ### Differential CPU oracle
 

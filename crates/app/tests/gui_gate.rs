@@ -213,3 +213,66 @@ fn gui_sample_paints_and_presents_a_surface_on_wine() {
 
     let _ = std::fs::remove_dir_all(&shot_dir);
 }
+
+/// W4.5: the guest drives native windows across the interpreter/main thread
+/// split. The interpreter runs on a spawned thread with a `CocoaPresenter`
+/// whose window commands flow over an mpsc channel; here the *test* thread
+/// stands in for the main-thread window host and drains that channel (real
+/// AppKit is unavailable off the process main thread, so this proves the
+/// plumbing — thread split + channel + clean exit, no deadlock — while the
+/// live NSWindow rendering is covered by `exemu cocoa-demo` / `run --gui
+/// --wine-boot`). Blocking `rx.iter()` returns only once the interpreter
+/// finishes and drops its sender, so a hang here would fail as a timeout.
+#[cfg(target_os = "macos")]
+#[test]
+fn gui_sample_drives_windows_across_the_thread_split_on_wine() {
+    use exemu_gui::{CocoaPresenter, WindowCommand};
+
+    if !Path::new(WINE_DLLS).join("win32u.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/win32u.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let exe = gui_sample::build();
+    let interp = std::thread::spawn(move || {
+        load_and_run(
+            &exe,
+            RunConfig {
+                echo: false,
+                max_steps: 20_000_000,
+                wine_boot_dir: Some(WINE_DLLS.to_string()),
+                driver: Some(Box::new(CocoaPresenter::with_channel(tx))),
+                ..RunConfig::default()
+            },
+        )
+    });
+
+    // Stand in for the main-thread window host: collect the whole stream.
+    let cmds: Vec<WindowCommand> = rx.iter().collect();
+
+    let res = interp
+        .join()
+        .expect("interpreter thread panicked")
+        .expect("gui_sample runs to completion across the thread split");
+    assert_eq!(res.exit_code, 0, "the guest exits cleanly on the split path");
+
+    // A top-level window was created and at least one real frame presented.
+    assert!(
+        cmds.iter().any(|c| matches!(c, WindowCommand::Create { .. })),
+        "the guest's CreateWindowEx reached the main-thread host as a Create command"
+    );
+    let present = cmds
+        .iter()
+        .find_map(|c| match c {
+            WindowCommand::Present { w, h, bgra, .. } => Some((*w, *h, bgra.clone())),
+            _ => None,
+        })
+        .expect("at least one Present command crossed the channel");
+    assert_eq!((present.0, present.1), (480, 260), "presented the 480×260 client surface");
+    assert_eq!(present.2.len(), 480 * 260 * 4, "BGRA frame is fully populated");
+    assert!(
+        present.2.iter().any(|&b| b != 0xFF),
+        "the text + rectangle paint non-white pixels into the presented frame"
+    );
+}

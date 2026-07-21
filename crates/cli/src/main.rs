@@ -75,6 +75,8 @@ RUN OPTIONS:\n\
     --trace         Log calls to unimplemented Windows APIs\n\
     --no-echo       Do not mirror guest console output to the host\n\
     --gui           Render dialogs in a real window (drive them yourself)\n\
+    --wine-boot D   Boot on Wine's PE DLL set in dir D; with --gui on macOS the\n\
+                    guest's windows appear as native NSWindows (roadmap W4.5)\n\
     --max-steps N   Instruction budget (0 = unlimited; default 2e9)\n\
     --load-base H   Map the image at hex address H instead of its preferred\n\
                     ImageBase and apply its base relocations (needs a .reloc)\n\
@@ -101,6 +103,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut max_steps: Option<u64> = None;
     let mut telemetry: Option<String> = None;
     let mut load_base: Option<u64> = None;
+    let mut wine_boot: Option<String> = None;
     let mut guest_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -117,6 +120,10 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             "--telemetry" => {
                 i += 1;
                 telemetry = Some(rest.get(i).ok_or("--telemetry needs a <path>")?.clone());
+            }
+            "--wine-boot" => {
+                i += 1;
+                wine_boot = Some(rest.get(i).ok_or("--wine-boot needs a <dir>")?.clone());
             }
             "--load-base" => {
                 i += 1;
@@ -155,9 +162,21 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     if let Some(m) = max_steps {
         cfg.max_steps = m;
     }
-    let proc = Process::load(&bytes, &mut cfg).map_err(|e| e.to_string())?;
+    cfg.wine_boot_dir = wine_boot;
+
     // The guest filesystem lives here regardless of how the run ends.
     let sandbox = std::env::temp_dir().join("exemu-sandbox");
+
+    // Live macOS window path (roadmap W4.5): `--gui` with a Wine boot dir runs
+    // the interpreter on a spawned thread while the main thread owns AppKit and
+    // drives the native windows the guest creates. Every other run (console,
+    // the emulated corpus, plain `--gui`) stays synchronous on this thread.
+    #[cfg(target_os = "macos")]
+    if gui && cfg.wine_boot_dir.is_some() {
+        return run_live_cocoa(bytes, cfg, &sandbox);
+    }
+
+    let proc = Process::load(&bytes, &mut cfg).map_err(|e| e.to_string())?;
     let run = proc.run();
 
     report_sandbox(&sandbox);
@@ -180,6 +199,45 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             }
             Err(e.to_string())
         }
+    }
+}
+
+/// The macOS live-window run path (roadmap W4.5): spawn the interpreter on its
+/// own thread with a Cocoa driver whose window commands feed this (main) thread,
+/// which owns AppKit and drives the native windows until the guest exits.
+#[cfg(target_os = "macos")]
+fn run_live_cocoa(
+    bytes: Vec<u8>,
+    mut cfg: RunConfig,
+    sandbox: &std::path::Path,
+) -> Result<u8, String> {
+    // The Cocoa driver replaces the legacy dialog GUI on this path.
+    cfg.gui = false;
+    let (tx, rx) = std::sync::mpsc::channel();
+    cfg.driver = Some(Box::new(exemu_gui::CocoaPresenter::with_channel(tx)));
+
+    // The interpreter owns the Process (WinOs is not Send), so build and run it
+    // entirely inside the spawned thread — only the Send channel crosses.
+    let interp = std::thread::spawn(move || {
+        let mut cfg = cfg;
+        Process::load(&bytes, &mut cfg).and_then(|p| p.run())
+    });
+
+    // Main thread: drain window commands and pump AppKit until the guest exits
+    // (the interpreter thread dropping its Sender is the "done" signal).
+    exemu_gui::run_live(rx, 3.0);
+
+    let run = interp.join().map_err(|_| "interpreter thread panicked".to_string())?;
+    report_sandbox(sandbox);
+    match run {
+        Ok(result) => {
+            eprintln!(
+                "\n[exemu] process exited with code {} after {} instructions",
+                result.exit_code, result.steps
+            );
+            Ok(result.exit_code as u8)
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
