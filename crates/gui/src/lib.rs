@@ -559,12 +559,16 @@ impl Presenter for OffscreenPresenter {
         self.frame_count += 1;
         let Some(dir) = &self.dir else { return };
         let path = dir.join(format!("hwnd{hwnd:08x}-frame{:04}.png", self.frame_count));
+        // The surface is top-down BGRA32 (§5); a PNG declared `Rgba` needs the
+        // B/R channels swapped or every colour comes out wrong. (Grayscale text
+        // on a white ground is swap-invariant, which hid this until now.)
+        let rgba = bgra_to_rgba(pixels);
         if let Ok(file) = std::fs::File::create(&path) {
             let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
             enc.set_color(png::ColorType::Rgba);
             enc.set_depth(png::BitDepth::Eight);
             if let Ok(mut w) = enc.write_header() {
-                let _ = w.write_image_data(pixels);
+                let _ = w.write_image_data(&rgba);
             }
             eprintln!("[exemu-gui] presenter: wrote {}", path.display());
         }
@@ -651,6 +655,23 @@ impl RecordingDriver {
             guard.push(call);
         }
     }
+}
+
+/// Convert a top-down BGRA32 buffer (`stride = width * 4`, the Windows DIB /
+/// win32k surface format) to tightly-packed RGBA8: each `[B, G, R, A]` pixel
+/// becomes `[R, G, B, A]`.
+///
+/// This is the single ground-truth transform shared by every presenter's PNG
+/// path (`OffscreenPresenter`, the Cocoa headless path) and by the W4.4 parity
+/// test, so "PNG parity vs Offscreen" reduces to feeding identical BGRA bytes
+/// through this one function. A live Metal presenter needs no swap — a
+/// `BGRA8Unorm` `MTLTexture` consumes the surface bytes directly (design §5).
+pub fn bgra_to_rgba(pixels: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pixels.len());
+    for px in pixels.chunks_exact(4) {
+        out.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    out
 }
 
 /// Count pixels in `pixels` (BGRA32, `w * h * 4` bytes) whose BGR bytes are
@@ -797,5 +818,33 @@ impl<P: Presenter + Send> UserDriver for PresenterDriver<P> {
 
     fn flush_surface(&mut self, hwnd: u32, pixels: &[u8], w: u32, h: u32) {
         self.presenter.flush(hwnd, pixels, w, h);
+    }
+}
+
+#[cfg(test)]
+mod pixel_tests {
+    use super::bgra_to_rgba;
+
+    #[test]
+    fn swaps_blue_and_red_keeps_alpha() {
+        // Two pixels: opaque blue then semi-transparent red, in BGRA byte order.
+        // blue  = B=255 G=0 R=0 A=255 -> RGBA R=0 G=0 B=255 A=255
+        // red   = B=0 G=0 R=255 A=128 -> RGBA R=255 G=0 B=0 A=128
+        let bgra = [255, 0, 0, 255, 0, 0, 255, 128];
+        assert_eq!(bgra_to_rgba(&bgra), vec![0, 0, 255, 255, 255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn grayscale_is_swap_invariant() {
+        // Why the bug hid: when B==G==R the swap is a no-op (black text/white bg).
+        let gray = [30, 30, 30, 255, 255, 255, 255, 255];
+        assert_eq!(bgra_to_rgba(&gray), gray.to_vec());
+    }
+
+    #[test]
+    fn ignores_a_trailing_partial_pixel() {
+        // chunks_exact drops a ragged tail rather than panicking.
+        let bgra = [1, 2, 3, 4, 9, 9];
+        assert_eq!(bgra_to_rgba(&bgra), vec![3, 2, 1, 4]);
     }
 }
