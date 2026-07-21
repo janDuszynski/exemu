@@ -25,7 +25,7 @@ mod render;
 #[cfg(target_os = "macos")]
 pub mod cocoa;
 #[cfg(target_os = "macos")]
-pub use cocoa::{metal_bgra_roundtrip, CocoaPresenter, CocoaWindow};
+pub use cocoa::{metal_bgra_roundtrip, run_demo as cocoa_demo, CocoaPresenter, CocoaWindow};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

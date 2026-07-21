@@ -16,6 +16,7 @@ path = "src/main.rs"
 exemu-core = { workspace = true }
 exemu-loader = { workspace = true }
 exemu-app = { workspace = true }
+exemu-gui = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

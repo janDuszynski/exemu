@@ -93,6 +93,8 @@ exemu run <file.exe> [--trace] [--no-echo] [--telemetry <path>] [-- <args>...]
 exemu info <file.exe>
 exemu opcodes [--telemetry <path>] [--clear]
 exemu sample <out.exe>
+exemu gui-sample <out.exe>
+exemu cocoa-demo [--size WxH] [--hold SECS]
 ```
 
 * `run` maps the image, resolves imports, and interprets it to completion,
@@ -109,7 +111,13 @@ exemu sample <out.exe>
 * `opcodes` reads that telemetry log and prints a **most-wanted ranking** of
   the unimplemented opcodes that blocked past runs — so the highest-leverage
   instruction to add next is obvious. `--clear` resets the log.
-* `sample` writes the built-in Hello-World PE to disk.
+* `sample` writes the built-in Hello-World PE to disk; `gui-sample` writes a
+  small real-window PE (run it with `--gui`).
+* `cocoa-demo` opens a live macOS **NSWindow** whose contents are a `CAMetalLayer`
+  and blits a BGRA test frame through the same Metal path the Wine GUI will use —
+  the from-scratch display presenter (macOS only). `--size WxH` sets the window
+  size, `--hold SECS` how long it stays up. This exercises the presenter's
+  pixel/Metal path directly; driving it from a guest window is in progress.
 
 ## How it runs a `.exe`
 
@@ -349,8 +357,14 @@ publishes the GDI shared handle table Wine's `gdi32` demands (at `PEB+0xF8`),
 gives every window a guest-mapped BGRA backing surface, and services the
 `NtGdiExtTextOutW`/`NtGdiRectangle` syscalls `gdi32` lowers `TextOutW`/
 `Rectangle` into — so the sample's first frame (text + rectangle, drawn by
-Wine's real GDI stack) renders headlessly to PNG. An on-screen native window
-and the event pump are the next steps.
+Wine's real GDI stack) renders headlessly to PNG. Those pixels now have a live
+destination: a from-scratch macOS presenter (`crates/gui/src/cocoa.rs`, `objc2`)
+gives each top-level window an **NSWindow + CAMetalLayer** and blits the BGRA
+surface into it via Metal — a real GPU round-trip verified pixel-lossless, byte-
+for-byte at parity with the headless PNG path, and runnable today with
+`exemu cocoa-demo`. Wiring that presenter to a *guest* window (the main-thread
+NSApplication runloop vs. interpreter-thread split) and the input event pump are
+the next steps.
 
 ### Differential CPU oracle
 
