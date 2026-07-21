@@ -276,3 +276,69 @@ fn gui_sample_drives_windows_across_the_thread_split_on_wine() {
         "the text + rectangle paint non-white pixels into the presented frame"
     );
 }
+
+/// W4.5c: with the native input channel attached, a live window **stays up** —
+/// the guest parks in `NtUserGetMessage` instead of quitting, and only exits
+/// once the window is closed. Proves the blocking, non-spinning pump and the
+/// main→interp close→WM_QUIT path (no real AppKit needed: the test stands in for
+/// the host, driving the input channel directly).
+#[cfg(target_os = "macos")]
+#[test]
+fn gui_sample_window_stays_live_until_close_on_wine() {
+    use exemu_core::InputEvent;
+    use exemu_gui::{CocoaPresenter, WindowCommand};
+    use std::sync::mpsc::TryRecvError;
+    use std::time::{Duration, Instant};
+
+    if !Path::new(WINE_DLLS).join("win32u.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/win32u.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    let exe = gui_sample::build();
+    let interp = std::thread::spawn(move || {
+        load_and_run(
+            &exe,
+            RunConfig {
+                echo: false,
+                max_steps: 20_000_000,
+                wine_boot_dir: Some(WINE_DLLS.to_string()),
+                driver: Some(Box::new(CocoaPresenter::with_channel(cmd_tx))),
+                input: Some(input_rx),
+                ..RunConfig::default()
+            },
+        )
+    });
+
+    // Wait until the window has been shown (a Present crossed the channel).
+    // Do NOT drain-to-completion: the guest will not exit on its own — it parks
+    // in GetMessage waiting for input.
+    let mut saw_present = false;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !saw_present && Instant::now() < deadline {
+        match cmd_rx.try_recv() {
+            Ok(WindowCommand::Present { .. }) => saw_present = true,
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    assert!(saw_present, "the guest presented its window before we intervened");
+
+    // The window stays live: the guest is parked in NtUserGetMessage, not exited.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !interp.is_finished(),
+        "GetMessage blocks (the window stays live) instead of quitting immediately"
+    );
+
+    // Close it: the pump wakes, delivers WM_QUIT, and the guest exits cleanly.
+    input_tx.send(InputEvent::Close).expect("the interpreter is still listening for input");
+    let res = interp
+        .join()
+        .expect("interpreter thread panicked")
+        .expect("gui_sample exits once its window is closed");
+    assert_eq!(res.exit_code, 0, "closing the window quits the guest cleanly");
+}

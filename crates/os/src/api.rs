@@ -3051,7 +3051,7 @@ impl WinOs {
     }
 
     /// Write a full MSG (hwnd, message, wParam, lParam) into a guest buffer.
-    fn write_msg_full(&self, mem: &mut dyn Memory, lp: u64, hwnd: u64, message: u64, wparam: u64, lparam: u64) -> Result<()> {
+    pub(crate) fn write_msg_full(&self, mem: &mut dyn Memory, lp: u64, hwnd: u64, message: u64, wparam: u64, lparam: u64) -> Result<()> {
         if lp == 0 {
             return Ok(());
         }

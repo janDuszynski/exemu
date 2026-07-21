@@ -213,19 +213,22 @@ fn run_live_cocoa(
 ) -> Result<u8, String> {
     // The Cocoa driver replaces the legacy dialog GUI on this path.
     cfg.gui = false;
-    let (tx, rx) = std::sync::mpsc::channel();
-    cfg.driver = Some(Box::new(exemu_gui::CocoaPresenter::with_channel(tx)));
+    // interp → main: window-lifecycle commands. main → interp: input events.
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    cfg.driver = Some(Box::new(exemu_gui::CocoaPresenter::with_channel(cmd_tx)));
+    cfg.input = Some(input_rx);
 
     // The interpreter owns the Process (WinOs is not Send), so build and run it
-    // entirely inside the spawned thread — only the Send channel crosses.
+    // entirely inside the spawned thread — only the Send channels cross.
     let interp = std::thread::spawn(move || {
         let mut cfg = cfg;
         Process::load(&bytes, &mut cfg).and_then(|p| p.run())
     });
 
-    // Main thread: drain window commands and pump AppKit until the guest exits
-    // (the interpreter thread dropping its Sender is the "done" signal).
-    exemu_gui::run_live(rx, 3.0);
+    // Main thread: drive native windows and forward close→guest until the guest
+    // exits (the interpreter thread dropping its command sender is the signal).
+    exemu_gui::run_live(cmd_rx, input_tx, 3.0);
 
     let run = interp.join().map_err(|_| "interpreter thread panicked".to_string())?;
     report_sandbox(sandbox);

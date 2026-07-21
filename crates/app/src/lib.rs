@@ -170,6 +170,11 @@ pub struct RunConfig {
     /// caller (e.g. the W3 gate test) can request the Wine boot hermetically
     /// without touching process-global env vars.
     pub wine_boot_dir: Option<String>,
+    /// The main→interpreter input channel (roadmap W4.5c). `Some` on the live
+    /// Cocoa path: native window events (close → `WM_QUIT`) reach the guest's
+    /// message pump, so `NtUserGetMessage` blocks until the user acts instead of
+    /// quitting at once. `None` everywhere else (unchanged behaviour).
+    pub input: Option<std::sync::mpsc::Receiver<exemu_core::InputEvent>>,
 }
 
 impl Default for RunConfig {
@@ -185,6 +190,7 @@ impl Default for RunConfig {
             load_base: None,
             wine_boot_dir: None,
             driver: None,
+            input: None,
         }
     }
 }
@@ -499,6 +505,10 @@ impl Process {
         // Default is NoDriver (all-no-ops), correct for the emulated path.
         if let Some(d) = cfg.driver.take() {
             os.set_driver(d);
+        }
+        // --- Optional W4.5c input channel (native window → guest pump) ------
+        if let Some(rx) = cfg.input.take() {
+            os.set_input(rx);
         }
 
         // --- Initial CPU state --------------------------------------------

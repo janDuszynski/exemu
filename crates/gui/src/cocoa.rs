@@ -48,7 +48,7 @@ use objc2_metal::{
 };
 use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer};
 
-use exemu_core::{UserDriver, WindowParams};
+use exemu_core::{InputEvent, UserDriver, WindowParams};
 
 use crate::{bgra_to_rgba, Presenter};
 
@@ -191,6 +191,12 @@ impl CocoaWindow {
         self.window.setTitle(&NSString::from_str(title));
     }
 
+    /// Whether the window is still on screen. Becomes `false` once the user
+    /// clicks the close button (the host turns that into a guest `WM_QUIT`).
+    pub fn is_visible(&self) -> bool {
+        self.window.isVisible()
+    }
+
     /// Run the current thread's run loop for `seconds`, letting the window draw
     /// and process events.
     pub fn pump(&self, seconds: f64) {
@@ -277,30 +283,65 @@ impl WindowHost {
             }
         }
     }
+
+    /// Drop any window the user has closed, sending a [`InputEvent::Close`] to
+    /// the guest for each so its message pump can quit. Called each host tick.
+    pub fn reap_closed(&mut self, input_tx: &Sender<InputEvent>) {
+        let closed: Vec<u32> =
+            self.windows.iter().filter(|(_, w)| !w.is_visible()).map(|(h, _)| *h).collect();
+        for hwnd in closed {
+            self.windows.remove(&hwnd);
+            let _ = input_tx.send(InputEvent::Close);
+        }
+    }
 }
 
-/// The main-thread window host loop (roadmap W4.5). Drain `rx`, applying each
-/// [`WindowCommand`] to native windows, and tick the AppKit run loop between
-/// polls so windows draw and stay responsive. Returns when the sender is
-/// dropped (the interpreter thread finished) **and** any remaining windows have
-/// been shown for up to `linger_secs`.
+/// The main-thread window host loop (roadmap W4.5). Drain `cmd_rx`, applying
+/// each [`WindowCommand`] to native windows, tick the AppKit run loop between
+/// polls, and forward window-close back to the guest over `input_tx` (so a
+/// blocking `NtUserGetMessage` wakes and the guest quits). Returns once the
+/// command sender is dropped — the interpreter thread finished — after showing
+/// any surviving window for up to `linger_secs`.
+///
+/// A live GUI guest blocks in its message loop until its window is closed, so
+/// this loop runs for the lifetime of the on-screen window. Set
+/// `EXEMU_COCOA_MAX_MS` to auto-close after that many milliseconds — a safety
+/// valve for headless/CI runs where no one clicks the close button.
 ///
 /// MUST be called on the main thread; `CocoaWindow::open` yields `None`
 /// otherwise and the host quietly draws nothing.
-pub fn run_live(rx: std::sync::mpsc::Receiver<WindowCommand>, linger_secs: f64) {
+pub fn run_live(
+    cmd_rx: std::sync::mpsc::Receiver<WindowCommand>,
+    input_tx: Sender<InputEvent>,
+    linger_secs: f64,
+) {
     use std::sync::mpsc::TryRecvError;
+
+    let auto_close_ms: Option<u128> =
+        std::env::var("EXEMU_COCOA_MAX_MS").ok().and_then(|s| s.parse().ok());
+    let start = std::time::Instant::now();
+    let mut auto_close_sent = false;
 
     let mut host = WindowHost::new();
     loop {
-        match rx.try_recv() {
+        match cmd_rx.try_recv() {
             Ok(cmd) => host.apply(cmd),
-            Err(TryRecvError::Empty) => pump_runloop(0.01),
-            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {
+                pump_runloop(0.01);
+                host.reap_closed(&input_tx);
+                if let Some(ms) = auto_close_ms {
+                    if !auto_close_sent && start.elapsed().as_millis() >= ms {
+                        let _ = input_tx.send(InputEvent::Close);
+                        auto_close_sent = true;
+                    }
+                }
+            }
+            Err(TryRecvError::Disconnected) => break, // the guest exited
         }
     }
     // The guest has exited; keep its window(s) visible briefly.
-    let start = std::time::Instant::now();
-    while !host.is_empty() && start.elapsed().as_secs_f64() < linger_secs {
+    let linger_start = std::time::Instant::now();
+    while !host.is_empty() && linger_start.elapsed().as_secs_f64() < linger_secs {
         pump_runloop(0.02);
     }
 }

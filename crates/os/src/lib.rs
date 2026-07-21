@@ -199,6 +199,13 @@ pub struct WinOs {
     /// windows; the concrete impl is injected by the application layer, mirroring
     /// `set_gui` (roadmap W4.2).
     driver: Box<dyn exemu_core::UserDriver>,
+    /// The main→interpreter input channel (roadmap W4.5c). `None` on every
+    /// headless/console/emulated-corpus run, where `NtUserGetMessage` keeps its
+    /// return-`WM_QUIT`-immediately behaviour. `Some` on the live Cocoa path: the
+    /// pump drains native input events (window close → `WM_QUIT`) and parks the
+    /// interpreter thread on it when the guest's queue is empty, so the window
+    /// stays live without a busy-spin.
+    input: Option<std::sync::mpsc::Receiver<exemu_core::InputEvent>>,
     /// Dialog templates parsed from the image, by resource id.
     dialogs: std::collections::HashMap<u32, exemu_core::DialogTemplate>,
     /// The active dialog's procedure and window handle (when a real window is
@@ -419,6 +426,7 @@ impl WinOs {
             msg_pumps: 8,
             gui: Box::new(exemu_core::NoGui),
             driver: Box::new(exemu_core::NoDriver),
+            input: None,
             dialogs: std::collections::HashMap::new(),
             dlgproc: 0,
             dialog_hwnd: 0,
@@ -683,6 +691,59 @@ impl WinOs {
     /// future `CocoaDriver` for live windows) before running the guest.
     pub fn set_driver(&mut self, d: Box<dyn exemu_core::UserDriver>) {
         self.driver = d;
+    }
+
+    /// Attach the main→interpreter input channel (roadmap W4.5c). With a channel
+    /// present, `NtUserGetMessage` blocks the interpreter thread on real input
+    /// instead of returning `WM_QUIT` immediately, so a live native window stays
+    /// interactive. Injected by the application layer on the Cocoa path only.
+    pub fn set_input(&mut self, rx: std::sync::mpsc::Receiver<exemu_core::InputEvent>) {
+        self.input = Some(rx);
+    }
+
+    /// Whether a live input channel is attached (the Cocoa path). Off this,
+    /// `NtUserGetMessage` keeps its immediate-`WM_QUIT` behaviour.
+    fn has_input(&self) -> bool {
+        self.input.is_some()
+    }
+
+    /// Drain any pending native input events into the running thread's message
+    /// state (roadmap W4.5c). `Close` becomes a pending `WM_QUIT`. A disconnected
+    /// channel (the window host went away) also quits, so the guest never spins.
+    /// Returns `true` while an input channel is attached.
+    fn drain_input(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = &self.input else { return false };
+        loop {
+            match rx.try_recv() {
+                Ok(exemu_core::InputEvent::Close) => {
+                    self.threads[self.current].quit_code.get_or_insert(0);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.threads[self.current].quit_code.get_or_insert(0);
+                    break;
+                }
+            }
+        }
+        true
+    }
+
+    /// Block the interpreter thread until an input event arrives or `timeout`
+    /// elapses, applying whatever arrives (roadmap W4.5c). Used by the message
+    /// pump when the guest's queue is empty. A dropped channel quits the guest.
+    fn wait_for_input(&mut self, timeout: std::time::Duration) {
+        use std::sync::mpsc::RecvTimeoutError;
+        let Some(rx) = &self.input else { return };
+        match rx.recv_timeout(timeout) {
+            Ok(exemu_core::InputEvent::Close) => {
+                self.threads[self.current].quit_code.get_or_insert(0);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                self.threads[self.current].quit_code.get_or_insert(0);
+            }
+        }
     }
 
     /// Whether a real (non-headless) window backend is installed and showing.
