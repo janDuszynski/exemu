@@ -19,6 +19,14 @@
 
 mod render;
 
+/// The live macOS AppKit/Metal display path (W4.4). macOS-only; the rest of the
+/// crate (the minifb/offscreen dialog backends and the `Presenter` trait) is
+/// cross-platform.
+#[cfg(target_os = "macos")]
+pub mod cocoa;
+#[cfg(target_os = "macos")]
+pub use cocoa::{metal_bgra_roundtrip, CocoaPresenter, CocoaWindow};
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

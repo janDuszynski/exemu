@@ -13,3 +13,15 @@ exemu-core = { workspace = true }
 minifb = "0.27"
 font8x8 = "0.3"
 png = "0.17"
+
+# The live macOS display path (W4.4): a from-scratch AppKit/Metal presenter —
+# one NSWindow + CAMetalLayer per top-level HWND, blitting the guest's BGRA
+# surface. objc2 default features already expose every type we use
+# (NSApplication/NSWindow/NSView, CAMetalLayer, MTL{Device,Texture,CommandQueue,
+# BlitCommandEncoder}); gated off non-macOS so the crate still builds elsewhere.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
