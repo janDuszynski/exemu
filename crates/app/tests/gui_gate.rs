@@ -405,13 +405,16 @@ fn gui_sample_wm_paint_reaches_the_wndproc_on_wine() {
     assert_eq!(res.exit_code, 0, "the guest exits cleanly");
 }
 
-/// W4.6: a native mouse click is translated into a `WM_LBUTTONDOWN`, delivered
-/// to the guest's WndProc, which repaints. After the initial frames (direct
-/// paint + synthesized WM_PAINT), an injected [`InputEvent::MouseButton`] is
-/// posted by the pump as `WM_LBUTTONDOWN` to the shown window; DispatchMessage
-/// routes it to the WndProc's click arm (GetDC → Rectangle → ReleaseDC), a
-/// further present. Seeing a *third* present proves native input reaches the
-/// guest procedure — the reverse (host→guest) half of the message path.
+/// W4.6/W4.7: a native mouse click is translated into a `WM_LBUTTONDOWN`,
+/// delivered to the guest's WndProc, which repaints — *at the cursor position*.
+/// After the initial frames (direct paint + synthesized WM_PAINT), an injected
+/// [`InputEvent::MouseButton`] at `(150, 90)` is posted as `WM_LBUTTONDOWN`;
+/// DispatchMessage routes it to the WndProc's click arm, which calls
+/// `GetCursorPos` and draws a rectangle whose top-left is that point (GetDC →
+/// Rectangle → ReleaseDC), a third present. Decoding that frame and finding the
+/// rectangle's edges at `x=150` / `y=90` proves two things at once: native input
+/// reached the guest procedure (W4.6), and `GetCursorPos` returns the tracked
+/// cursor position (W4.7) — had it returned `(0,0)` the frame would be elsewhere.
 #[cfg(target_os = "macos")]
 #[test]
 fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
@@ -424,6 +427,9 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
         eprintln!("SKIP: {WINE_DLLS}/win32u.dll not present (Wine DLL set is git-ignored)");
         return;
     }
+
+    const CLICK_X: i32 = 150;
+    const CLICK_Y: i32 = 90;
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let (input_tx, input_rx) = std::sync::mpsc::channel();
@@ -443,19 +449,24 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
     });
 
     // Count presents, injecting a click once the initial frames (#1 direct
-    // paint, #2 synthesized WM_PAINT) have arrived; the click drives present #3.
+    // paint, #2 synthesized WM_PAINT) have arrived; the click drives present #3,
+    // whose BGRA frame we keep to inspect where the rectangle landed.
     let mut presents = 0;
     let mut clicked = false;
+    let mut click_frame: Option<(u32, Vec<u8>)> = None;
     let deadline = Instant::now() + Duration::from_secs(25);
     while presents < 3 && Instant::now() < deadline {
         match cmd_rx.try_recv() {
-            Ok(WindowCommand::Present { .. }) => {
+            Ok(WindowCommand::Present { w, bgra, .. }) => {
                 presents += 1;
                 if presents >= 2 && !clicked {
                     input_tx
-                        .send(InputEvent::MouseButton { button: MouseButton::Left, down: true, x: 40, y: 40 })
+                        .send(InputEvent::MouseButton { button: MouseButton::Left, down: true, x: CLICK_X, y: CLICK_Y })
                         .expect("the interpreter is still listening for input");
                     clicked = true;
+                }
+                if presents == 3 {
+                    click_frame = Some((w, bgra));
                 }
             }
             Ok(_) => {}
@@ -467,6 +478,17 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
         presents >= 3,
         "the injected WM_LBUTTONDOWN reached the WndProc and repainted (saw {presents} presents)"
     );
+
+    // The click rectangle spans (150,90)→(460,250): a black frame whose left edge
+    // is at x=150 and top edge at y=90. Sample one pixel on each edge, away from
+    // the WM_PAINT content, so both cursor coordinates are pinned.
+    let (w, bgra) = click_frame.expect("captured the click repaint frame");
+    let dark = |x: u32, y: u32| {
+        let o = ((y * w + x) * 4) as usize;
+        bgra[o] < 64 && bgra[o + 1] < 64 && bgra[o + 2] < 64 // B, G, R all near black
+    };
+    assert!(dark(CLICK_X as u32, 200), "the click rect's left edge tracks cursor.x={CLICK_X}");
+    assert!(dark(220, CLICK_Y as u32), "the click rect's top edge tracks cursor.y={CLICK_Y}");
 
     // Close the window; the guest exits cleanly.
     input_tx.send(InputEvent::Close).expect("the interpreter is still listening for input");

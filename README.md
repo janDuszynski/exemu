@@ -377,8 +377,12 @@ is now **interactive**: a main-thread `NSEvent` tap translates real mouse and
 keyboard input into `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_KEYDOWN`/… and posts them
 to the guest's message queue, which `DispatchMessage` (via `NtUserMessageCall`,
 the syscall Wine actually lowers input messages into) routes to the `WndProc` —
-so clicking the window makes the guest repaint. `exemu cocoa-demo` still opens the
-same presenter directly with a test frame.
+so clicking the window makes the guest repaint. The cursor and display members
+are serviced too: `GetCursorPos` reports the tracked pointer position (so the app
+knows where it was clicked), `SetCursor`/`SetCursorPos`/`ClipCursor` are honoured,
+and `EnumDisplaySettings`/`ChangeDisplaySettings` present a single 1920×1080
+monitor. `exemu cocoa-demo` still opens the same presenter directly with a test
+frame.
 
 ### Differential CPU oracle
 
