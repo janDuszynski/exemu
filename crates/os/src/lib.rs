@@ -185,6 +185,11 @@ pub struct WinOs {
     cb_driver: u64,
     /// Active guest-callback sequences (see [`api::CbFrame`]).
     cb_stack: Vec<api::CbFrame>,
+    /// Thunk a WndProc invoked from a win32k syscall returns to (roadmap W4.6).
+    win32k_cb_driver: u64,
+    /// Resume state of win32k syscalls that are mid-WndProc (see
+    /// [`api::Win32kCbFrame`]); a stack so a WndProc can itself dispatch.
+    win32k_cb: Vec<api::Win32kCbFrame>,
     /// Dialog-control text by control id (single active dialog assumed),
     /// stored as UTF-16 code units. Backs Get/SetDlgItemTextW & WM_GET/SETTEXT.
     controls: std::collections::HashMap<u32, Vec<u16>>,
@@ -422,6 +427,8 @@ impl WinOs {
             initterm_stack: Vec::new(),
             cb_driver: 0,
             cb_stack: Vec::new(),
+            win32k_cb_driver: 0,
+            win32k_cb: Vec::new(),
             controls: std::collections::HashMap::new(),
             msg_pumps: 8,
             gui: Box::new(exemu_core::NoGui),
@@ -483,6 +490,7 @@ impl WinOs {
         // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
         os.cb_driver = os.alloc_thunk(Api::CallbackDriver);
+        os.win32k_cb_driver = os.alloc_thunk(Api::Win32kCbDriver);
         os.exc_driver = os.alloc_thunk(Api::ExceptionDriver);
         os.thread_exit_thunk = os.alloc_thunk(Api::ThreadExit);
         os.thread_tls_thunk = os.alloc_thunk(Api::ThreadTlsAttach);
