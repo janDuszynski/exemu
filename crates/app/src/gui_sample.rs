@@ -5,12 +5,14 @@
 //! counterpart to [`crate::sample`], exercising the `CreateWindowEx` + GDI
 //! surface/present path rather than a console.
 //!
-//! The direct paint after `ShowWindow` is the honest W4.3 gate: WM_PAINT
-//! delivery through the kernel WndProc callback is W4.6, so the `WM_PAINT` arm
-//! of `wndproc` below is present but never reached in this build (the message
-//! loop's `GetMessage` returns `WM_QUIT` immediately). The direct sequence
-//! drives the same GDI calls into the real per-window backing surface so the
-//! present pipeline is fully exercised.
+//! The direct paint after `ShowWindow` is the honest W4.3 gate: it renders the
+//! first frame without a message pump. With a live input channel (W4.6), the
+//! message loop's `GetMessage` synthesizes an initial `WM_PAINT` for the shown
+//! window and `DispatchMessageW` routes it through `NtUserDispatchMessage` into
+//! the `WM_PAINT` arm of `wndproc` below, which repaints via BeginPaint →
+//! Rectangle → TextOutW → EndPaint (a second present). Without an input channel
+//! `GetMessage` returns `WM_QUIT` immediately and only the direct paint runs —
+//! either way the surface/present pipeline is fully exercised, so both stay green.
 //!
 //! The code is hand-assembled x86-64 with a small local assembler (`Asm`) so
 //! branch targets and RIP-relative references stay correct.

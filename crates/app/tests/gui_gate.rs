@@ -342,3 +342,65 @@ fn gui_sample_window_stays_live_until_close_on_wine() {
         .expect("gui_sample exits once its window is closed");
     assert_eq!(res.exit_code, 0, "closing the window quits the guest cleanly");
 }
+
+/// W4.6: a synthesized WM_PAINT is dispatched to the guest's WndProc, which
+/// repaints. The interpreter runs on a spawned thread; the test stands in for
+/// the host. gui_sample paints once directly after ShowWindow (present #1), then
+/// its message loop's GetMessage synthesizes a WM_PAINT for the shown window,
+/// DispatchMessage invokes the WndProc, whose WM_PAINT arm BeginPaint/Rectangle/
+/// TextOut/EndPaints — present #2. Seeing a *second* present proves the WndProc
+/// dispatch (the direct-call kernel-callback path) actually ran the guest proc.
+#[cfg(target_os = "macos")]
+#[test]
+fn gui_sample_wm_paint_reaches_the_wndproc_on_wine() {
+    use exemu_core::InputEvent;
+    use exemu_gui::{CocoaPresenter, WindowCommand};
+    use std::sync::mpsc::TryRecvError;
+    use std::time::{Duration, Instant};
+
+    if !Path::new(WINE_DLLS).join("win32u.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/win32u.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    let exe = gui_sample::build();
+    let interp = std::thread::spawn(move || {
+        load_and_run(
+            &exe,
+            RunConfig {
+                echo: false,
+                max_steps: 20_000_000,
+                wine_boot_dir: Some(WINE_DLLS.to_string()),
+                driver: Some(Box::new(CocoaPresenter::with_channel(cmd_tx))),
+                input: Some(input_rx),
+                ..RunConfig::default()
+            },
+        )
+    });
+
+    // Count presents until the WM_PAINT repaint (#2) has crossed the channel.
+    let mut presents = 0;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while presents < 2 && Instant::now() < deadline {
+        match cmd_rx.try_recv() {
+            Ok(WindowCommand::Present { .. }) => presents += 1,
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+            Err(TryRecvError::Disconnected) => break, // guest exited/crashed early
+        }
+    }
+    assert!(
+        presents >= 2,
+        "the WM_PAINT WndProc dispatch produced a second present (saw {presents})"
+    );
+
+    // Close the window; the guest exits cleanly through the (now real) pump.
+    input_tx.send(InputEvent::Close).expect("the interpreter is still listening for input");
+    let res = interp
+        .join()
+        .expect("interpreter thread panicked")
+        .expect("gui_sample exits after the WM_PAINT dispatch and close");
+    assert_eq!(res.exit_code, 0, "the guest exits cleanly");
+}

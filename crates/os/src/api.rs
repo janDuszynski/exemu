@@ -47,6 +47,19 @@ pub(crate) struct CbFrame {
     pub modal: bool,
 }
 
+/// The resume state of a win32k syscall (e.g. `NtUserDispatchMessage`) that
+/// invoked a guest WndProc via [`WinOs::call_wndproc_from_syscall`] (roadmap
+/// W4.6). When the WndProc returns to the win32k driver thunk, the guest is put
+/// back exactly at the post-SYSCALL point.
+pub(crate) struct Win32kCbFrame {
+    /// The instruction after the guest's `SYSCALL` (from rcx on entry).
+    pub resume_rip: u64,
+    /// The guest rsp captured before the unix-stack switch.
+    pub resume_rsp: u64,
+    /// The guest RFLAGS the SYSCALL preserved in r11.
+    pub resume_flags: u64,
+}
+
 /// Every Windows symbol the emulator implements natively. Anything else
 /// becomes [`Api::Unsupported`] and returns 0.
 #[derive(Debug, Clone)]
@@ -235,6 +248,10 @@ pub enum Api {
     // --- GUI: dialog driving + control text -------------------------------
     /// Not an import: drives a queued sequence of guest callbacks.
     CallbackDriver,
+    /// Not an import: the return thunk for a WndProc invoked from a win32k
+    /// syscall (roadmap W4.6). When the guest WndProc returns to it, the
+    /// interrupted `NtUser*` syscall is resumed.
+    Win32kCbDriver,
     /// CreateDialogParamW / DialogBoxParamW — invoke the DLGPROC.
     CreateDialogParam { modal: bool },
     SetDlgItemTextW,
@@ -918,7 +935,7 @@ impl Api {
             Api::GetVersion => 0,
             Api::GetVersionEx => 1,
             // GUI.
-            Api::CallbackDriver => 0,
+            Api::CallbackDriver | Api::Win32kCbDriver => 0,
             Api::GetDlgItemApi | Api::GetWindowTextApi => 2,
             Api::SetWindowTextApi | Api::IsDialogMessageApi | Api::EndDialogApi => 2,
             Api::DestroyWindowApi | Api::PostQuitMessageApi => 1,
@@ -2006,6 +2023,8 @@ impl WinOs {
             Api::InittermDriver => self.initterm_advance(cpu, mem),
             // A guest callback (window/dialog proc) returned: advance the queue.
             Api::CallbackDriver => self.cb_advance(cpu, mem),
+            // A WndProc invoked from a win32k syscall returned: resume the syscall.
+            Api::Win32kCbDriver => self.win32k_cb_advance(cpu, mem),
 
             // --- GUI: drive the dialog procedure ---------------------------
             Api::CreateDialogParam { modal } => {
@@ -2940,6 +2959,55 @@ impl WinOs {
         } else {
             cpu.gpr_write(0, 4, result);
         }
+        Ok(Outcome::Resume)
+    }
+
+    /// Invoke a guest `wndproc(hwnd, message, wParam, lParam)` from *inside* a
+    /// win32k syscall handler and resume that syscall's caller once it returns
+    /// (roadmap W4.6). This is the direct-call dispatch path — correct for the
+    /// scalar messages exemu originates (WM_PAINT/WM_LBUTTONDOWN/WM_KEYDOWN/
+    /// WM_DESTROY); the full `KiUserCallbackDispatcher` route is only needed when
+    /// message flow re-enters real user32.
+    ///
+    /// It seats the WndProc on the *guest* stack with the win32k driver thunk as
+    /// its return address, records the interrupted syscall's resume state, and
+    /// sets [`syscall_resume_as_is`](Self::syscall_resume_as_is) so
+    /// `dispatch_syscall` does not run its own restore/return. When the WndProc
+    /// returns to the driver thunk, [`win32k_cb_advance`](Self::win32k_cb_advance)
+    /// restores the guest at the post-syscall point (the WndProc's LRESULT stays
+    /// in rax = what `DispatchMessage` returns).
+    pub(crate) fn call_wndproc_from_syscall(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+        wndproc: u64,
+        msg: crate::msg::PostedMsg,
+    ) -> Result<()> {
+        // SYSCALL left the return rip in rcx and the flags in r11; the guest rsp
+        // was captured before the unix-stack switch. These are the resume state.
+        let frame = Win32kCbFrame {
+            resume_rip: cpu.reg(Reg::Rcx),
+            resume_rsp: self.syscall_guest_rsp,
+            resume_flags: cpu.reg(Reg::R11),
+        };
+        let guest_rsp = frame.resume_rsp;
+        self.win32k_cb.push(frame);
+        let driver = self.win32k_cb_driver;
+        let args = [msg.hwnd, msg.message as u64, msg.wparam, msg.lparam];
+        self.setup_call_args(cpu, mem, wndproc, &args, driver, guest_rsp)?;
+        // dispatch_syscall must not restore/return: we've installed the WndProc.
+        self.syscall_resume_as_is = true;
+        Ok(())
+    }
+
+    /// A WndProc invoked from a win32k syscall returned to the driver thunk:
+    /// resume the interrupted syscall's caller. The WndProc's return value is
+    /// already in rax (= the `DispatchMessage` LRESULT the loop ignores).
+    fn win32k_cb_advance(&mut self, cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<Outcome> {
+        let f = self.win32k_cb.pop().expect("win32k cb driver without frame");
+        cpu.rip = f.resume_rip;
+        cpu.set_rsp(f.resume_rsp);
+        cpu.rflags = f.resume_flags;
         Ok(Outcome::Resume)
     }
 

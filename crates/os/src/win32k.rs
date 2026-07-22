@@ -57,6 +57,7 @@ const NT_USER_END_PAINT: u32 = 0x13bc;
 const NT_USER_GET_MESSAGE: u32 = 0x141b;
 const NT_USER_PEEK_MESSAGE: u32 = 0x14ca;
 const NT_USER_POST_QUIT_MESSAGE: u32 = 0x14d1;
+const NT_USER_DISPATCH_MESSAGE: u32 = 0x138b;
 
 // --- NtGdi* indices (the win32u.dll `mov eax,IDX` immediates; spot-verified
 //     against the pinned build's stubs — see the W4.3 static gdi32 contract).
@@ -143,6 +144,14 @@ struct Window {
     ex_style: u32,
     parent: u32,
     shown: bool,
+    /// The window-class WndProc (resolved from the class at CreateWindowEx), the
+    /// guest procedure `NtUserDispatchMessage` invokes (roadmap W4.6). 0 when the
+    /// class was never registered.
+    wndproc: u64,
+    /// A WM_PAINT is owed to this window (set on show / expose). `NtUserGetMessage`
+    /// synthesizes the WM_PAINT when the queue is otherwise empty (exemu drives
+    /// the initial paint; design §5), then clears the flag.
+    needs_paint: bool,
     /// The per-window backing surface (W4.3), allocated lazily on the first
     /// GetDC/BeginPaint. Top-down BGRA32, guest-mapped so gdi32's PE code and
     /// the presenter share one allocation.
@@ -202,6 +211,25 @@ impl Win32kState {
             .map(|(a, _)| *a)
     }
 
+    fn class_by_atom(&self, atom: u16) -> Option<&Class> {
+        self.classes.iter().find(|(a, _)| *a == atom).map(|(_, c)| c)
+    }
+
+    /// The WndProc a message for `hwnd` should be dispatched to, or 0.
+    fn wndproc_for(&self, hwnd: u32) -> u64 {
+        self.window(hwnd).map(|w| w.wndproc).unwrap_or(0)
+    }
+
+    /// A shown window owing a WM_PAINT, clearing its flag. Used by the pump to
+    /// synthesize a WM_PAINT when the queue is empty.
+    fn take_paint_pending(&mut self) -> Option<u32> {
+        let hwnd = self.windows.iter().find(|(_, w)| w.needs_paint && w.shown).map(|(h, _)| *h)?;
+        if let Some(w) = self.window_mut(hwnd) {
+            w.needs_paint = false;
+        }
+        Some(hwnd)
+    }
+
     fn window_mut(&mut self, hwnd: u32) -> Option<&mut Window> {
         self.windows.iter_mut().find(|(h, _)| *h == hwnd).map(|(_, w)| w)
     }
@@ -249,6 +277,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_GET_MESSAGE, nt_user_get_message);
     os.set_win32k_handler(NT_USER_PEEK_MESSAGE, nt_user_peek_message);
     os.set_win32k_handler(NT_USER_POST_QUIT_MESSAGE, nt_user_post_quit_message);
+    os.set_win32k_handler(NT_USER_DISPATCH_MESSAGE, nt_user_dispatch_message);
     // NtGdi paint path (W4.3): rasterize into the per-window surface.
     os.set_win32k_handler(NT_GDI_EXT_TEXT_OUT_W, nt_gdi_ext_text_out_w);
     os.set_win32k_handler(NT_GDI_RECTANGLE, nt_gdi_rectangle);
@@ -411,6 +440,8 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     // Resolve the class atom from the registered name so the driver + window
     // carry a stable identifier; 0 when the class was never registered.
     let class_atom = os.win32k_state.class_by_name(&class_name).unwrap_or(0);
+    // The class WndProc is the guest procedure NtUserDispatchMessage invokes.
+    let wndproc = os.win32k_state.class_by_atom(class_atom).map(|c| c.wndproc).unwrap_or(0);
 
     let hwnd = alloc_handle(os);
     os.win32k_state.windows.push((
@@ -424,6 +455,8 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
             ex_style,
             parent,
             shown: false,
+            wndproc,
+            needs_paint: false,
             surface: None,
         },
     ));
@@ -459,6 +492,11 @@ fn nt_user_show_window(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
             let prev = w.shown;
             // SW_HIDE = 0 hides; any other SW_* command shows.
             w.shown = cmd != 0;
+            // Showing a window owes it an initial WM_PAINT (design §5): exemu
+            // drives the first paint rather than waiting on the native compositor.
+            if w.shown {
+                w.needs_paint = true;
+            }
             prev
         }
         None => false,
@@ -788,6 +826,9 @@ fn nt_user_get_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
     let lp = os.syscall_arg(cpu, mem, 0)?; // lpMsg
     loop {
         os.drain_input();
+        // A shown window owes an initial WM_PAINT; synthesize it when the queue
+        // is otherwise empty (roadmap W4.6) so the guest's WM_PAINT handler runs.
+        synthesize_paint(os);
         if let Some(m) = os.msg_next() {
             os.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
             // GetMessage returns 0 only for WM_QUIT (stop the loop).
@@ -797,17 +838,47 @@ fn nt_user_get_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
     }
 }
 
+/// Post a synthetic `WM_PAINT` to a shown window that owes one, when the current
+/// thread's queue is otherwise empty (roadmap W4.6 / design §5).
+fn synthesize_paint(os: &mut WinOs) {
+    if !os.threads[os.current].msgs.is_empty() {
+        return;
+    }
+    if let Some(hwnd) = os.win32k_state.take_paint_pending() {
+        os.post_internal(hwnd as u64, crate::gdi::WM_PAINT as u32, 0, 0);
+    }
+}
+
+/// `NtUserDispatchMessage(lpMsg)` — invoke the target window's WndProc with the
+/// message (roadmap W4.6). Direct-call path: seat `wndproc(hwnd, msg, wParam,
+/// lParam)` on the guest stack and resume this syscall's caller when it returns.
+/// A message for an unknown window / class-less window is a no-op (returns 0).
+fn nt_user_dispatch_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let lp = os.syscall_arg(cpu, mem, 0)?;
+    if lp == 0 {
+        return Ok(0);
+    }
+    let (hwnd, message, wparam, lparam) = os.read_msg(mem, lp)?;
+    let wndproc = os.win32k_state.wndproc_for(hwnd as u32);
+    if wndproc == 0 {
+        return Ok(0);
+    }
+    let msg = crate::msg::PostedMsg { hwnd, message: message as u32, wparam, lparam };
+    os.call_wndproc_from_syscall(cpu, mem, wndproc, msg)?;
+    Ok(0) // ignored: call_wndproc_from_syscall sets syscall_resume_as_is
+}
+
 /// `NtUserPeekMessage` → 0 (no message available).
 fn nt_user_peek_message(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
     Ok(0)
 }
 
-/// `NtUserPostQuitMessage` → 0. The quit flag is a W4.5 concern.
-fn nt_user_post_quit_message(
-    _os: &mut WinOs,
-    _cpu: &mut CpuState,
-    _mem: &mut dyn Memory,
-) -> Result<u32> {
+/// `NtUserPostQuitMessage(nExitCode)` — mark the running thread to receive
+/// `WM_QUIT` once its queue drains (roadmap W4.6), so a guest WndProc's
+/// `WM_DESTROY → PostQuitMessage` stops the message loop.
+fn nt_user_post_quit_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let code = os.syscall_arg(cpu, mem, 0)? as i32;
+    os.threads[os.current].quit_code = Some(code);
     Ok(0)
 }
 

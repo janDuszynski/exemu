@@ -368,11 +368,14 @@ with `CreateWindowEx` appears as a native `NSWindow` and shows what the guest
 paints — no deadlock. And the window now **stays live**: the guest blocks in its
 message loop (`GetMessage` parks the interpreter thread on a native input channel
 instead of busy-spinning), the window stays on screen, and closing it delivers a
-`WM_QUIT` so the guest exits cleanly. What's left to make it fully interactive:
-mouse/keyboard events (`NSEvent` → the guest's message queue) and the
-kernel-callback path that dispatches them into the guest's `WndProc` (so it
-repaints on demand) — the next steps (W4.6). `exemu cocoa-demo` still opens the
-same presenter directly with a test frame.
+`WM_QUIT` so the guest exits cleanly. Messages now reach the guest's own
+`WndProc`: `GetMessage` synthesizes the shown window's initial `WM_PAINT` and
+`DispatchMessage` (Wine's real `user32` → `NtUserDispatchMessage`) invokes the
+guest procedure, whose `WM_PAINT` arm repaints through `BeginPaint`/`Rectangle`/
+`TextOutW`/`EndPaint` — a second, on-demand frame drawn by the app itself. What's
+left to make it fully interactive: native mouse/keyboard events (`NSEvent` → the
+guest's message queue) so those `WndProc` dispatches carry real input (W4.6).
+`exemu cocoa-demo` still opens the same presenter directly with a test frame.
 
 ### Differential CPU oracle
 
