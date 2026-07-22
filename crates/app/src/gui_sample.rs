@@ -112,6 +112,7 @@ fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
                 "PostQuitMessage",
                 "GetDC",
                 "ReleaseDC",
+                "GetCursorPos",
             ],
         ),
         ("gdi32.dll", vec!["TextOutW", "Rectangle"]),
@@ -346,19 +347,23 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.xor32(RAX);
     a.jmp("wp_ret");
 
-    // WM_LBUTTONDOWN: repaint on click — GetDC → Rectangle → ReleaseDC, a fresh
-    // present driven by real input (W4.6). hwnd is saved at [rsp+0x70]; the hdc
-    // stashes at [rsp+0x78] like the paint arm.
+    // WM_LBUTTONDOWN: repaint on click — GetCursorPos → GetDC → Rectangle →
+    // ReleaseDC, a fresh present driven by real input (W4.6/W4.7). The rectangle's
+    // top-left tracks the cursor, so the frame lands where the click landed —
+    // proving GetCursorPos returns the position the input carried. hwnd is at
+    // [rsp+0x70], hdc stashes at [rsp+0x78], the POINT at [rsp+0x80].
     a.label("click");
+    a.lea_rsp(RCX, 0x80); // &pt
+    a.call_iat(r.slot("GetCursorPos"));
     a.mov_reg_at_rsp(RCX, 0x70); // hwnd
     a.call_iat(r.slot("GetDC"));
     a.mov_at_rsp_reg(0x78, RAX); // save hdc
-    // Rectangle(hdc, 100, 100, 300, 180) — the "clicked" marker rectangle.
+    // Rectangle(hdc, pt.x, pt.y, 460, 250) — top-left = the cursor position.
     a.mov_reg_reg(RCX, RAX);
-    a.mov32(RDX, 100);
-    a.mov32(R8, 100);
-    a.mov32(R9, 300);
-    a.mov_at_rsp_imm(0x20, 180);
+    a.mov_reg32_at_rsp(RDX, 0x80); // pt.x
+    a.mov_reg32_at_rsp(R8, 0x84); // pt.y
+    a.mov32(R9, 460);
+    a.mov_at_rsp_imm(0x20, 250);
     a.call_iat(r.slot("Rectangle"));
     // ReleaseDC(hwnd, hdc) — the present point for the click repaint.
     a.mov_reg_at_rsp(RCX, 0x70);
@@ -474,6 +479,16 @@ impl Asm {
     }
     fn mov_reg_at_rsp(&mut self, reg: u8, disp: i32) {
         self.rex(reg, RBX);
+        self.code.push(0x8B);
+        self.modrm_rsp(reg, disp);
+    }
+    /// 32-bit `mov reg32, [rsp+disp]` — loads a `LONG`/`DWORD` (e.g. a `POINT`
+    /// field) without sign/zero-extending the whole qword. The destination is the
+    /// ModRM.reg field, so r8..r15 need REX.R (0x44), not REX.B.
+    fn mov_reg32_at_rsp(&mut self, reg: u8, disp: i32) {
+        if reg >= 8 {
+            self.code.push(0x44); // REX.R extends ModRM.reg to r8..r15
+        }
         self.code.push(0x8B);
         self.modrm_rsp(reg, disp);
     }

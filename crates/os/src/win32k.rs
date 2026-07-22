@@ -59,6 +59,16 @@ const NT_USER_PEEK_MESSAGE: u32 = 0x14ca;
 const NT_USER_POST_QUIT_MESSAGE: u32 = 0x14d1;
 const NT_USER_DISPATCH_MESSAGE: u32 = 0x138b;
 
+// --- cursor / display members (roadmap W4.7) ------------------------------
+const NT_USER_GET_CURSOR: u32 = 0x13e7;
+const NT_USER_GET_CURSOR_POS: u32 = 0x13ea;
+const NT_USER_SET_CURSOR: u32 = 0x1546;
+const NT_USER_SET_CURSOR_POS: u32 = 0x154a;
+const NT_USER_CLIP_CURSOR: u32 = 0x1350;
+const NT_USER_CHANGE_DISPLAY_SETTINGS: u32 = 0x1342;
+const NT_USER_ENUM_DISPLAY_SETTINGS: u32 = 0x13c1;
+const NT_USER_MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX: u32 = 0x14bb;
+
 // --- NtGdi* indices (the win32u.dll `mov eax,IDX` immediates; spot-verified
 //     against the pinned build's stubs — see the W4.3 static gdi32 contract).
 //     gdi32!TextOutW→ExtTextOutW lowers to NtGdiExtTextOutW; gdi32!Rectangle
@@ -115,6 +125,25 @@ const DEFAULT_CY: i32 = 480;
 /// `WM_SETTEXT` — the message `SetWindowTextW` delivers via `NtUserMessageCall`
 /// (there is no dedicated `NtUserSetWindowText` syscall; recovered evidence).
 const WM_SETTEXT: u32 = 0x000c;
+
+// --- DEVMODEW field offsets (64-bit `_devicemodeW`, roadmap W4.7) ----------
+// `NtUserEnumDisplaySettings` fills these display fields; the rest of the
+// caller-supplied struct is left as-is (the caller zeroes it and sets dmSize).
+const DEVMODE_SIZE: u16 = 220; // full DEVMODEW incl. the ICM tail
+const DEVMODE_DMSIZE_OFF: u64 = 68;
+const DEVMODE_DMFIELDS_OFF: u64 = 72;
+const DEVMODE_DMLOGPIXELS_OFF: u64 = 166;
+const DEVMODE_DMBITSPERPEL_OFF: u64 = 168;
+const DEVMODE_DMPELSWIDTH_OFF: u64 = 172;
+const DEVMODE_DMPELSHEIGHT_OFF: u64 = 176;
+const DEVMODE_DMDISPLAYFREQUENCY_OFF: u64 = 184;
+/// `dmFields`: DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY.
+const DM_DISPLAY_FIELDS: u32 = 0x0004_0000 | 0x0008_0000 | 0x0010_0000 | 0x0040_0000;
+/// `ChangeDisplaySettings` return: the mode is compatible / applied.
+const DISP_CHANGE_SUCCESSFUL: u32 = 0;
+/// `EnumDisplaySettings` `iModeNum` sentinels that mean "the current mode".
+const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+const ENUM_REGISTRY_SETTINGS: u32 = 0xFFFF_FFFE;
 
 /// A registered window class. `name` keys the registry (atom lookup on
 /// CreateWindow / GetClassInfoEx); `wndproc`/`style`/`background` are stored for
@@ -201,6 +230,13 @@ pub(crate) struct Win32kState {
     /// Guest base of the DC-object arena (one `GDI_DC_OBJECT_SIZE` block per
     /// slot); the handle-table entry at +0x10 points into this.
     gdi_dc_arena: u64,
+    /// Last known cursor position in screen pixels (roadmap W4.7). Tracked from
+    /// native input (`post_input_event`) and `SetCursorPos`; read by
+    /// `NtUserGetCursorPos`. The window is at (0,0) so screen == client here.
+    cursor_pos: (i32, i32),
+    /// The current cursor handle (`SetCursor`/`GetCursor`, roadmap W4.7). 0 = the
+    /// default arrow / hidden.
+    current_cursor: u64,
 }
 
 impl Win32kState {
@@ -284,6 +320,18 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_PEEK_MESSAGE, nt_user_peek_message);
     os.set_win32k_handler(NT_USER_POST_QUIT_MESSAGE, nt_user_post_quit_message);
     os.set_win32k_handler(NT_USER_DISPATCH_MESSAGE, nt_user_dispatch_message);
+    // Cursor / display driver members (W4.7).
+    os.set_win32k_handler(NT_USER_GET_CURSOR, nt_user_get_cursor);
+    os.set_win32k_handler(NT_USER_GET_CURSOR_POS, nt_user_get_cursor_pos);
+    os.set_win32k_handler(NT_USER_SET_CURSOR, nt_user_set_cursor);
+    os.set_win32k_handler(NT_USER_SET_CURSOR_POS, nt_user_set_cursor_pos);
+    os.set_win32k_handler(NT_USER_CLIP_CURSOR, nt_user_clip_cursor);
+    os.set_win32k_handler(NT_USER_CHANGE_DISPLAY_SETTINGS, nt_user_change_display_settings);
+    os.set_win32k_handler(NT_USER_ENUM_DISPLAY_SETTINGS, nt_user_enum_display_settings);
+    os.set_win32k_handler(
+        NT_USER_MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX,
+        nt_user_msg_wait_for_multiple_objects_ex,
+    );
     // NtGdi paint path (W4.3): rasterize into the per-window surface.
     os.set_win32k_handler(NT_GDI_EXT_TEXT_OUT_W, nt_gdi_ext_text_out_w);
     os.set_win32k_handler(NT_GDI_RECTANGLE, nt_gdi_rectangle);
@@ -872,6 +920,13 @@ impl WinOs {
             WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
         };
         use exemu_core::{InputEvent, MouseButton};
+        // Track the cursor position from every pointer event so GetCursorPos
+        // reports where the user last pointed (roadmap W4.7).
+        match ev {
+            InputEvent::MouseMove { x, y }
+            | InputEvent::MouseButton { x, y, .. } => self.win32k_state.cursor_pos = (x, y),
+            _ => {}
+        }
         let Some(hwnd) = self.win32k_state.shown_window() else { return };
         // Mouse position packs into lParam as (x in low word, y in high word).
         let pos = |x: i32, y: i32| (x as u32 as u64 & 0xffff) | ((y as u32 as u64 & 0xffff) << 16);
@@ -946,6 +1001,122 @@ fn nt_user_post_quit_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn M
     let code = os.syscall_arg(cpu, mem, 0)? as i32;
     os.threads[os.current].quit_code = Some(code);
     Ok(0)
+}
+
+// ============================ W4.7: cursor / display =========================
+
+/// `NtUserGetCursor()` → the current cursor handle (roadmap W4.7).
+fn nt_user_get_cursor(os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
+    Ok(os.win32k_state.current_cursor as u32)
+}
+
+/// `NtUserSetCursor(hCursor)` — install a new cursor shape, returning the
+/// previous handle (roadmap W4.7). Notifies the driver so a live backend can swap
+/// the `NSCursor`.
+fn nt_user_set_cursor(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hcursor = os.syscall_arg(cpu, mem, 0)?;
+    let prev = os.win32k_state.current_cursor;
+    os.win32k_state.current_cursor = hcursor;
+    os.driver.set_cursor(hcursor);
+    Ok(prev as u32)
+}
+
+/// `NtUserGetCursorPos(lpPoint)` — write the tracked cursor position (screen
+/// pixels) into the guest `POINT{LONG x, LONG y}` (roadmap W4.7). Returns TRUE.
+fn nt_user_get_cursor_pos(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let lp = os.syscall_arg(cpu, mem, 0)?;
+    if lp == 0 {
+        return Ok(0);
+    }
+    let (x, y) = os.win32k_state.cursor_pos;
+    mem.write_u32(lp, x as u32)?;
+    mem.write_u32(lp + 4, y as u32)?;
+    Ok(1)
+}
+
+/// `NtUserSetCursorPos(x, y)` — move the tracked cursor position (roadmap W4.7).
+/// exemu does not warp the host cursor; it updates the position `GetCursorPos`
+/// reports. Returns TRUE.
+fn nt_user_set_cursor_pos(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let x = os.syscall_arg(cpu, mem, 0)? as i32;
+    let y = os.syscall_arg(cpu, mem, 1)? as i32;
+    os.win32k_state.cursor_pos = (x, y);
+    Ok(1)
+}
+
+/// `NtUserClipCursor(lpRect)` — accept the cursor confinement (roadmap W4.7).
+/// exemu does not confine the host cursor; the call succeeds so guests that gate
+/// on the BOOL proceed. Returns TRUE.
+fn nt_user_clip_cursor(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
+    Ok(1)
+}
+
+/// `NtUserChangeDisplaySettings(...)` — accept the requested mode (roadmap W4.7).
+/// exemu presents a fixed display, so the change is not applied, but a query /
+/// compatible mode reports success. Returns `DISP_CHANGE_SUCCESSFUL`.
+fn nt_user_change_display_settings(
+    _os: &mut WinOs,
+    _cpu: &mut CpuState,
+    _mem: &mut dyn Memory,
+) -> Result<u32> {
+    Ok(DISP_CHANGE_SUCCESSFUL)
+}
+
+/// `NtUserEnumDisplaySettings(device, iModeNum, lpDevMode, flags)` — report the
+/// driver's single display mode (roadmap W4.7). Mode 0 and the current/registry
+/// sentinels resolve to that mode; any higher index returns FALSE (end of
+/// enumeration). Fills the display fields of the caller's `DEVMODEW`, leaving the
+/// rest (which the caller zeroed) untouched.
+fn nt_user_enum_display_settings(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let mode_num = os.syscall_arg(cpu, mem, 1)? as u32;
+    let lp = os.syscall_arg(cpu, mem, 2)?;
+    if lp == 0 {
+        return Ok(0);
+    }
+    if mode_num != 0 && mode_num != ENUM_CURRENT_SETTINGS && mode_num != ENUM_REGISTRY_SETTINGS {
+        return Ok(0); // exemu exposes exactly one mode
+    }
+    write_devmode(mem, lp, os.driver.display_mode())?;
+    Ok(1)
+}
+
+/// Fill the display fields of a guest `DEVMODEW` at `lp` from `mode` (roadmap
+/// W4.7). Leaves the rest of the struct — which the caller zeroed — untouched.
+fn write_devmode(mem: &mut dyn Memory, lp: u64, mode: exemu_core::DisplayMode) -> Result<()> {
+    mem.write_u16(lp + DEVMODE_DMSIZE_OFF, DEVMODE_SIZE)?;
+    mem.write_u32(lp + DEVMODE_DMFIELDS_OFF, DM_DISPLAY_FIELDS)?;
+    mem.write_u16(lp + DEVMODE_DMLOGPIXELS_OFF, mode.dpi as u16)?;
+    mem.write_u32(lp + DEVMODE_DMBITSPERPEL_OFF, mode.bpp)?;
+    mem.write_u32(lp + DEVMODE_DMPELSWIDTH_OFF, mode.width)?;
+    mem.write_u32(lp + DEVMODE_DMPELSHEIGHT_OFF, mode.height)?;
+    mem.write_u32(lp + DEVMODE_DMDISPLAYFREQUENCY_OFF, mode.frequency)?;
+    Ok(())
+}
+
+/// `NtUserMsgWaitForMultipleObjectsEx(count, handles, timeout, wakeMask, flags)`
+/// — the message-aware wait (roadmap W4.7). exemu's single interpreter thread
+/// drains native input; if a message is now queued it reports it, otherwise it
+/// parks briefly on the input channel (never blocking the OS thread on AppKit)
+/// and reports the message-available result so the caller re-checks its queue.
+fn nt_user_msg_wait_for_multiple_objects_ex(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let count = os.syscall_arg(cpu, mem, 0)? as u32;
+    os.drain_input();
+    synthesize_paint(os);
+    let idle = os.threads[os.current].msgs.is_empty() && os.threads[os.current].quit_code.is_none();
+    if idle {
+        os.wait_for_input(std::time::Duration::from_millis(50));
+    }
+    // WAIT_OBJECT_0 + count == "a queued message is available"; the caller then
+    // drains it via PeekMessage/GetMessage.
+    Ok(count)
 }
 
 // ============================ W4.3: NtGdi paint handlers =====================
@@ -1053,4 +1224,33 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
         put_pixel(mem, &surface, x1, y, BGRA_BLACK)?;
     }
     Ok(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exemu_core::{DisplayMode, Perm, Region};
+    use exemu_memory::VirtualMemory;
+
+    /// `NtUserEnumDisplaySettings` writes the DEVMODEW display fields at their
+    /// ABI offsets, non-overlapping, from the driver's mode (roadmap W4.7).
+    #[test]
+    fn devmode_display_fields_land_at_their_offsets() {
+        let mut mem = VirtualMemory::new();
+        let base = 0x1_0000u64;
+        mem.map(Region::new("dm", base, 0x1000, Perm::RW)).unwrap();
+        let mode = DisplayMode { width: 1920, height: 1080, bpp: 32, frequency: 60, dpi: 96 };
+        write_devmode(&mut mem, base, mode).unwrap();
+
+        assert_eq!(mem.read_u16(base + DEVMODE_DMSIZE_OFF).unwrap(), DEVMODE_SIZE);
+        assert_eq!(mem.read_u32(base + DEVMODE_DMFIELDS_OFF).unwrap(), DM_DISPLAY_FIELDS);
+        assert_eq!(mem.read_u16(base + DEVMODE_DMLOGPIXELS_OFF).unwrap(), 96);
+        assert_eq!(mem.read_u32(base + DEVMODE_DMBITSPERPEL_OFF).unwrap(), 32);
+        assert_eq!(mem.read_u32(base + DEVMODE_DMPELSWIDTH_OFF).unwrap(), 1920);
+        assert_eq!(mem.read_u32(base + DEVMODE_DMPELSHEIGHT_OFF).unwrap(), 1080);
+        assert_eq!(mem.read_u32(base + DEVMODE_DMDISPLAYFREQUENCY_OFF).unwrap(), 60);
+        // Width and height are distinct 4-byte fields (a classic overlap bug).
+        assert_ne!(DEVMODE_DMPELSWIDTH_OFF, DEVMODE_DMPELSHEIGHT_OFF);
+        assert_eq!(DEVMODE_DMPELSHEIGHT_OFF - DEVMODE_DMPELSWIDTH_OFF, 4);
+    }
 }

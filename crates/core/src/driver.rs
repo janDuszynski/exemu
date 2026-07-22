@@ -45,6 +45,30 @@ pub struct WindowParams {
     pub parent: u32,
 }
 
+/// The display mode a [`UserDriver`] presents (roadmap W4.7). Backs
+/// `NtUserEnumDisplaySettings` / `ChangeDisplaySettings`; a live backend can
+/// override [`UserDriver::display_mode`] with the real `NSScreen` geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayMode {
+    /// Horizontal resolution in pixels.
+    pub width: u32,
+    /// Vertical resolution in pixels.
+    pub height: u32,
+    /// Colour depth in bits per pixel.
+    pub bpp: u32,
+    /// Refresh rate in Hz.
+    pub frequency: u32,
+    /// Logical dots per inch (`dmLogPixels` / `GetDpiForSystem`).
+    pub dpi: u32,
+}
+
+impl Default for DisplayMode {
+    /// A single 1920×1080, 32-bpp, 60 Hz, 96-DPI monitor — the headless default.
+    fn default() -> Self {
+        DisplayMode { width: 1920, height: 1080, bpp: 32, frequency: 60, dpi: 96 }
+    }
+}
+
 /// A window-management driver. Implemented by `exemu-gui`; the OS layer holds a
 /// `Box<dyn UserDriver>`.
 ///
@@ -144,6 +168,22 @@ pub trait UserDriver: Send {
     /// Called by the win32k `NtUserEndPaint` handler (the present point).
     fn flush_surface(&mut self, hwnd: u32, pixels: &[u8], w: u32, h: u32) {
         let _ = (hwnd, pixels, w, h);
+    }
+
+    /// The cursor shape changed (roadmap W4.7). `hcursor` is the guest `HCURSOR`
+    /// the app passed to `SetCursor`, or 0 to hide the cursor. Default no-op; a
+    /// live backend maps it to an `NSCursor`. The current-cursor bookkeeping (and
+    /// the previous-handle return `SetCursor` needs) lives in the win32k layer.
+    fn set_cursor(&mut self, hcursor: u64) {
+        let _ = hcursor;
+    }
+
+    /// The display mode this driver presents (roadmap W4.7). Default: a single
+    /// 1920×1080 monitor (see [`DisplayMode::default`]). A live backend reports
+    /// the real screen. Read-only here — `ChangeDisplaySettings` is accepted but
+    /// not applied (exemu does not resize the host display).
+    fn display_mode(&self) -> DisplayMode {
+        DisplayMode::default()
     }
 }
 
