@@ -716,23 +716,31 @@ impl WinOs {
     }
 
     /// Drain any pending native input events into the running thread's message
-    /// state (roadmap W4.5c). `Close` becomes a pending `WM_QUIT`. A disconnected
-    /// channel (the window host went away) also quits, so the guest never spins.
-    /// Returns `true` while an input channel is attached.
+    /// state (roadmap W4.5c/W4.6). `Close` becomes a pending `WM_QUIT`;
+    /// mouse/keyboard events are posted as `WM_*` to the shown window. A
+    /// disconnected channel (the window host went away) also quits, so the guest
+    /// never spins. Returns `true` while an input channel is attached.
     fn drain_input(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
         let Some(rx) = &self.input else { return false };
+        let mut pending = Vec::new();
+        let mut quit = false;
         loop {
             match rx.try_recv() {
-                Ok(exemu_core::InputEvent::Close) => {
-                    self.threads[self.current].quit_code.get_or_insert(0);
-                }
+                Ok(exemu_core::InputEvent::Close) => quit = true,
+                Ok(ev) => pending.push(ev),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.threads[self.current].quit_code.get_or_insert(0);
+                    quit = true;
                     break;
                 }
             }
+        }
+        if quit {
+            self.threads[self.current].quit_code.get_or_insert(0);
+        }
+        for ev in pending {
+            self.post_input_event(ev);
         }
         true
     }
@@ -747,6 +755,7 @@ impl WinOs {
             Ok(exemu_core::InputEvent::Close) => {
                 self.threads[self.current].quit_code.get_or_insert(0);
             }
+            Ok(ev) => self.post_input_event(ev),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 self.threads[self.current].quit_code.get_or_insert(0);
