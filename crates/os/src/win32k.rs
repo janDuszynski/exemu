@@ -220,6 +220,12 @@ impl Win32kState {
         self.window(hwnd).map(|w| w.wndproc).unwrap_or(0)
     }
 
+    /// The first shown window — the target for synthesized native input
+    /// (roadmap W4.6). Single top-level window is the model for now.
+    fn shown_window(&self) -> Option<u32> {
+        self.windows.iter().find(|(_, w)| w.shown).map(|(h, _)| *h)
+    }
+
     /// A shown window owing a WM_PAINT, clearing its flag. Used by the pump to
     /// synthesize a WM_PAINT when the queue is empty.
     fn take_paint_pending(&mut self) -> Option<u32> {
@@ -555,29 +561,33 @@ fn nt_user_set_window_pos(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memo
 }
 
 /// `NtUserMessageCall(hwnd, msg, wParam, lParam, resultInfo, type, ansi)` — the
-/// syscall user32's `SendMessageW` reaches (recovered: there is *no* dedicated
-/// `NtUserSetWindowText` syscall — `SetWindowTextW` delivers `WM_SETTEXT` here).
-/// We implement the minimal `WM_SETTEXT` arm: update the stored title and notify
-/// the driver's `set_window_text`. Every other message returns 0 (the full
-/// message dispatch is W4.5/W4.6).
+/// syscall user32's `SendMessageW` reaches, and the path Wine's `DispatchMessageW`
+/// lowers *input* messages (`WM_LBUTTONDOWN`/`WM_KEYDOWN`/…) into (`WM_PAINT` and
+/// other posted messages go via [`nt_user_dispatch_message`] instead — recovered
+/// by tracing gui_sample's pump). `WM_SETTEXT` keeps its native arm (there is no
+/// dedicated `NtUserSetWindowText` syscall — `SetWindowTextW` delivers it here):
+/// update the stored title and notify the driver. Every other message is
+/// dispatched to the window's WndProc, returning its LRESULT (roadmap W4.6).
 fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
     let msg = os.syscall_arg(cpu, mem, 1)? as u32;
-    if msg != WM_SETTEXT {
-        return Ok(0);
+    if msg == WM_SETTEXT {
+        let text_ptr = os.syscall_arg(cpu, mem, 3)?; // lParam = the text pointer
+        let ansi = os.syscall_arg(cpu, mem, 6)? != 0;
+        let text = if ansi {
+            crate::api::read_astr(mem, text_ptr)?
+        } else {
+            read_wstr(mem, text_ptr)?
+        };
+        if let Some(w) = os.win32k_state.window_mut(hwnd) {
+            w.title = text.clone();
+        }
+        os.driver.set_window_text(hwnd, &text);
+        return Ok(1);
     }
-    let text_ptr = os.syscall_arg(cpu, mem, 3)?; // lParam = the text pointer
-    let ansi = os.syscall_arg(cpu, mem, 6)? != 0;
-    let text = if ansi {
-        crate::api::read_astr(mem, text_ptr)?
-    } else {
-        read_wstr(mem, text_ptr)?
-    };
-    if let Some(w) = os.win32k_state.window_mut(hwnd) {
-        w.title = text.clone();
-    }
-    os.driver.set_window_text(hwnd, &text);
-    Ok(1)
+    let wparam = os.syscall_arg(cpu, mem, 2)?;
+    let lparam = os.syscall_arg(cpu, mem, 3)?;
+    dispatch_to_wndproc(os, cpu, mem, hwnd as u64, msg, wparam, lparam)
 }
 
 /// `NtUserInternalGetWindowText(hwnd, buffer, maxCount)` — the kernel-side text
@@ -849,23 +859,79 @@ fn synthesize_paint(os: &mut WinOs) {
     }
 }
 
+impl WinOs {
+    /// Translate a native [`InputEvent`](exemu_core::InputEvent) into the Win32
+    /// message the guest expects and post it to the shown window's queue (roadmap
+    /// W4.6). The [`NtUserDispatchMessage`](nt_user_dispatch_message) path then
+    /// routes it to the guest's WndProc. `Close` is handled by the caller (it
+    /// becomes `WM_QUIT`, not a window message), so it is a no-op here; input for
+    /// a guest with no shown window is dropped.
+    pub(crate) fn post_input_event(&mut self, ev: exemu_core::InputEvent) {
+        use crate::gdi::{
+            MK_LBUTTON, MK_RBUTTON, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+            WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        };
+        use exemu_core::{InputEvent, MouseButton};
+        let Some(hwnd) = self.win32k_state.shown_window() else { return };
+        // Mouse position packs into lParam as (x in low word, y in high word).
+        let pos = |x: i32, y: i32| (x as u32 as u64 & 0xffff) | ((y as u32 as u64 & 0xffff) << 16);
+        let (message, wparam, lparam) = match ev {
+            InputEvent::Close => return,
+            InputEvent::MouseMove { x, y } => (WM_MOUSEMOVE, 0, pos(x, y)),
+            InputEvent::MouseButton { button: MouseButton::Left, down: true, x, y } => {
+                (WM_LBUTTONDOWN, MK_LBUTTON, pos(x, y))
+            }
+            InputEvent::MouseButton { button: MouseButton::Left, down: false, x, y } => {
+                (WM_LBUTTONUP, 0, pos(x, y))
+            }
+            InputEvent::MouseButton { button: MouseButton::Right, down: true, x, y } => {
+                (WM_RBUTTONDOWN, MK_RBUTTON, pos(x, y))
+            }
+            InputEvent::MouseButton { button: MouseButton::Right, down: false, x, y } => {
+                (WM_RBUTTONUP, 0, pos(x, y))
+            }
+            InputEvent::Key { vk, down: true } => (WM_KEYDOWN, vk as u64, 0),
+            InputEvent::Key { vk, down: false } => (WM_KEYUP, vk as u64, 0),
+        };
+        self.post_internal(hwnd as u64, message as u32, wparam, lparam);
+    }
+}
+
+/// Dispatch `(hwnd, msg, wParam, lParam)` to the target window's WndProc via the
+/// direct-call path (roadmap W4.6): seat `wndproc(hwnd, msg, wParam, lParam)` on
+/// the guest stack and resume the interrupted syscall's caller when it returns,
+/// with the WndProc's LRESULT in rax. A message for an unknown / class-less
+/// window is a no-op (returns 0). Shared by `NtUserDispatchMessage` and the
+/// WndProc arm of `NtUserMessageCall`.
+fn dispatch_to_wndproc(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+    hwnd: u64,
+    msg: u32,
+    wparam: u64,
+    lparam: u64,
+) -> Result<u32> {
+    let wndproc = os.win32k_state.wndproc_for(hwnd as u32);
+    if wndproc == 0 {
+        return Ok(0);
+    }
+    let m = crate::msg::PostedMsg { hwnd, message: msg, wparam, lparam };
+    os.call_wndproc_from_syscall(cpu, mem, wndproc, m)?;
+    Ok(0) // ignored: call_wndproc_from_syscall sets syscall_resume_as_is
+}
+
 /// `NtUserDispatchMessage(lpMsg)` — invoke the target window's WndProc with the
-/// message (roadmap W4.6). Direct-call path: seat `wndproc(hwnd, msg, wParam,
-/// lParam)` on the guest stack and resume this syscall's caller when it returns.
-/// A message for an unknown window / class-less window is a no-op (returns 0).
+/// message (roadmap W4.6). Wine's `DispatchMessageW` reaches this for `WM_PAINT`
+/// (and other "posted" messages that lower straight to the dispatcher); input
+/// messages arrive instead through [`nt_user_message_call`].
 fn nt_user_dispatch_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let lp = os.syscall_arg(cpu, mem, 0)?;
     if lp == 0 {
         return Ok(0);
     }
     let (hwnd, message, wparam, lparam) = os.read_msg(mem, lp)?;
-    let wndproc = os.win32k_state.wndproc_for(hwnd as u32);
-    if wndproc == 0 {
-        return Ok(0);
-    }
-    let msg = crate::msg::PostedMsg { hwnd, message: message as u32, wparam, lparam };
-    os.call_wndproc_from_syscall(cpu, mem, wndproc, msg)?;
-    Ok(0) // ignored: call_wndproc_from_syscall sets syscall_resume_as_is
+    dispatch_to_wndproc(os, cpu, mem, hwnd, message as u32, wparam, lparam)
 }
 
 /// `NtUserPeekMessage` → 0 (no message available).

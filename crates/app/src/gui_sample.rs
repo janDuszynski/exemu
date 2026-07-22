@@ -10,9 +10,11 @@
 //! message loop's `GetMessage` synthesizes an initial `WM_PAINT` for the shown
 //! window and `DispatchMessageW` routes it through `NtUserDispatchMessage` into
 //! the `WM_PAINT` arm of `wndproc` below, which repaints via BeginPaint →
-//! Rectangle → TextOutW → EndPaint (a second present). Without an input channel
-//! `GetMessage` returns `WM_QUIT` immediately and only the direct paint runs —
-//! either way the surface/present pipeline is fully exercised, so both stay green.
+//! Rectangle → TextOutW → EndPaint (a second present). A native mouse click
+//! arrives as `WM_LBUTTONDOWN` and the `wndproc` click arm repaints again
+//! (GetDC → Rectangle → ReleaseDC). Without an input channel `GetMessage`
+//! returns `WM_QUIT` immediately and only the direct paint runs — either way the
+//! surface/present pipeline is fully exercised, so both stay green.
 //!
 //! The code is hand-assembled x86-64 with a small local assembler (`Asm`) so
 //! branch targets and RIP-relative references stay correct.
@@ -330,6 +332,8 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.mov_at_rsp_reg(0x70, RCX); // save hwnd
     a.cmp_rdx_imm8(0x0F); // WM_PAINT
     a.je("paint");
+    a.cmp_rdx_imm32(0x0201); // WM_LBUTTONDOWN
+    a.je("click");
     a.cmp_rdx_imm8(0x02); // WM_DESTROY
     a.je("destroy");
     // default: DefWindowProcW(hwnd,msg,wparam,lparam) — regs already set.
@@ -339,6 +343,27 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.label("destroy");
     a.xor32(RCX);
     a.call_iat(r.slot("PostQuitMessage"));
+    a.xor32(RAX);
+    a.jmp("wp_ret");
+
+    // WM_LBUTTONDOWN: repaint on click — GetDC → Rectangle → ReleaseDC, a fresh
+    // present driven by real input (W4.6). hwnd is saved at [rsp+0x70]; the hdc
+    // stashes at [rsp+0x78] like the paint arm.
+    a.label("click");
+    a.mov_reg_at_rsp(RCX, 0x70); // hwnd
+    a.call_iat(r.slot("GetDC"));
+    a.mov_at_rsp_reg(0x78, RAX); // save hdc
+    // Rectangle(hdc, 100, 100, 300, 180) — the "clicked" marker rectangle.
+    a.mov_reg_reg(RCX, RAX);
+    a.mov32(RDX, 100);
+    a.mov32(R8, 100);
+    a.mov32(R9, 300);
+    a.mov_at_rsp_imm(0x20, 180);
+    a.call_iat(r.slot("Rectangle"));
+    // ReleaseDC(hwnd, hdc) — the present point for the click repaint.
+    a.mov_reg_at_rsp(RCX, 0x70);
+    a.mov_reg_at_rsp(RDX, 0x78);
+    a.call_iat(r.slot("ReleaseDC"));
     a.xor32(RAX);
     a.jmp("wp_ret");
 
@@ -497,6 +522,10 @@ impl Asm {
     }
     fn cmp_rdx_imm8(&mut self, imm: i8) {
         self.code.extend_from_slice(&[0x48, 0x83, 0xFA, imm as u8]);
+    }
+    fn cmp_rdx_imm32(&mut self, imm: i32) {
+        self.code.extend_from_slice(&[0x48, 0x81, 0xFA]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
     }
     fn int3(&mut self) {
         self.code.push(0xCC);

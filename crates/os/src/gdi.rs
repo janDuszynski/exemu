@@ -26,6 +26,17 @@ pub const WM_DESTROY: u64 = 0x0002;
 pub const WM_LBUTTONDOWN: u64 = 0x0201;
 pub const WM_CLOSE: u64 = 0x0010;
 
+/// Input messages the win32k pump synthesizes from native events (roadmap W4.6).
+pub const WM_KEYDOWN: u64 = 0x0100;
+pub const WM_KEYUP: u64 = 0x0101;
+pub const WM_MOUSEMOVE: u64 = 0x0200;
+pub const WM_LBUTTONUP: u64 = 0x0202;
+pub const WM_RBUTTONDOWN: u64 = 0x0204;
+pub const WM_RBUTTONUP: u64 = 0x0205;
+/// `wParam` virtual-key flags for the mouse-button messages.
+pub const MK_LBUTTON: u64 = 0x0001;
+pub const MK_RBUTTON: u64 = 0x0002;
+
 /// A real Win32 window object (roadmap P5a.2). Keyed by its HWND in
 /// [`Gdi::windows`], so guest code that stores an HWND and later queries it
 /// (`GetWindowLongPtr`, `GetProp`, `IsWindow`, subclassing) sees consistent

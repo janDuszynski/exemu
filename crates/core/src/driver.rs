@@ -159,12 +159,29 @@ impl UserDriver for NoDriver {}
 ///
 /// This is the reverse direction of [`UserDriver`]: the host produces these as
 /// the user interacts with a native window; the win32k `NtUserGetMessage`
-/// handler drains them into the guest's message queue so a Wine-hosted GUI stays
-/// live. Only window-close is modelled for now; mouse/keyboard follow in W4.6.
+/// handler drains them into the guest's message queue (as `WM_MOUSEMOVE` /
+/// `WM_*BUTTON*` / `WM_KEY*` / `WM_QUIT`) so a Wine-hosted GUI stays interactive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
     /// The user asked to close the window (the red close button / Cmd-W). The
     /// pump turns this into a `WM_QUIT`, so the guest's message loop exits
     /// cleanly.
     Close,
+    /// The pointer moved to client-area point `(x, y)`. → `WM_MOUSEMOVE`.
+    MouseMove { x: i32, y: i32 },
+    /// A mouse button transitioned at client-area point `(x, y)`. →
+    /// `WM_LBUTTONDOWN`/`WM_LBUTTONUP` (or the right-button pair).
+    MouseButton { button: MouseButton, down: bool, x: i32, y: i32 },
+    /// A key transitioned. `vk` is the Windows virtual-key code. →
+    /// `WM_KEYDOWN`/`WM_KEYUP`.
+    Key { vk: u32, down: bool },
+}
+
+/// Which mouse button an [`InputEvent::MouseButton`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    /// The primary (left) button.
+    Left,
+    /// The secondary (right) button.
+    Right,
 }
