@@ -37,10 +37,10 @@ use objc2::runtime::ProtocolObject;
 use objc2::{MainThreadMarker, MainThreadOnly};
 
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
+    NSEventType, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSDate, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
+use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize,
@@ -48,7 +48,7 @@ use objc2_metal::{
 };
 use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer};
 
-use exemu_core::{InputEvent, UserDriver, WindowParams};
+use exemu_core::{InputEvent, MouseButton, UserDriver, WindowParams};
 
 use crate::{bgra_to_rgba, Presenter};
 
@@ -121,6 +121,8 @@ impl CocoaWindow {
 
         window.setContentView(Some(&view));
         window.setTitle(&NSString::from_str(title));
+        // Deliver WM_MOUSEMOVE-worthy moves even when no button is down (W4.6).
+        window.setAcceptsMouseMovedEvents(true);
         window.center();
         window.makeKeyAndOrderFront(None);
         app.activate();
@@ -229,6 +231,105 @@ pub fn run_demo(w: u32, h: u32, title: &str, bgra: &[u8], hold_secs: f64) -> Res
     Ok(())
 }
 
+// ============================ native input tap (W4.6) =======================
+
+/// The client-area point (top-left origin, pixels) of a mouse `NSEvent`, mapping
+/// AppKit's bottom-left window coordinates into the guest's top-down space. `None`
+/// when the event has no window (e.g. a system event).
+fn event_client_pos(event: &NSEvent, mtm: MainThreadMarker) -> Option<(i32, i32)> {
+    let win = event.window(mtm)?;
+    let view = win.contentView()?;
+    let loc = event.locationInWindow();
+    let p = view.convertPoint_fromView(loc, None);
+    let bounds = view.bounds();
+    let x = p.x.round() as i32;
+    let y = (bounds.size.height - p.y).round() as i32; // flip bottom-left → top-left
+    Some((x, y))
+}
+
+/// The Windows virtual-key code for a key `NSEvent`, or `None` for a key exemu
+/// does not map. Alphanumerics derive from the character (VK_A..VK_Z = 0x41..0x5A,
+/// VK_0..VK_9 = 0x30..0x39 == the uppercase ASCII code); control/navigation keys
+/// come from the macOS virtual keycode. Unmapped keys are dropped rather than
+/// delivered with a wrong code.
+fn event_vk(event: &NSEvent) -> Option<u32> {
+    if let Some(s) = event.charactersIgnoringModifiers() {
+        if let Some(c) = s.to_string().chars().next() {
+            let up = c.to_ascii_uppercase();
+            if up.is_ascii_alphanumeric() {
+                return Some(up as u32);
+            }
+        }
+    }
+    let vk = match event.keyCode() {
+        0x24 => 0x0D, // Return   → VK_RETURN
+        0x30 => 0x09, // Tab      → VK_TAB
+        0x31 => 0x20, // Space    → VK_SPACE
+        0x33 => 0x08, // Delete   → VK_BACK
+        0x35 => 0x1B, // Escape   → VK_ESCAPE
+        0x7B => 0x25, // Left     → VK_LEFT
+        0x7C => 0x27, // Right    → VK_RIGHT
+        0x7D => 0x28, // Down     → VK_DOWN
+        0x7E => 0x26, // Up       → VK_UP
+        _ => return None,
+    };
+    Some(vk)
+}
+
+/// Translate one native `NSEvent` into the [`InputEvent`] the guest pump expects,
+/// or `None` for events exemu does not forward (window drags, system events, …).
+fn translate_event(event: &NSEvent, mtm: MainThreadMarker) -> Option<InputEvent> {
+    let mouse = |button, down| {
+        event_client_pos(event, mtm).map(|(x, y)| InputEvent::MouseButton { button, down, x, y })
+    };
+    match event.r#type() {
+        NSEventType::LeftMouseDown => mouse(MouseButton::Left, true),
+        NSEventType::LeftMouseUp => mouse(MouseButton::Left, false),
+        NSEventType::RightMouseDown => mouse(MouseButton::Right, true),
+        NSEventType::RightMouseUp => mouse(MouseButton::Right, false),
+        NSEventType::MouseMoved | NSEventType::LeftMouseDragged | NSEventType::RightMouseDragged => {
+            event_client_pos(event, mtm).map(|(x, y)| InputEvent::MouseMove { x, y })
+        }
+        NSEventType::KeyDown => event_vk(event).map(|vk| InputEvent::Key { vk, down: true }),
+        NSEventType::KeyUp => event_vk(event).map(|vk| InputEvent::Key { vk, down: false }),
+        _ => None,
+    }
+}
+
+/// Pump native `NSEvent`s for up to `seconds`: block for the first event, then
+/// drain the rest without blocking. Each is translated and forwarded to the guest
+/// over `input_tx` (so its `NtUserGetMessage` wakes and its WndProc sees the
+/// input) and then handed to AppKit via `sendEvent` so the window keeps its normal
+/// behaviour (dragging, the close button, key focus). This *is* the run-loop tick
+/// for the live host — it replaces a bare `runUntilDate` so no event slips past
+/// the tap. Off the main thread (no `NSApplication`) it falls back to a plain
+/// run-loop pump. (roadmap W4.6)
+fn pump_events(input_tx: &Sender<InputEvent>, seconds: f64) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        pump_runloop(seconds);
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    // Block up to `seconds` for the first event; poll (distantPast) thereafter.
+    let mut until = NSDate::dateWithTimeIntervalSinceNow(seconds);
+    loop {
+        let event = unsafe {
+            app.nextEventMatchingMask_untilDate_inMode_dequeue(
+                NSEventMask::Any,
+                Some(&until),
+                NSDefaultRunLoopMode,
+                true,
+            )
+        };
+        let Some(event) = event else { break };
+        if let Some(ev) = translate_event(&event, mtm) {
+            let _ = input_tx.send(ev);
+        }
+        app.sendEvent(&event);
+        until = NSDate::distantPast();
+    }
+}
+
 // ============================ main → window host ============================
 
 /// The main-thread consumer of [`WindowCommand`]s: it owns one [`CocoaWindow`]
@@ -327,7 +428,7 @@ pub fn run_live(
         match cmd_rx.try_recv() {
             Ok(cmd) => host.apply(cmd),
             Err(TryRecvError::Empty) => {
-                pump_runloop(0.01);
+                pump_events(&input_tx, 0.01);
                 host.reap_closed(&input_tx);
                 if let Some(ms) = auto_close_ms {
                     if !auto_close_sent && start.elapsed().as_millis() >= ms {

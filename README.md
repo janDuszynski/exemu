@@ -372,10 +372,13 @@ instead of busy-spinning), the window stays on screen, and closing it delivers a
 `WndProc`: `GetMessage` synthesizes the shown window's initial `WM_PAINT` and
 `DispatchMessage` (Wine's real `user32` → `NtUserDispatchMessage`) invokes the
 guest procedure, whose `WM_PAINT` arm repaints through `BeginPaint`/`Rectangle`/
-`TextOutW`/`EndPaint` — a second, on-demand frame drawn by the app itself. What's
-left to make it fully interactive: native mouse/keyboard events (`NSEvent` → the
-guest's message queue) so those `WndProc` dispatches carry real input (W4.6).
-`exemu cocoa-demo` still opens the same presenter directly with a test frame.
+`TextOutW`/`EndPaint` — a second, on-demand frame drawn by the app itself. And it
+is now **interactive**: a main-thread `NSEvent` tap translates real mouse and
+keyboard input into `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_KEYDOWN`/… and posts them
+to the guest's message queue, which `DispatchMessage` (via `NtUserMessageCall`,
+the syscall Wine actually lowers input messages into) routes to the `WndProc` —
+so clicking the window makes the guest repaint. `exemu cocoa-demo` still opens the
+same presenter directly with a test frame.
 
 ### Differential CPU oracle
 
