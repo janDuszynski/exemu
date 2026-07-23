@@ -558,3 +558,61 @@ fn wow64cpu_loads_and_bopcode_stub_runs() {
     let mut buf = [0u8; 4];
     mem.read(ptr, &mut buf).expect("the BOP slot is mapped");
 }
+
+/// W5.4/W5.2: the *real* `wow64cpu!BTCpuSimulate` stub drives the 64→32 mode
+/// switch into a 32-bit guest. We set up the WoW64 process model the stub reads —
+/// the TEB self-pointer, the CPU-reserved area at TEB+0x1488 → a WOW64_CONTEXT
+/// (Eip/Esp/SegCs at the recovered offsets), and the .bss CS/SS selector slots
+/// `BTCpuProcessInit` would fill — then let the stub's own bytes run: it loads the
+/// 32-bit regs, `xchg`es to the 32-bit stack, and far-jumps through [Eip, SegCs].
+/// The guest's `C7 05 …` is an **absolute** `[disp32]` store in 32-bit mode but a
+/// **RIP-relative** one in 64-bit mode — so its sentinel lands at the expected
+/// address *only if* the CPU actually dropped into 32-bit mode (roadmap W5.2/W5.4).
+#[test]
+fn btcpusimulate_switches_into_a_32bit_guest() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("exemu-w5_4-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem, _ntdll) = setup(&dir);
+    let bytes = std::fs::read(WOW64CPU).expect("read wow64cpu.dll");
+    let wow64cpu = load_dll(&mut mem, &bytes, WOW64CPU_BASE);
+
+    // A 32-bit guest region (< 4 GiB, so Esp/Eip fit in 32 bits): code + stack +
+    // the sentinel target.
+    const GUEST_CODE: u64 = 0x0040_0000;
+    const GUEST_STACK: u64 = 0x0041_0000;
+    const SENTINEL32: u64 = 0x0042_0000;
+    mem.map(Region::new("guest32", GUEST_CODE, 0x3_0000, Perm::RWX)).unwrap();
+    // mov dword [0x00420000], 0xCAFEBABE ; hlt
+    mem.write(GUEST_CODE, &[0xC7, 0x05, 0x00, 0x00, 0x42, 0x00, 0xBE, 0xBA, 0xFE, 0xCA, 0xF4]).unwrap();
+
+    // The WoW64 process model BTCpuSimulate reads: TEB self-pointer (gs:[0x30])
+    // and the CPU-reserved area pointer at TEB+0x1488.
+    mem.write_u64(GS_BASE + 0x30, GS_BASE).unwrap();
+    const CPU_AREA: u64 = SCRATCH + 0x1000;
+    mem.write_u64(GS_BASE + 0x1488, CPU_AREA).unwrap();
+    mem.write_u32(CPU_AREA, 0).unwrap(); // machine-type header; bit0=0 → forward path
+    let ctx = CPU_AREA + 4; // the WOW64_CONTEXT
+    mem.write_u32(ctx + 0xb8, GUEST_CODE as u32).unwrap(); // Eip
+    mem.write_u32(ctx + 0xc0, 0x202).unwrap(); // EFlags
+    mem.write_u32(ctx + 0xc4, GUEST_STACK as u32).unwrap(); // Esp
+
+    // The CS/SS selector constants BTCpuProcessInit would populate (we skip init):
+    // 32-bit WoW64 CS=0x23, SS=0x2b. BTCpuSimulate copies these into the context.
+    mem.write_u32(WOW64CPU_BASE + 0x600c, 0x23).unwrap();
+    mem.write_u32(WOW64CPU_BASE + 0x6008, 0x2b).unwrap();
+
+    // Run the real stub: 64-bit setup → far jmp → 32-bit guest → hlt.
+    call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
+
+    assert_eq!(
+        mem.read_u32(SENTINEL32).unwrap(),
+        0xCAFE_BABE,
+        "the 32-bit guest ran its absolute-disp32 store — the CS-mode switch worked"
+    );
+}
