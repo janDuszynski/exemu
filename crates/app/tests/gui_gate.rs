@@ -480,15 +480,17 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
     );
 
     // The click rectangle spans (150,90)→(460,250): a black frame whose left edge
-    // is at x=150 and top edge at y=90. Sample one pixel on each edge, away from
-    // the WM_PAINT content, so both cursor coordinates are pinned.
+    // is at x=150 and top edge at y=90. Sample one pixel on each edge, clear of
+    // the WM_PAINT text/rectangle content (the left edge below both text lines,
+    // the top edge past the text's right extent), so both cursor coordinates are
+    // pinned to the click and nothing else.
     let (w, bgra) = click_frame.expect("captured the click repaint frame");
     let dark = |x: u32, y: u32| {
         let o = ((y * w + x) * 4) as usize;
         bgra[o] < 64 && bgra[o + 1] < 64 && bgra[o + 2] < 64 // B, G, R all near black
     };
-    assert!(dark(CLICK_X as u32, 200), "the click rect's left edge tracks cursor.x={CLICK_X}");
-    assert!(dark(220, CLICK_Y as u32), "the click rect's top edge tracks cursor.y={CLICK_Y}");
+    assert!(dark(CLICK_X as u32, 220), "the click rect's left edge tracks cursor.x={CLICK_X}");
+    assert!(dark(440, CLICK_Y as u32), "the click rect's top edge tracks cursor.y={CLICK_Y}");
 
     // Close the window; the guest exits cleanly.
     input_tx.send(InputEvent::Close).expect("the interpreter is still listening for input");

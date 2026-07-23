@@ -1179,16 +1179,57 @@ fn nt_gdi_ext_text_out_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
         return Ok(0);
     };
 
-    // Read `count` WCHARs and rasterize left-to-right at a fixed 8px advance
-    // (metric-only stub; proportional metrics + the CoreText path are W4.8).
-    let mut cx = x;
+    // Read the run.
+    let mut units = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let unit = mem.read_u16(str_ptr + i as u64 * 2)?;
-        let ch = char::from_u32(unit as u32).unwrap_or('\u{FFFD}');
-        draw_glyph(mem, &surface, ch, cx, y, BGRA_BLACK)?;
-        cx += 8;
+        units.push(mem.read_u16(str_ptr + i as u64 * 2)?);
+    }
+    let text = String::from_utf16_lossy(&units);
+
+    // Prefer the driver's real (CoreText) glyph rasterizer (roadmap W4.8),
+    // compositing its alpha coverage in black at the run origin; fall back to the
+    // built-in font8x8 stub headlessly / when the driver has no font backend.
+    // The HFONT-selected size isn't tracked yet, so a default cell height stands
+    // in (proportional metrics come from the rasterizer regardless).
+    const DEFAULT_TEXT_PX: u32 = 16;
+    if let Some(tb) = os.driver.rasterize_text(&text, DEFAULT_TEXT_PX) {
+        composite_coverage(mem, &surface, x, y, &tb)?;
+    } else {
+        let mut cx = x;
+        for ch in text.chars() {
+            draw_glyph(mem, &surface, ch, cx, y, BGRA_BLACK)?;
+            cx += 8;
+        }
     }
     Ok(1)
+}
+
+/// Composite a top-down 8-bit alpha `coverage` (from the driver's text
+/// rasterizer) onto the surface at `(x, y)`, blending each covered pixel toward
+/// black — the default text colour (roadmap W4.8). Clipped to the surface;
+/// `SetTextColor` / opaque background modes are deferred.
+fn composite_coverage(mem: &mut dyn Memory, s: &Surface, x: i32, y: i32, tb: &exemu_core::TextBitmap) -> Result<()> {
+    for gy in 0..tb.height {
+        for gx in 0..tb.width {
+            let a = tb.coverage[(gy * tb.width + gx) as usize] as u32;
+            if a == 0 {
+                continue; // fully transparent: leave the background pixel
+            }
+            let (px, py) = (x + gx as i32, y + gy as i32);
+            if px < 0 || py < 0 || px >= s.w as i32 || py >= s.h as i32 {
+                continue;
+            }
+            let off = s.base + (py as u64 * s.w as u64 + px as u64) * 4;
+            let existing = mem.read_u32(off)?;
+            // out = existing * (1 - a): blend toward black, per BGR channel; keep A.
+            let inv = 255 - a;
+            let b = (existing & 0xff) * inv / 255;
+            let g = ((existing >> 8) & 0xff) * inv / 255;
+            let r = ((existing >> 16) & 0xff) * inv / 255;
+            mem.write_u32(off, (existing & 0xff00_0000) | (r << 16) | (g << 8) | b)?;
+        }
+    }
+    Ok(())
 }
 
 /// `NtGdiRectangle(hdc, left, top, right, bottom)` — the syscall gdi32!Rectangle
