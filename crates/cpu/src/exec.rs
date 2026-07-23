@@ -542,6 +542,30 @@ impl Interpreter {
                         self.state.rip = target & self.addr_mask();
                         return Ok(Exit::Continue);
                     }
+                    5 => {
+                        // JMP m16:32 / m16:64 — far *indirect* jump. exemu has no
+                        // GDT; it models the flat WoW64 selectors, so the loaded CS
+                        // selector picks the operating mode (index 6 / 0x33 →
+                        // 64-bit long mode, else → 32-bit compat). This is the
+                        // `Wow64Transition` CS-based mode switch (roadmap W5.2): the
+                        // guest reads `[offset, selector]` from memory, and the
+                        // mode change reinterprets the width of everything after.
+                        // A far jump requires a memory operand.
+                        let Rm::Mem { .. } = ctx.rm else {
+                            return Err(EmuError::Unsupported(format!(
+                                "far JMP with register operand at {start:#x}"
+                            )));
+                        };
+                        let addr = ctx.rm_addr();
+                        let offset = match size {
+                            8 => mem.read_u64(addr)?,
+                            _ => mem.read_u32(addr)? as u64,
+                        };
+                        let selector = mem.read_u16(addr + size as u64)?;
+                        self.bits = if selector & 0xFFF8 == 0x30 { Bits::B64 } else { Bits::B32 };
+                        self.state.rip = offset & self.addr_mask();
+                        return Ok(Exit::Continue);
+                    }
                     6 => {
                         let w = self.stack_width();
                         let v = self.read_rm(&ctx, &*mem, w)?;
