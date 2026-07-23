@@ -69,6 +69,21 @@ impl Default for DisplayMode {
     }
 }
 
+/// A rasterized run of text produced by [`UserDriver::rasterize_text`] (roadmap
+/// W4.8). `coverage` is a top-down, `width × height` 8-bit alpha mask (0 =
+/// background, 255 = full glyph coverage); the win32k text path composites it in
+/// the text colour over the DIB. `(0,0)` is the top-left of the text cell, so it
+/// blits directly at the `TextOut` origin (baseline sits `height − descent` down).
+#[derive(Debug, Clone)]
+pub struct TextBitmap {
+    /// Width of the coverage mask in pixels (the summed glyph advances).
+    pub width: u32,
+    /// Height of the coverage mask in pixels (font ascent + descent).
+    pub height: u32,
+    /// Row-major, top-down 8-bit alpha, `width * height` bytes.
+    pub coverage: Vec<u8>,
+}
+
 /// A window-management driver. Implemented by `exemu-gui`; the OS layer holds a
 /// `Box<dyn UserDriver>`.
 ///
@@ -184,6 +199,16 @@ pub trait UserDriver: Send {
     /// not applied (exemu does not resize the host display).
     fn display_mode(&self) -> DisplayMode {
         DisplayMode::default()
+    }
+
+    /// Rasterize `text` at `px` pixels into an alpha-coverage [`TextBitmap`]
+    /// (roadmap W4.8). The win32k `NtGdiExtTextOutW` path calls this so real
+    /// (CoreText) glyphs land in the DIB; returning `None` (the default) makes it
+    /// fall back to the built-in `font8x8` stub, so headless / non-macOS runs
+    /// still render text deterministically.
+    fn rasterize_text(&self, text: &str, px: u32) -> Option<TextBitmap> {
+        let _ = (text, px);
+        None
     }
 }
 

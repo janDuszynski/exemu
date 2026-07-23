@@ -41,6 +41,9 @@ use objc2_app_kit::{
     NSEventType, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
+use objc2_core_foundation::{CFString, CGPoint, CGSize};
+use objc2_core_graphics::{CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext};
+use objc2_core_text::{CTFont, CTFontOrientation};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize,
@@ -48,7 +51,7 @@ use objc2_metal::{
 };
 use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer};
 
-use exemu_core::{InputEvent, MouseButton, UserDriver, WindowParams};
+use exemu_core::{InputEvent, MouseButton, TextBitmap, UserDriver, WindowParams};
 
 use crate::{bgra_to_rgba, Presenter};
 
@@ -658,12 +661,121 @@ impl UserDriver for CocoaPresenter {
             <Self as Presenter>::flush(self, hwnd, pixels, w, h);
         }
     }
+
+    fn rasterize_text(&self, text: &str, px: u32) -> Option<TextBitmap> {
+        coretext_rasterize(text, px)
+    }
+}
+
+/// Rasterize `text` at `px` pixels with CoreText into a top-down 8-bit alpha
+/// coverage mask (roadmap W4.8). Lays the run out in the system "Helvetica" at
+/// `px`, maps characters→glyphs, draws them white-on-black into a grayscale
+/// `CGBitmapContext`, and reads the buffer back (flipped, since CG is bottom-up)
+/// as the coverage the win32k text path composites in the text colour. Returns
+/// `None` on any failure so the caller falls back to the font8x8 stub.
+///
+/// CoreText/CoreGraphics objects here are process-global and thread-safe (no
+/// AppKit `MainThreadOnly` types), so this runs on the interpreter thread.
+fn coretext_rasterize(text: &str, px: u32) -> Option<TextBitmap> {
+    if text.is_empty() || px == 0 {
+        return None;
+    }
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let n = utf16.len();
+
+    let name = CFString::from_static_str("Helvetica");
+    let font = unsafe { CTFont::with_name(&name, px as f64, std::ptr::null()) };
+
+    // Characters → glyph ids (missing glyphs come back as 0 = .notdef; still drawn).
+    let mut glyphs = vec![0u16; n];
+    unsafe {
+        font.glyphs_for_characters(
+            NonNull::new(utf16.as_ptr() as *mut u16)?,
+            NonNull::new(glyphs.as_mut_ptr())?,
+            n as isize,
+        );
+    }
+
+    // Per-glyph advances → total width; ascent/descent → height + baseline.
+    let mut advances = vec![CGSize { width: 0.0, height: 0.0 }; n];
+    unsafe {
+        font.advances_for_glyphs(
+            CTFontOrientation::Default,
+            NonNull::new(glyphs.as_mut_ptr())?,
+            advances.as_mut_ptr(),
+            n as isize,
+        );
+    }
+    let ascent = unsafe { font.ascent() };
+    let descent = unsafe { font.descent() };
+    let total_w: f64 = advances.iter().map(|a| a.width).sum();
+    let width = (total_w.ceil() as usize).max(1);
+    let height = ((ascent + descent).ceil() as usize).max(1);
+
+    // Grayscale, 8-bit, no alpha; CG allocates + zero-fills (black) the buffer.
+    let space = CGColorSpace::new_device_gray()?;
+    let ctx = unsafe {
+        CGBitmapContextCreate(std::ptr::null_mut(), width, height, 8, width, Some(&space), 0)
+    }?;
+
+    // Positions: CG origin is bottom-left, so the baseline sits `descent` up;
+    // glyphs advance along x from the pen.
+    let mut positions = Vec::with_capacity(n);
+    let mut pen = 0.0f64;
+    for a in &advances {
+        positions.push(CGPoint { x: pen, y: descent });
+        pen += a.width;
+    }
+
+    // White glyphs on the black ground → the buffer is the coverage directly.
+    CGContext::set_gray_fill_color(Some(&ctx), 1.0, 1.0);
+    unsafe {
+        font.draw_glyphs(
+            NonNull::new(glyphs.as_mut_ptr())?,
+            NonNull::new(positions.as_mut_ptr())?,
+            n,
+            &ctx,
+        );
+    }
+
+    // Read the coverage out. The bitmap context's buffer is already top-down
+    // (row 0 = the top of the drawn image; CG applies its bottom-left→buffer flip
+    // internally), matching the DIB, so no manual flip. `bytesPerRow == width`
+    // was requested and honoured (a mismatch would skew, not just invert).
+    let data = CGBitmapContextGetData(Some(&ctx)) as *const u8;
+    if data.is_null() {
+        return None;
+    }
+    let coverage = unsafe { std::slice::from_raw_parts(data, width * height) }.to_vec();
+    Some(TextBitmap { width: width as u32, height: height as u32, coverage })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::OffscreenPresenter;
+
+    /// CoreText rasterizes a real run into non-empty alpha coverage (roadmap
+    /// W4.8): sensible dimensions and at least some covered pixels — proving the
+    /// win32k text path gets true glyphs, not the font8x8 fallback.
+    #[test]
+    fn coretext_rasterizes_a_run_to_coverage() {
+        let tb = coretext_rasterize("Hi!", 16).expect("CoreText rasterizes on macOS");
+        assert!(tb.width >= 8 && tb.width <= 200, "plausible run width: {}", tb.width);
+        assert!(tb.height >= 8 && tb.height <= 64, "plausible cell height: {}", tb.height);
+        assert_eq!(tb.coverage.len(), (tb.width * tb.height) as usize);
+        let covered = tb.coverage.iter().filter(|&&a| a > 0).count();
+        assert!(covered > 0, "the glyphs cover some pixels ({covered})");
+        // Anti-aliased edges mean partial (non-0/255) coverage — a real rasterizer,
+        // not the binary font8x8 stub.
+        assert!(
+            tb.coverage.iter().any(|&a| a > 0 && a < 255),
+            "CoreText anti-aliases glyph edges"
+        );
+        // Empty string / zero size are rejected (the caller then draws nothing).
+        assert!(coretext_rasterize("", 16).is_none());
+        assert!(coretext_rasterize("x", 0).is_none());
+    }
 
     /// A 2×2 BGRA frame exercising a non-grayscale colour (so the B/R swap
     /// actually matters): blue, red, green, gray.

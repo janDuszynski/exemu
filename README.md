@@ -357,7 +357,11 @@ publishes the GDI shared handle table Wine's `gdi32` demands (at `PEB+0xF8`),
 gives every window a guest-mapped BGRA backing surface, and services the
 `NtGdiExtTextOutW`/`NtGdiRectangle` syscalls `gdi32` lowers `TextOutW`/
 `Rectangle` into — so the sample's first frame (text + rectangle, drawn by
-Wine's real GDI stack) renders headlessly to PNG. Those pixels now reach a real
+Wine's real GDI stack) renders headlessly to PNG. Text is rendered with **real
+fonts**: `NtGdiExtTextOutW` asks the display driver to rasterize the run with
+**CoreText** (proportional, anti-aliased Helvetica glyphs) and composites the
+alpha coverage into the DIB, falling back to a built-in bitmap font only when no
+CoreText backend is present (headless CI). Those pixels now reach a real
 window: a from-scratch macOS presenter (`crates/gui/src/cocoa.rs`, `objc2`) gives
 each top-level window an **NSWindow + CAMetalLayer** and blits the BGRA surface
 into it via Metal — a real GPU round-trip verified pixel-lossless and byte-for-
