@@ -38,6 +38,7 @@ mod unixlib;
 mod vm;
 mod win;
 mod win32k;
+pub mod wow64;
 
 use std::collections::HashMap;
 
