@@ -334,6 +334,11 @@ allocate memory, query the clock, open+write a file (bytes land on the host),
 and create+wait an event, all via genuine `SYSCALL`s. It skips cleanly when the
 (separately obtained, non-redistributed) Wine DLL set is absent.
 
+A **golden-image gate** (`gui_gate.rs`) pins the GUI sample's first painted frame
+against a committed PNG so any pixel drift in the GDI paint path fails CI; it
+renders headlessly through the deterministic offscreen presenter, and
+`EXEMU_BLESS=1` re-blesses the golden after an intended rendering change.
+
 **Running on Wine's real PE core (experimental, opt-in).** A **console `.exe`
 runs to completion on Wine's own PE `ntdll` → `kernelbase` → `kernel32` →
 `ucrtbase`**, running natively on the software CPU. With the Wine DLL set present

@@ -175,6 +175,7 @@ dependencies = [
  "exemu-loader",
  "exemu-memory",
  "exemu-os",
+ "png",
 ]
 
 [[package]]
