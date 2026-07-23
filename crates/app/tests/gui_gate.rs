@@ -500,3 +500,92 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
         .expect("gui_sample exits after the click repaint and close");
     assert_eq!(res.exit_code, 0, "the guest exits cleanly");
 }
+
+/// Decode an RGBA8 PNG into `(width, height, rgba_bytes)`.
+fn decode_png(path: &Path) -> (u32, u32, Vec<u8>) {
+    let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut reader = png::Decoder::new(f).read_info().expect("valid PNG header");
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).expect("decode PNG frame");
+    buf.truncate(info.buffer_size());
+    (info.width, info.height, buf)
+}
+
+/// W4.10: the sample's first painted frame is pinned against a committed golden
+/// PNG, so any pixel drift in the GDI paint path fails CI — the standing
+/// regression gate for the W4+ paint work. Rendered headlessly through the
+/// **deterministic** `OffscreenPresenter` (the built-in font8x8 stub, since
+/// `rasterize_text` returns `None` for it — CoreText output would vary by macOS
+/// version), so the golden is platform-independent and this test is not
+/// macOS-gated. Set `EXEMU_BLESS=1` to (re)generate the golden after an
+/// intentional rendering change.
+#[test]
+fn gui_sample_first_frame_matches_golden_on_wine() {
+    if !Path::new(WINE_DLLS).join("win32u.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/win32u.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    // Render the first frame to a fresh temp dir via the deterministic presenter.
+    let shot_dir = std::env::temp_dir().join(format!(
+        "exemu-w410-golden-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&shot_dir);
+    let presenter = OffscreenPresenter::with_dir(Some(shot_dir.clone()));
+    let exe = gui_sample::build();
+    let res = load_and_run(
+        &exe,
+        RunConfig {
+            echo: false,
+            max_steps: 20_000_000,
+            wine_boot_dir: Some(WINE_DLLS.to_string()),
+            driver: Some(Box::new(PresenterDriver::new(presenter))),
+            ..RunConfig::default()
+        },
+    )
+    .expect("gui_sample renders its first frame");
+    assert_eq!(res.exit_code, 0, "the guest exits cleanly through the paint path");
+
+    let rendered = std::fs::read_dir(&shot_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("png"))
+        .expect("the presenter wrote a first-frame PNG");
+
+    let golden =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/goldens/gui_sample_first_frame.png");
+
+    if std::env::var_os("EXEMU_BLESS").is_some() {
+        std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+        std::fs::copy(&rendered, &golden).unwrap();
+        eprintln!("BLESSED golden: {}", golden.display());
+        let _ = std::fs::remove_dir_all(&shot_dir);
+        return;
+    }
+    assert!(
+        golden.exists(),
+        "no golden at {} — run once with EXEMU_BLESS=1 to create it",
+        golden.display()
+    );
+
+    let (rw, rh, rpix) = decode_png(&rendered);
+    let (gw, gh, gpix) = decode_png(&golden);
+    let _ = std::fs::remove_dir_all(&shot_dir);
+
+    assert_eq!((rw, rh), (gw, gh), "first-frame dimensions match the golden");
+    if rpix != gpix {
+        let diff = rpix.iter().zip(&gpix).filter(|(a, b)| a != b).count();
+        let first = rpix.iter().zip(&gpix).position(|(a, b)| a != b).unwrap_or(0);
+        panic!(
+            "first frame drifted from the golden: {diff}/{} bytes differ (first at byte {first}); \
+             set EXEMU_BLESS=1 to re-bless after an intended change",
+            rpix.len()
+        );
+    }
+}

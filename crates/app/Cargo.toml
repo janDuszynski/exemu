@@ -16,5 +16,9 @@ exemu-cpu = { workspace = true }
 exemu-os = { workspace = true }
 exemu-gui = { workspace = true }
 
+[dev-dependencies]
+# Decode the OffscreenPresenter's first-frame PNG for the golden-image gate (W4.10).
+png = "0.17"
+
 [lints.rust]
 unsafe_code = "forbid"
