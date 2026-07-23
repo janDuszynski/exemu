@@ -40,6 +40,9 @@ use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
 
 const NTDLL: &str = "../../example_exe/wine-dlls/x86_64-windows/ntdll.dll";
+const WOW64CPU: &str = "../../example_exe/wine-dlls/x86_64-windows/wow64cpu.dll";
+// A base clear of ntdll's (kept below the TEB/PEB); wow64cpu has a full .reloc.
+const WOW64CPU_BASE: u64 = 0x0000_0007_0000_0000;
 
 // --- The fixed low-page layout Wine's ntdll stubs assume. ------------------
 // KUSER_SHARED_DATA read-only at 0x7ffe0000 with SystemCall@0x308 nonzero (the
@@ -509,4 +512,49 @@ fn event_capability(os: &mut WinOs, mem: &mut VirtualMemory, dll: &Dll) {
     // NtClose(h).
     let st = call_export(os, mem, dll.export("NtClose"), &[handle]);
     assert_eq!(st, STATUS_SUCCESS, "NtClose (ntdll stub) on the event handle");
+}
+
+// ==========================================================================
+// W5.1: Wine's WoW64 thunk layer loads and its stubs run under exemu.
+// ==========================================================================
+/// `wow64cpu.dll` (the 64-bit binary-translator core for 32-bit guests) maps,
+/// relocates, resolves its `BTCpu*` exports, and one of its stubs actually runs:
+/// `BTCpuGetBopCode` (`lea rax,[rip+disp]; ret`) returns a pointer into the
+/// mapped image at the recovered BOP bytes — proving the load + relocation +
+/// RIP-relative computation are correct (roadmap W5.1). The `BTCpuSimulate`
+/// mode-switch integration is W5.2+/W5.4.
+#[test]
+fn wow64cpu_loads_and_bopcode_stub_runs() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!("exemu-w5_1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem, _ntdll) = setup(&dir);
+
+    let bytes = std::fs::read(WOW64CPU).expect("read wow64cpu.dll");
+    let wow64cpu = load_dll(&mut mem, &bytes, WOW64CPU_BASE);
+
+    // The binary-translator ABI ntdll drives is present as callable stubs.
+    for name in ["BTCpuProcessInit", "BTCpuSimulate", "BTCpuGetBopCode", "BTCpuGetContext", "BTCpuSetContext"] {
+        assert!(wow64cpu.exports.contains_key(name), "wow64cpu must export {name}");
+    }
+
+    // Run BTCpuGetBopCode through its own bytes: `lea rax,[rip+0x5c59]; ret`
+    // resolves to the BOP-code slot at rva 0x7000 (in .bss — filled at runtime by
+    // wow64cpu's init, so it reads back zero statically). The exact pointer proves
+    // the load + relocation + RIP-relative computation are all correct.
+    const BOP_SLOT_RVA: u64 = 0x7000;
+    let ptr = call_export(&mut os, &mut mem, wow64cpu.export("BTCpuGetBopCode"), &[]);
+    assert_eq!(
+        ptr,
+        WOW64CPU_BASE + BOP_SLOT_RVA,
+        "BTCpuGetBopCode's rip-relative lea resolves to the BOP slot after relocation"
+    );
+    // The slot is a mapped, readable page (zero-filled .bss until runtime init).
+    let mut buf = [0u8; 4];
+    mem.read(ptr, &mut buf).expect("the BOP slot is mapped");
 }
