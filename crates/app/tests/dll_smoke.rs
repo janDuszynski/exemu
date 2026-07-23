@@ -592,22 +592,20 @@ fn drive_btcpusimulate_guest(resume: bool) -> u32 {
     mem.write(GUEST_CODE, &[0xC7, 0x05, 0x00, 0x00, 0x42, 0x00, 0xBE, 0xBA, 0xFE, 0xCA, 0xF4]).unwrap();
 
     // The WoW64 process model BTCpuSimulate reads: TEB self-pointer (gs:[0x30])
-    // and the CPU-reserved area pointer at TEB+0x1488.
+    // and the CPU-reserved area (pointer at TEB+0x1488 → the WOW64_CONTEXT), laid
+    // out by the production `exemu_os::wow64` helper the real boot will use.
     mem.write_u64(GS_BASE + 0x30, GS_BASE).unwrap();
     const CPU_AREA: u64 = SCRATCH + 0x1000;
-    mem.write_u64(GS_BASE + 0x1488, CPU_AREA).unwrap();
-    // Machine-type header bit 0 selects the resume (iretq) path vs the fast path.
-    mem.write_u32(CPU_AREA, resume as u32).unwrap();
-    let ctx = CPU_AREA + 4; // the WOW64_CONTEXT
-    mem.write_u32(ctx + 0xb8, GUEST_CODE as u32).unwrap(); // Eip
-    mem.write_u32(ctx + 0xc0, 0x202).unwrap(); // EFlags
-    mem.write_u32(ctx + 0xc4, GUEST_STACK as u32).unwrap(); // Esp
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, GUEST_CODE as u32, GUEST_STACK as u32).unwrap();
+    if resume {
+        mem.write_u32(CPU_AREA, 1).unwrap(); // set the resume bit → iretq forward path
+    }
 
     // The CS/SS selector constants BTCpuProcessInit would populate (we skip init):
-    // 32-bit WoW64 CS=0x23, SS=0x2b. BTCpuSimulate copies these into the context —
-    // and the iretq path pops CS from there, so setting them right matters here.
-    mem.write_u32(WOW64CPU_BASE + 0x600c, 0x23).unwrap();
-    mem.write_u32(WOW64CPU_BASE + 0x6008, 0x2b).unwrap();
+    // BTCpuSimulate copies these into the context, and the iretq path pops CS from
+    // there, so setting them right matters here.
+    mem.write_u32(WOW64CPU_BASE + 0x600c, exemu_os::wow64::SEL_CS32).unwrap();
+    mem.write_u32(WOW64CPU_BASE + 0x6008, exemu_os::wow64::SEL_SS32).unwrap();
 
     // Run the real stub: 64-bit setup → far jmp / iretq → 32-bit guest → hlt.
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
@@ -679,14 +677,9 @@ fn btcpusimulate_round_trips_32bit_to_64bit() {
     // The WoW64 process model + CS/SS constants (as in the single-hop tests).
     mem.write_u64(GS_BASE + 0x30, GS_BASE).unwrap();
     const CPU_AREA: u64 = SCRATCH + 0x1000;
-    mem.write_u64(GS_BASE + 0x1488, CPU_AREA).unwrap();
-    mem.write_u32(CPU_AREA, 0).unwrap();
-    let ctx = CPU_AREA + 4;
-    mem.write_u32(ctx + 0xb8, GUEST_CODE as u32).unwrap(); // Eip
-    mem.write_u32(ctx + 0xc0, 0x202).unwrap(); // EFlags
-    mem.write_u32(ctx + 0xc4, GUEST_STACK as u32).unwrap(); // Esp
-    mem.write_u32(WOW64CPU_BASE + 0x600c, 0x23).unwrap();
-    mem.write_u32(WOW64CPU_BASE + 0x6008, 0x2b).unwrap();
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, GUEST_CODE as u32, GUEST_STACK as u32).unwrap();
+    mem.write_u32(WOW64CPU_BASE + 0x600c, exemu_os::wow64::SEL_CS32).unwrap();
+    mem.write_u32(WOW64CPU_BASE + 0x6008, exemu_os::wow64::SEL_SS32).unwrap();
 
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
 
