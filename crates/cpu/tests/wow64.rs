@@ -55,3 +55,40 @@ fn far_jmp_within_64bit_stays_64bit() {
     assert_eq!(cpu.bits(), Bits::B64);
     assert_eq!(cpu.state().rip, 0x0040_1000);
 }
+
+/// `iretq` is BTCpuSimulate's *other* forward path (full-context restore): it
+/// pops RIP/CS/RFLAGS/RSP/SS, and the popped CS selector switches the mode.
+fn iretq(cs: u64) -> Interpreter {
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", 0x8000, 0x2000, Perm::RW)).unwrap();
+    let sp = 0x9000;
+    mem.write(CODE, &[0x48, 0xCF]).unwrap(); // iretq (REX.W + CF)
+    mem.write_u64(sp, 0x0040_1234).unwrap(); // RIP
+    mem.write_u64(sp + 8, cs).unwrap(); // CS
+    mem.write_u64(sp + 16, 0x202).unwrap(); // RFLAGS
+    mem.write_u64(sp + 24, 0x0041_0000).unwrap(); // RSP
+    mem.write_u64(sp + 32, 0x2b).unwrap(); // SS
+
+    let mut cpu = Interpreter::with_bits(Bits::B64);
+    cpu.state_mut().rip = CODE;
+    cpu.state_mut().set_rsp(sp);
+    let mut hooks = NoHooks;
+    cpu.step(&mut mem, &mut hooks).expect("iretq executes");
+    cpu
+}
+
+#[test]
+fn iretq_to_cs_0x23_restores_32bit_context() {
+    let cpu = iretq(0x23);
+    assert_eq!(cpu.bits(), Bits::B32, "popped CS=0x23 → 32-bit compat mode");
+    assert_eq!(cpu.state().rip, 0x0040_1234, "rip = popped RIP");
+    assert_eq!(cpu.state().rsp(), 0x0041_0000, "rsp = popped RSP");
+}
+
+#[test]
+fn iretq_to_cs_0x33_stays_64bit() {
+    let cpu = iretq(0x33);
+    assert_eq!(cpu.bits(), Bits::B64, "popped CS=0x33 → 64-bit long mode");
+    assert_eq!(cpu.state().rip, 0x0040_1234);
+}
