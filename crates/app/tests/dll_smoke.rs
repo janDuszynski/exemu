@@ -568,14 +568,15 @@ fn wow64cpu_loads_and_bopcode_stub_runs() {
 /// The guest's `C7 05 …` is an **absolute** `[disp32]` store in 32-bit mode but a
 /// **RIP-relative** one in 64-bit mode — so its sentinel lands at the expected
 /// address *only if* the CPU actually dropped into 32-bit mode (roadmap W5.2/W5.4).
-#[test]
-fn btcpusimulate_switches_into_a_32bit_guest() {
-    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
-        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
-        return;
-    }
-
-    let dir = std::env::temp_dir().join(format!("exemu-w5_4-{}", std::process::id()));
+/// Drive the real `BTCpuSimulate` into a 32-bit guest and return the value the
+/// guest stored at its sentinel address. `resume` selects the stub's forward
+/// path via the cpu-area header bit 0: `false` → the fast far-jmp path, `true` →
+/// the full-context `iretq` restore path. The guest is
+/// `mov dword [0x00420000], 0xCAFEBABE ; hlt` — an **absolute** `[disp32]` store
+/// in 32-bit mode but **RIP-relative** in 64-bit, so its sentinel only lands if
+/// the CPU truly switched to 32-bit mode.
+fn drive_btcpusimulate_guest(resume: bool) -> u32 {
+    let dir = std::env::temp_dir().join(format!("exemu-w5_4-{}-{resume}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let (mut os, mut mem, _ntdll) = setup(&dir);
@@ -588,7 +589,6 @@ fn btcpusimulate_switches_into_a_32bit_guest() {
     const GUEST_STACK: u64 = 0x0041_0000;
     const SENTINEL32: u64 = 0x0042_0000;
     mem.map(Region::new("guest32", GUEST_CODE, 0x3_0000, Perm::RWX)).unwrap();
-    // mov dword [0x00420000], 0xCAFEBABE ; hlt
     mem.write(GUEST_CODE, &[0xC7, 0x05, 0x00, 0x00, 0x42, 0x00, 0xBE, 0xBA, 0xFE, 0xCA, 0xF4]).unwrap();
 
     // The WoW64 process model BTCpuSimulate reads: TEB self-pointer (gs:[0x30])
@@ -596,23 +596,43 @@ fn btcpusimulate_switches_into_a_32bit_guest() {
     mem.write_u64(GS_BASE + 0x30, GS_BASE).unwrap();
     const CPU_AREA: u64 = SCRATCH + 0x1000;
     mem.write_u64(GS_BASE + 0x1488, CPU_AREA).unwrap();
-    mem.write_u32(CPU_AREA, 0).unwrap(); // machine-type header; bit0=0 → forward path
+    // Machine-type header bit 0 selects the resume (iretq) path vs the fast path.
+    mem.write_u32(CPU_AREA, resume as u32).unwrap();
     let ctx = CPU_AREA + 4; // the WOW64_CONTEXT
     mem.write_u32(ctx + 0xb8, GUEST_CODE as u32).unwrap(); // Eip
     mem.write_u32(ctx + 0xc0, 0x202).unwrap(); // EFlags
     mem.write_u32(ctx + 0xc4, GUEST_STACK as u32).unwrap(); // Esp
 
     // The CS/SS selector constants BTCpuProcessInit would populate (we skip init):
-    // 32-bit WoW64 CS=0x23, SS=0x2b. BTCpuSimulate copies these into the context.
+    // 32-bit WoW64 CS=0x23, SS=0x2b. BTCpuSimulate copies these into the context —
+    // and the iretq path pops CS from there, so setting them right matters here.
     mem.write_u32(WOW64CPU_BASE + 0x600c, 0x23).unwrap();
     mem.write_u32(WOW64CPU_BASE + 0x6008, 0x2b).unwrap();
 
-    // Run the real stub: 64-bit setup → far jmp → 32-bit guest → hlt.
+    // Run the real stub: 64-bit setup → far jmp / iretq → 32-bit guest → hlt.
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
+    mem.read_u32(SENTINEL32).unwrap()
+}
 
-    assert_eq!(
-        mem.read_u32(SENTINEL32).unwrap(),
-        0xCAFE_BABE,
-        "the 32-bit guest ran its absolute-disp32 store — the CS-mode switch worked"
-    );
+/// W5.4/W5.2: the real `BTCpuSimulate` **fast far-jmp** path drops into a 32-bit
+/// guest. (See [`drive_btcpusimulate_guest`] for the decode-sensitive proof.)
+#[test]
+fn btcpusimulate_switches_into_a_32bit_guest() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+    assert_eq!(drive_btcpusimulate_guest(false), 0xCAFE_BABE, "far-jmp path: 32-bit guest ran");
+}
+
+/// W5.2: the real `BTCpuSimulate` **full-restore `iretq`** path (resume bit set)
+/// also drops into a 32-bit guest — exercising `iretq`'s mode switch and the
+/// `mov ds/es/fs` (0x8E) segment moves through wow64cpu's own bytes.
+#[test]
+fn btcpusimulate_iretq_path_switches_into_a_32bit_guest() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+    assert_eq!(drive_btcpusimulate_guest(true), 0xCAFE_BABE, "iretq path: 32-bit guest ran");
 }

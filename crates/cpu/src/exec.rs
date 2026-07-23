@@ -207,6 +207,23 @@ impl Interpreter {
                 self.write_reg_field(&ctx, size, v);
             }
 
+            // ---- MOV Sreg, r/m16 / MOV r/m16, Sreg ----------------------
+            // Segment-register moves. exemu is flat-model: segment *selectors*
+            // don't affect execution (ES/DS/SS bases are 0; the FS/GS *bases* are
+            // managed via the TEB setup / WRFSBASE, not derived from the loaded
+            // selector), so a load (`mov ds,eax`; wow64cpu's iretq path uses these)
+            // just consumes its 16-bit operand, and a store yields 0. The mode
+            // switch that WoW64 needs rides the CS *selector* through the far
+            // jmp / iretq handlers, not these moves.
+            0x8C => {
+                self.read_modrm(&mut ctx, mem)?;
+                self.write_rm(&ctx, mem, 2, 0)?; // no meaningful selector in flat mode
+            }
+            0x8E => {
+                self.read_modrm(&mut ctx, mem)?;
+                let _selector = self.read_rm(&ctx, &*mem, 2)?; // loaded, then ignored
+            }
+
             // ---- LEA r, m -----------------------------------------------
             0x8D => {
                 self.read_modrm(&mut ctx, mem)?;
