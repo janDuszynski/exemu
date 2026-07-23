@@ -406,6 +406,32 @@ impl Interpreter {
                 return Ok(Exit::Interrupt(n));
             }
 
+            // ---- IRET / IRETQ -------------------------------------------
+            // Interrupt return. exemu has no GDT/IDT and models Wine's flat
+            // WoW64 selectors, so `iretq` doubles as the full-context mode
+            // switch `wow64cpu!BTCpuSimulate` uses on its resume path (roadmap
+            // W5.2): pop RIP, CS, RFLAGS, RSP, SS — the popped CS selector picks
+            // the operating mode (0x33 → 64-bit long, else 32-bit compat). Stack
+            // slots are the operand width (8 with REX.W = iretq, else 4).
+            0xCF => {
+                let sp = self.state.rsp();
+                let (rip, cs, rflags, new_rsp) = if ctx.pfx.w() {
+                    (mem.read_u64(sp)?, mem.read_u64(sp + 8)?, mem.read_u64(sp + 16)?, mem.read_u64(sp + 24)?)
+                } else {
+                    (
+                        mem.read_u32(sp)? as u64,
+                        mem.read_u32(sp + 4)? as u64,
+                        mem.read_u32(sp + 8)? as u64,
+                        mem.read_u32(sp + 12)? as u64,
+                    )
+                };
+                self.bits = if cs & 0xFFF8 == 0x30 { Bits::B64 } else { Bits::B32 };
+                self.state.rflags = (rflags & 0x0000_0000_00FC_FFD5) | flags::RESERVED_ONE;
+                self.state.set_rsp(new_rsp & self.addr_mask());
+                self.state.rip = rip & self.addr_mask();
+                return Ok(Exit::Continue);
+            }
+
             // ---- LOOP / LOOPE / LOOPNE / JECXZ --------------------------
             0xE0..=0xE3 => {
                 let rel = ctx.u8(mem)? as i8 as i64;
