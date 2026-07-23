@@ -636,3 +636,60 @@ fn btcpusimulate_iretq_path_switches_into_a_32bit_guest() {
     }
     assert_eq!(drive_btcpusimulate_guest(true), 0xCAFE_BABE, "iretq path: 32-bit guest ran");
 }
+
+/// W5.2 capstone: a full **64→32→64 round trip**. The real `BTCpuSimulate`
+/// forward-switches into a 32-bit guest, which stores its sentinel and then
+/// **far-jumps back to a 64-bit stub** (selector 0x33) — the reverse transition
+/// Wine's WoW64 uses (a far transfer to the 64-bit return handler). The 64-bit
+/// stub, reachable only if the reverse switch landed in *long* mode, stores its
+/// own sentinel with a `movabs`-addressed store (an instruction form that only
+/// exists in 64-bit). Seeing both sentinels proves the round trip end to end.
+#[test]
+fn btcpusimulate_round_trips_32bit_to_64bit() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("exemu-w5_rt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem, _ntdll) = setup(&dir);
+    let bytes = std::fs::read(WOW64CPU).expect("read wow64cpu.dll");
+    let wow64cpu = load_dll(&mut mem, &bytes, WOW64CPU_BASE);
+
+    const GUEST_CODE: u64 = 0x0040_0000; // 32-bit guest
+    const STUB64: u64 = 0x0040_1000; // 64-bit return stub
+    const RET_PTR: u64 = 0x0040_2000; // far pointer [STUB64:32, 0x33:16]
+    const GUEST_STACK: u64 = 0x0041_0000;
+    const SENTINEL32: u64 = 0x0042_0000;
+    const SENTINEL64: u64 = 0x0042_0004;
+    mem.map(Region::new("guest32", GUEST_CODE, 0x3_0000, Perm::RWX)).unwrap();
+
+    // 32-bit guest: mov dword [SENTINEL32], 0xCAFEBABE ; jmp fword [RET_PTR]
+    mem.write(GUEST_CODE, &[0xC7, 0x05, 0x00, 0x00, 0x42, 0x00, 0xBE, 0xBA, 0xFE, 0xCA]).unwrap();
+    mem.write(GUEST_CODE + 10, &[0xFF, 0x2D, 0x00, 0x20, 0x40, 0x00]).unwrap();
+    // The far pointer the reverse jump reads: offset = STUB64, selector = 0x33.
+    mem.write_u32(RET_PTR, STUB64 as u32).unwrap();
+    mem.write_u16(RET_PTR + 4, 0x33).unwrap();
+    // 64-bit stub: movabs rax, SENTINEL64 ; mov dword [rax], 0x0000F00D ; hlt
+    mem.write(STUB64, &[0x48, 0xB8]).unwrap();
+    mem.write_u64(STUB64 + 2, SENTINEL64).unwrap();
+    mem.write(STUB64 + 10, &[0xC7, 0x00, 0x0D, 0xF0, 0x00, 0x00, 0xF4]).unwrap();
+
+    // The WoW64 process model + CS/SS constants (as in the single-hop tests).
+    mem.write_u64(GS_BASE + 0x30, GS_BASE).unwrap();
+    const CPU_AREA: u64 = SCRATCH + 0x1000;
+    mem.write_u64(GS_BASE + 0x1488, CPU_AREA).unwrap();
+    mem.write_u32(CPU_AREA, 0).unwrap();
+    let ctx = CPU_AREA + 4;
+    mem.write_u32(ctx + 0xb8, GUEST_CODE as u32).unwrap(); // Eip
+    mem.write_u32(ctx + 0xc0, 0x202).unwrap(); // EFlags
+    mem.write_u32(ctx + 0xc4, GUEST_STACK as u32).unwrap(); // Esp
+    mem.write_u32(WOW64CPU_BASE + 0x600c, 0x23).unwrap();
+    mem.write_u32(WOW64CPU_BASE + 0x6008, 0x2b).unwrap();
+
+    call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
+
+    assert_eq!(mem.read_u32(SENTINEL32).unwrap(), 0xCAFE_BABE, "32-bit guest ran (64→32)");
+    assert_eq!(mem.read_u32(SENTINEL64).unwrap(), 0x0000_F00D, "64-bit stub ran after the reverse switch (32→64)");
+}
