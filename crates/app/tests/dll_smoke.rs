@@ -41,8 +41,14 @@ use exemu_os::{WinConfig, WinOs};
 
 const NTDLL: &str = "../../example_exe/wine-dlls/x86_64-windows/ntdll.dll";
 const WOW64CPU: &str = "../../example_exe/wine-dlls/x86_64-windows/wow64cpu.dll";
-// A base clear of ntdll's (kept below the TEB/PEB); wow64cpu has a full .reloc.
-const WOW64CPU_BASE: u64 = 0x0000_0007_0000_0000;
+// wow64cpu's load base. It MUST be **sub-4 GiB**: `BTCpuProcessInit` builds the
+// 32→64 return BOP as a far pointer with an m16:32 (32-bit) offset and range-checks
+// that the return handler's high 32 bits are zero (`shr rcx,0x20; jne <error>`) —
+// above 4 GiB it takes the error path and never builds the BOP. A 32-bit guest also
+// reaches the BOP via an absolute 32-bit address, so it must live low. (Preferred
+// base is 0x7a40_0000; we relocate to exercise the fixups, staying clear of the
+// 32-bit guest region, SCRATCH/SENTINEL, and KUSER.)
+const WOW64CPU_BASE: u64 = 0x0000_0000_6A40_0000;
 
 // --- The fixed low-page layout Wine's ntdll stubs assume. ------------------
 // KUSER_SHARED_DATA read-only at 0x7ffe0000 with SystemCall@0x308 nonzero (the
@@ -591,21 +597,17 @@ fn drive_btcpusimulate_guest(resume: bool) -> u32 {
     mem.map(Region::new("guest32", GUEST_CODE, 0x3_0000, Perm::RWX)).unwrap();
     mem.write(GUEST_CODE, &[0xC7, 0x05, 0x00, 0x00, 0x42, 0x00, 0xBE, 0xBA, 0xFE, 0xCA, 0xF4]).unwrap();
 
-    // The WoW64 process model BTCpuSimulate reads: TEB self-pointer (gs:[0x30])
-    // and the CPU-reserved area (pointer at TEB+0x1488 → the WOW64_CONTEXT), laid
-    // out by the production `exemu_os::wow64` helper the real boot will use.
-    mem.write_u64(GS_BASE + 0x30, GS_BASE).unwrap();
+    // Run the real `BTCpuProcessInit` first: it populates the CS/SS selector .bss
+    // slots BTCpuSimulate reads (and the iretq path pops CS from) plus the TEB
+    // self-pointer — exactly as a WoW64 boot would, with no hand-faked constants.
+    run_wow64_process_init(&mut os, &mut mem, &wow64cpu);
+    // The CPU-reserved area (pointer at TEB+0x1488 → the WOW64_CONTEXT) the real
+    // BTCpuSimulate reads, laid out by the production `exemu_os::wow64` helper.
     const CPU_AREA: u64 = SCRATCH + 0x1000;
     exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, GUEST_CODE as u32, GUEST_STACK as u32).unwrap();
     if resume {
         mem.write_u32(CPU_AREA, 1).unwrap(); // set the resume bit → iretq forward path
     }
-
-    // The CS/SS selector constants BTCpuProcessInit would populate (we skip init):
-    // BTCpuSimulate copies these into the context, and the iretq path pops CS from
-    // there, so setting them right matters here.
-    mem.write_u32(WOW64CPU_BASE + 0x600c, exemu_os::wow64::SEL_CS32).unwrap();
-    mem.write_u32(WOW64CPU_BASE + 0x6008, exemu_os::wow64::SEL_SS32).unwrap();
 
     // Run the real stub: 64-bit setup → far jmp / iretq → 32-bit guest → hlt.
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
@@ -674,15 +676,131 @@ fn btcpusimulate_round_trips_32bit_to_64bit() {
     mem.write_u64(STUB64 + 2, SENTINEL64).unwrap();
     mem.write(STUB64 + 10, &[0xC7, 0x00, 0x0D, 0xF0, 0x00, 0x00, 0xF4]).unwrap();
 
-    // The WoW64 process model + CS/SS constants (as in the single-hop tests).
-    mem.write_u64(GS_BASE + 0x30, GS_BASE).unwrap();
+    // Populate the CS/SS selectors + TEB self via the real BTCpuProcessInit, then
+    // lay out the WOW64_CONTEXT for the forward switch (as in the single-hop tests).
+    run_wow64_process_init(&mut os, &mut mem, &wow64cpu);
     const CPU_AREA: u64 = SCRATCH + 0x1000;
     exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, GUEST_CODE as u32, GUEST_STACK as u32).unwrap();
-    mem.write_u32(WOW64CPU_BASE + 0x600c, exemu_os::wow64::SEL_CS32).unwrap();
-    mem.write_u32(WOW64CPU_BASE + 0x6008, exemu_os::wow64::SEL_SS32).unwrap();
 
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
 
     assert_eq!(mem.read_u32(SENTINEL32).unwrap(), 0xCAFE_BABE, "32-bit guest ran (64→32)");
     assert_eq!(mem.read_u32(SENTINEL64).unwrap(), 0x0000_F00D, "64-bit stub ran after the reverse switch (32→64)");
+}
+
+/// Run the **real** `wow64cpu!BTCpuProcessInit` through its own bytes (roadmap
+/// W5.1). Unlike `BTCpuSimulate`, the init is *not* self-contained — it calls five
+/// ntdll routines. We patch its five IAT slots (rvas recovered from wow64cpu's
+/// import table) to tiny hand-assembled stubs that feed exactly what a real WoW64
+/// boot would: the live 64-bit selectors (`RtlCaptureContext` → CS=0x33/DS=0x2b/
+/// FS=0x53) and the 32-bit CONTEXT selectors (`RtlWow64GetThreadContext` →
+/// SegCs=0x23/SegSs=0x2b). Then its own bytes populate the `.bss` selector slots
+/// and build the 32→64 **return-BOP trampoline** at rva 0x7000. Requires `wow64cpu`
+/// at a **sub-4 GiB base** (see [`WOW64CPU_BASE`]).
+fn run_wow64_process_init(os: &mut WinOs, mem: &mut VirtualMemory, wow64cpu: &Dll) {
+    let base = wow64cpu.base;
+
+    // A page for the five import stubs (Win64 ABI: rcx/rdx/r8/r9, arg5 @[rsp+0x28]).
+    const STUBS: u64 = 0x0000_0000_5200_0000;
+    const FIND_RET: u64 = STUBS + 0x200; // a readable ptr the init dereferences once
+    mem.map(Region::new("wow64_stubs", STUBS, 0x1000, Perm::RWX)).unwrap();
+
+    // (A) LdrGetDllHandle(_, _, _, r9=&handle) → *handle = ntdll base; return 0.
+    let mut a = vec![0x48, 0xB8];
+    a.extend_from_slice(&NTDLL_BASE.to_le_bytes()); // mov rax, NTDLL_BASE
+    a.extend_from_slice(&[0x49, 0x89, 0x01, 0x31, 0xC0, 0xC3]); // mov [r9],rax; xor eax,eax; ret
+    // (B) RtlFindExportedRoutineByName(_, _) → rax = a readable ptr (the init does
+    //     `mov rax,[rax]` and stashes it, unused by the BOP build); return it.
+    let mut b = vec![0x48, 0xB8];
+    b.extend_from_slice(&FIND_RET.to_le_bytes()); // mov rax, FIND_RET
+    b.push(0xC3); // ret
+    // (C) RtlCaptureContext(rcx=&CONTEXT) → seed the live 64-bit selectors the init
+    //     reads (SegCs@0x38, SegDs@0x3a, SegFs@0x3e). CS=0x33 becomes the BOP's sel.
+    let c = vec![
+        0x66, 0xC7, 0x41, 0x38, 0x33, 0x00, // mov word [rcx+0x38], 0x33
+        0x66, 0xC7, 0x41, 0x3A, 0x2B, 0x00, // mov word [rcx+0x3a], 0x2b
+        0x66, 0xC7, 0x41, 0x3E, 0x53, 0x00, // mov word [rcx+0x3e], 0x53
+        0xC3,
+    ];
+    // (D) RtlWow64GetThreadContext(_, rdx=&WOW64_CONTEXT) → seed the 32-bit selectors
+    //     (SegCs@0xbc=0x23, SegSs@0xc8=0x2b) the init copies to .bss; return 0.
+    let d = vec![
+        0xC7, 0x82, 0xBC, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00, // mov dword [rdx+0xbc], 0x23
+        0xC7, 0x82, 0xC8, 0x00, 0x00, 0x00, 0x2B, 0x00, 0x00, 0x00, // mov dword [rdx+0xc8], 0x2b
+        0x31, 0xC0, 0xC3, // xor eax,eax; ret
+    ];
+    // (E) NtProtectVirtualMemory(...) → success (the BOP page is already RWX here).
+    let e = vec![0x31, 0xC0, 0xC3]; // xor eax,eax; ret
+
+    let (stub_a, stub_b, stub_c, stub_d, stub_e) =
+        (STUBS, STUBS + 0x40, STUBS + 0x80, STUBS + 0xC0, STUBS + 0x100);
+    mem.write(stub_a, &a).unwrap();
+    mem.write(stub_b, &b).unwrap();
+    mem.write(stub_c, &c).unwrap();
+    mem.write(stub_d, &d).unwrap();
+    mem.write(stub_e, &e).unwrap();
+
+    // Patch BTCpuProcessInit's five IAT slots to the stubs above.
+    mem.write_u64(base + 0x90b8, stub_a).unwrap(); // LdrGetDllHandle
+    mem.write_u64(base + 0x90d0, stub_b).unwrap(); // RtlFindExportedRoutineByName
+    mem.write_u64(base + 0x90c8, stub_c).unwrap(); // RtlCaptureContext
+    mem.write_u64(base + 0x90e0, stub_d).unwrap(); // RtlWow64GetThreadContext
+    mem.write_u64(base + 0x90c0, stub_e).unwrap(); // NtProtectVirtualMemory
+
+    // The init reads gs:[0x30] (TEB self) and [TEB+0x14d0] (a writable pointer it
+    // flags with `or [P+4],1`); point the latter at scratch.
+    mem.write_u64(GS_BASE + 0x30, GS_BASE).unwrap();
+    mem.write_u64(GS_BASE + 0x14d0, SCRATCH).unwrap();
+
+    call_export(os, mem, wow64cpu.export("BTCpuProcessInit"), &[]);
+}
+
+/// W5.1: run the **real** `wow64cpu!BTCpuProcessInit` and verify it builds the
+/// 32→64 return BOP and populates the selector slots — no hand-faked constants.
+/// The init constructs, at rva 0x7000, a `jmp fword ptr [...]` (opcode `FF 2D`)
+/// far-indirect jump whose m16:32 far pointer is `{offset = the 64-bit return
+/// handler @0x1110, selector = the 64-bit CS 0x33}` — i.e. the reverse of the W5.2
+/// forward switch, assembled from wow64cpu's own bytes. Recovering the BOP by
+/// *running* the init (the slot is zero-filled `.bss` statically — the W5.1 note's
+/// trap) is the de-risk, and confirms the CS/SS constants the `BTCpuSimulate` tests
+/// previously hand-faked are exactly what the real init writes (roadmap W5.1).
+#[test]
+fn btcpuprocessinit_builds_the_return_bop_and_selectors() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("exemu-w5_1init-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem, _ntdll) = setup(&dir);
+    let bytes = std::fs::read(WOW64CPU).expect("read wow64cpu.dll");
+    let wow64cpu = load_dll(&mut mem, &bytes, WOW64CPU_BASE);
+    let base = wow64cpu.base;
+
+    run_wow64_process_init(&mut os, &mut mem, &wow64cpu);
+
+    // The BOP trampoline at rva 0x7000: `FF 2D <disp32>` (far indirect jmp fword).
+    assert_eq!(mem.read_u16(base + 0x7000).unwrap(), 0x2DFF, "BOP opcode = FF 2D (jmp fword [mem])");
+    // Its m16:32 far pointer at 0x7006: offset = low32(return handler @0x1110),
+    // selector = the 64-bit CS 0x33 — the reverse-switch target.
+    assert_eq!(
+        mem.read_u32(base + 0x7006).unwrap(),
+        (base + 0x1110) as u32,
+        "BOP far-ptr offset = the 64-bit return handler",
+    );
+    assert_eq!(mem.read_u16(base + 0x700a).unwrap(), 0x33, "BOP far-ptr selector = 64-bit CS");
+    // The disp32 addresses the far pointer as an absolute 32-bit address — why the
+    // image must be sub-4 GiB (a 32-bit guest reaches it): abs32 of the 0x7006 VA.
+    assert_eq!(
+        mem.read_u32(base + 0x7002).unwrap(),
+        (base + 0x7006) as u32,
+        "BOP disp32 = abs32(far-ptr) — the sub-4 GiB requirement",
+    );
+
+    // The selector `.bss` slots the init populated from the captured contexts — the
+    // exact values the BTCpuSimulate tests fed by hand before this step.
+    assert_eq!(mem.read_u32(base + 0x600c).unwrap(), exemu_os::wow64::SEL_CS32, "32-bit CS = 0x23");
+    assert_eq!(mem.read_u32(base + 0x6008).unwrap(), exemu_os::wow64::SEL_SS32, "32-bit SS = 0x2b");
+    assert_eq!(mem.read_u16(base + 0x6014).unwrap(), 0x33, "64-bit CS = 0x33");
 }
