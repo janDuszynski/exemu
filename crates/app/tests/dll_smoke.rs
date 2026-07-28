@@ -804,3 +804,79 @@ fn btcpuprocessinit_builds_the_return_bop_and_selectors() {
     assert_eq!(mem.read_u32(base + 0x6008).unwrap(), exemu_os::wow64::SEL_SS32, "32-bit SS = 0x2b");
     assert_eq!(mem.read_u16(base + 0x6014).unwrap(), 0x33, "64-bit CS = 0x33");
 }
+
+/// W5.1 capstone: a 32-bit guest issues a **WoW64 service call through the real
+/// init-built BOP** — the full syscall cycle on wow64cpu's own bytes.
+///
+/// `BTCpuProcessInit` builds the BOP trampoline at 0x7000; `BTCpuSimulate`
+/// forward-switches into the 32-bit guest; the guest `call`s the BOP, which
+/// far-jumps back to the real 64-bit return handler @0x1110; that handler saves
+/// the 32-bit context and dispatches to `wow64.dll!Wow64SystemServiceEx` (via the
+/// turbo-thunk at 0x12e0 → IAT 0x9110) with the service index the guest left in
+/// eax; we stub Wow64SystemServiceEx to record the index and return a sentinel
+/// result, and the handler **resumes the 32-bit guest** (fast far-jmp path) with
+/// that result in eax — which the guest stores. Both the recorded index and the
+/// resumed result landing prove forward + reverse (through the *real* BOP) +
+/// context save + dispatch + resume, entirely on wow64cpu's own code (roadmap
+/// W5.1). This is the mechanism a real 32-bit guest uses to reach the 64-bit NT
+/// layer — no hand-built reverse stub (contrast `btcpusimulate_round_trips_*`).
+#[test]
+fn wow64_guest_syscall_round_trips_through_the_real_bop() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("exemu-w5_1bop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem, _ntdll) = setup(&dir);
+    let bytes = std::fs::read(WOW64CPU).expect("read wow64cpu.dll");
+    let wow64cpu = load_dll(&mut mem, &bytes, WOW64CPU_BASE);
+    let base = wow64cpu.base;
+
+    // Build the real BOP + fill the selector slots by running BTCpuProcessInit.
+    run_wow64_process_init(&mut os, &mut mem, &wow64cpu);
+
+    // Stub wow64.dll!Wow64SystemServiceEx (the turbo-thunk target at IAT 0x9110):
+    // record the service index (ecx = the guest's eax) and return a sentinel result
+    // (eax = 0xD00D). The real service would dispatch the 64-bit NT syscall (W5.3+).
+    const SVC: u64 = 0x0000_0000_5300_0000;
+    const RECORD: u64 = SVC + 0x100;
+    mem.map(Region::new("wow64_svc", SVC, 0x1000, Perm::RWX)).unwrap();
+    let mut svc = vec![0x48, 0xB8];
+    svc.extend_from_slice(&RECORD.to_le_bytes()); // mov rax, RECORD
+    svc.extend_from_slice(&[0x89, 0x08]); // mov [rax], ecx
+    svc.extend_from_slice(&[0xB8, 0x0D, 0xD0, 0x00, 0x00]); // mov eax, 0xD00D
+    svc.push(0xC3); // ret
+    mem.write(SVC, &svc).unwrap();
+    mem.write_u64(base + 0x9110, SVC).unwrap(); // IAT: Wow64SystemServiceEx
+
+    // The 32-bit guest: `mov eax, INDEX ; call BOP ; mov [SENTINEL32], eax ; hlt`.
+    // `call BOP` pushes a 32-bit return address; the BOP far-jumps to the 64-bit
+    // handler @0x1110, which dispatches and resumes here with the service result in
+    // eax — which the guest stores at SENTINEL32.
+    const GUEST_CODE: u64 = 0x0040_0000;
+    const GUEST_STACK: u64 = 0x0041_0000;
+    const SENTINEL32: u64 = 0x0042_0000;
+    const INDEX: u32 = 0x0000_1234;
+    mem.map(Region::new("guest32", GUEST_CODE, 0x3_0000, Perm::RWX)).unwrap();
+    let bop = base + 0x7000;
+    let call_next = GUEST_CODE + 5 + 5; // rip after `mov eax,imm32`(5) + `call rel32`(5)
+    let rel32 = (bop as i64 - call_next as i64) as i32 as u32;
+    let mut g = vec![0xB8];
+    g.extend_from_slice(&INDEX.to_le_bytes()); // mov eax, INDEX
+    g.push(0xE8);
+    g.extend_from_slice(&rel32.to_le_bytes()); // call BOP (near, rel32)
+    g.extend_from_slice(&[0x89, 0x05, 0x00, 0x00, 0x42, 0x00]); // mov [0x00420000], eax
+    g.push(0xF4); // hlt
+    mem.write(GUEST_CODE, &g).unwrap();
+
+    // Lay out the WOW64_CONTEXT (fast-entry: resume bit clear) and forward-switch.
+    const CPU_AREA: u64 = SCRATCH + 0x1000;
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, GUEST_CODE as u32, GUEST_STACK as u32).unwrap();
+
+    call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
+
+    assert_eq!(mem.read_u32(RECORD).unwrap(), INDEX, "Wow64SystemServiceEx received the guest's service index");
+    assert_eq!(mem.read_u32(SENTINEL32).unwrap(), 0x0000_D00D, "the 32-bit guest resumed with the service result in eax");
+}
