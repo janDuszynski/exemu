@@ -711,6 +711,435 @@ fn build_fileio_text(s: FileioSyms) -> Vec<u8> {
     c
 }
 
+// ==========================================================================
+// The COM sample (roadmap W6.3/W6.4)
+// ==========================================================================
+
+/// The CLSID the COM sample asks `CoCreateInstance` for, in registry string
+/// form. It is `CLSID_FileMoniker` — one of the classes Wine's own `ole32.dll`
+/// serves from its `DllGetClassObject`, so a real prefix registers it with
+/// `InprocServer32 = ole32.dll`. exemu's hive is seeded the same way
+/// ([`COM_INPROC_SERVER`]), which is exactly the registry-backed CLSID
+/// resolution roadmap W6.4 is about.
+pub const COM_CLSID_STRING: &str = "{00000303-0000-0000-C000-000000000046}";
+
+/// [`COM_CLSID_STRING`] in binary `GUID` order (Data1/Data2/Data3 little-endian,
+/// Data4 big-endian) — the 16 bytes the sample passes to `CoCreateInstance`.
+pub const COM_CLSID_BYTES: [u8; 16] = [
+    0x03, 0x03, 0x00, 0x00, // Data1 = 0x00000303
+    0x00, 0x00, // Data2
+    0x00, 0x00, // Data3
+    0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, // Data4
+];
+
+/// `IID_IUnknown` = `{00000000-0000-0000-C000-000000000046}`, the interface the
+/// sample asks for (so the returned vtable is the bare `IUnknown` one:
+/// QueryInterface\@0, AddRef\@8, Release\@0x10).
+pub const COM_IID_IUNKNOWN_BYTES: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+
+/// The in-proc server the hive must name for [`COM_CLSID_STRING`].
+pub const COM_INPROC_SERVER: &str = "ole32.dll";
+
+/// The exit code the COM sample returns when the whole sequence worked
+/// (`CoInitializeEx` ok, `CoCreateInstance` returned `S_OK`, and the vtable
+/// `AddRef` through the returned interface pointer reported >= 2 references).
+pub const COM_OK_EXIT: i32 = 55;
+
+/// The line the COM sample prints on the success path.
+pub const COM_OK_MESSAGE: &str = "COM OK\n";
+/// The line the COM sample prints when any step failed.
+pub const COM_FAIL_MESSAGE: &str = "COM FAIL\n";
+
+/// The three labels the sample prints before each hex-formatted result, so a
+/// failing run is diagnosable from stdout alone.
+pub const COM_LABEL_INIT: &str = "CoInitializeEx=";
+pub const COM_LABEL_HR: &str = "CoCreateInstance=";
+pub const COM_LABEL_REFS: &str = "AddRef=";
+
+/// Build a 64-bit PE32+ AMD64 console program that drives **COM** end to end
+/// (roadmap W6.3): it imports `CoInitializeEx`, `CoCreateInstance` and
+/// `CoUninitialize` from `ole32.dll` **by name** (plus `GetStdHandle`/
+/// `WriteFile`/`ExitProcess` from `kernel32.dll`) and:
+///
+///   1. `CoInitializeEx(NULL, COINIT_MULTITHREADED)`, printing the HRESULT;
+///   2. `CoCreateInstance(&CLSID_FileMoniker, NULL, CLSCTX_INPROC_SERVER,
+///      &IID_IUnknown, &punk)`, printing the HRESULT — this is the call that
+///      forces Wine's COM core to resolve the CLSID through the **registry**
+///      (`HKCR\CLSID\{…}\InprocServer32`, roadmap W6.4);
+///   3. a **guest vtable call on guest memory**: `punk->lpVtbl->AddRef(punk)`
+///      (slot 1), printing the returned reference count — the claim W6 makes
+///      about COM needing no native support;
+///   4. `Release` twice (slot 2) and `CoUninitialize`;
+///   5. `"COM OK\n"` + exit [`COM_OK_EXIT`] when every step held, else
+///      `"COM FAIL\n"` + exit 1.
+///
+/// Every result is also printed as 8 hex digits, so a run that stops short is
+/// diagnosable from stdout without a debugger.
+pub fn build_com() -> Vec<u8> {
+    const TEXT_RVA_L: u32 = 0x1000;
+    const RDATA_RVA_L: u32 = 0x2000;
+    const DATA_RVA_L: u32 = 0x3000;
+
+    // --- .data (BSS scratch): the interface pointer, a byte-count out-param,
+    //     and the 9-byte hex/newline buffer the printer fills. -------------
+    let punk_rva = DATA_RVA_L;
+    let written_rva = DATA_RVA_L + 8;
+    let hexbuf_rva = DATA_RVA_L + 0x10;
+    let data_len = 0x20u32;
+
+    let ole_names = ["CoInitializeEx", "CoCreateInstance", "CoUninitialize"];
+    let k32_names = ["GetStdHandle", "WriteFile", "ExitProcess"];
+
+    // --- .rdata layout: two import descriptors, two ILT/IAT pairs --------
+    let import_dir_off = 0u32;
+    let import_dir_size = 3 * 20u32; // two descriptors + null terminator
+    let thunks_ole = (ole_names.len() as u32 + 1) * 8;
+    let thunks_k32 = (k32_names.len() as u32 + 1) * 8;
+    let ilt_ole_off = import_dir_off + import_dir_size;
+    let ilt_k32_off = ilt_ole_off + thunks_ole;
+    // Both IATs are contiguous so the IAT data directory covers them as one run.
+    let iat_ole_off = ilt_k32_off + thunks_k32;
+    let iat_k32_off = iat_ole_off + thunks_ole;
+    let iat_size = thunks_ole + thunks_k32;
+    let mut pos = iat_k32_off + thunks_k32;
+
+    // IMAGE_IMPORT_BY_NAME blobs (hint u16 + asciiz), 2-byte aligned.
+    let mut ibn_rva: Vec<u32> = Vec::new();
+    for n in ole_names.iter().chain(k32_names.iter()) {
+        pos = align_up_u32(pos, 2);
+        ibn_rva.push(RDATA_RVA_L + pos);
+        pos += 2 + n.len() as u32 + 1;
+    }
+    pos = align_up_u32(pos, 2);
+    let ole_dllname_rva = RDATA_RVA_L + pos;
+    let ole_dllname = b"ole32.dll\0";
+    pos += ole_dllname.len() as u32;
+    let k32_dllname_rva = RDATA_RVA_L + pos;
+    let k32_dllname = b"kernel32.dll\0";
+    pos += k32_dllname.len() as u32;
+
+    // The two GUIDs, 16-byte aligned.
+    pos = align_up_u32(pos, 16);
+    let clsid_rva = RDATA_RVA_L + pos;
+    pos += 16;
+    let iid_rva = RDATA_RVA_L + pos;
+    pos += 16;
+
+    // The printed strings.
+    let strings: [&str; 5] = [
+        COM_LABEL_INIT,
+        COM_LABEL_HR,
+        COM_LABEL_REFS,
+        COM_OK_MESSAGE,
+        COM_FAIL_MESSAGE,
+    ];
+    let mut str_rva = [0u32; 5];
+    for (i, s) in strings.iter().enumerate() {
+        str_rva[i] = RDATA_RVA_L + pos;
+        pos += s.len() as u32;
+    }
+
+    // --- emit .rdata bytes ------------------------------------------------
+    let mut rd = vec![0u8; pos as usize];
+    for (i, (dllname_rva, (ilt, iat))) in [
+        (ole_dllname_rva, (ilt_ole_off, iat_ole_off)),
+        (k32_dllname_rva, (ilt_k32_off, iat_k32_off)),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let d = import_dir_off as usize + i * 20;
+        put_u32(&mut rd, d, RDATA_RVA_L + ilt); // OriginalFirstThunk
+        put_u32(&mut rd, d + 12, *dllname_rva); // Name
+        put_u32(&mut rd, d + 16, RDATA_RVA_L + iat); // FirstThunk
+    }
+    for (i, &rva) in ibn_rva.iter().enumerate() {
+        let (ilt, iat, slot) = if i < ole_names.len() {
+            (ilt_ole_off, iat_ole_off, i)
+        } else {
+            (ilt_k32_off, iat_k32_off, i - ole_names.len())
+        };
+        put_u64(&mut rd, ilt as usize + slot * 8, rva as u64);
+        put_u64(&mut rd, iat as usize + slot * 8, rva as u64);
+    }
+    for (i, n) in ole_names.iter().chain(k32_names.iter()).enumerate() {
+        let off = (ibn_rva[i] - RDATA_RVA_L) as usize;
+        rd[off + 2..off + 2 + n.len()].copy_from_slice(n.as_bytes());
+    }
+    let o = (ole_dllname_rva - RDATA_RVA_L) as usize;
+    rd[o..o + ole_dllname.len()].copy_from_slice(ole_dllname);
+    let o = (k32_dllname_rva - RDATA_RVA_L) as usize;
+    rd[o..o + k32_dllname.len()].copy_from_slice(k32_dllname);
+    let o = (clsid_rva - RDATA_RVA_L) as usize;
+    rd[o..o + 16].copy_from_slice(&COM_CLSID_BYTES);
+    let o = (iid_rva - RDATA_RVA_L) as usize;
+    rd[o..o + 16].copy_from_slice(&COM_IID_IUNKNOWN_BYTES);
+    for (i, s) in strings.iter().enumerate() {
+        let off = (str_rva[i] - RDATA_RVA_L) as usize;
+        rd[off..off + s.len()].copy_from_slice(s.as_bytes());
+    }
+
+    // --- .text ------------------------------------------------------------
+    let iat_slot = |base: u32, i: u32| RDATA_RVA_L + base + i * 8;
+    let text = build_com_text(ComSyms {
+        iat_co_initialize_ex: iat_slot(iat_ole_off, 0),
+        iat_co_create_instance: iat_slot(iat_ole_off, 1),
+        iat_co_uninitialize: iat_slot(iat_ole_off, 2),
+        iat_get_std_handle: iat_slot(iat_k32_off, 0),
+        iat_write_file: iat_slot(iat_k32_off, 1),
+        iat_exit_process: iat_slot(iat_k32_off, 2),
+        clsid_rva,
+        iid_rva,
+        punk_rva,
+        written_rva,
+        hexbuf_rva,
+        label_init_rva: str_rva[0],
+        label_hr_rva: str_rva[1],
+        label_refs_rva: str_rva[2],
+        ok_rva: str_rva[3],
+        fail_rva: str_rva[4],
+    });
+
+    // --- assemble the file ------------------------------------------------
+    let headers_raw = FILE_ALIGN as usize;
+    let text_ptr = headers_raw;
+    let text_raw = align_up(text.len(), FILE_ALIGN as usize);
+    let rdata_ptr = text_ptr + text_raw;
+    let rdata_raw = align_up(rd.len(), FILE_ALIGN as usize);
+    let file_len = rdata_ptr + rdata_raw; // .data is BSS — no raw bytes
+
+    let mut f = vec![0u8; file_len];
+    f[0] = b'M';
+    f[1] = b'Z';
+    put_u32(&mut f, 0x3C, PE_OFF as u32);
+    put_u32(&mut f, PE_OFF, 0x0000_4550);
+    let coff = PE_OFF + 4;
+    put_u16(&mut f, coff, 0x8664); // AMD64
+    put_u16(&mut f, coff + 2, 3); // 3 sections
+    put_u16(&mut f, coff + 16, OPT_HEADER_SIZE as u16);
+    put_u16(&mut f, coff + 18, 0x0022); // EXECUTABLE | LARGE_ADDRESS_AWARE
+
+    let opt = coff + 20;
+    let image_size = align_up_u32(DATA_RVA_L + data_len, SECTION_ALIGN);
+    put_u16(&mut f, opt, 0x20B); // PE32+
+    f[opt + 2] = 14;
+    put_u32(&mut f, opt + 4, text_raw as u32);
+    put_u32(&mut f, opt + 8, rdata_raw as u32);
+    put_u32(&mut f, opt + 16, TEXT_RVA_L); // AddressOfEntryPoint
+    put_u32(&mut f, opt + 20, TEXT_RVA_L); // BaseOfCode
+    put_u64(&mut f, opt + 24, IMAGE_BASE);
+    put_u32(&mut f, opt + 32, SECTION_ALIGN);
+    put_u32(&mut f, opt + 36, FILE_ALIGN);
+    put_u16(&mut f, opt + 40, 6);
+    put_u16(&mut f, opt + 48, 6);
+    put_u32(&mut f, opt + 56, image_size);
+    put_u32(&mut f, opt + 60, headers_raw as u32);
+    put_u16(&mut f, opt + 68, 3); // CONSOLE
+    put_u64(&mut f, opt + 72, 0x10_0000);
+    put_u64(&mut f, opt + 80, 0x1000);
+    put_u64(&mut f, opt + 88, 0x10_0000);
+    put_u64(&mut f, opt + 96, 0x1000);
+    put_u32(&mut f, opt + 108, 16);
+
+    let dir = |i: usize| opt + 112 + i * 8;
+    put_u32(&mut f, dir(1), RDATA_RVA_L + import_dir_off); // Import table
+    put_u32(&mut f, dir(1) + 4, import_dir_size);
+    put_u32(&mut f, dir(12), RDATA_RVA_L + iat_ole_off); // IAT (both runs)
+    put_u32(&mut f, dir(12) + 4, iat_size);
+
+    let sec = opt + OPT_HEADER_SIZE;
+    write_section(&mut f, sec, SecHeader {
+        name: b".text",
+        vsize: text.len() as u32,
+        vaddr: TEXT_RVA_L,
+        raw_size: text_raw as u32,
+        raw_ptr: text_ptr as u32,
+        chars: 0x6000_0020, // CODE | EXECUTE | READ
+    });
+    write_section(&mut f, sec + 40, SecHeader {
+        name: b".rdata",
+        vsize: rd.len() as u32,
+        vaddr: RDATA_RVA_L,
+        raw_size: rdata_raw as u32,
+        raw_ptr: rdata_ptr as u32,
+        chars: 0x4000_0040, // INITIALIZED_DATA | READ
+    });
+    write_section(&mut f, sec + 80, SecHeader {
+        name: b".data",
+        vsize: data_len,
+        vaddr: DATA_RVA_L,
+        raw_size: 0,
+        raw_ptr: 0,
+        chars: 0xC000_0080, // UNINITIALIZED_DATA | READ | WRITE
+    });
+
+    f[text_ptr..text_ptr + text.len()].copy_from_slice(&text);
+    f[rdata_ptr..rdata_ptr + rd.len()].copy_from_slice(&rd);
+    f
+}
+
+/// RVAs the COM sample's `.text` needs (IAT slots, GUIDs, scratch, strings).
+struct ComSyms {
+    iat_co_initialize_ex: u32,
+    iat_co_create_instance: u32,
+    iat_co_uninitialize: u32,
+    iat_get_std_handle: u32,
+    iat_write_file: u32,
+    iat_exit_process: u32,
+    clsid_rva: u32,
+    iid_rva: u32,
+    punk_rva: u32,
+    written_rva: u32,
+    hexbuf_rva: u32,
+    label_init_rva: u32,
+    label_hr_rva: u32,
+    label_refs_rva: u32,
+    ok_rva: u32,
+    fail_rva: u32,
+}
+
+/// Emit the COM sample's `.text`.
+///
+/// Register conventions (all callee-saved per the Win64 ABI, so they survive
+/// the calls into Wine's ole32/combase): `rsi` = the cached stdout handle,
+/// `r12d` = the `CoCreateInstance` HRESULT, `r14d` = the reference count the
+/// vtable `AddRef` returned, `r13d` = the pending exit code. The hex printer
+/// additionally uses `rbx` (the value being printed) and `rdi` (its write
+/// cursor).
+fn build_com_text(s: ComSyms) -> Vec<u8> {
+    const TEXT_RVA_L: u32 = 0x1000;
+    let mut c: Vec<u8> = Vec::new();
+
+    fn rip(c: &mut Vec<u8>, prefix: &[u8], target_rva: u32) {
+        c.extend_from_slice(prefix);
+        let next_rva = TEXT_RVA_L as i64 + c.len() as i64 + 4;
+        let disp = target_rva as i64 - next_rva;
+        c.extend_from_slice(&(disp as i32).to_le_bytes());
+    }
+
+    /// `WriteFile(rsi, buf, len, &written, NULL)`.
+    fn write_str(c: &mut Vec<u8>, s: &ComSyms, buf_rva: u32, len: u32) {
+        c.extend_from_slice(&[0x48, 0x89, 0xF1]); // mov rcx, rsi
+        rip(c, &[0x48, 0x8D, 0x15], buf_rva); // lea rdx, [rip+buf]
+        c.extend_from_slice(&[0x41, 0xB8]); // mov r8d, len
+        c.extend_from_slice(&len.to_le_bytes());
+        rip(c, &[0x4C, 0x8D, 0x0D], s.written_rva); // lea r9, [rip+written]
+        c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov [rsp+0x20], 0
+        rip(c, &[0xFF, 0x15], s.iat_write_file); // call [WriteFile]
+    }
+
+    /// Print `<label>` then `eax` as 8 hex digits + '\n'. `eax` is preserved.
+    fn print_hex(c: &mut Vec<u8>, s: &ComSyms, label_rva: u32, label_len: u32) {
+        c.extend_from_slice(&[0x89, 0xC3]); // mov ebx, eax  (save the value)
+        write_str(c, s, label_rva, label_len);
+        rip(c, &[0x48, 0x8D, 0x3D], s.hexbuf_rva); // lea rdi, [rip+hexbuf]
+        c.extend_from_slice(&[0x89, 0xD8]); // mov eax, ebx
+        c.extend_from_slice(&[0xB9, 0x08, 0x00, 0x00, 0x00]); // mov ecx, 8
+        let loop_start = c.len();
+        c.extend_from_slice(&[0xC1, 0xC0, 0x04]); // rol eax, 4
+        c.extend_from_slice(&[0x89, 0xC2]); // mov edx, eax
+        c.extend_from_slice(&[0x83, 0xE2, 0x0F]); // and edx, 0xF
+        c.extend_from_slice(&[0x80, 0xC2, 0x30]); // add dl, '0'
+        c.extend_from_slice(&[0x80, 0xFA, 0x39]); // cmp dl, '9'
+        c.extend_from_slice(&[0x76, 0x03]); // jbe +3 (skip the a-f fixup)
+        c.extend_from_slice(&[0x80, 0xC2, 0x27]); // add dl, 'a'-'0'-10
+        c.extend_from_slice(&[0x88, 0x17]); // mov [rdi], dl
+        c.extend_from_slice(&[0x48, 0xFF, 0xC7]); // inc rdi
+        c.extend_from_slice(&[0xFF, 0xC9]); // dec ecx
+        c.extend_from_slice(&[0x75, 0x00]); // jnz .loop
+        let back = c.len();
+        c[back - 1] = ((loop_start as i64 - back as i64) as i8) as u8;
+        c.extend_from_slice(&[0xC6, 0x07, 0x0A]); // mov byte [rdi], '\n'
+        write_str(c, s, s.hexbuf_rva, 9);
+        c.extend_from_slice(&[0x89, 0xD8]); // mov eax, ebx  (restore)
+    }
+
+    // sub rsp, 0x68 — shadow space (0x00..0x20) + the 5th-arg slot at +0x20,
+    // leaving rsp 16-byte aligned at every call site.
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]);
+
+    // rsi = GetStdHandle(STD_OUTPUT_HANDLE = -11)
+    c.push(0xB9);
+    c.extend_from_slice(&(-11i32).to_le_bytes());
+    rip(&mut c, &[0xFF, 0x15], s.iat_get_std_handle);
+    c.extend_from_slice(&[0x48, 0x89, 0xC6]); // mov rsi, rax
+
+    // CoInitializeEx(NULL, COINIT_MULTITHREADED = 0)
+    c.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
+    c.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    rip(&mut c, &[0xFF, 0x15], s.iat_co_initialize_ex);
+    print_hex(&mut c, &s, s.label_init_rva, COM_LABEL_INIT.len() as u32);
+
+    // CoCreateInstance(&CLSID, NULL, CLSCTX_INPROC_SERVER=1, &IID_IUnknown, &punk)
+    rip(&mut c, &[0x48, 0x8D, 0x0D], s.clsid_rva); // lea rcx, [rip+clsid]
+    c.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    c.extend_from_slice(&[0x41, 0xB8, 0x01, 0x00, 0x00, 0x00]); // mov r8d, 1
+    rip(&mut c, &[0x4C, 0x8D, 0x0D], s.iid_rva); // lea r9, [rip+iid]
+    rip(&mut c, &[0x48, 0x8D, 0x05], s.punk_rva); // lea rax, [rip+punk]
+    c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x20]); // mov [rsp+0x20], rax
+    rip(&mut c, &[0xFF, 0x15], s.iat_co_create_instance);
+    c.extend_from_slice(&[0x41, 0x89, 0xC4]); // mov r12d, eax  (hr)
+    print_hex(&mut c, &s, s.label_hr_rva, COM_LABEL_HR.len() as u32);
+
+    c.extend_from_slice(&[0x45, 0x31, 0xF6]); // xor r14d, r14d  (refs default 0)
+    // if (hr != S_OK) goto fail
+    c.extend_from_slice(&[0x45, 0x85, 0xE4]); // test r12d, r12d
+    c.extend_from_slice(&[0x0F, 0x85, 0, 0, 0, 0]); // jne .fail
+    let jne_fail = c.len() - 4;
+    // if (punk == NULL) goto fail
+    rip(&mut c, &[0x48, 0x8B, 0x0D], s.punk_rva); // mov rcx, [rip+punk]
+    c.extend_from_slice(&[0x48, 0x85, 0xC9]); // test rcx, rcx
+    c.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // je .fail
+    let je_fail = c.len() - 4;
+
+    // THE VTABLE CALL: punk->lpVtbl->AddRef(punk)  — guest code, guest memory.
+    c.extend_from_slice(&[0x48, 0x8B, 0x01]); // mov rax, [rcx]   (lpVtbl)
+    c.extend_from_slice(&[0xFF, 0x50, 0x08]); // call [rax+8]     (AddRef)
+    c.extend_from_slice(&[0x41, 0x89, 0xC6]); // mov r14d, eax    (refs)
+    c.extend_from_slice(&[0x44, 0x89, 0xF0]); // mov eax, r14d
+    print_hex(&mut c, &s, s.label_refs_rva, COM_LABEL_REFS.len() as u32);
+
+    // Release twice (the AddRef above plus the CoCreateInstance reference).
+    for _ in 0..2 {
+        rip(&mut c, &[0x48, 0x8B, 0x0D], s.punk_rva); // mov rcx, [rip+punk]
+        c.extend_from_slice(&[0x48, 0x8B, 0x01]); // mov rax, [rcx]
+        c.extend_from_slice(&[0xFF, 0x50, 0x10]); // call [rax+0x10]  (Release)
+    }
+    rip(&mut c, &[0xFF, 0x15], s.iat_co_uninitialize); // CoUninitialize()
+
+    // if (refs < 2) goto fail  — AddRef on a live object must report >= 2.
+    c.extend_from_slice(&[0x41, 0x83, 0xFE, 0x02]); // cmp r14d, 2
+    c.extend_from_slice(&[0x0F, 0x82, 0, 0, 0, 0]); // jb .fail
+    let jb_fail = c.len() - 4;
+
+    // .ok: message + the distinguishing exit code.
+    c.extend_from_slice(&[0x41, 0xBD]); // mov r13d, COM_OK_EXIT
+    c.extend_from_slice(&(COM_OK_EXIT as u32).to_le_bytes());
+    write_str(&mut c, &s, s.ok_rva, COM_OK_MESSAGE.len() as u32);
+    c.extend_from_slice(&[0xE9, 0, 0, 0, 0]); // jmp .exit
+    let jmp_exit = c.len() - 4;
+
+    // .fail:
+    let fail_at = c.len();
+    for site in [jne_fail, je_fail, jb_fail] {
+        let rel = (fail_at as i64 - (site as i64 + 4)) as i32;
+        c[site..site + 4].copy_from_slice(&rel.to_le_bytes());
+    }
+    c.extend_from_slice(&[0x41, 0xBD, 0x01, 0x00, 0x00, 0x00]); // mov r13d, 1
+    write_str(&mut c, &s, s.fail_rva, COM_FAIL_MESSAGE.len() as u32);
+
+    // .exit: ExitProcess(r13d)
+    let exit_at = c.len();
+    let rel = (exit_at as i64 - (jmp_exit as i64 + 4)) as i32;
+    c[jmp_exit..jmp_exit + 4].copy_from_slice(&rel.to_le_bytes());
+    c.extend_from_slice(&[0x44, 0x89, 0xE9]); // mov ecx, r13d
+    rip(&mut c, &[0xFF, 0x15], s.iat_exit_process);
+    c.push(0xCC); // int3 (unreached)
+    c
+}
+
 /// The `.rdata` blob: imports (descriptor table, ILT, IAT, name table),
 /// the DLL name and the message, with the RVAs the code and headers need.
 struct Rdata {
