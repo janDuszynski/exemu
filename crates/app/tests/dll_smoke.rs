@@ -949,6 +949,8 @@ const G32_STACK: u64 = 0x0041_0000; // initial 32-bit ESP
 const G32_STATUS: u64 = 0x0042_0000; // caller stores the returned EAX here
 const G32_ESP_OUT: u64 = 0x0042_0004; // …and the post-call ESP here
 const G32_OUT: u64 = 0x0042_0008; // the NT service's out-buffer (8 bytes)
+const G32_INOUT_A: u64 = 0x0042_0010; // a 32-bit IN/OUT cell (e.g. *BaseAddress)
+const G32_INOUT_B: u64 = 0x0042_0014; // a second 32-bit IN/OUT cell (e.g. *RegionSize)
 
 /// Lay out the synthesized 32-bit guest: an application-side caller, an
 /// ntdll32-shaped `Nt*` stub for `index` taking `args` (stdcall, `4*len` bytes
@@ -1195,6 +1197,83 @@ fn wow64_32bit_guest_reaches_the_real_nt_ssdt() {
         mem.read_u32(G32_ESP_OUT).unwrap(),
         G32_STACK as u32,
         "the 32-bit stack is balanced after the full WoW64 round trip",
+    );
+}
+
+/// W5.3, the marshalling half: a 32-bit guest **allocates memory** through the
+/// same chain, exercising `wow64.dll`'s real 32↔64 argument marshalling.
+///
+/// `NtQuerySystemTime` proves the route; this proves the thunk does real work on
+/// it. `NtAllocateVirtualMemory`'s wow64 thunk (unlike the time thunk's
+/// two-instruction tail-jump) is a couple of hundred instructions: it reads the
+/// six 32-bit stdcall arguments out of the guest block, **sign-extends** the
+/// pseudo-handle (`movsxd`, so the guest's `0xFFFFFFFF` becomes the 64-bit
+/// `NtCurrentProcess` = -1), widens the `*BaseAddress` / `*RegionSize` IN/OUT
+/// cells into 64-bit locals, calls `ntdll!RtlIsCurrentProcess` to pick the
+/// in-process path, **substitutes its own `0x7fffffff` for a zero `ZeroBits`**,
+/// places the two overflow arguments at the Win64 home slots, issues the real
+/// 64-bit `ntdll!NtAllocateVirtualMemory`, and narrows the results back into the
+/// guest's 32-bit cells.
+///
+/// That `ZeroBits` substitution is load-bearing and is why `crates/os/src/vm.rs`
+/// now honours the argument: exemu's `VirtualAlloc` arena lives at 256 GiB, so
+/// ignoring the ceiling handed the guest a **truncated, unmapped** base. The
+/// assertions below (nonzero 64 KiB-aligned base under 2 GiB, page-rounded size,
+/// pages actually writable at the address the *guest* sees) only hold if Wine's
+/// own marshalling and exemu's ceiling agree.
+#[test]
+fn wow64_32bit_guest_allocates_through_the_real_wow64_thunk() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() || !Path::new(WOW64).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+    const MEM_COMMIT_RESERVE: u32 = 0x3000;
+    const PAGE_READWRITE: u32 = 0x04;
+    const CURRENT_PROCESS32: u32 = 0xFFFF_FFFF; // the 32-bit NtCurrentProcess
+
+    let (mut os, mut mem, ntdll, wow64cpu, bop) = boot_wow64_stack("w5_3alloc");
+    let index = ssdt_index_of(&mem, &ntdll, "NtAllocateVirtualMemory");
+
+    // NtAllocateVirtualMemory(ProcessHandle, &BaseAddress, ZeroBits, &RegionSize,
+    //                         AllocationType, Protect) — six 32-bit stdcall args.
+    build_wow64_syscall_guest(
+        &mut mem,
+        bop,
+        index,
+        &[
+            CURRENT_PROCESS32,
+            G32_INOUT_A as u32,
+            0, // ZeroBits — wow64.dll replaces this with its own 0x7fffffff
+            G32_INOUT_B as u32,
+            MEM_COMMIT_RESERVE,
+            PAGE_READWRITE,
+        ],
+    );
+    mem.write_u32(G32_INOUT_A, 0).unwrap(); // *BaseAddress = NULL → kernel picks
+    mem.write_u32(G32_INOUT_B, 0x2000).unwrap(); // *RegionSize
+
+    const CPU_AREA: u64 = SCRATCH + 0x1000;
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, G32_CALLER as u32, G32_STACK as u32).unwrap();
+    call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
+
+    assert_eq!(
+        mem.read_u32(G32_STATUS).unwrap() as u64,
+        STATUS_SUCCESS,
+        "the 32-bit guest got STATUS_SUCCESS back from exemu's NtAllocateVirtualMemory",
+    );
+    let base = mem.read_u32(G32_INOUT_A).unwrap() as u64;
+    assert_ne!(base, 0, "wow64.dll narrowed the 64-bit base back into the guest's 32-bit cell");
+    assert_eq!(base & 0xFFFF, 0, "the written-back base is 64 KiB aligned");
+    assert!(base <= 0x7FFF_FFFF, "the base honours wow64.dll's 0x7fffffff ZeroBits ceiling");
+    assert_eq!(mem.read_u32(G32_INOUT_B).unwrap(), 0x2000, "the region size was written back");
+    // THE LOAD-BEARING CHECK: the base the *32-bit guest* sees is the real,
+    // writable allocation — not a pointer truncated out of the 64-bit arena.
+    mem.write_u32(base, 0xCAFE_BABE).unwrap();
+    assert_eq!(mem.read_u32(base).unwrap(), 0xCAFE_BABE, "the allocated pages are writable");
+    assert_eq!(
+        mem.read_u32(G32_ESP_OUT).unwrap(),
+        G32_STACK as u32,
+        "the six-argument stdcall unwound to a balanced 32-bit stack",
     );
 }
 
