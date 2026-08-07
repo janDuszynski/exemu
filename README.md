@@ -92,6 +92,7 @@ Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
 exemu run <file.exe> [--trace] [--no-echo] [--telemetry <path>] [-- <args>...]
 exemu info <file.exe>
 exemu opcodes [--telemetry <path>] [--clear]
+exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]
 exemu sample <out.exe>
 exemu gui-sample <out.exe>
 exemu cocoa-demo [--size WxH] [--hold SECS]
@@ -111,6 +112,12 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
 * `opcodes` reads that telemetry log and prints a **most-wanted ranking** of
   the unimplemented opcodes that blocked past runs — so the highest-leverage
   instruction to add next is obvious. `--clear` resets the log.
+* `corpus` runs the **per-exe regression pins** in `corpus.toml` and prints a
+  pass/fail table with the instruction delta against each pin and where each
+  binary stopped. Every binary runs in its own child process with a private
+  `TMPDIR`, so its sandbox artifacts are counted in isolation. Exit status is 1
+  on any drift; `--update` re-blesses the manifest so refreshing a pin is a
+  deliberate, reviewable diff. See [Corpus regression gate](#corpus-regression-gate).
 * `sample` writes the built-in Hello-World PE to disk; `gui-sample` writes a
   small real-window PE (run it with `--gui`).
 * `cocoa-demo` opens a live macOS **NSWindow** whose contents are a `CAMetalLayer`
@@ -333,6 +340,48 @@ stubs through the emulator's syscall dispatcher — proving a Wine-PE guest can
 allocate memory, query the clock, open+write a file (bytes land on the host),
 and create+wait an event, all via genuine `SYSCALL`s. It skips cleanly when the
 (separately obtained, non-redistributed) Wine DLL set is absent.
+
+### Corpus regression gate
+
+`corpus.toml` at the repository root pins what each real installer in the test
+corpus does — outcome, instruction count, where it stopped, and how many files
+it wrote — and `exemu corpus` (or `crates/cli/tests/corpus_gate.rs`) runs them
+and fails on drift. This is the harness that catches cross-thread / IPC /
+integration regressions: the differential CPU oracle is single-stream and
+structurally cannot see them.
+
+```sh
+cargo run  --release -p exemu-cli -- corpus            # the table
+cargo run  --release -p exemu-cli -- corpus --update   # re-bless, reviewably
+cargo test --release -p exemu-cli --test corpus_gate   # the gate (quick tier)
+EXEMU_CORPUS=full cargo test --release -p exemu-cli --test corpus_gate
+```
+
+Two things make the counts reproducible at all, and both are load-bearing:
+
+* **A fresh sandbox per binary.** The guest filesystem sandbox
+  (`$TMPDIR/exemu-sandbox`) persists and accumulates across runs, and an
+  installer enumerates and overwrites what it finds there — so the same binary
+  really does execute a different number of instructions against a dirty
+  sandbox (7-Zip: 496,505,788 instructions/110 files against one, 496,505,786/115
+  against another, 496,505,572/108 against a fresh one). Each entry therefore
+  gets its own `TMPDIR`, deleted and recreated first. A count measured by a bare
+  `exemu run` is not comparable to a pin.
+* **A bare `argv[0]`.** The guest's command line is built into guest memory
+  where the CRT parses it, so a longer path makes the guest execute more
+  instructions (measured: 936 of them on Firefox Installer). Each binary is
+  invoked by file name from its own directory, which keeps the counts a property
+  of the emulator rather than of where the repo lives.
+
+Even so, execution repeats only to about ±1 instruction — the emulator services
+the real host clock, so a guest comparing two timestamps can branch on host
+speed. Tolerances are therefore noise floors, not change budgets: a clean
+**exit** is a completed trace and gets the bare 64-instruction floor, while a
+**fault** pin's meaning is *where and why* it dies, so `rip` and the fault text
+are exact and only the "how far did we get" step count gets ~0.1% slack. The
+corpus binaries are git-ignored third-party installers, so a fresh checkout has
+none and the gate skips cleanly; it also skips on a debug build, because the
+pins are release-measured.
 
 A **golden-image gate** (`gui_gate.rs`) pins the GUI sample's first painted frame
 against a committed PNG so any pixel drift in the GDI paint path fails CI; it
