@@ -1,0 +1,167 @@
+name: licensing
+
+# Roadmap W9.1 / acquisition A10′, A11, AW2.
+#
+# Three questions, three jobs, deliberately kept apart so a failure names its
+# own cause:
+#
+#   licence-gate  — is every crate exemu compiles under a permitted licence?
+#   sbom          — is the committed bill of materials current?
+#   separability  — is any Wine code inside exemu's sources or artifacts?
+#
+# NOTE FOR REVIEWERS: a green run of this workflow means "no copyleft **crate**
+# in the Rust dependency closure, and no Wine code compiled into exemu". It does
+# NOT mean "no LGPL anywhere in the shipped product" — the Wine PE builtin DLLs
+# exemu loads as guest images are LGPL-2.1-or-later, are not cargo dependencies,
+# and are governed by the redistribution checklist in docs/COMPLIANCE.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Licences change under you: a crate can be relicensed in a patch release.
+  # A weekly run catches that without waiting for the next PR.
+  schedule:
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so the gate is reproducible and cannot change verdict because a new
+  # cargo-deny shipped overnight. Bump deliberately, in its own commit.
+  CARGO_DENY_VERSION: "0.20.2"
+
+jobs:
+  licence-gate:
+    name: dependency licences (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      # cargo-deny ships prebuilt binaries; `cargo install` would compile ~250
+      # crates on every run. Cached by version so the download happens once.
+      - name: Cache cargo-deny
+        id: cache-deny
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}-x86_64-unknown-linux-musl
+
+      - name: Install cargo-deny
+        if: steps.cache-deny.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.local/bin
+          v="${CARGO_DENY_VERSION}"
+          t="x86_64-unknown-linux-musl"
+          base="https://github.com/EmbarkStudios/cargo-deny/releases/download/${v}"
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/cargo-deny.tar.gz \
+            "${base}/cargo-deny-${v}-${t}.tar.gz"
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/cargo-deny.sha256 \
+            "${base}/cargo-deny-${v}-${t}.tar.gz.sha256"
+          # The release publishes a checksum next to the archive; verify it
+          # rather than trusting the transport. A compliance gate that installs
+          # an unverified binary is theatre.
+          echo "$(cat /tmp/cargo-deny.sha256 | awk '{print $1}')  /tmp/cargo-deny.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/cargo-deny.tar.gz -C /tmp
+          mv "/tmp/cargo-deny-${v}-${t}/cargo-deny" ~/.local/bin/cargo-deny
+          chmod +x ~/.local/bin/cargo-deny
+
+      - name: Add cargo-deny to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # deny.toml and deny.dev.toml must differ ONLY in their exceptions block.
+      # If the allow-lists drift, the dev policy could quietly permit something
+      # the shipping policy forbids — and nobody would notice.
+      - name: Assert the two policies share one allow-list
+        run: |
+          set -euo pipefail
+          extract() {
+            sed -n '/^allow = \[/,/^\]/p' "$1" | grep -vE '^[[:space:]]*#' | tr -d ' \t'
+          }
+          if ! diff <(extract deny.toml) <(extract deny.dev.toml); then
+            echo "::error::deny.toml and deny.dev.toml have diverging allow-lists."
+            echo "They must differ only in [licenses].exceptions."
+            exit 1
+          fi
+          echo "allow-lists are identical"
+
+      # THE GATE. No exceptions in deny.toml, so this failing means a copyleft
+      # or unvetted-licence crate entered the shipping closure.
+      - name: Shipping closure — zero exceptions
+        run: |
+          cargo deny --workspace --exclude-dev --exclude-unpublished \
+            --locked check licenses bans sources
+
+      # The whole graph, including the dev-only GPL differential oracle. Its two
+      # crates are the only recorded exception; anything else copyleft fails.
+      - name: Full graph — dev-only GPL oracle exception only
+        run: |
+          cargo deny --workspace --all-features --config deny.dev.toml \
+            --locked check licenses bans sources
+
+  sbom:
+    name: SBOM is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      # The SBOM is a pure function of Cargo.lock + target + the generator, so
+      # regenerating and diffing proves the committed copy is not stale. A
+      # dependency cannot be added without the SBOM moving in the same PR.
+      - name: Regenerate and diff
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/sbom.py --format cyclonedx \
+            > /tmp/exemu.cdx.json
+          python3 .github/scripts/sbom.py --format markdown \
+            > /tmp/DEPENDENCIES.md
+          if ! diff -u docs/sbom/exemu-cli-aarch64-apple-darwin.cdx.json /tmp/exemu.cdx.json; then
+            echo "::error::docs/sbom/exemu-cli-aarch64-apple-darwin.cdx.json is stale."
+            echo "Regenerate: .github/scripts/sbom.py --format cyclonedx > docs/sbom/exemu-cli-aarch64-apple-darwin.cdx.json"
+            exit 1
+          fi
+          if ! diff -u docs/sbom/DEPENDENCIES.md /tmp/DEPENDENCIES.md; then
+            echo "::error::docs/sbom/DEPENDENCIES.md is stale."
+            echo "Regenerate: .github/scripts/sbom.py --format markdown > docs/sbom/DEPENDENCIES.md"
+            exit 1
+          fi
+          echo "SBOM matches Cargo.lock"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: exemu-sbom
+          path: docs/sbom/
+
+  separability:
+    name: no Wine code in exemu
+    # macOS: the shipping target, and the only place `otool -L` can inspect the
+    # artifact exemu actually distributes.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-sep-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build the release binary
+        run: cargo build --release --locked -p exemu-cli
+
+      - name: Assert separability
+        run: .github/scripts/separability.sh target/release/exemu

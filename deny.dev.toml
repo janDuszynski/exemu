@@ -1,0 +1,105 @@
+# exemu dependency-licence policy — the FULL graph, including dev-only tooling.
+#
+#     cargo deny --workspace --all-features --config deny.dev.toml \
+#                check licenses bans sources
+#
+# `deny.toml` governs what ships. This file governs *everything a developer can
+# build*, so that the one deliberate copyleft dependency in the project is
+# named, bounded, and re-checked on every push — instead of being invisible.
+#
+# The `[licenses].allow` list below is byte-identical to the one in `deny.toml`;
+# CI asserts that with a diff (`.github/workflows/licenses.yml`), so the two
+# policies cannot drift. The ONLY difference between the two files is the
+# `[licenses].exceptions` block.
+
+[graph]
+all-features = true
+exclude-dev = false
+
+[output]
+feature-depth = 1
+
+[licenses]
+# --- BEGIN allow-list (must match deny.toml byte-for-byte) ---
+allow = [
+    # --- the permissive core of the Rust ecosystem ---
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    "MIT-0",
+    # `unicode-ident` is `(MIT OR Apache-2.0) AND Unicode-3.0`; the AND makes
+    # Unicode-3.0 non-optional. Unicode-3.0 is permissive (Unicode Licence v3,
+    # BSD-3-Clause-shaped with a data/trademark clause) and OSI-approved.
+    "Unicode-3.0",
+
+    # --- exemu's own crates ---
+    # PolyForm Noncommercial 1.0.0 is a source-available, NON-open-source
+    # licence: it forbids commercial use by third parties. It is listed here
+    # only so the workspace's own crates pass their own gate. It must never be
+    # used to justify accepting a *third-party* crate under a
+    # non-commercial-use licence — that would be a genuine problem, because
+    # exemu is intended to be commercially licensable by its owner. Any new
+    # third-party crate appearing under this identifier is a defect, not a pass.
+    "PolyForm-Noncommercial-1.0.0",
+]
+# --- END allow-list ---
+
+# ---------------------------------------------------------------------------
+# The one exception in the project. Read the reason before touching it.
+# ---------------------------------------------------------------------------
+# `unicorn-engine` / `unicorn-engine-sys` are GPL-2.0 (declared with the
+# deprecated SPDX id `GPL-2.0`; the current id is `GPL-2.0-only`). Unicorn is
+# the reference x86 implementation the differential oracle cross-checks exemu's
+# interpreter against. It is admissible ONLY because it is provably isolated
+# from anything exemu distributes:
+#
+#   1. It is an OPTIONAL dependency of `exemu-oracle` alone, behind the
+#      `unicorn` cargo feature, which is OFF by default. It therefore does not
+#      appear in the graph checked by `deny.toml` at all — verify with
+#      `cargo tree --target aarch64-apple-darwin -p exemu-cli --edges normal`.
+#   2. `exemu-oracle` is `publish = false` and builds no shipped artifact. It is
+#      a development harness; no release ever contains it.
+#   3. The oracle compares exemu against Unicorn BEHAVIOURALLY — black-box
+#      register/memory state after executing generated instructions. Unicorn's
+#      (and QEMU's) source is never read, per `docs/CLEANROOM.md` Class A. No
+#      GPL code, structure, or algorithm enters exemu.
+#
+# Consequence for the gate: `deny.toml` must NEVER gain this exception. If
+# `cargo deny check licenses` with the shipping policy ever reports Unicorn,
+# the isolation has been broken and the build must fail. That is the whole
+# design of the two-file split.
+exceptions = [
+    { crate = "unicorn-engine", allow = ["GPL-2.0"] },
+    { crate = "unicorn-engine-sys", allow = ["GPL-2.0"] },
+]
+
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+[bans]
+# See deny.toml for the rationale behind each of these settings.
+multiple-versions = "allow"
+wildcards = "allow"
+allow-wildcard-paths = true
+
+deny = [
+    { crate = "dynasmrt", reason = "MPL-2.0 file-level reciprocity is incompatible with the JIT remaining proprietary-licensable (roadmap W8); the emitter is hand-rolled in-repo." },
+    { crate = "dynasm", reason = "MPL-2.0; the proc-macro half of dynasmrt." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
