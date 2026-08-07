@@ -6,6 +6,107 @@ API stability: `0.0.x` is the pre-GUI foundation, `0.1.0` will be the first real
 interactive native window, and `1.0.0` is the notarized product. A version
 advertises only what is actually implemented.
 
+## Unreleased — the Wine personality (W0–W5)
+
+A change of *means*, not of goal. Up to v0.0.4 exemu re-implemented the Windows
+personality by hand — kernel32, USER32, GDI, one function at a time. It now
+**boots Wine's own PE builtin DLLs (`ntdll`, `kernelbase`, `kernel32`,
+`ucrtbase`, `win32u`, `user32`, `gdi32`, …) as ordinary emulated x86-64 guest
+code**, and implements natively in Rust only the small, well-defined *unix side*
+of Wine's PE/Unix boundary: the NT syscall surface, ntdll's unixlib, a
+wineserver-equivalent object manager, the win32u backend, and a from-scratch
+macOS display driver.
+
+The hand-written personality is **still the default path** and is unchanged; the
+Wine path is opt-in via `exemu run --wine-boot <dir>` (or `EXEMU_WINE_BOOT`).
+Wine's DLLs are loaded as separate guest image files, never linked or transcribed
+into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
+written from public NT/PE specs and Wine's published architecture docs.
+
+Tests grew 199 → 496, clippy clean at `-D warnings`; 7-Zip still installs
+end-to-end on the default path.
+
+### CPU coverage for Wine's own binaries (W1)
+- **x87 FPU**: ST0–ST7 with real 80-bit storage, control/status/tag words, the
+  load/store/arithmetic/compare families, `FSQRT`/`FSCALE`/`FPREM`/`FRNDINT`, the
+  transcendentals, and the `fnstsw ax`→`jcc` idiom.
+- **`FXSAVE`/`FXRSTOR`** with the full 512-byte SDM layout (incl. abridged-FTW
+  re-expansion) and **`XSAVE`/`XRSTOR`/`XGETBV`/`XSETBV`** over the x87+SSE+AVX
+  state components.
+- **`CPUID` honesty**: a machine-checked invariant that every advertised feature
+  bit has a probe instruction the interpreter actually executes — so Wine never
+  dispatches onto a path exemu cannot run.
+- **SSSE3 / SSE4.1 / SSE4.2** (`0F 38`/`0F 3A`) incl. `PCMPESTR`/`PCMPISTR` with
+  full `imm8` semantics, and `CRC32`.
+- **AVX / AVX2 via VEX** (`0xC4`/`0xC5`): a 256-bit `YMM0`–`YMM15` file with
+  correct VEX.128 zero-upper vs legacy-SSE preserve semantics.
+- **BMI1/BMI2/ADX/F16C**, `CMPXCHG16B`, and the bare-form **MMX** register file
+  aliased onto the physical x87 stack.
+- **Self-modifying-code seam**: per-page generation counters on writes into
+  executable memory — the invalidation hook a future JIT code cache consumes.
+- Each family landed only after a **new differential-oracle category** diffed it
+  against Unicorn; a Wine-`ntdll` `.text` decode sweep gates against whole-family
+  decode regressions.
+
+### The PE/Unix boundary (W2)
+- `KUSER_SHARED_DATA` at its fixed `0x7ffe0000`, and `SYSCALL` / the fixed
+  dispatcher page routed to an **NT syscall dispatcher**: save the Windows context
+  into the TEB syscall frame, switch to a unix stack, index the SSDT, call the
+  native handler, restore and return.
+- **`__wine_unix_call`** fast path and ntdll's 8-entry **unixlib**
+  (`load_so_dll`, `unwind_builtin_dll`, `wine_dbg_write`, `wine_server_call`,
+  `server_fd_to_handle`, `server_handle_to_fd`, `spawnvp`, `system_time_precise`).
+- Native `Nt*` services: **memory** (`NtAllocate/Free/Protect/QueryVirtualMemory`
+  with `MEM_IMAGE`/`MEM_MAPPED`), **sections** (`SEC_IMAGE` file-backed images for
+  Wine's own PE loader), **files** (`IO_STATUS_BLOCK` + `OBJECT_ATTRIBUTES` +
+  `UNICODE_STRING` + the `\??\` namespace), **threads/process**, **synchronization**
+  (with *real* blocking via syscall rewind — no speculative `WAIT_OBJECT_0`),
+  **registry** (`\Registry\` namespace onto the existing hive, with the full
+  buffer-too-small protocol), and **time**.
+- A complete Wine-walkable **TEB (~0x1838) and PEB (~0x7C8)** per thread.
+- A **wineserver-equivalent**: an in-process object manager speaking a
+  `wine_server_call` protocol subset, with real cross-thread blocking.
+- The `LOCK` prefix is honored, pinned by a cross-thread `lock cmpxchg` test.
+
+### A real Wine process (W3)
+- The **`LdrInitializeThunk` handoff** and `NtContinue`, the bootstrap Wine's
+  ntdll expects; `PEB.ApiSetMap`, a full `RTL_USER_PROCESS_PARAMETERS`, the NLS
+  data mapping, and the per-thread debug-string ring Wine's tracing writes to.
+- A **console bridge** (`NtWriteFile` → host stdio) and a **hardware→software
+  exception bridge** that delivers guest faults through
+  `KiUserExceptionDispatcher` and resumes via `NtContinue`.
+- **GATE:** a console `.exe` runs to completion on **Wine's real PE
+  kernel32/kernelbase/ucrtbase** — correct stdout, file-I/O round-trip, and a
+  propagated non-zero exit code — with none of exemu's emulated API thunks used.
+
+### The first Wine-rendered window (W4)
+- A **second SSDT** for win32k (`NtUser*`/`NtGdi*`) and a `UserDriver`/`Presenter`
+  seam: Wine's user32/gdi32/win32u run as guest code and push real
+  `CreateWindowEx`/`ShowWindow` calls through an injected display driver.
+- A per-HWND **guest-mapped BGRA surface** plus the GDI handle table at `PEB+0xF8`,
+  so Wine's own gdi32 renders into a DIB exemu owns.
+- **`CocoaPresenter`**: a real `NSWindow` + `CAMetalLayer` blit path, with an
+  interpreter/main-thread split so AppKit owns the window and the interpreter
+  posts over a channel — guest windows appear as **native macOS windows**.
+- An **`NSEvent` tap** feeding real mouse/keyboard into the guest's own `WndProc`,
+  and a **CoreText glyph rasterizer** (real fonts in the DIB, not a bitmap font).
+- **PNG golden-image CI gate**: pixel drift in the sample's first frame fails CI.
+
+### WoW64 — 32-bit guests on the 64-bit Wine set (W5, in progress)
+- The **CS-selector mode switch**: far indirect `jmp m16:32/m16:64` and `iretq`
+  now switch the interpreter between 64-bit long mode and 32-bit compat mode —
+  the primitive Wine's WoW64 is built on. PE32 loader coverage pinned.
+- A **WoW64 process model** module: the CPU-reserved area at `TEB+0x1488` and the
+  `WOW64_CONTEXT` layout `wow64cpu!BTCpuSimulate` reads.
+- The pinned `wow64cpu.dll` is driven **through its own bytes**: the real
+  `BTCpuProcessInit` builds the 32→64 return BOP (recovered by *running* it — the
+  slot is `.bss`, zero-filled statically), and the real `BTCpuSimulate` switches
+  into a 32-bit guest on both its forward paths.
+- **Full WoW64 syscall round trip** on wow64cpu's own code: a 32-bit guest calls
+  the init-built BOP → the 64-bit return handler saves the 32-bit context and
+  dispatches → the guest resumes with the result. *Still to come:* routing that
+  dispatch to the real NT SSDT and the full 32-bit process boot.
+
 ## v0.0.4 — the windowing substrate
 
 The last foundation layer *under* the GUI: a real USER32/GDI object model the

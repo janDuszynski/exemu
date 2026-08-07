@@ -17,15 +17,22 @@ independent, testable crate behind a trait.
 
 > **Scope.** This is a from-scratch userland emulator built for clarity and
 > extensibility. It implements a broad subset of the x86/x86-64 instruction
-> set (through SSE4.2 plus AVX/AVX2), ~200 Win32 functions, a host-backed sandbox
-> filesystem, and a lightweight **window + GDI renderer** — enough to run
-> real console programs end to end and to drive real GUI apps (`--gui`)
-> interactively, both dialog-template UIs and custom `CreateWindowEx`
-> windows. It is **not** a drop-in replacement for Wine: it does not emulate
-> the NT kernel, COM, or the .NET CLR, and its rendering is a software
-> subset (solid fills, frames, text, lines) — **not** Windows' native
-> theming, GDI+, or DirectX — so visually complex apps hit unimplemented
-> drawing calls.
+> set (through SSE4.2 plus AVX/AVX2, x87 and MMX), ~200 Win32 functions, a
+> host-backed sandbox filesystem, and a lightweight **window + GDI renderer** —
+> enough to run real console programs end to end and to drive real GUI apps
+> (`--gui`) interactively, both dialog-template UIs and custom
+> `CreateWindowEx` windows. On this default path the rendering is a software
+> subset (solid fills, frames, text, lines) — **not** Windows' native theming,
+> GDI+, or DirectX — so visually complex apps hit unimplemented drawing calls.
+>
+> **There is a second path.** exemu also implements the **NT syscall layer and
+> the PE/Unix boundary Wine's own builtin DLLs call through**, so it can boot
+> Wine's PE `ntdll`/`kernel32`/`user32`/`gdi32`/`win32u` as emulated guest code
+> instead of re-implementing them — see
+> [Running on Wine's PE personality](#running-on-wines-pe-personality---wine-boot).
+> That path is opt-in and still under construction, but it is where the
+> project is going: the Windows personality comes from Wine, and exemu supplies
+> the CPU, the kernel, and a from-scratch macOS display driver.
 
 ## Architecture
 
@@ -89,7 +96,9 @@ Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
 ### CLI
 
 ```
-exemu run <file.exe> [--trace] [--no-echo] [--telemetry <path>] [-- <args>...]
+exemu run <file.exe> [--trace] [--no-echo] [--gui] [--wine-boot <dir>]
+                     [--max-steps N] [--load-base <hex>]
+                     [--telemetry <path>] [-- <args>...]
 exemu info <file.exe>
 exemu opcodes [--telemetry <path>] [--clear]
 exemu sample <out.exe>
@@ -100,6 +109,10 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
 * `run` maps the image, resolves imports, and interprets it to completion,
   exiting with the guest's exit code. `--trace` logs calls to unimplemented
   Windows APIs; `--no-echo` suppresses mirroring guest output to the host.
+  `--max-steps N` sets the instruction budget (0 = unlimited); `--load-base`
+  maps the image away from its preferred `ImageBase` and applies its base
+  relocations. `--wine-boot <dir>` selects the Wine PE personality
+  ([below](#running-on-wines-pe-personality---wine-boot)).
   If a run stops on an instruction the decoder doesn't implement, the opcode
   is appended to a telemetry log (`--telemetry <path>`, else the
   `EXEMU_TELEMETRY` env var, else `$TMPDIR/exemu-telemetry.log`).
@@ -301,7 +314,7 @@ catch resumes execution, an unmatched throw terminates like `std::terminate`.
 
 | Executable | Kind | Result |
 | ---------- | ---- | ------ |
-| **7-Zip installer** | 64-bit MSVC GUI | **installs end to end** — drives its dialog, "clicks" Install, decompresses its LZMA archive, writes all 107 files + registry, exits 0 (~496M instructions) |
+| **7-Zip installer** | 64-bit MSVC GUI | **installs end to end** — drives its dialog, "clicks" Install, decompresses its LZMA archive, writes all 110 files + registry, exits 0 (496,505,788 instructions) |
 | **extracted `7z.exe`** | 64-bit console | **runs and prints its banner/usage** (`7-Zip 26.02 … Igor Pavlov`); `7z i` also runs |
 | generated `hello.exe` | 64-bit console | **runs fully**, prints output incl. an SSE2 computation, exits 0 |
 | Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; the inner program runs CRT init + setup + SEH frame build + thread/sync init for ~4.7M instructions before a fault deep in unpacked code |
@@ -315,6 +328,56 @@ its real extraction and writes its files to the host sandbox.
 Extraction is compute-heavy (LZMA), so a real installer needs a raised step
 budget: `exemu run --max-steps 800000000 installer.exe`. Files land under
 `$TMPDIR/exemu-sandbox`.
+
+## Running on Wine's PE personality (`--wine-boot`)
+
+Everything above is exemu's **hand-written** Windows personality — the default
+path, and the one the corpus results describe. Alongside it exemu implements the
+other half of the problem: the **NT kernel surface Wine's own builtin DLLs call
+through**. Point `--wine-boot` at a directory of Wine's `x86_64-windows` PE
+builtins and exemu boots *those* instead:
+
+```sh
+exemu run --wine-boot /path/to/wine/x86_64-windows hello.exe
+exemu run --wine-boot /path/to/wine/x86_64-windows --gui app.exe   # native window
+```
+
+The division of labour is the point. Wine's `ntdll`, `kernelbase`, `kernel32`,
+`ucrtbase`, `win32u`, `user32` and `gdi32` are **ordinary PE files that exemu
+interprets as guest x86-64 code** — the same interpreter, no special-casing.
+exemu supplies only what is genuinely below them:
+
+* **The NT syscall boundary.** `KUSER_SHARED_DATA` at its fixed address, `SYSCALL`
+  and the dispatcher page routed into a real **SSDT**: the dispatcher saves the
+  Windows context into the TEB syscall frame, switches to a unix stack, calls the
+  native handler, and restores. Memory, sections (`SEC_IMAGE`), files, threads,
+  synchronization, registry and time are implemented as genuine `Nt*` services —
+  including *real* blocking (a wait that cannot be satisfied rewinds the syscall
+  and switches threads; there is no speculative `WAIT_OBJECT_0`).
+* **ntdll's unixlib** — the 8-entry table reached via `__wine_unix_call`.
+* **A wineserver-equivalent** — an in-process object manager speaking a
+  `wine_server_call` protocol subset, with real cross-thread blocking.
+* **A second SSDT for win32k** (`NtUser*`/`NtGdi*`) plus a display-driver seam, so
+  Wine's user32/gdi32 render into a per-HWND BGRA surface exemu owns.
+* **A from-scratch macOS display driver** — `NSWindow` + `CAMetalLayer`, an
+  `NSEvent` tap feeding the guest's own `WndProc`, and a **CoreText** glyph
+  rasterizer, with an interpreter/main-thread split so AppKit owns the window.
+
+What is verified today:
+
+| Capability | Status |
+| ---------- | ------ |
+| A console `.exe` runs to completion on Wine's real PE `kernel32`/`kernelbase`/`ucrtbase` | **works** — correct stdout, file-I/O round-trip, propagated exit code, none of exemu's emulated thunks used |
+| A Win32 GUI app on Wine's `user32`/`gdi32`/`win32u` opens a **native macOS window** | **works** — real mouse/keyboard reach the guest `WndProc`; first frame pinned by a golden-PNG CI gate |
+| Guest faults delivered as Windows exceptions | **works** — via `KiUserExceptionDispatcher`, resumed through `NtContinue` |
+| **WoW64** (32-bit guests on the 64-bit Wine set) | **mechanism verified, boot in progress** — the CS-selector mode switch, the `WOW64_CONTEXT` process model, and a full 32→64 syscall round trip run through the pinned `wow64cpu.dll`'s own code; routing that dispatch to the NT SSDT and the full 32-bit process boot are next |
+| comctl32 / COM / MSI / multimedia / networking | **not yet** — these are Wine PE DLLs, so they arrive as guest code once the boundary carries them |
+
+**exemu does not ship Wine's DLLs.** You point `--wine-boot` at a set you already
+have. They are loaded as separate guest image files and are never linked or
+transcribed into any exemu crate (Wine is LGPL-2.1-or-later); every native
+backend here is written from public NT/PE specifications and Wine's published
+architecture documentation.
 
 ## Testing
 
