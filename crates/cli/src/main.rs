@@ -3,6 +3,7 @@
 //! Subcommands:
 //!   * `run <file.exe> [--trace] [--no-echo] [-- args...]` — load and execute
 //!   * `info <file.exe>`                                    — dump PE metadata
+//!   * `corpus [--manifest P] [--update]`                   — the regression gate
 //!   * `sample <out.exe>`                                   — write a demo exe
 //!
 //! Argument parsing is hand-rolled to keep the dependency graph and build
@@ -15,6 +16,7 @@ use std::process::ExitCode;
 use std::path::PathBuf;
 
 use exemu_app::{gui_sample, sample, Process, RunConfig};
+use exemu_cli::corpus;
 use exemu_core::{rank_opcode_misses, EmuError, ImportSymbol, MissRecord};
 
 fn main() -> ExitCode {
@@ -35,6 +37,7 @@ fn run(args: Vec<String>) -> Result<u8, String> {
         Some("run") => cmd_run(it.as_slice()),
         Some("info") => cmd_info(it.as_slice()),
         Some("opcodes") => cmd_opcodes(it.as_slice()),
+        Some("corpus") => corpus::cmd_corpus(it.as_slice()),
         Some("sample") => cmd_sample(it.as_slice()),
         Some("gui-sample") => cmd_gui_sample(it.as_slice()),
         Some("cocoa-demo") => cmd_cocoa_demo(it.as_slice()),
@@ -58,6 +61,7 @@ USAGE:\n\
     exemu run <file.exe> [--trace] [--no-echo] [-- <args>...]\n\
     exemu info <file.exe>\n\
     exemu opcodes [--telemetry <path>] [--clear]\n\
+    exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]\n\
     exemu sample <out.exe>\n\
     exemu gui-sample <out.exe>\n\
     exemu cocoa-demo [--size WxH] [--hold SECS]\n\
@@ -66,10 +70,22 @@ COMMANDS:\n\
     run        Load and execute a PE64 executable\n\
     info       Print headers, sections and imports of a PE64 file\n\
     opcodes    Rank unimplemented opcodes that blocked past runs (most-wanted)\n\
+    corpus     Run the pinned corpus binaries and diff against the manifest\n\
     sample     Generate a console demo .exe (Hello World via kernel32)\n\
     gui-sample Generate a GUI demo .exe (a real window; run with --gui)\n\
     cocoa-demo Open a live macOS NSWindow/Metal window showing a test frame\n\
                through the W4.4 CocoaPresenter blit path (macOS only)\n\
+\n\
+CORPUS OPTIONS:\n\
+    --manifest P    Pin file (default corpus.toml in the working directory)\n\
+    --only S        Run only binaries whose name contains S\n\
+    --quick         Run only the entries flagged `quick` (seconds, not minutes)\n\
+    --update        Re-bless the manifest from this run's measurements\n\
+\n\
+Each corpus binary runs in its own `exemu run` child with a private TMPDIR, so\n\
+its sandbox artifacts are counted in isolation. Exit status is 1 on any drift.\n\
+Use a --release build: a debug build is ~10x slower and 7-Zip alone executes\n\
+~496M instructions.\n\
 \n\
 RUN OPTIONS:\n\
     --trace         Log calls to unimplemented Windows APIs\n\
