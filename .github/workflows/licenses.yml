@@ -112,6 +112,17 @@ jobs:
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
 
+      # `cargo metadata --filter-platform aarch64-apple-darwin` works on a Linux
+      # runner without the Apple target installed — it only evaluates cfg from
+      # the built-in target spec — but it still wants the registry index.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-sbom-${{ hashFiles('**/Cargo.lock') }}
+
       # The SBOM is a pure function of Cargo.lock + target + the generator, so
       # regenerating and diffing proves the committed copy is not stale. A
       # dependency cannot be added without the SBOM moving in the same PR.
