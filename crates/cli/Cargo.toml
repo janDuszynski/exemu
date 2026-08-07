@@ -8,6 +8,10 @@ authors.workspace = true
 repository.workspace = true
 description = "Command-line front-end for the exemu Windows PE emulator."
 
+[lib]
+name = "exemu_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "exemu"
 path = "src/main.rs"

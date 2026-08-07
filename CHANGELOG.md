@@ -250,6 +250,31 @@ treat an HWND as a real, dereferenceable object with consistent per-window state
   that kind; `CreateFontIndirect` parses a LOGFONT subset and `GetObject` marshals
   it back; `SaveDC`/`RestoreDC` (a real DC-state stack); `SetBkColor`/`SetBkMode`.
 
+### Corpus regression gate (W9.6)
+- The per-exe regression pins stop being prose and become a **gate**.
+  `corpus.toml` declares, per corpus binary, the expected outcome, instruction
+  count and tolerance, fault site and reason, sandbox artifact count and step
+  budget; `exemu corpus` runs them and prints a pass/fail table with the delta
+  against each pin; `--update` re-blesses the manifest as a reviewable diff.
+  `crates/cli/tests/corpus_gate.rs` is the same runner as a test, skip-guarded
+  on the git-ignored corpus (a fresh checkout stays green) and on debug builds
+  (the pins are release-measured).
+- Each binary runs in its own child process with a private `TMPDIR`, so its
+  guest-sandbox artifacts are counted in isolation, and is invoked by bare file
+  name from its own directory — the guest command line lives in guest memory, so
+  a longer `argv[0]` costs real instructions (measured: 936 of them on Firefox
+  Installer). The pins are therefore a property of the emulator, not of the
+  checkout path.
+- **Reproducibility trap documented and fixed in the runner.** The guest sandbox
+  `$TMPDIR/exemu-sandbox` persists and accumulates across runs, and an installer
+  enumerates and overwrites what it finds there — so the same binary executes a
+  different number of instructions against a dirty sandbox (7-Zip: 496,505,788
+  instructions/110 files, 496,505,786/115, and 496,505,572/108 against a fresh
+  one). Execution is deterministic *given* the sandbox state, not across a dirty
+  one. The gate resets the sandbox per entry; even then, runs repeat only to
+  about ±1 instruction because the emulator services the real host clock, which
+  is why the tolerances are small noise floors rather than zero.
+
 ## v0.0.3 — a real process
 
 The kernel personality underneath the (still-headless) GUI grew up: a program
