@@ -28,8 +28,10 @@ end-to-end on the default path.
 
 ### Interpreter performance (W8.1)
 - **7-Zip installs in 27.5 s instead of ~65 s — 2.4× faster, with byte-identical
-  behaviour** (both the pre- and post-change binaries execute exactly
-  496,505,786 instructions on the same sandbox state).
+  behaviour.** Proven by A/B-ing the pre- and post-change binaries against the
+  *same* sandbox state: both execute exactly 496,505,786 instructions. (That
+  figure is a dirty-sandbox count; the fresh-sandbox pin is 496,505,572 — see
+  the corpus-gate section. What matters here is that the two binaries agree.)
 - Profile-driven, not guesswork: sampling the 496M-instruction run showed the
   **guest-memory path taking ~51% of the total**. Three fixes: every access was
   resolving its region *twice* (`locate` searched, discarded the reference, then

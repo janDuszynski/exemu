@@ -321,7 +321,7 @@ catch resumes execution, an unmatched throw terminates like `std::terminate`.
 
 | Executable | Kind | Result |
 | ---------- | ---- | ------ |
-| **7-Zip installer** | 64-bit MSVC GUI | **installs end to end** — drives its dialog, "clicks" Install, decompresses its LZMA archive, writes all 110 files + registry, exits 0 (496,505,788 instructions) |
+| **7-Zip installer** | 64-bit MSVC GUI | **installs end to end** — drives its dialog, "clicks" Install, decompresses its LZMA archive, writes all 108 files + registry, exits 0 (496,505,572 instructions against a **fresh** sandbox — see the note below) |
 | **extracted `7z.exe`** | 64-bit console | **runs and prints its banner/usage** (`7-Zip 26.02 … Igor Pavlov`); `7z i` also runs |
 | generated `hello.exe` | 64-bit console | **runs fully**, prints output incl. an SSE2 computation, exits 0 |
 | Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; the inner program runs CRT init + setup + SEH frame build + thread/sync init for ~4.7M instructions before a fault deep in unpacked code |
@@ -344,7 +344,7 @@ budget: `exemu run --max-steps 800000000 installer.exe`. Files land under
 
 ### Speed
 
-The 7-Zip install above — 496,505,786 emulated instructions — takes about
+The 7-Zip install above — ~4.97×10⁸ emulated instructions — takes about
 **27 seconds** on an M-series Mac (~18M instructions/second). That is a pure
 software interpreter: no JIT yet.
 
