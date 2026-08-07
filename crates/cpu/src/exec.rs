@@ -48,6 +48,10 @@ pub struct CpuidFeature {
 impl Interpreter {
     pub(crate) fn execute_one(&mut self, mem: &mut dyn Memory) -> Result<Exit> {
         let start = self.state.rip;
+        // One wide fetch covers the whole instruction encoding (roadmap W8.1);
+        // if it can't (region tail), the window stays empty and every byte is
+        // fetched individually, which is bit-for-bit the pre-W8.1 behaviour.
+        let (ibuf, ibuf_n) = Ctx::prefetch(&*mem, start);
         let mut ctx = Ctx {
             pfx: Prefixes::default(),
             cur: start,
@@ -55,6 +59,9 @@ impl Interpreter {
             rm: Rm::Reg(0),
             bits: self.bits,
             u8_at_op: 0,
+            ibuf,
+            ibuf_base: start,
+            ibuf_n,
         };
 
         self.read_prefixes(&mut ctx, mem)?;

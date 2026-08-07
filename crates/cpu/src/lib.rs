@@ -195,6 +195,11 @@ enum Rm {
     Mem { base: u64, disp: i64, rip_rel: bool },
 }
 
+/// How many instruction bytes are prefetched in one go. x86-64 caps an
+/// instruction at 15 bytes, so a 16-byte window covers every legal encoding
+/// (and the byte-at-a-time fallback covers the illegal over-long ones).
+pub(crate) const IBUF_LEN: usize = 16;
+
 /// Mutable per-instruction decode state threaded through the handlers.
 struct Ctx {
     pfx: Prefixes,
@@ -210,6 +215,17 @@ struct Ctx {
     /// consumed before the ModRM, so the opcode is stashed here). Unused by the
     /// legacy decode path.
     u8_at_op: u8,
+    /// Prefetched instruction bytes covering `[ibuf_base, ibuf_base + ibuf_n)`
+    /// (roadmap W8.1). Decoding an instruction used to issue one `Memory::fetch`
+    /// — a dynamic dispatch plus a region lookup plus a permission test — *per
+    /// byte*; a 4-byte instruction paid for it four times. One window fetch per
+    /// instruction serves the prefixes, opcode, ModRM/SIB, displacement and
+    /// immediate out of registers instead.
+    ibuf: [u8; IBUF_LEN],
+    /// Guest address `ibuf[0]` came from.
+    ibuf_base: u64,
+    /// Valid bytes in `ibuf`; `0` means "no window, fetch byte by byte".
+    ibuf_n: u8,
 }
 
 impl Ctx {
@@ -223,23 +239,84 @@ impl Ctx {
 }
 
 impl Ctx {
+    /// Prefetch the instruction window for an instruction starting at `addr`.
+    ///
+    /// A failure is *not* an error: it just leaves the window empty so every
+    /// byte is fetched individually, exactly as before roadmap W8.1. That is
+    /// what makes the window observationally invisible — a fault is raised only
+    /// by the per-byte path, at the same byte, with the same `EmuError`, so an
+    /// instruction sitting in the last 15 bytes of an executable region (where
+    /// the wide fetch would overrun the region) behaves identically, just
+    /// slower.
+    #[inline]
+    fn prefetch(mem: &dyn Memory, addr: u64) -> ([u8; IBUF_LEN], u8) {
+        let mut buf = [0u8; IBUF_LEN];
+        if mem.fetch(addr, &mut buf).is_ok() {
+            (buf, IBUF_LEN as u8)
+        } else {
+            (buf, 0)
+        }
+    }
+
+    /// Take the next `N` instruction bytes from the prefetch window, or `None`
+    /// if they are not (entirely) in it.
+    #[inline]
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let off = self.cur.wrapping_sub(self.ibuf_base);
+        // `off + N <= ibuf_n`, written so it cannot overflow for any `off`.
+        if off < (self.ibuf_n as u64).saturating_sub(N as u64 - 1) {
+            let i = off as usize;
+            let mut out = [0u8; N];
+            out.copy_from_slice(&self.ibuf[i..i + N]);
+            self.cur += N as u64;
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     fn u8(&mut self, mem: &dyn Memory) -> Result<u8> {
+        match self.take::<1>() {
+            Some([b]) => Ok(b),
+            None => self.u8_slow(mem),
+        }
+    }
+
+    /// The byte lies outside the prefetch window (over-long instruction, or no
+    /// window at all): go to memory for it, exactly as the pre-W8.1 decoder did.
+    #[cold]
+    #[inline(never)]
+    fn u8_slow(&mut self, mem: &dyn Memory) -> Result<u8> {
         let mut b = [0u8; 1];
         mem.fetch(self.cur, &mut b)?;
         self.cur += 1;
         Ok(b[0])
     }
+
+    #[inline]
     fn u16(&mut self, mem: &dyn Memory) -> Result<u16> {
-        Ok(u16::from_le_bytes([self.u8(mem)?, self.u8(mem)?]))
+        match self.take::<2>() {
+            Some(v) => Ok(u16::from_le_bytes(v)),
+            None => Ok(u16::from_le_bytes([self.u8(mem)?, self.u8(mem)?])),
+        }
     }
+    #[inline]
     fn u32(&mut self, mem: &dyn Memory) -> Result<u32> {
+        if let Some(v) = self.take::<4>() {
+            return Ok(u32::from_le_bytes(v));
+        }
         let mut v = [0u8; 4];
         for x in &mut v {
             *x = self.u8(mem)?;
         }
         Ok(u32::from_le_bytes(v))
     }
+    #[inline]
     fn u64(&mut self, mem: &dyn Memory) -> Result<u64> {
+        if let Some(v) = self.take::<8>() {
+            return Ok(u64::from_le_bytes(v));
+        }
         let mut v = [0u8; 8];
         for x in &mut v {
             *x = self.u8(mem)?;

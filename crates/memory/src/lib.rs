@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use exemu_core::{EmuError, Memory, Perm, Region, Result, CODE_PAGE_SIZE};
@@ -42,7 +43,24 @@ pub struct VirtualMemory {
     /// permission test and a predictably-not-taken branch.
     code_gen: u64,
     page_gen: HashMap<u64, u64>,
+    /// Region-lookup cache (roadmap W8.1): a direct-mapped table of `regions`
+    /// indices, indexed by the guest page number of the address. Guest accesses
+    /// cluster hard, but they *interleave* — one instruction fetches code, reads
+    /// its stack and writes the heap — so a single hint would thrash. Hashing on
+    /// the page keeps a live entry for each of those working sets at once and
+    /// turns the common case into one compare instead of a binary search over
+    /// every mapping.
+    ///
+    /// **It cannot return a wrong answer.** Regions are non-overlapping, so any
+    /// region that contains `addr` *is* the region containing `addr`; the hint is
+    /// always re-validated with [`Region::contains`] and a bounds-checked
+    /// `Vec::get`, so a stale index (after a map/unmap shifts the vector) can
+    /// only cause a miss, never a mis-resolution.
+    hints: [Cell<usize>; HINT_SLOTS],
 }
+
+/// Slots in the region-lookup cache. A power of two so the index is a mask.
+const HINT_SLOTS: usize = 8;
 
 impl VirtualMemory {
     pub fn new() -> Self {
@@ -141,49 +159,76 @@ impl VirtualMemory {
         Ok(())
     }
 
-    /// Find the region containing `addr` via binary search.
+    /// Index of the region containing `addr`: the cached hint for the address's
+    /// page slot if it still covers the address, else a binary search that
+    /// refreshes that slot.
     #[inline]
-    fn find(&self, addr: u64) -> Option<&Mapped> {
+    fn find_idx(&self, addr: u64) -> Option<usize> {
+        let slot = ((addr >> 12) as usize) & (HINT_SLOTS - 1);
+        let hint = self.hints[slot].get();
+        if let Some(m) = self.regions.get(hint) {
+            if m.region.contains(addr) {
+                return Some(hint);
+            }
+        }
+        self.find_idx_slow(addr, slot)
+    }
+
+    /// The binary-search half of [`find_idx`](Self::find_idx), kept out of line
+    /// so the cache-hit path stays a handful of instructions.
+    #[inline(never)]
+    fn find_idx_slow(&self, addr: u64, slot: usize) -> Option<usize> {
         // The candidate is the last region whose base <= addr.
         let idx = self.regions.partition_point(|m| m.region.base <= addr);
         if idx == 0 {
             return None;
         }
-        let m = &self.regions[idx - 1];
-        if m.region.contains(addr) {
-            Some(m)
+        if self.regions[idx - 1].region.contains(addr) {
+            self.hints[slot].set(idx - 1);
+            Some(idx - 1)
         } else {
             None
         }
     }
 
+    /// Find the region containing `addr`.
     #[inline]
     fn find_mut(&mut self, addr: u64) -> Option<&mut Mapped> {
-        let idx = self.regions.partition_point(|m| m.region.base <= addr);
-        if idx == 0 {
-            return None;
-        }
-        let m = &mut self.regions[idx - 1];
-        if m.region.contains(addr) {
-            Some(m)
-        } else {
-            None
-        }
+        let i = self.find_idx(addr)?;
+        Some(&mut self.regions[i])
     }
 
     /// Resolve `[addr, addr+len)` to a slice inside one region, checking that
     /// the whole range is contained and that `needed` permission is present.
-    fn locate(&self, addr: u64, len: usize, needed: Perm, what: &'static str) -> Result<(usize, usize)> {
-        let m = self.find(addr).ok_or(EmuError::Unmapped { addr, len })?;
+    /// Returns `(region index, start, end)` so the caller can reach the backing
+    /// bytes without repeating the lookup.
+    ///
+    /// The error values are built only on the failing branch (`match`, not
+    /// `ok_or`): `EmuError` carries `String` payloads in other variants, so
+    /// constructing one eagerly cost a call to its drop glue on *every*
+    /// successful access — 5% of the whole 7z run before roadmap W8.1.
+    #[inline]
+    fn locate(
+        &self,
+        addr: u64,
+        len: usize,
+        needed: Perm,
+        what: &'static str,
+    ) -> Result<(usize, usize, usize)> {
+        let idx = match self.find_idx(addr) {
+            Some(i) => i,
+            None => return Err(EmuError::Unmapped { addr, len }),
+        };
+        let m = &self.regions[idx];
         let start = (addr - m.region.base) as usize;
-        let end = start
-            .checked_add(len)
-            .filter(|&e| e as u64 <= m.region.size)
-            .ok_or(EmuError::Unmapped { addr, len })?;
+        let end = match start.checked_add(len) {
+            Some(e) if e as u64 <= m.region.size => e,
+            _ => return Err(EmuError::Unmapped { addr, len }),
+        };
         if !m.region.perm.contains(needed) {
             return Err(EmuError::Permission { addr, needed: what });
         }
-        Ok((start, end))
+        Ok((idx, start, end))
     }
 }
 
@@ -192,9 +237,8 @@ impl Memory for VirtualMemory {
         if buf.is_empty() {
             return Ok(());
         }
-        let (start, end) = self.locate(addr, buf.len(), Perm::READ, "read")?;
-        let m = self.find(addr).expect("located above");
-        buf.copy_from_slice(&m.bytes[start..end]);
+        let (idx, start, end) = self.locate(addr, buf.len(), Perm::READ, "read")?;
+        buf.copy_from_slice(&self.regions[idx].bytes[start..end]);
         Ok(())
     }
 
@@ -202,9 +246,8 @@ impl Memory for VirtualMemory {
         if buf.is_empty() {
             return Ok(());
         }
-        let (start, end) = self.locate(addr, buf.len(), Perm::EXEC, "execute")?;
-        let m = self.find(addr).expect("located above");
-        buf.copy_from_slice(&m.bytes[start..end]);
+        let (idx, start, end) = self.locate(addr, buf.len(), Perm::EXEC, "execute")?;
+        buf.copy_from_slice(&self.regions[idx].bytes[start..end]);
         Ok(())
     }
 
@@ -212,12 +255,65 @@ impl Memory for VirtualMemory {
         if data.is_empty() {
             return Ok(());
         }
-        let (start, end) = self.locate(addr, data.len(), Perm::WRITE, "write")?;
-        let m = self.find_mut(addr).expect("located above");
+        let (idx, start, end) = self.locate(addr, data.len(), Perm::WRITE, "write")?;
+        let m = &mut self.regions[idx];
         let is_exec = m.region.perm.contains(Perm::EXEC);
         m.bytes[start..end].copy_from_slice(data);
         if is_exec {
             self.note_code_write(addr, data.len());
+        }
+        Ok(())
+    }
+
+    // ---- typed accessors, specialised (roadmap W8.1) ----------------------
+    //
+    // Every memory *operand* the interpreter touches arrives here. The default
+    // trait bodies route `read_uint`/`write_uint` through `read_u8`/`u16`/`u32`/
+    // `u64` and then through `read`/`write` with a runtime-length slice, which
+    // costs an extra dynamic dispatch and a `memmove` call for 1–8 bytes. These
+    // overrides resolve the region once and load/store the integer directly.
+    // Semantics are unchanged, including the order in which errors are raised:
+    // an unsupported `size` is rejected *before* the address is examined, and
+    // the message text matches the default bodies verbatim.
+
+    fn read_uint(&self, addr: u64, size: u8) -> Result<u64> {
+        let len = match size {
+            1 => 1usize,
+            2 => 2,
+            4 => 4,
+            8 => 8,
+            _ => return Err(EmuError::Unsupported(format!("memory read of {size} bytes"))),
+        };
+        let (idx, start, end) = self.locate(addr, len, Perm::READ, "read")?;
+        let b = &self.regions[idx].bytes[start..end];
+        Ok(match size {
+            1 => b[0] as u64,
+            2 => u16::from_le_bytes([b[0], b[1]]) as u64,
+            4 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64,
+            _ => u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
+        })
+    }
+
+    fn write_uint(&mut self, addr: u64, size: u8, v: u64) -> Result<()> {
+        let len = match size {
+            1 => 1usize,
+            2 => 2,
+            4 => 4,
+            8 => 8,
+            _ => return Err(EmuError::Unsupported(format!("memory write of {size} bytes"))),
+        };
+        let (idx, start, end) = self.locate(addr, len, Perm::WRITE, "write")?;
+        let m = &mut self.regions[idx];
+        let is_exec = m.region.perm.contains(Perm::EXEC);
+        let dst = &mut m.bytes[start..end];
+        match size {
+            1 => dst[0] = v as u8,
+            2 => dst.copy_from_slice(&(v as u16).to_le_bytes()),
+            4 => dst.copy_from_slice(&(v as u32).to_le_bytes()),
+            _ => dst.copy_from_slice(&v.to_le_bytes()),
+        }
+        if is_exec {
+            self.note_code_write(addr, len);
         }
         Ok(())
     }
