@@ -54,7 +54,13 @@
 //! reproducible to about ±1 instruction, not exactly. A zero-tolerance pin
 //! would be a flaky gate, and a flaky gate gets re-blessed without being read —
 //! which destroys the pin. So every tolerance here is a **noise floor**, sized
-//! from that measurement, not a change budget:
+//! from that measurement, not a change budget.
+//!
+//! An independent full pass after the pins were written confirms the shape of
+//! the noise: 7-Zip Δ 0, tcc Δ 0, Firefox Δ +1, SteamSetup Δ −189. The two runs
+//! that finish deterministically stay put; the two whose guests poll the clock
+//! wander, and the 93M-instruction one wanders by ~189 instructions — which is
+//! precisely why a fault's reach metric must not be pinned to zero.
 //!
 //!   * **`outcome = "exit"` — 64 instructions.** The program reached a defined
 //!     end state, so the count is the complete trace length rather than a
