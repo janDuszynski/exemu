@@ -78,14 +78,30 @@ Run them locally with the commands given.
       cargo build --release -p exemu-cli
       .github/scripts/separability.sh target/release/exemu
 
-- [ ] **A6. Third-party attribution ships with the artifact.** The permissive
-      licences in the shipping closure (MIT, Apache-2.0, BSD, ISC, Zlib,
-      Unicode-3.0, 0BSD) all require the copyright notice and licence text to
-      accompany binary distribution. Generate `THIRD_PARTY_LICENSES` from
-      `docs/sbom/DEPENDENCIES.md` and place it in the `.app` bundle's
-      `Contents/Resources/`.
+- [ ] **A6. Third-party attribution ships with the artifact.** Every licence in
+      the shipping closure (MIT, Apache-2.0, Zlib, 0BSD) requires the copyright
+      notice and licence text to accompany binary distribution. Generate
+      `THIRD_PARTY_LICENSES` from `docs/sbom/DEPENDENCIES.md` and place it in
+      the `.app` bundle's `Contents/Resources/`.
       **Not yet automated — see "Known gaps" below. This is a real obligation
       that is currently unmet for any binary distribution.**
+
+### Two things a scanner will flag that are not problems
+
+Both are real entries in `Cargo.lock` and both will light up an automated
+licence scanner. Neither is a defect; the explanation is recorded here so it
+does not have to be rediscovered under diligence time pressure.
+
+- **`r-efi` declares `MIT OR Apache-2.0 OR LGPL-2.1-or-later`.** The expression
+  is a *disjunction*: exemu elects MIT, and `cargo deny` records that election.
+  `r-efi` is additionally a UEFI-target dependency of `getrandom` and is not
+  built for any target exemu ships. It appears in `Cargo.lock` and nowhere in
+  a produced binary. **This is not the Wine LGPL; do not conflate the two.**
+- **`unicorn-engine` / `unicorn-engine-sys` declare `GPL-2.0`** (the deprecated
+  SPDX identifier for `GPL-2.0-only`, hence the parse warning `cargo deny`
+  prints). These are the differential oracle's reference CPU — see A2 and A3.
+  They are the only copyleft crates in the workspace and the only recorded
+  exception.
 
 ---
 
