@@ -586,6 +586,13 @@ impl WinOs {
         os.set_syscall_handler(reg::SSDT_NT_SET_VALUE_KEY, reg::ssdt_nt_set_value_key);
         os.set_syscall_handler(reg::SSDT_NT_ENUMERATE_KEY, reg::ssdt_nt_enumerate_key);
         os.set_syscall_handler(reg::SSDT_NT_QUERY_KEY, reg::ssdt_nt_query_key);
+        // The rest of the registry surface Wine's kernelbase `Reg*` layer binds
+        // (roadmap W6.4) — COM's CLSID resolution drives these for real.
+        os.set_syscall_handler(reg::SSDT_NT_OPEN_KEY_EX, reg::ssdt_nt_open_key_ex);
+        os.set_syscall_handler(reg::SSDT_NT_ENUMERATE_VALUE_KEY, reg::ssdt_nt_enumerate_value_key);
+        os.set_syscall_handler(reg::SSDT_NT_DELETE_KEY, reg::ssdt_nt_delete_key);
+        os.set_syscall_handler(reg::SSDT_NT_DELETE_VALUE_KEY, reg::ssdt_nt_delete_value_key);
+        os.set_syscall_handler(reg::SSDT_NT_FLUSH_KEY, reg::ssdt_nt_flush_key);
         // NT time syscalls (roadmap W2.14).
         os.set_syscall_handler(time::SSDT_NT_QUERY_SYSTEM_TIME, time::ssdt_nt_query_system_time);
         os.set_syscall_handler(time::SSDT_NT_QUERY_PERFORMANCE_COUNTER, time::ssdt_nt_query_performance_counter);
@@ -1034,9 +1041,16 @@ impl WinOs {
     // ---- in-memory registry hive ----------------------------------------
 
     /// Map a predefined HKEY constant to its canonical root name string.
+    ///
+    /// `HKEY_CLASSES_ROOT` is **not** a hive of its own: on Windows (and in
+    /// Wine's kernelbase, whose NT path for it is
+    /// `\Registry\Machine\Software\Classes`) it is a view of the machine's
+    /// class registrations. Mapping it onto that subtree makes the Win32 seam,
+    /// the NT syscalls and the CLSID seed meet on one set of keys, which is
+    /// what COM's class resolution needs (roadmap W6.4).
     fn reg_hkey_root(hkey: u64) -> Option<&'static str> {
         match hkey {
-            0x8000_0000 => Some("HKCR"),
+            0x8000_0000 => Some(Self::CLASSES_ROOT),
             0x8000_0001 => Some("HKCU"),
             0x8000_0002 => Some("HKLM"),
             0x8000_0003 => Some("HKU"),
