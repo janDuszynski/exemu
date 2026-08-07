@@ -401,6 +401,88 @@ mod tests {
         assert!(matches!(m.fetch(0x1000, &mut b), Err(EmuError::Permission { .. })));
     }
 
+    // ---- region-lookup cache (roadmap W8.1) -------------------------------
+    //
+    // The cache stores raw `regions` indices, and `map`/`unmap` shift that
+    // vector under it. These pin the property the whole design rests on: a
+    // stale hint can only *miss*, never mis-resolve, because it is always
+    // re-validated with `contains` and regions never overlap.
+
+    #[test]
+    fn lookup_cache_survives_a_map_that_shifts_the_region_vector() {
+        let mut m = mem();
+        // Warm the hint for the code region (index 1 of [stack, code]).
+        m.write_u8(0x400010, 0x11).ok();
+        assert_eq!(m.read_u8(0x400010).unwrap(), 0x00); // code is not writable
+        assert_eq!(m.read_u32(0x400000).unwrap(), 0);
+
+        // Insert a region *below* both, pushing every existing index up by one.
+        m.map(Region::new("low", 0x100, 0x100, Perm::RW)).unwrap();
+        m.write_u8(0x180, 0x5A).unwrap();
+
+        // The warmed hint now names the wrong slot; the lookup must still be
+        // right for every region.
+        assert_eq!(m.read_u8(0x180).unwrap(), 0x5A, "new low region");
+        assert_eq!(m.read_u32(0x400000).unwrap(), 0, "code region after the shift");
+        m.write_u64(0x1100, 0xFEED).unwrap();
+        assert_eq!(m.read_u64(0x1100).unwrap(), 0xFEED, "stack region after the shift");
+    }
+
+    #[test]
+    fn lookup_cache_does_not_resurrect_an_unmapped_region() {
+        let mut m = mem();
+        m.map_fixed(0x5000_0000, 0x1000, Perm::RW, "valloc").unwrap();
+        m.write_u32(0x5000_0010, 0xABCD).unwrap();
+        assert_eq!(m.read_u32(0x5000_0010).unwrap(), 0xABCD); // hint now warm
+
+        m.unmap(0x5000_0000, 0).unwrap();
+        assert!(matches!(m.read_u32(0x5000_0010), Err(EmuError::Unmapped { .. })));
+        assert!(matches!(m.write_u32(0x5000_0010, 1), Err(EmuError::Unmapped { .. })));
+        // The regions that remain are still reachable.
+        m.write_u64(0x1100, 7).unwrap();
+        assert_eq!(m.read_u64(0x1100).unwrap(), 7);
+    }
+
+    #[test]
+    fn lookup_cache_sees_a_protection_change() {
+        let mut m = mem();
+        // Warm the hint, then take WRITE away from the region it names.
+        m.write_u8(0x1000, 1).unwrap();
+        m.protect(0x1000, 0x1000, Perm::READ).unwrap();
+        assert!(matches!(m.write_u8(0x1000, 2), Err(EmuError::Permission { .. })));
+        assert_eq!(m.read_u8(0x1000).unwrap(), 1);
+    }
+
+    /// The typed accessors are overridden for speed; they must reject an
+    /// unsupported width *before* looking at the address, exactly as the
+    /// default trait bodies did.
+    #[test]
+    fn typed_accessors_match_the_default_semantics() {
+        let mut m = mem();
+        for (size, v) in [(1u8, 0xAAu64), (2, 0xBBBB), (4, 0xCCCC_CCCC), (8, 0xDDDD_DDDD_DDDD_DDDD)] {
+            m.write_uint(0x1200, size, v).unwrap();
+            assert_eq!(m.read_uint(0x1200, size).unwrap(), v, "width {size}");
+        }
+        // A 4-byte store leaves the neighbouring bytes alone (little-endian).
+        m.write_u64(0x1300, 0).unwrap();
+        m.write_uint(0x1300, 4, 0x1122_3344).unwrap();
+        assert_eq!(m.read_u64(0x1300).unwrap(), 0x1122_3344);
+
+        // Unsupported widths are refused on an *unmapped* address too, proving
+        // the width is checked first.
+        assert!(matches!(m.read_uint(0x9999_9999, 3), Err(EmuError::Unsupported(_))));
+        assert!(matches!(m.write_uint(0x9999_9999, 3, 0), Err(EmuError::Unsupported(_))));
+        // ...and permissions/bounds still apply at supported widths.
+        assert!(matches!(m.write_uint(0x400000, 4, 0), Err(EmuError::Permission { .. })));
+        assert!(matches!(m.read_uint(0x9999_9999, 4), Err(EmuError::Unmapped { .. })));
+        // A typed store into executable memory still trips the SMC seam.
+        let mut rwx = rwx_mem();
+        let before = rwx.code_generation();
+        rwx.write_uint(0x400040, 4, 0x9090_9090).unwrap();
+        assert_eq!(rwx.code_generation() - before, 1);
+        assert_eq!(rwx.code_page_generation(0x400000), 1);
+    }
+
     #[test]
     fn overlap_rejected() {
         let mut m = mem();
