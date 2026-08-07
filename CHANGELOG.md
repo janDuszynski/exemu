@@ -104,8 +104,40 @@ end-to-end on the default path.
   into a 32-bit guest on both its forward paths.
 - **Full WoW64 syscall round trip** on wow64cpu's own code: a 32-bit guest calls
   the init-built BOP → the 64-bit return handler saves the 32-bit context and
-  dispatches → the guest resumes with the result. *Still to come:* routing that
-  dispatch to the real NT SSDT and the full 32-bit process boot.
+  dispatches → the guest resumes with the result.
+- **A 32-bit guest reaches the real NT syscall table** through Wine's *own*
+  `wow64.dll`: `Wow64Transition` → BOP → wow64cpu's return handler →
+  `Wow64SystemServiceEx` → wow64.dll's per-service marshalling thunk →
+  `ntdll` → exemu's SSDT → back. **exemu marshals nothing** — the 32→64
+  argument conversion is Wine's job, done in guest code, which is the whole
+  point of the new-WoW64 model. Verified for `NtQuerySystemTime` (a live
+  FILETIME bracketed against the host clock) and `NtAllocateVirtualMemory`.
+  The pinned Wine set contains no 32-bit `ntdll`, so the 32-bit caller is a
+  synthesized stub of the documented shape: this pins the mechanism, not
+  Wine's own 32-bit ntdll bytes.
+- **Bug found by that work:** exemu ignored `NtAllocateVirtualMemory`'s
+  `ZeroBits`, and its allocation arena starts well above 4 GiB — so a WoW64
+  guest was handed a truncated, unmapped base. Now honoured.
+- *Still to come:* loading wow64 into a real process boot.
+
+### comctl32 / uxtheme / comdlg32 as guest code (W6.1)
+- The pivot's central efficiency claim — that these DLLs cost exemu almost
+  nothing because they are just guest PE code — is now **tested rather than
+  asserted**. A generated sample that *statically* imports
+  `comctl32!InitCommonControlsEx` (forcing the Wine loader to map, relocate,
+  bind and run its DllMain before the entry point) runs to completion on the
+  Wine boot, and the display driver observes **Wine's own comctl32 registering
+  `msctls_progress32` as a real window class** with its own atom, instantiated
+  at the requested geometry. exemu implements no progress bar.
+- Each of the three DLLs is checked to relocate to a non-preferred base and to
+  have **every named import it declares** (309 / 139 / 279 of them) resolve to
+  a real export of the pinned DLL it names, forwarders included; one export per
+  DLL is then executed through the interpreter from the DLL's own bytes.
+- **Two measured gaps are pinned as tests** so they stay visible rather than
+  being worked around: the built-in `BUTTON` class never reaches
+  `NtUserCreateWindowEx` (user32 leaves the built-ins to the kernel side), and
+  child windows do not paint — win32k allocates one surface per *top-level*
+  window and `NtUserCreateWindowEx` dispatches no `WM_NCCREATE`/`WM_CREATE`.
 
 ## v0.0.4 — the windowing substrate
 

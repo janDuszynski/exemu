@@ -370,8 +370,9 @@ What is verified today:
 | A console `.exe` runs to completion on Wine's real PE `kernel32`/`kernelbase`/`ucrtbase` | **works** — correct stdout, file-I/O round-trip, propagated exit code, none of exemu's emulated thunks used |
 | A Win32 GUI app on Wine's `user32`/`gdi32`/`win32u` opens a **native macOS window** | **works** — real mouse/keyboard reach the guest `WndProc`; first frame pinned by a golden-PNG CI gate |
 | Guest faults delivered as Windows exceptions | **works** — via `KiUserExceptionDispatcher`, resumed through `NtContinue` |
-| **WoW64** (32-bit guests on the 64-bit Wine set) | **mechanism verified, boot in progress** — the CS-selector mode switch, the `WOW64_CONTEXT` process model, and a full 32→64 syscall round trip run through the pinned `wow64cpu.dll`'s own code; routing that dispatch to the NT SSDT and the full 32-bit process boot are next |
-| comctl32 / COM / MSI / multimedia / networking | **not yet** — these are Wine PE DLLs, so they arrive as guest code once the boundary carries them |
+| **WoW64** (32-bit guests on the 64-bit Wine set) | **the syscall path works, process boot is next** — a 32-bit guest reaches exemu's real NT syscall table through Wine's own `wow64cpu.dll` + `wow64.dll`, which do the 32→64 marshalling themselves (exemu marshals nothing). Verified end to end for `NtQuerySystemTime` and `NtAllocateVirtualMemory`. The pinned Wine set has no 32-bit `ntdll`, so the 32-bit caller is a synthesized stub of the documented shape: this pins the mechanism, not Wine's own 32-bit ntdll bytes. Loading wow64 into a *real* process boot is the remaining work |
+| **comctl32 / uxtheme / comdlg32** | **arrive as guest code** — a sample that statically imports `comctl32!InitCommonControlsEx` runs to completion on the Wine boot, and Wine's own comctl32 registers `msctls_progress32` as a real window class. exemu implements no progress bar. Two measured gaps are pinned as tests: the built-in `BUTTON` class is not registered by exemu's win32k, and child windows do not paint yet |
+| COM / MSI / multimedia / networking | **not yet** — these are Wine PE DLLs, so they arrive as guest code once the boundary carries them |
 
 **exemu does not ship Wine's DLLs.** You point `--wine-boot` at a set you already
 have. They are loaded as separate guest image files and are never linked or
