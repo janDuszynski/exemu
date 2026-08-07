@@ -1456,3 +1456,112 @@ fn gs_base_is_a_per_thread_state_value() {
     let (b_self, _, _) = run_with_teb(teb_b);
     assert_eq!(b_self, teb_b, "the same gs:[0x30] reads thread B's TEB under B's gs base");
 }
+
+// --- instruction prefetch window (roadmap W8.1) ----------------------------
+//
+// `execute_one` fetches a 16-byte window up front instead of one byte at a
+// time. The window is deliberately *wider* than the instruction, so it can
+// reach past the end of the executable region the instruction lives in. These
+// pins nail the boundary behaviour: the wide fetch must never make an
+// otherwise-legal instruction fault, and must never let an illegal one
+// succeed. The differential oracle cannot cover this — it assembles every
+// trial at the base of a 4 KiB page, so its window always fits.
+
+/// Place `code` so its **last** byte is the last byte of a 4 KiB executable
+/// region and run it to `hlt`. With `with_neighbour`, a readable-but-not-
+/// executable region is butted directly against the end of the code, so a
+/// 16-byte window starting in the tail overruns into memory the guest must
+/// not execute from.
+fn run_at_region_tail(code: &[u8], with_neighbour: bool) -> exemu_core::Result<Interpreter> {
+    const RGN: u64 = 0x1000;
+    let code_end = CODE_BASE + RGN;
+
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, RGN, Perm::RWX)).unwrap();
+    if with_neighbour {
+        mem.map(Region::new("data", code_end, RGN, Perm::RW)).unwrap();
+    }
+    mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+
+    let start = code_end - code.len() as u64;
+    mem.write(start, code).unwrap();
+
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = start;
+    cpu.state_mut().set_rsp(STACK_TOP);
+
+    let mut hooks = NoHooks;
+    for _ in 0..1000 {
+        match cpu.step(&mut mem, &mut hooks)? {
+            Exit::Continue => {}
+            Exit::Halted => return Ok(cpu),
+            other => panic!("unexpected exit: {other:?}"),
+        }
+    }
+    panic!("program did not halt within the step budget");
+}
+
+/// An instruction whose encoding ends exactly at the end of the executable
+/// region still runs: the 16-byte prefetch cannot cover it, so the decoder
+/// falls back to fetching byte by byte — the pre-W8.1 path.
+#[test]
+fn instruction_flush_against_the_end_of_a_code_region_still_executes() {
+    // mov eax, 0x11223344 ; hlt — 6 bytes, occupying the last 6 of the page.
+    let code = [0xB8, 0x44, 0x33, 0x22, 0x11, 0xF4];
+    let cpu = run_at_region_tail(&code, false).expect("tail instruction must execute");
+    assert_eq!(rax(&cpu), 0x1122_3344);
+
+    // Same, but with a non-executable region butted against the code. The wide
+    // window would read into it (and must not be allowed to), yet the
+    // instruction itself is entirely inside executable memory, so it runs.
+    let cpu = run_at_region_tail(&code, true).expect("tail instruction must execute");
+    assert_eq!(rax(&cpu), 0x1122_3344);
+}
+
+/// A *long* instruction in the tail — the one whose immediate crosses where a
+/// window would have ended — decodes byte by byte and still gets the right
+/// operand. Guards the mid-instruction transition from window to slow path.
+#[test]
+fn long_instruction_in_the_region_tail_decodes_correctly() {
+    // movabs rax, 0x0123456789ABCDEF ; hlt — 11 bytes.
+    let code = [
+        0x48, 0xB8, 0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01, // movabs rax, imm64
+        0xF4, // hlt
+    ];
+    let cpu = run_at_region_tail(&code, true).expect("tail instruction must execute");
+    assert_eq!(rax(&cpu), 0x0123_4567_89AB_CDEF);
+}
+
+/// The mirror image: an instruction whose encoding *runs past* the end of the
+/// executable region must still fault. The prefetch must not paper over a
+/// genuine fetch fault by having already read the bytes out of a neighbouring
+/// region that the guest may read but not execute.
+#[test]
+fn instruction_running_off_the_end_of_a_code_region_still_faults() {
+    use exemu_core::EmuError;
+
+    const RGN: u64 = 0x1000;
+    let code_end = CODE_BASE + RGN;
+
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE_BASE, RGN, Perm::RWX)).unwrap();
+    mem.map(Region::new("data", code_end, RGN, Perm::RW)).unwrap();
+    // The neighbour holds bytes that would decode as a plausible immediate.
+    mem.write_u64(code_end, 0xDEAD_BEEF_DEAD_BEEF).unwrap();
+    // `mov eax, imm32` with only its opcode byte inside the code region.
+    mem.write(code_end - 1, &[0xB8]).unwrap();
+
+    let mut cpu = Interpreter::new();
+    cpu.state_mut().rip = code_end - 1;
+    cpu.state_mut().set_rsp(STACK_TOP);
+
+    let err = cpu
+        .step(&mut mem, &mut NoHooks)
+        .expect_err("must fault rather than execute the neighbouring region's bytes");
+    assert!(
+        matches!(err.cause(), EmuError::Permission { .. } | EmuError::Unmapped { .. }),
+        "expected a fetch fault, got {err:?}"
+    );
+    // And no operand was taken from the out-of-bounds bytes.
+    assert_eq!(rax(&cpu), 0);
+}
