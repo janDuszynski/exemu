@@ -5,8 +5,18 @@
 //! enumeration treats the flat map as a tree (a deep path implies its
 //! ancestors). HKLM/HKCU are seeded with a handful of values real installers
 //! probe. Persistence across runs is still a TODO.
+//!
+//! **Case (roadmap W6.4).** The Windows registry is case-*insensitive* and
+//! case-*preserving*: a key created as `Software\Classes` is reached by
+//! `SOFTWARE\CLASSES`, but enumeration reports the spelling it was created
+//! with. Every path entering the hive is therefore folded onto the stored
+//! spelling by [`WinOs::reg_canonical`] before it is used as a map key, and
+//! value names are looked up case-insensitively. This is not cosmetic: Wine's
+//! COM core reaches `HKEY_CLASSES_ROOT` through the NT path
+//! `\Registry\Machine\Software\Classes` while other code spells the same hive
+//! `HKLM\SOFTWARE\…`, so an exact-match hive would silently miss.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap};
 
 use exemu_core::{CpuState, Memory, Result};
 
@@ -35,29 +45,167 @@ fn dword(v: u32) -> (u32, Vec<u8>) {
     (REG_DWORD, v.to_le_bytes().to_vec())
 }
 
+/// `str::strip_prefix`, but comparing ASCII case-insensitively — the registry's
+/// own notion of "same key path". An empty prefix matches everything.
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if prefix.is_empty() {
+        return Some(s);
+    }
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+}
+
 impl WinOs {
+    /// The hive's stored spelling of the immediate child named `name` of the
+    /// (already canonical) key path `base`, if any stored key materialises it.
+    /// An exact-case hit wins; otherwise the first case-insensitive match.
+    fn reg_child_spelling(&self, base: &str, name: &str) -> Option<String> {
+        let prefix = if base.is_empty() { String::new() } else { format!("{base}\\") };
+        let mut ci: Option<String> = None;
+        for k in self.reg_hive.keys() {
+            let rest = match strip_prefix_ci(k, &prefix) {
+                Some(r) => r,
+                None => continue,
+            };
+            let first = rest.split('\\').next().unwrap_or("");
+            if first.is_empty() {
+                continue;
+            }
+            if first == name {
+                return Some(first.to_string());
+            }
+            if ci.is_none() && first.eq_ignore_ascii_case(name) {
+                ci = Some(first.to_string());
+            }
+        }
+        ci
+    }
+
+    /// Fold `path` onto the hive's stored spelling, component by component
+    /// (see the module docs on case). Components with no stored counterpart
+    /// keep the caller's spelling — a subsequent create materialises that.
+    pub(crate) fn reg_canonical(&self, path: &str) -> String {
+        let mut out = String::new();
+        let mut in_hive = true;
+        for comp in path.split('\\') {
+            if comp.is_empty() {
+                continue;
+            }
+            let spelling = if in_hive {
+                match self.reg_child_spelling(&out, comp) {
+                    Some(actual) => actual,
+                    None => {
+                        in_hive = false;
+                        comp.to_string()
+                    }
+                }
+            } else {
+                comp.to_string()
+            };
+            if out.is_empty() {
+                out = spelling;
+            } else {
+                out.push('\\');
+                out.push_str(&spelling);
+            }
+        }
+        out
+    }
+
+    /// Resolve an open HKEY to its canonical hive path (the case-folded face of
+    /// [`WinOs::reg_resolve`]).
+    fn reg_path_of(&self, hkey: u64) -> Option<String> {
+        self.reg_resolve(hkey).map(|p| self.reg_canonical(&p))
+    }
+
+    /// Read a value case-insensitively: `(stored name, type, data)`.
+    fn reg_value(&self, path: &str, name: &str) -> Option<(String, u32, Vec<u8>)> {
+        let m = self.reg_hive.get(path)?;
+        if let Some((t, d)) = m.get(name) {
+            return Some((name.to_string(), *t, d.clone()));
+        }
+        m.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(k, (t, d))| (k.clone(), *t, d.clone()))
+    }
+
+    /// Write a value, replacing an existing case-insensitive match in place so
+    /// `Foo` and `FOO` never coexist as two values of one key.
+    fn reg_value_set(&mut self, path: &str, name: &str, val: (u32, Vec<u8>)) {
+        let m: &mut HashMap<String, (u32, Vec<u8>)> = self.reg_hive.entry(path.to_string()).or_default();
+        if !m.contains_key(name) {
+            if let Some(stored) = m.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned() {
+                m.insert(stored, val);
+                return;
+            }
+        }
+        m.insert(name.to_string(), val);
+    }
+
+    /// Remove a value case-insensitively; `true` when something was removed.
+    fn reg_value_remove(&mut self, path: &str, name: &str) -> bool {
+        let Some(m) = self.reg_hive.get_mut(path) else {
+            return false;
+        };
+        if m.remove(name).is_some() {
+            return true;
+        }
+        let Some(stored) = m.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned() else {
+            return false;
+        };
+        m.remove(&stored).is_some()
+    }
+
     /// Resolve `hkey` + a sub-key path into a canonical full path.
     fn reg_join(&self, hkey: u64, subkey: &str) -> Option<String> {
         let base = self.reg_resolve(hkey)?;
-        Some(if subkey.is_empty() { base } else { format!("{base}\\{subkey}") })
+        let joined = if subkey.is_empty() {
+            base
+        } else {
+            format!("{base}\\{}", subkey.trim_matches('\\'))
+        };
+        Some(self.reg_canonical(&joined))
     }
 
     /// The immediate sub-key names of `base` (the hive is treated as a tree, so
-    /// a deep path materialises its ancestors' membership).
+    /// a deep path materialises its ancestors' membership). Matching is
+    /// case-insensitive and the result is de-duplicated case-insensitively, so
+    /// two stored spellings of one ancestor never enumerate as two sub-keys.
     fn subkeys(&self, base: &str) -> Vec<String> {
         let prefix = format!("{base}\\");
-        let mut set = BTreeSet::new();
+        let mut set: BTreeMap<String, String> = BTreeMap::new();
         for k in self.reg_hive.keys() {
-            if let Some(rest) = k.strip_prefix(&prefix) {
+            if let Some(rest) = strip_prefix_ci(k, &prefix) {
                 if let Some(first) = rest.split('\\').next() {
-                    set.insert(first.to_string());
+                    if !first.is_empty() {
+                        set.entry(first.to_ascii_lowercase()).or_insert_with(|| first.to_string());
+                    }
                 }
             }
         }
-        set.into_iter().collect()
+        set.into_values().collect()
     }
 
-    /// Seed HKLM/HKCU with values installers commonly probe.
+    /// The `HKEY_CLASSES_ROOT` subtree's canonical hive path. Wine's kernelbase
+    /// opens `HKEY_CLASSES_ROOT` as the NT key `\Registry\Machine\Software\
+    /// Classes` (the string is in the pinned `kernelbase.dll`), which
+    /// [`map_nt_registry_root`] folds onto exactly this path — so the NT face,
+    /// the Win32 `HKEY_CLASSES_ROOT` pseudo-handle and the seed below all meet
+    /// on one subtree (roadmap W6.4).
+    pub(crate) const CLASSES_ROOT: &'static str = "HKLM\\SOFTWARE\\Classes";
+
+    /// Materialise a key, folding it onto the hive's existing spelling first.
+    /// Seeds go through here (rather than straight into `reg_hive`) so the hive
+    /// never holds two spellings of one component — `reg_canonical` is only a
+    /// well-defined function when each key path has a single stored spelling.
+    fn reg_key_create(&mut self, path: &str) -> String {
+        let canon = self.reg_canonical(path);
+        self.reg_hive.entry(canon.clone()).or_default();
+        canon
+    }
+
+    /// Seed HKLM/HKCU with values installers commonly probe, plus the
+    /// `HKCR\CLSID\…\InprocServer32` registrations COM's class resolution needs.
     pub(crate) fn reg_seed(&mut self) {
         // (key path, value name, (REG_* type, raw bytes)).
         type Seed<'a> = (&'a str, &'a str, (u32, Vec<u8>));
@@ -71,7 +219,49 @@ impl WinOs {
             ("HKCU\\Software", "", sz("")),
         ];
         for (path, name, val) in entries {
-            self.reg_hive.entry((*path).to_string()).or_default().insert((*name).to_string(), val.clone());
+            let canon = self.reg_key_create(path);
+            self.reg_value_set(&canon, name, val.clone());
+        }
+        self.reg_seed_classes();
+    }
+
+    /// Seed the `HKEY_CLASSES_ROOT` subtree (roadmap W6.4).
+    ///
+    /// COM's `CoGetClassObject`/`CoCreateInstance` resolve a CLSID by reading
+    /// `HKCR\CLSID\{…}\InprocServer32` — its default value names the DLL to
+    /// `LoadLibrary` and call `DllGetClassObject` on, and `ThreadingModel`
+    /// decides whether the object can be created in the caller's apartment.
+    /// The classes below are the ones **Wine's own `ole32.dll` serves from its
+    /// `DllGetClassObject`** (the CLSIDs appear verbatim in the pinned
+    /// binary's `.rdata`), registered exactly as a real prefix registers them,
+    /// so `CoCreateInstance` on any of them finds a real in-proc server.
+    fn reg_seed_classes(&mut self) {
+        /// The in-proc server DLL every class below is served by — Wine's own
+        /// `ole32.dll`, which the guest loads by this name from the prefix.
+        const COM_INPROC_SERVER: &str = "ole32.dll";
+        // (CLSID string, the class's friendly name / default value).
+        const OLE32_CLASSES: &[(&str, &str)] = &[
+            ("{00000303-0000-0000-C000-000000000046}", "FileMoniker"),
+            ("{00000304-0000-0000-C000-000000000046}", "ItemMoniker"),
+            ("{00000305-0000-0000-C000-000000000046}", "AntiMoniker"),
+            ("{00000306-0000-0000-C000-000000000046}", "PointerMoniker"),
+            ("{00000309-0000-0000-C000-000000000046}", "CompositeMoniker"),
+            ("{0000031A-0000-0000-C000-000000000046}", "ClassMoniker"),
+            ("{00000323-0000-0000-C000-000000000046}", "StdGlobalInterfaceTable"),
+        ];
+        let root = Self::CLASSES_ROOT;
+        // Materialise the container keys so an `NtOpenKey`/`RegOpenKeyEx` on
+        // them (which COM does before descending) succeeds even before any
+        // class below them is read.
+        for key in [root.to_string(), format!("{root}\\CLSID")] {
+            self.reg_key_create(&key);
+        }
+        for (clsid, name) in OLE32_CLASSES {
+            let key = self.reg_key_create(&format!("{root}\\CLSID\\{clsid}"));
+            self.reg_value_set(&key, "", sz(name));
+            let inproc = self.reg_key_create(&format!("{key}\\InprocServer32"));
+            self.reg_value_set(&inproc, "", sz(COM_INPROC_SERVER));
+            self.reg_value_set(&inproc, "ThreadingModel", sz("Both"));
         }
     }
 
@@ -107,10 +297,7 @@ impl WinOs {
             self.last_error = ERROR_INVALID_HANDLE as u32;
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
-        // A key exists if it has its own entry or any descendant.
-        let exists = self.reg_hive.contains_key(&path)
-            || self.reg_hive.keys().any(|k| k.starts_with(&format!("{path}\\")));
-        if !exists {
+        if !self.reg_key_exists(&path) {
             self.last_error = ERROR_FILE_NOT_FOUND as u32;
             return Ok(Outcome::Return(ERROR_FILE_NOT_FOUND));
         }
@@ -129,7 +316,7 @@ impl WinOs {
         let dw_type = self.arg(cpu, mem, 3)? as u32;
         let lp_data = self.arg(cpu, mem, 4)?;
         let cb_data = self.arg(cpu, mem, 5)? as usize;
-        let Some(path) = self.reg_resolve(hkey) else {
+        let Some(path) = self.reg_path_of(hkey) else {
             self.last_error = ERROR_INVALID_HANDLE as u32;
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
@@ -137,7 +324,7 @@ impl WinOs {
         if lp_data != 0 && cb_data > 0 {
             mem.read(lp_data, &mut data)?;
         }
-        self.reg_hive.entry(path).or_default().insert(name, (dw_type, data));
+        self.reg_value_set(&path, &name, (dw_type, data));
         Ok(Outcome::Return(ERROR_SUCCESS))
     }
 
@@ -148,11 +335,11 @@ impl WinOs {
         let lp_type = self.arg(cpu, mem, 3)?;
         let lp_data = self.arg(cpu, mem, 4)?;
         let lpcb_data = self.arg(cpu, mem, 5)?;
-        let Some(path) = self.reg_resolve(hkey) else {
+        let Some(path) = self.reg_path_of(hkey) else {
             self.last_error = ERROR_INVALID_HANDLE as u32;
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
-        let Some((ty, data)) = self.reg_hive.get(&path).and_then(|m| m.get(&name)).map(|(t, d)| (*t, d.clone())) else {
+        let Some((_, ty, data)) = self.reg_value(&path, &name) else {
             self.last_error = ERROR_FILE_NOT_FOUND as u32;
             return Ok(Outcome::Return(ERROR_FILE_NOT_FOUND));
         };
@@ -188,12 +375,11 @@ impl WinOs {
     pub(crate) fn reg_delete_value(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, wide: bool) -> Result<Outcome> {
         let hkey = self.arg(cpu, mem, 0)?;
         let name = read_path(mem, self.arg(cpu, mem, 1)?, wide)?;
-        let Some(path) = self.reg_resolve(hkey) else {
+        let Some(path) = self.reg_path_of(hkey) else {
             self.last_error = ERROR_INVALID_HANDLE as u32;
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
-        let removed = self.reg_hive.get_mut(&path).and_then(|m| m.remove(&name)).is_some();
-        if removed {
+        if self.reg_value_remove(&path, &name) {
             Ok(Outcome::Return(ERROR_SUCCESS))
         } else {
             self.last_error = ERROR_FILE_NOT_FOUND as u32;
@@ -221,7 +407,7 @@ impl WinOs {
         let name_ptr = self.arg(cpu, mem, 2)?;
         let cch_ptr = self.arg(cpu, mem, 3)?;
         let ft_ptr = self.arg(cpu, mem, 7)?;
-        let Some(base) = self.reg_resolve(hkey) else {
+        let Some(base) = self.reg_path_of(hkey) else {
             self.last_error = ERROR_INVALID_HANDLE as u32;
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
@@ -245,7 +431,7 @@ impl WinOs {
         let type_ptr = self.arg(cpu, mem, 5)?;
         let data_ptr = self.arg(cpu, mem, 6)?;
         let cb_ptr = self.arg(cpu, mem, 7)?;
-        let Some(path) = self.reg_resolve(hkey) else {
+        let Some(path) = self.reg_path_of(hkey) else {
             self.last_error = ERROR_INVALID_HANDLE as u32;
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
@@ -289,7 +475,7 @@ impl WinOs {
         let c_max_vname = self.arg(cpu, mem, 8)?;
         let c_max_vlen = self.arg(cpu, mem, 9)?;
         let ft_ptr = self.arg(cpu, mem, 11)?;
-        let Some(base) = self.reg_resolve(hkey) else {
+        let Some(base) = self.reg_path_of(hkey) else {
             self.last_error = ERROR_INVALID_HANDLE as u32;
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
@@ -353,6 +539,9 @@ const KEY_NODE_INFORMATION: u64 = 1;
 const KEY_FULL_INFORMATION: u64 = 2;
 const KEY_NAME_INFORMATION: u64 = 3;
 
+// STATUS_CANNOT_DELETE — `NtDeleteKey` on a key that still has sub-keys.
+const STATUS_CANNOT_DELETE: u32 = 0xC000_0121;
+
 // SSDT indices (pinned guest ntdll.dll `mov eax,N`).
 pub(crate) const SSDT_NT_CREATE_KEY: u32 = 0x1d;
 pub(crate) const SSDT_NT_OPEN_KEY: u32 = 0x12;
@@ -360,6 +549,15 @@ pub(crate) const SSDT_NT_QUERY_VALUE_KEY: u32 = 0x17;
 pub(crate) const SSDT_NT_SET_VALUE_KEY: u32 = 0x60;
 pub(crate) const SSDT_NT_ENUMERATE_KEY: u32 = 0x32;
 pub(crate) const SSDT_NT_QUERY_KEY: u32 = 0x16;
+// Roadmap W6.4 — the rest of the surface Wine's kernelbase `Reg*` layer binds
+// (its ntdll import table names exactly these), needed once real guest code
+// (COM's class resolution, `RegOpenKeyEx`/`RegEnumValue`/`RegDeleteKey`) drives
+// the hive instead of a test harness.
+pub(crate) const SSDT_NT_OPEN_KEY_EX: u32 = 0xb0;
+pub(crate) const SSDT_NT_ENUMERATE_VALUE_KEY: u32 = 0x13;
+pub(crate) const SSDT_NT_DELETE_KEY: u32 = 0x8e;
+pub(crate) const SSDT_NT_DELETE_VALUE_KEY: u32 = 0x8f;
+pub(crate) const SSDT_NT_FLUSH_KEY: u32 = 0x94;
 
 /// Fold an absolute NT registry path (`\Registry\Machine\SOFTWARE\…`) onto the
 /// hive's `HKLM\…`/`HKU\…` convention so an NT-opened key and a Win32-opened key
@@ -404,6 +602,69 @@ fn utf16_bytes(s: &str) -> u32 {
     (s.encode_utf16().count() * 2) as u32
 }
 
+/// Lay one registry value out in a `KEY_VALUE_*_INFORMATION` buffer (wdm.h) and
+/// return the NTSTATUS: shared by `NtQueryValueKey` (value by name) and
+/// `NtEnumerateValueKey` (value by index), which differ only in how they pick
+/// the value. Buffer too small for the fixed header → STATUS_BUFFER_TOO_SMALL;
+/// header fits but not the whole record → STATUS_BUFFER_OVERFLOW;
+/// `*ResultLength` always reports the full required size.
+#[allow(clippy::too_many_arguments)]
+fn write_key_value_info(
+    mem: &mut dyn Memory,
+    class: u64,
+    buf: u64,
+    length: u64,
+    result_len_ptr: u64,
+    name: &str,
+    ty: u32,
+    data: &[u8],
+) -> Result<u32> {
+    let name_bytes = utf16_bytes(name);
+    let data_len = data.len() as u32;
+    let (header, total) = match class {
+        KEY_VALUE_BASIC_INFORMATION => (12u32, 12 + name_bytes),
+        KEY_VALUE_FULL_INFORMATION => (20u32, 20 + name_bytes + data_len),
+        KEY_VALUE_PARTIAL_INFORMATION => (12u32, 12 + data_len),
+        _ => return Ok(STATUS_INVALID_PARAMETER),
+    };
+    if result_len_ptr != 0 {
+        mem.write_u32(result_len_ptr, total)?;
+    }
+    if (length as u32) < header {
+        return Ok(STATUS_BUFFER_TOO_SMALL);
+    }
+    match class {
+        KEY_VALUE_BASIC_INFORMATION => {
+            mem.write_u32(buf, 0)?; // TitleIndex
+            mem.write_u32(buf + 4, ty)?;
+            mem.write_u32(buf + 8, name_bytes)?;
+            write_utf16_bounded(mem, buf + 12, name, length - 12)?;
+        }
+        KEY_VALUE_FULL_INFORMATION => {
+            mem.write_u32(buf, 0)?;
+            mem.write_u32(buf + 4, ty)?;
+            mem.write_u32(buf + 8, 20 + name_bytes)?; // DataOffset
+            mem.write_u32(buf + 12, data_len)?;
+            mem.write_u32(buf + 16, name_bytes)?;
+            write_utf16_bounded(mem, buf + 20, name, length.saturating_sub(20))?;
+            let data_at = 20 + name_bytes as u64;
+            if length > data_at {
+                let n = ((length - data_at) as usize).min(data.len());
+                mem.write(buf + data_at, &data[..n])?;
+            }
+        }
+        KEY_VALUE_PARTIAL_INFORMATION => {
+            mem.write_u32(buf, 0)?;
+            mem.write_u32(buf + 4, ty)?;
+            mem.write_u32(buf + 8, data_len)?;
+            let n = ((length - 12) as usize).min(data.len());
+            mem.write(buf + 12, &data[..n])?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(if (length as u32) < total { STATUS_BUFFER_OVERFLOW } else { NT_SUCCESS })
+}
+
 impl WinOs {
     /// Resolve an `OBJECT_ATTRIBUTES` (RootDirectory + ObjectName) into a
     /// canonical hive path. 64-bit layout (the W2 pivot pins 64-bit ntdll):
@@ -418,18 +679,26 @@ impl WinOs {
         let root_dir = mem.read_u64(objattr + 0x08).ok()?;
         let name_ptr = mem.read_u64(objattr + 0x10).ok()?;
         let name = crate::fs::read_unicode_string(mem, name_ptr).unwrap_or_default();
-        if root_dir != 0 {
+        let joined = if root_dir != 0 {
             let base = self.reg_resolve(root_dir)?;
-            let sub = name.trim_start_matches('\\');
-            Some(if sub.is_empty() { base } else { format!("{base}\\{sub}") })
+            let sub = name.trim_matches('\\');
+            if sub.is_empty() { base } else { format!("{base}\\{sub}") }
         } else {
-            map_nt_registry_root(&name)
-        }
+            map_nt_registry_root(&name)?
+        };
+        // Fold onto the hive's stored spelling: the NT face and the Win32 face
+        // must land on one key however each spelled it (see the module docs).
+        Some(self.reg_canonical(&joined))
     }
 
-    /// Whether `path` names a live key (its own entry or any descendant).
+    /// Whether `path` names a live key (its own entry or any descendant),
+    /// compared case-insensitively like every other registry path match.
     fn reg_key_exists(&self, path: &str) -> bool {
-        self.reg_hive.contains_key(path) || self.reg_hive.keys().any(|k| k.starts_with(&format!("{path}\\")))
+        if self.reg_hive.contains_key(path) {
+            return true;
+        }
+        let prefix = format!("{path}\\");
+        self.reg_hive.keys().any(|k| k.eq_ignore_ascii_case(path) || strip_prefix_ci(k, &prefix).is_some())
     }
 
     /// The leaf component of a key path (`HKLM\SOFTWARE\Foo` → `Foo`).
@@ -492,7 +761,7 @@ impl WinOs {
         // the whole 8-byte slot picks up that garbage (observed on the Wine boot:
         // a real size of 0xC arriving as 0x1_0000000C), so mask to 32 bits.
         let data_size = (self.syscall_arg(cpu, mem, 5)? as u32) as usize;
-        let Some(path) = self.reg_resolve(hkey) else {
+        let Some(path) = self.reg_path_of(hkey) else {
             return Ok(STATUS_INVALID_HANDLE);
         };
         let name = crate::fs::read_unicode_string(mem, name_ptr).unwrap_or_default();
@@ -500,7 +769,7 @@ impl WinOs {
         if data_ptr != 0 && data_size > 0 {
             mem.read(data_ptr, &mut data)?;
         }
-        self.reg_hive.entry(path).or_default().insert(name, (ty, data));
+        self.reg_value_set(&path, &name, (ty, data));
         Ok(NT_SUCCESS)
     }
 
@@ -516,57 +785,87 @@ impl WinOs {
         let buf = self.syscall_arg(cpu, mem, 3)?;
         let length = self.syscall_arg(cpu, mem, 4)?;
         let result_len_ptr = self.syscall_arg(cpu, mem, 5)?;
-        let Some(path) = self.reg_resolve(hkey) else {
+        let Some(path) = self.reg_path_of(hkey) else {
             return Ok(STATUS_INVALID_HANDLE);
         };
         let name = crate::fs::read_unicode_string(mem, name_ptr).unwrap_or_default();
-        let Some((ty, data)) = self.reg_hive.get(&path).and_then(|m| m.get(&name)).map(|(t, d)| (*t, d.clone())) else {
+        // Case-insensitive, but report the *stored* spelling — that is what the
+        // Basic/Full classes carry back to the caller.
+        let Some((stored, ty, data)) = self.reg_value(&path, &name) else {
             return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
         };
-        let name_bytes = utf16_bytes(&name);
-        let data_len = data.len() as u32;
-        let (header, total) = match class {
-            KEY_VALUE_BASIC_INFORMATION => (12u32, 12 + name_bytes),
-            KEY_VALUE_FULL_INFORMATION => (20u32, 20 + name_bytes + data_len),
-            KEY_VALUE_PARTIAL_INFORMATION => (12u32, 12 + data_len),
-            _ => return Ok(STATUS_INVALID_PARAMETER),
+        write_key_value_info(mem, class, buf, length, result_len_ptr, &stored, ty, &data)
+    }
+
+    /// `NtEnumerateValueKey(KeyHandle, Index, InfoClass, *KeyValueInformation,
+    /// Length, *ResultLength)` — the `Index`-th **value** of the key, in the
+    /// same Basic/Full/Partial class layouts as `NtQueryValueKey`. Values are
+    /// enumerated in sorted name order (a stable order the flat hive can
+    /// guarantee); an index past the last value → STATUS_NO_MORE_ENTRIES.
+    /// This is what `RegEnumValueW` binds to (roadmap W6.4).
+    pub(crate) fn nt_enumerate_value_key(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let hkey = self.syscall_arg(cpu, mem, 0)?;
+        let index = self.syscall_arg(cpu, mem, 1)? as usize;
+        let class = self.syscall_arg(cpu, mem, 2)?;
+        let buf = self.syscall_arg(cpu, mem, 3)?;
+        let length = self.syscall_arg(cpu, mem, 4)?;
+        let result_len_ptr = self.syscall_arg(cpu, mem, 5)?;
+        let Some(path) = self.reg_path_of(hkey) else {
+            return Ok(STATUS_INVALID_HANDLE);
         };
-        if result_len_ptr != 0 {
-            mem.write_u32(result_len_ptr, total)?;
+        let mut items: Vec<(String, u32, Vec<u8>)> = match self.reg_hive.get(&path) {
+            Some(m) => m.iter().map(|(k, (t, d))| (k.clone(), *t, d.clone())).collect(),
+            None => Vec::new(),
+        };
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        let Some((name, ty, data)) = items.get(index).cloned() else {
+            return Ok(STATUS_NO_MORE_ENTRIES);
+        };
+        write_key_value_info(mem, class, buf, length, result_len_ptr, &name, ty, &data)
+    }
+
+    /// `NtDeleteKey(KeyHandle)` — remove the key the handle names. NT refuses to
+    /// delete a key that still has sub-keys (STATUS_CANNOT_DELETE); the caller
+    /// (`RegDeleteKeyExW`) is expected to walk depth-first.
+    pub(crate) fn nt_delete_key(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let hkey = self.syscall_arg(cpu, mem, 0)?;
+        let Some(path) = self.reg_path_of(hkey) else {
+            return Ok(STATUS_INVALID_HANDLE);
+        };
+        if !self.reg_key_exists(&path) {
+            return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
         }
-        if (length as u32) < header {
-            return Ok(STATUS_BUFFER_TOO_SMALL);
+        if !self.subkeys(&path).is_empty() {
+            return Ok(STATUS_CANNOT_DELETE);
         }
-        match class {
-            KEY_VALUE_BASIC_INFORMATION => {
-                mem.write_u32(buf, 0)?; // TitleIndex
-                mem.write_u32(buf + 4, ty)?;
-                mem.write_u32(buf + 8, name_bytes)?;
-                write_utf16_bounded(mem, buf + 12, &name, length - 12)?;
-            }
-            KEY_VALUE_FULL_INFORMATION => {
-                mem.write_u32(buf, 0)?;
-                mem.write_u32(buf + 4, ty)?;
-                mem.write_u32(buf + 8, 20 + name_bytes)?; // DataOffset
-                mem.write_u32(buf + 12, data_len)?;
-                mem.write_u32(buf + 16, name_bytes)?;
-                write_utf16_bounded(mem, buf + 20, &name, length.saturating_sub(20))?;
-                let data_at = 20 + name_bytes as u64;
-                if length > data_at {
-                    let n = ((length - data_at) as usize).min(data.len());
-                    mem.write(buf + data_at, &data[..n])?;
-                }
-            }
-            KEY_VALUE_PARTIAL_INFORMATION => {
-                mem.write_u32(buf, 0)?;
-                mem.write_u32(buf + 4, ty)?;
-                mem.write_u32(buf + 8, data_len)?;
-                let n = ((length - 12) as usize).min(data.len());
-                mem.write(buf + 12, &data[..n])?;
-            }
-            _ => unreachable!(),
+        self.reg_hive.remove(&path);
+        Ok(NT_SUCCESS)
+    }
+
+    /// `NtDeleteValueKey(KeyHandle, *ValueName)` — remove one value.
+    pub(crate) fn nt_delete_value_key(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let hkey = self.syscall_arg(cpu, mem, 0)?;
+        let name_ptr = self.syscall_arg(cpu, mem, 1)?;
+        let Some(path) = self.reg_path_of(hkey) else {
+            return Ok(STATUS_INVALID_HANDLE);
+        };
+        let name = crate::fs::read_unicode_string(mem, name_ptr).unwrap_or_default();
+        if self.reg_value_remove(&path, &name) {
+            Ok(NT_SUCCESS)
+        } else {
+            Ok(STATUS_OBJECT_NAME_NOT_FOUND)
         }
-        Ok(if (length as u32) < total { STATUS_BUFFER_OVERFLOW } else { NT_SUCCESS })
+    }
+
+    /// `NtFlushKey(KeyHandle)` — commit a key to backing store. exemu's hive is
+    /// in memory and every write is already visible, so this only validates the
+    /// handle; `RegFlushKey` callers just need the SUCCESS.
+    pub(crate) fn nt_flush_key(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let hkey = self.syscall_arg(cpu, mem, 0)?;
+        match self.reg_path_of(hkey) {
+            Some(_) => Ok(NT_SUCCESS),
+            None => Ok(STATUS_INVALID_HANDLE),
+        }
     }
 
     /// `NtEnumerateKey(KeyHandle, Index, InfoClass, *KeyInformation, Length,
@@ -579,7 +878,7 @@ impl WinOs {
         let buf = self.syscall_arg(cpu, mem, 3)?;
         let length = self.syscall_arg(cpu, mem, 4)?;
         let result_len_ptr = self.syscall_arg(cpu, mem, 5)?;
-        let Some(base) = self.reg_resolve(hkey) else {
+        let Some(base) = self.reg_path_of(hkey) else {
             return Ok(STATUS_INVALID_HANDLE);
         };
         let subs = self.subkeys(&base);
@@ -620,7 +919,7 @@ impl WinOs {
         let buf = self.syscall_arg(cpu, mem, 2)?;
         let length = self.syscall_arg(cpu, mem, 3)?;
         let result_len_ptr = self.syscall_arg(cpu, mem, 4)?;
-        let Some(path) = self.reg_resolve(hkey) else {
+        let Some(path) = self.reg_path_of(hkey) else {
             return Ok(STATUS_INVALID_HANDLE);
         };
         let lwt = crate::time::filetime_now();
@@ -716,6 +1015,26 @@ pub(crate) fn ssdt_nt_enumerate_key(os: &mut WinOs, cpu: &mut CpuState, mem: &mu
 }
 pub(crate) fn ssdt_nt_query_key(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_query_key(cpu, mem)
+}
+/// `NtOpenKeyEx(*KeyHandle, DesiredAccess, *ObjectAttributes, OpenOptions)` —
+/// `NtOpenKey` plus an options word (REG_OPTION_OPEN_LINK / BACKUP_RESTORE),
+/// none of which change the in-memory hive's behaviour, so it shares the
+/// handler. Wine's kernelbase binds this one, not `NtOpenKey`, for
+/// `RegOpenKeyExW` (roadmap W6.4).
+pub(crate) fn ssdt_nt_open_key_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_open_key(cpu, mem)
+}
+pub(crate) fn ssdt_nt_enumerate_value_key(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_enumerate_value_key(cpu, mem)
+}
+pub(crate) fn ssdt_nt_delete_key(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_delete_key(cpu, mem)
+}
+pub(crate) fn ssdt_nt_delete_value_key(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_delete_value_key(cpu, mem)
+}
+pub(crate) fn ssdt_nt_flush_key(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_flush_key(cpu, mem)
 }
 
 /// Write a registry name to `name_ptr` honouring the IN/OUT char count at
