@@ -49,6 +49,12 @@ const WOW64CPU: &str = "../../example_exe/wine-dlls/x86_64-windows/wow64cpu.dll"
 // base is 0x7a40_0000; we relocate to exercise the fixups, staying clear of the
 // 32-bit guest region, SCRATCH/SENTINEL, and KUSER.)
 const WOW64CPU_BASE: u64 = 0x0000_0000_6A40_0000;
+// `wow64.dll` — the 64-bit WoW64 *service* half: it owns the 32→64 argument
+// marshalling and issues the real 64-bit `Nt*` calls itself (roadmap W5.3).
+// Unlike wow64cpu it has no sub-4 GiB constraint (only 64-bit code calls it);
+// relocated off its preferred 0x1_8000_0000 base to exercise the fixups.
+const WOW64: &str = "../../example_exe/wine-dlls/x86_64-windows/wow64.dll";
+const WOW64_BASE: u64 = 0x0000_0000_6B00_0000;
 
 // --- The fixed low-page layout Wine's ntdll stubs assume. ------------------
 // KUSER_SHARED_DATA read-only at 0x7ffe0000 with SystemCall@0x308 nonzero (the
@@ -87,6 +93,11 @@ struct Dll {
     base: u64,
     /// export name → absolute virtual address (base + rva). Forwarders excluded.
     exports: HashMap<String, u64>,
+    /// `(IAT slot rva, imported symbol name)` for every by-name import. Used by
+    /// [`bind_imports`] to wire one loaded image's IAT to another's real exports
+    /// — `wow64.dll` reaches the 64-bit NT layer through 271 ntdll imports
+    /// (roadmap W5.3).
+    imports: Vec<(u32, String)>,
 }
 
 impl Dll {
@@ -97,6 +108,36 @@ impl Dll {
             .get(name)
             .unwrap_or_else(|| panic!("{name} not exported by the loaded DLL"))
     }
+}
+
+/// Bind every by-name import of `dll` that `provider` actually exports, writing
+/// the provider's real export VA into the importer's IAT slot — the loader step
+/// that makes `wow64.dll`'s thunks reach Wine's real 64-bit `ntdll` stubs (and
+/// through them exemu's SSDT). Returns the number of slots bound; imports the
+/// provider does not export are left as-is (they are never called on the paths
+/// under test, and a null slot faults loudly if that ever changes).
+fn bind_imports(mem: &mut VirtualMemory, dll: &Dll, provider: &Dll) -> usize {
+    let mut bound = 0;
+    for (iat_rva, name) in &dll.imports {
+        if let Some(&addr) = provider.exports.get(name) {
+            mem.write_u64(dll.base + *iat_rva as u64, addr).unwrap();
+            bound += 1;
+        }
+    }
+    bound
+}
+
+/// The SSDT index a Wine 64-bit `ntdll` stub carries, read out of the **mapped
+/// image's own bytes**: every stub opens `4C 8B D1` (`mov r10,rcx`) followed by
+/// `B8 <imm32>` (`mov eax,<index>`). Resolving the index this way keeps the
+/// WoW64 tests free of hardcoded service numbers — the same "resolve, never
+/// hardcode" rule the rest of this harness follows.
+fn ssdt_index_of(mem: &VirtualMemory, dll: &Dll, name: &str) -> u32 {
+    let stub = dll.export(name);
+    let mut head = [0u8; 4];
+    mem.read(stub, &mut head).expect("the stub is mapped");
+    assert_eq!(&head, &[0x4C, 0x8B, 0xD1, 0xB8], "{name} is not a `mov r10,rcx; mov eax,N` syscall stub");
+    mem.read_u32(stub + 4).unwrap()
 }
 
 /// Parse + map + relocate `bytes` at `base` into `mem`, returning the resolved
@@ -137,7 +178,15 @@ fn load_dll(mem: &mut VirtualMemory, bytes: &[u8], base: u64) -> Dll {
             exports.insert(name.clone(), base + e.rva as u64);
         }
     }
-    Dll { base, exports }
+    let imports = image
+        .imports
+        .iter()
+        .filter_map(|i| match &i.symbol {
+            exemu_core::ImportSymbol::Named(n) => Some((i.iat_rva, n.clone())),
+            exemu_core::ImportSymbol::Ordinal(_) => None,
+        })
+        .collect();
+    Dll { base, exports, imports }
 }
 
 /// Build a fresh `(WinOs, VirtualMemory)` with the fixed low-page layout, a
@@ -880,3 +929,272 @@ fn wow64_guest_syscall_round_trips_through_the_real_bop() {
     assert_eq!(mem.read_u32(RECORD).unwrap(), INDEX, "Wow64SystemServiceEx received the guest's service index");
     assert_eq!(mem.read_u32(SENTINEL32).unwrap(), 0x0000_D00D, "the 32-bit guest resumed with the service result in eax");
 }
+
+// ==========================================================================
+// W5.1-final + W5.3: `ntdll!Wow64Transition` — a 32-bit ntdll-shaped syscall
+// stub reaches the 64-bit NT layer through the real BOP.
+// ==========================================================================
+// The synthesized 32-bit guest image. The pinned Wine set is the **64-bit**
+// `x86_64-windows` set and contains **no 32-bit ntdll**, so the ntdll32 half
+// below is hand-assembled to the documented stub shape (see
+// `exemu_os::wow64::publish_wow64_transition`). It pins the *mechanism* —
+// published pointer → BOP → 64-bit handler → service → resume — not Wine's own
+// 32-bit ntdll bytes.
+const G32_REGION: u64 = 0x0040_0000; // one RWX region, 0x30000 bytes
+const G32_CALLER: u64 = G32_REGION; // the "application" that calls NtXxx
+const G32_STUB: u64 = G32_REGION + 0x100; // ntdll32!NtXxx (the syscall stub)
+const G32_SVC_CALL: u64 = G32_REGION + 0x200; // ntdll32!Wow64SystemServiceCall
+const G32_TRANSITION: u64 = G32_REGION + 0x300; // ntdll32!Wow64Transition (data)
+const G32_STACK: u64 = 0x0041_0000; // initial 32-bit ESP
+const G32_STATUS: u64 = 0x0042_0000; // caller stores the returned EAX here
+const G32_ESP_OUT: u64 = 0x0042_0004; // …and the post-call ESP here
+const G32_OUT: u64 = 0x0042_0008; // the NT service's out-buffer (8 bytes)
+
+/// Lay out the synthesized 32-bit guest: an application-side caller, an
+/// ntdll32-shaped `Nt*` stub for `index` taking `args` (stdcall, `4*len` bytes
+/// of arguments), `Wow64SystemServiceCall`, and the `Wow64Transition` data slot
+/// — then publish `bop` into that slot through the production
+/// [`exemu_os::wow64::publish_wow64_transition`].
+///
+/// ```text
+///   caller:                   push argN … push arg0   ; stdcall, right-to-left
+///                             call ntdll32!NtXxx      ; pushes the OUTER retaddr
+///                             mov [G32_STATUS], eax   ; the NTSTATUS
+///                             mov [G32_ESP_OUT], esp  ; the stack must be balanced
+///                             hlt
+///   ntdll32!NtXxx:            mov eax, index
+///                             mov edx, offset Wow64SystemServiceCall
+///                             call edx                ; pushes the INNER retaddr
+///                             ret 4*N                 ; stdcall callee cleanup
+///   ntdll32!Wow64SystemServiceCall:
+///                             jmp dword ptr [Wow64Transition]
+/// ```
+///
+/// That double-call depth is what makes `wow64cpu`'s recovered return handler
+/// line up: it takes `Eip` from `[esp]` (the inner retaddr), `Esp = esp+4` (past
+/// it), and the **argument block from `esp+8`** — i.e. past the outer retaddr,
+/// exactly where a stdcall's first argument sits.
+fn build_wow64_syscall_guest(mem: &mut VirtualMemory, bop: u64, index: u32, args: &[u32]) {
+    mem.map(Region::new("guest32", G32_REGION, 0x3_0000, Perm::RWX)).unwrap();
+
+    // caller — push the stdcall arguments right-to-left, then call the stub.
+    let mut c = Vec::new();
+    for a in args.iter().rev() {
+        c.push(0x68); // push imm32
+        c.extend_from_slice(&a.to_le_bytes());
+    }
+    c.push(0xE8); // call rel32 → G32_STUB
+    let after_call = G32_CALLER + c.len() as u64 + 4;
+    c.extend_from_slice(&((G32_STUB as i64 - after_call as i64) as i32).to_le_bytes());
+    c.extend_from_slice(&[0x89, 0x05]); // mov [disp32], eax
+    c.extend_from_slice(&(G32_STATUS as u32).to_le_bytes());
+    c.extend_from_slice(&[0x89, 0x25]); // mov [disp32], esp
+    c.extend_from_slice(&(G32_ESP_OUT as u32).to_le_bytes());
+    c.push(0xF4); // hlt
+    mem.write(G32_CALLER, &c).unwrap();
+
+    // ntdll32!NtXxx — the real 32-bit ntdll stub shape.
+    let mut s = vec![0xB8]; // mov eax, index
+    s.extend_from_slice(&index.to_le_bytes());
+    s.push(0xBA); // mov edx, offset Wow64SystemServiceCall
+    s.extend_from_slice(&(G32_SVC_CALL as u32).to_le_bytes());
+    s.extend_from_slice(&[0xFF, 0xD2]); // call edx
+    s.push(0xC2); // ret imm16 (stdcall: callee pops the arguments)
+    s.extend_from_slice(&((args.len() * 4) as u16).to_le_bytes());
+    mem.write(G32_STUB, &s).unwrap();
+
+    // ntdll32!Wow64SystemServiceCall — `jmp dword ptr [Wow64Transition]`. In
+    // 32-bit mode `FF 25 disp32` is an **absolute** indirect near jump.
+    let mut j = vec![0xFF, 0x25];
+    j.extend_from_slice(&(G32_TRANSITION as u32).to_le_bytes());
+    mem.write(G32_SVC_CALL, &j).unwrap();
+
+    // THE STEP UNDER TEST: publish the BOP pointer into ntdll32!Wow64Transition.
+    exemu_os::wow64::publish_wow64_transition(mem, G32_TRANSITION, bop).unwrap();
+}
+
+/// W5.1-final: **`Wow64Transition` published from the real `BTCpuGetBopCode`**.
+///
+/// Everything on the wow64cpu side is the DLL's own bytes: `BTCpuProcessInit`
+/// builds the BOP, `BTCpuGetBopCode` (`lea rax,[rip+disp]; ret`) *hands out its
+/// address* — no 0x7000 assumption — and the production
+/// `exemu_os::wow64::publish_wow64_transition` writes that address into the
+/// 32-bit `Wow64Transition` slot. A 32-bit ntdll-shaped syscall stub then runs
+/// as real 32-bit guest code: `mov eax,index; mov edx,&Wow64SystemServiceCall;
+/// call edx` → `jmp dword ptr [Wow64Transition]` → the BOP → wow64cpu's own
+/// return handler in 64-bit mode → `Wow64SystemServiceEx` → resume.
+///
+/// The `Wow64SystemServiceEx` seam is stubbed here so the assertions can pin the
+/// *boundary contract* exactly: the service index the guest left in `eax`, and
+/// the **argument block pointer** (`esp+8`) actually addressing the guest's
+/// pushed stdcall argument. `wow64_32bit_guest_reaches_the_real_nt_ssdt` (W5.3)
+/// replaces the stub with the real `wow64.dll`.
+///
+/// **The pinned DLL set has no 32-bit ntdll**, so the stub is synthesized to the
+/// documented shape — this pins the mechanism, not Wine's 32-bit ntdll bytes.
+#[test]
+fn wow64_transition_routes_a_32bit_ntdll_stub_through_the_real_bop() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("exemu-w5_1trans-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem, _ntdll) = setup(&dir);
+    let bytes = std::fs::read(WOW64CPU).expect("read wow64cpu.dll");
+    let wow64cpu = load_dll(&mut mem, &bytes, WOW64CPU_BASE);
+    let base = wow64cpu.base;
+
+    run_wow64_process_init(&mut os, &mut mem, &wow64cpu);
+
+    // Obtain the BOP the *real* way: run wow64cpu's own `BTCpuGetBopCode`.
+    let bop = call_export(&mut os, &mut mem, wow64cpu.export("BTCpuGetBopCode"), &[]);
+    assert_eq!(mem.read_u16(bop).unwrap(), 0x2DFF, "BTCpuGetBopCode points at the init-built `FF 2D` far jmp");
+
+    // Stub Wow64SystemServiceEx (wow64cpu IAT 0x9110): record ecx (the service
+    // index) and [rdx] (the first dword of the argument block), return a sentinel.
+    const SVC: u64 = 0x0000_0000_5300_0000;
+    const RECORD_INDEX: u64 = SVC + 0x100;
+    const RECORD_ARG0: u64 = SVC + 0x104;
+    mem.map(Region::new("wow64_svc", SVC, 0x1000, Perm::RWX)).unwrap();
+    let mut svc = vec![0x48, 0xB8];
+    svc.extend_from_slice(&RECORD_INDEX.to_le_bytes()); // mov rax, RECORD_INDEX
+    svc.extend_from_slice(&[0x89, 0x08]); // mov [rax], ecx        (service index)
+    svc.extend_from_slice(&[0x8B, 0x0A]); // mov ecx, [rdx]        (args[0])
+    svc.extend_from_slice(&[0x89, 0x48, 0x04]); // mov [rax+4], ecx
+    svc.extend_from_slice(&[0xB8, 0x0D, 0xD0, 0x00, 0x00]); // mov eax, 0xD00D
+    svc.push(0xC3); // ret
+    mem.write(SVC, &svc).unwrap();
+    mem.write_u64(base + 0x9110, SVC).unwrap();
+
+    const INDEX: u32 = 0x0000_005A;
+    const ARG0: u32 = 0x0042_1234;
+    build_wow64_syscall_guest(&mut mem, bop, INDEX, &[ARG0]);
+    assert_eq!(mem.read_u32(G32_TRANSITION).unwrap(), bop as u32, "Wow64Transition holds the BOP VA");
+
+    const CPU_AREA: u64 = SCRATCH + 0x1000;
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, G32_CALLER as u32, G32_STACK as u32).unwrap();
+    call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
+
+    assert_eq!(mem.read_u32(RECORD_INDEX).unwrap(), INDEX, "the service index reached Wow64SystemServiceEx");
+    assert_eq!(
+        mem.read_u32(RECORD_ARG0).unwrap(),
+        ARG0,
+        "the argument-block pointer (esp+8) addressed the guest's pushed stdcall argument",
+    );
+    assert_eq!(mem.read_u32(G32_STATUS).unwrap(), 0x0000_D00D, "the 32-bit caller got the result in eax");
+    assert_eq!(
+        mem.read_u32(G32_ESP_OUT).unwrap(),
+        G32_STACK as u32,
+        "the stub's `ret 4` unwound the double-call to a balanced 32-bit stack",
+    );
+}
+
+/// Boot the whole WoW64 stack for a W5.3 case: Wine's 64-bit `ntdll`,
+/// `wow64cpu.dll` and `wow64.dll` all mapped, relocated and **IAT-bound to each
+/// other**, `BTCpuProcessInit` run through its own bytes, and the BOP obtained
+/// from the real `BTCpuGetBopCode`. Returns `(os, mem, ntdll, wow64cpu, bop)`.
+///
+/// `wow64.dll` needs **no initialization call**: its ntdll service descriptor
+/// (`{ServiceTable, Counter, ServiceLimit = 0x108, ArgumentTable}`) is
+/// statically initialized in `.data` and merely relocated by the loader.
+fn boot_wow64_stack(tag: &str) -> (WinOs, VirtualMemory, Dll, Dll, u64) {
+    let dir = std::env::temp_dir().join(format!("exemu-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut os, mut mem, ntdll) = setup(&dir);
+
+    let cpu_bytes = std::fs::read(WOW64CPU).expect("read wow64cpu.dll");
+    let wow64cpu = load_dll(&mut mem, &cpu_bytes, WOW64CPU_BASE);
+    let svc_bytes = std::fs::read(WOW64).expect("read wow64.dll");
+    let wow64 = load_dll(&mut mem, &svc_bytes, WOW64_BASE);
+
+    // wow64.dll reaches the 64-bit NT layer through its own ntdll IAT — bind it
+    // to the real, already-mapped Wine ntdll stubs (the loader's job).
+    let bound = bind_imports(&mut mem, &wow64, &ntdll);
+    assert!(bound > 200, "wow64.dll's ntdll imports bound to real stubs (bound {bound})");
+    // …and wow64cpu's single wow64.dll import is the real Wow64SystemServiceEx.
+    let dispatched = bind_imports(&mut mem, &wow64cpu, &wow64);
+    assert_eq!(dispatched, 1, "wow64cpu imports exactly one wow64.dll symbol");
+    assert_eq!(
+        mem.read_u64(wow64cpu.base + 0x9110).unwrap(),
+        wow64.export("Wow64SystemServiceEx"),
+        "wow64cpu's turbo-thunk IAT slot now holds the real Wow64SystemServiceEx",
+    );
+
+    run_wow64_process_init(&mut os, &mut mem, &wow64cpu);
+    let bop = call_export(&mut os, &mut mem, wow64cpu.export("BTCpuGetBopCode"), &[]);
+    (os, mem, ntdll, wow64cpu, bop)
+}
+
+/// **W5.3 GATE** — a 32-bit guest issues a real NT service that lands in exemu's
+/// real 64-bit SSDT handler, with **no exemu marshalling anywhere**.
+///
+/// The chain, every hop on Wine's own bytes except the synthesized 32-bit stub:
+///
+/// ```text
+///   32-bit ntdll stub (mov eax,N; call Wow64SystemServiceCall)
+///     → jmp [Wow64Transition]              (published by exemu_os::wow64)
+///     → wow64cpu BOP  (FF 2D → CS 0x33)    (built by the real BTCpuProcessInit)
+///     → wow64cpu return handler @0x1110    (saves the 32-bit context)
+///     → wow64.dll!Wow64SystemServiceEx     (index → service table → thunk)
+///     → wow64.dll's per-service thunk      (32→64 argument marshalling)
+///     → ntdll.dll!NtQuerySystemTime        (Wine's real 64-bit stub: `syscall`)
+///     → exemu's SSDT handler               (crates/os/src/syscall.rs)
+///     → back out to the 32-bit guest with the NTSTATUS in eax
+/// ```
+///
+/// Two recovered facts make this work and are asserted here rather than assumed:
+///
+/// 1. `Wow64SystemServiceEx(ecx = index, rdx = &args32)` splits the index as
+///    `table = (index >> 12) & 3`, `service = index & 0xfff`, bounds-checks it
+///    against a 32-byte service **descriptor** `{ServiceTable, Counter,
+///    ServiceLimit, ArgumentTable}` and tail-calls `ServiceTable[service]`. The
+///    ntdll descriptor (table 0, 0x108 services) is **statically initialized in
+///    `wow64.dll`'s `.data`** — relocated by the loader, needing no init call.
+/// 2. That table's index space is **identical to the 64-bit ntdll SSDT index
+///    space**: entry 0x5a is `NtQuerySystemTime`, which is exactly the immediate
+///    in the 64-bit `ntdll` stub's `mov eax,0x5a`. The test therefore reads the
+///    index out of the mapped 64-bit stub ([`ssdt_index_of`]) and feeds it to the
+///    32-bit guest — if the two spaces ever diverged, this test fails.
+///
+/// The service returns a real FILETIME written by exemu's own handler into a
+/// **32-bit guest pointer**, bracketed against the host clock: a serviced value,
+/// not just a status code.
+#[test]
+fn wow64_32bit_guest_reaches_the_real_nt_ssdt() {
+    if !Path::new(NTDLL).exists() || !Path::new(WOW64CPU).exists() || !Path::new(WOW64).exists() {
+        eprintln!("SKIP: Wine WoW64 DLL set not present (git-ignored)");
+        return;
+    }
+    let (mut os, mut mem, ntdll, wow64cpu, bop) = boot_wow64_stack("w5_3time");
+
+    // The service index, read out of Wine's own 64-bit ntdll stub bytes.
+    let index = ssdt_index_of(&mem, &ntdll, "NtQuerySystemTime");
+    build_wow64_syscall_guest(&mut mem, bop, index, &[G32_OUT as u32]);
+
+    const CPU_AREA: u64 = SCRATCH + 0x1000;
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, G32_CALLER as u32, G32_STACK as u32).unwrap();
+
+    let before = filetime_host_now();
+    call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
+    let after = filetime_host_now();
+
+    assert_eq!(
+        mem.read_u32(G32_STATUS).unwrap() as u64,
+        STATUS_SUCCESS,
+        "the 32-bit guest got STATUS_SUCCESS back from exemu's NtQuerySystemTime",
+    );
+    let t = mem.read_u64(G32_OUT).unwrap();
+    assert!(
+        before <= t && t <= after,
+        "exemu's SSDT handler wrote a live FILETIME {t} into the 32-bit guest's buffer (not in [{before}, {after}])",
+    );
+    assert_eq!(
+        mem.read_u32(G32_ESP_OUT).unwrap(),
+        G32_STACK as u32,
+        "the 32-bit stack is balanced after the full WoW64 round trip",
+    );
+}
+
