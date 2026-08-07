@@ -1184,6 +1184,22 @@ impl Hooks for WinOs {
         if self.preempt(cpu) {
             return Ok(Some(Exit::Continue));
         }
+        // Fast reject before the hash lookup. Thunk addresses are handed out
+        // **linearly** from `cfg.api_base` (`alloc_thunk` / `resolve_import` are
+        // the only inserters, and both take `next_thunk` then bump it by 8), so
+        // every key in `self.thunks` lies in `[api_base, next_thunk)` — exactly
+        // the range [`WinOs::thunk_range`] already publishes. A `rip` outside it
+        // therefore *cannot* be a thunk, and the compare is equivalent to the
+        // lookup, not an approximation of it.
+        //
+        // This matters because `intercept` runs before **every guest
+        // instruction**: a 7-Zip install is ~4.97e8 instructions, essentially
+        // none of them thunks, so this turns ~5e8 hashes of a `u64` into ~5e8
+        // predictable compares. `next_thunk` only grows, so the guard stays
+        // correct as thunks are allocated mid-run.
+        if rip < self.cfg.api_base || rip >= self.next_thunk {
+            return Ok(None);
+        }
         let Some(api) = self.thunks.get(&rip).cloned() else {
             return Ok(None);
         };
