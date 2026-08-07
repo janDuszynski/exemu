@@ -346,6 +346,14 @@ def build_markdown(
     all_pkgs: Dict[str, dict],
     target: str,
 ) -> str:
+    # Sort on (name, version), never on name alone. Two crates can share a name
+    # (bitflags 1.x and 2.x both reach the shipping closure), and the ids being
+    # sorted come out of a Python set whose iteration order is not stable across
+    # processes — a name-only key would let the tied rows swap between runs and
+    # make the committed table spuriously "stale" in CI.
+    def order(table: Dict[str, dict]):
+        return lambda i: (table[i]["name"].lower(), table[i]["version"])
+
     def row(pkg: dict, scope: str) -> str:
         expr = license_of(pkg)
         return (
@@ -400,7 +408,7 @@ def build_markdown(
     lines.append("")
     lines.append("| Crate | Version | Licence (SPDX) | Scope | Verdict |")
     lines.append("| ----- | ------- | -------------- | ----- | ------- |")
-    for pid in sorted(ship_ids, key=lambda i: pkgs[i]["name"].lower()):
+    for pid in sorted(ship_ids, key=order(pkgs)):
         lines.append(row(pkgs[pid], "ship"))
     lines.append("")
 
@@ -409,7 +417,7 @@ def build_markdown(
         lines.append("")
         lines.append("| Crate | Version | Licence (SPDX) | Scope | Verdict |")
         lines.append("| ----- | ------- | -------------- | ----- | ------- |")
-        for pid in sorted(build_only, key=lambda i: pkgs[i]["name"].lower()):
+        for pid in sorted(build_only, key=order(pkgs)):
             lines.append(row(pkgs[pid], "build"))
         lines.append("")
 
@@ -423,7 +431,7 @@ def build_markdown(
     lines.append("")
     lines.append("| Crate | Version | Licence (SPDX) | Scope | Verdict |")
     lines.append("| ----- | ------- | -------------- | ----- | ------- |")
-    for pid in sorted(dev_only, key=lambda i: all_pkgs[i]["name"].lower()):
+    for pid in sorted(dev_only, key=order(all_pkgs)):
         lines.append(row(all_pkgs[pid], "dev"))
     lines.append("")
     return "\n".join(lines) + "\n"
