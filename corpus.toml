@@ -60,6 +60,14 @@
 #   being read — which destroys the pin. So every tolerance below is a NOISE
 #   FLOOR sized from that measurement, not a change budget.
 #
+#   Confirmed by an independent full pass after these pins were written, which
+#   was green on all four: 7-Zip Δ 0, tcc Δ 0, Firefox Δ +1, SteamSetup Δ −189.
+#   The two that finish deterministically stay put; the two whose guests poll
+#   the clock wander. A completed run has repeated EXACTLY on every clean-
+#   sandbox measurement so far — the floor is insurance, not slack — while a
+#   93M-instruction fault run drifting 189 instructions between passes is why a
+#   fault's reach metric must never be pinned to zero.
+#
 #   A clean **exit** is a completed trace: the count is the whole trace length,
 #   not a progress marker, so it is the strongest assertion here and gets the
 #   bare 64-instruction floor — two orders of magnitude above the observed
