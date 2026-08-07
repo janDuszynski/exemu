@@ -15,7 +15,7 @@
 //! It is verified both by [`tests`] (layout) and end to end by the real
 //! `BTCpuSimulate` in `crates/app/tests/dll_smoke.rs`.
 
-use exemu_core::{Memory, Result};
+use exemu_core::{EmuError, Memory, Result};
 
 /// Offset of the CPU-reserved-area pointer within the 64-bit TEB
 /// (`WOW64_CPURESERVED`). `BTCpuSimulate` reads it as `gs:[0x30]` → `[teb+0x1488]`.
@@ -78,6 +78,51 @@ pub fn init_cpu_area(mem: &mut dyn Memory, teb_base: u64, area: u64, eip: u32, e
     Ok(())
 }
 
+/// Publish the WoW64 **transition pointer** into a 32-bit ntdll's
+/// `ntdll!Wow64Transition` slot (roadmap W5.1).
+///
+/// This is the one seam a 32-bit guest needs in order to reach the 64-bit NT
+/// layer. Every `Nt*` stub in a 32-bit ntdll has the shape
+///
+/// ```text
+///   NtXxx:                      mov eax, <service index>
+///                               mov edx, offset Wow64SystemServiceCall
+///                               call edx                 ; pushes the inner retaddr
+///                               ret <bytes of args>
+///   Wow64SystemServiceCall:     jmp dword ptr [Wow64Transition]
+/// ```
+///
+/// so `Wow64Transition` is a plain **32-bit data cell holding the VA of the BOP
+/// trampoline** — the `jmp fword ptr [...]` that `wow64cpu!BTCpuProcessInit`
+/// assembles and `wow64cpu!BTCpuGetBopCode` hands out. The near `jmp` through
+/// this cell lands on the BOP, which far-jumps (CS = 0x33) into wow64cpu's
+/// 64-bit return handler; that handler reads the guest return address from
+/// `[esp]`, the service index from `eax`, and the argument block from `[esp+8]`
+/// (past the inner and outer return addresses this double-call shape stacks),
+/// then dispatches to `wow64.dll!Wow64SystemServiceEx`.
+///
+/// The cell is 32 bits wide, so the BOP — and therefore the whole `wow64cpu`
+/// image — must live **below 4 GiB**; a higher address is rejected rather than
+/// silently truncated. (`BTCpuProcessInit` range-checks the same invariant from
+/// the other side and refuses to build the BOP above 4 GiB.)
+///
+/// **The pinned Wine 11.0 DLL set contains no 32-bit ntdll** (it is the 64-bit
+/// `x86_64-windows` set only). So `transition_slot` is supplied by the caller —
+/// a real boot resolves it from the 32-bit ntdll's export table — and the
+/// end-to-end coverage in `crates/app/tests/dll_smoke.rs` drives a *synthesized*
+/// 32-bit stub shaped exactly as above. That pins the **mechanism**, not a real
+/// ntdll: it proves the published pointer routes a 32-bit `call` through the
+/// real BOP into the real 64-bit handler, but it cannot prove that Wine's own
+/// 32-bit ntdll stubs are byte-identical to the shape assumed here.
+pub fn publish_wow64_transition(mem: &mut dyn Memory, transition_slot: u64, bop: u64) -> Result<()> {
+    if bop > u32::MAX as u64 {
+        return Err(EmuError::Os(format!(
+            "WoW64 BOP at {bop:#x} is above 4 GiB — a 32-bit `jmp dword ptr [Wow64Transition]` cannot reach it"
+        )));
+    }
+    mem.write_u32(transition_slot, bop as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +149,23 @@ mod tests {
         assert_eq!(mem.read_u32(ctx + CTX_EFLAGS).unwrap(), EFLAGS_INIT, "EFlags");
         // Distinct, non-overlapping context fields (a classic layout bug).
         assert_eq!(CTX_SEGCS - CTX_EIP, 4, "SegCs directly follows Eip");
+    }
+
+    /// `Wow64Transition` is a 32-bit cell holding the BOP VA; a BOP above 4 GiB
+    /// is refused rather than truncated into an unreachable pointer.
+    #[test]
+    fn publish_wow64_transition_writes_a_32bit_bop_pointer() {
+        let mut mem = VirtualMemory::new();
+        let slot = 0x50_0000u64;
+        mem.map(Region::new("ntdll32", slot, 0x1000, Perm::RW)).unwrap();
+
+        publish_wow64_transition(&mut mem, slot, 0x6A40_7000).unwrap();
+        assert_eq!(mem.read_u32(slot).unwrap(), 0x6A40_7000, "BOP VA published as a 32-bit cell");
+        // The neighbouring cell is untouched — the slot is 4 bytes, not 8.
+        assert_eq!(mem.read_u32(slot + 4).unwrap(), 0, "only the 32-bit slot is written");
+
+        let err = publish_wow64_transition(&mut mem, slot, 0x1_0000_7000).unwrap_err();
+        assert!(matches!(err, EmuError::Os(_)), "a BOP above 4 GiB is rejected, not truncated: {err}");
+        assert_eq!(mem.read_u32(slot).unwrap(), 0x6A40_7000, "the rejected publish left the slot intact");
     }
 }

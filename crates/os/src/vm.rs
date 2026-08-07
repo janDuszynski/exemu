@@ -35,6 +35,32 @@ pub(crate) const MEM_IMAGE: u32 = 0x0100_0000;
 const PAGE: u64 = 0x1000; // 4 KiB page
 const GRAN: u64 = 0x1_0000; // 64 KiB allocation granularity
 
+/// Lowest address a user-space allocation may occupy: the first 64 KiB is the
+/// permanently-reserved null-dereference guard window. Used as the search origin
+/// when [`WinOs::vm_alloc_region_below`] has to place an allocation under an
+/// address ceiling, which the ordinary bump hint sits far above.
+const LOW_ARENA_BASE: u64 = 0x1_0000;
+
+/// The highest address an allocation may occupy, from `NtAllocateVirtualMemory`'s
+/// `ZeroBits` argument (roadmap W5.3).
+///
+/// Public NT semantics: `0` means "no constraint"; `1..=31` is the number of
+/// high-order bits of the returned address that must be **zero**; a larger value
+/// is instead a **mask giving the highest acceptable address**. The second form
+/// is the one that matters for WoW64 — `wow64.dll`'s `NtAllocateVirtualMemory`
+/// thunk substitutes its own `0x7fffffff` whenever a 32-bit guest passes
+/// `ZeroBits = 0` (recovered from the pinned binary: it loads the constant from
+/// its `.data` and puts it in `R8`). That is what keeps the 64-bit result inside
+/// the low 2 GiB so the thunk can narrow it back into the guest's 32-bit
+/// `*BaseAddress` cell without truncating it into an unmapped pointer.
+fn zero_bits_ceiling(zero_bits: u64) -> u64 {
+    match zero_bits {
+        0 => u64::MAX,
+        n if n < 32 => (1u64 << (64 - n)) - 1,
+        mask => mask,
+    }
+}
+
 /// One `VirtualAlloc` reservation.
 pub(crate) struct VmAlloc {
     /// 64 KiB-aligned allocation base (the `AllocationBase` for every page).
@@ -126,13 +152,36 @@ impl WinOs {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64> {
+        self.vm_alloc_region_below(mem, addr_req, size_req, alloc_type, protect, u64::MAX)
+    }
+
+    /// [`WinOs::vm_alloc_region`] with an **address ceiling**: a kernel-picked
+    /// base (`addr_req == 0`) is placed so the whole region ends at or below
+    /// `max_addr`. `u64::MAX` means unconstrained (the ordinary bump arena).
+    ///
+    /// The constrained search starts low ([`LOW_ARENA_BASE`]) rather than at the
+    /// bump hint, because the hint lives far above any realistic ceiling. This
+    /// is what makes a WoW64 32-bit guest's allocations land where its 32-bit
+    /// pointers can address them — see [`zero_bits_ceiling`].
+    pub(crate) fn vm_alloc_region_below(
+        &mut self,
+        mem: &mut dyn Memory,
+        addr_req: u64,
+        size_req: u64,
+        alloc_type: u32,
+        protect: u32,
+        max_addr: u64,
+    ) -> Result<u64> {
         let committed = alloc_type & MEM_COMMIT != 0;
         let size = align_up(size_req.max(1), PAGE);
 
         if addr_req == 0 {
             // Fresh reservation: find a free, 64 KiB-aligned window and back it
             // permissively (the tracked `protect` carries the nominal value).
-            let base = self.vm_find_free(mem, size);
+            let Some(base) = self.vm_find_free_below(mem, size, max_addr) else {
+                self.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+                return Ok(0);
+            };
             if mem.map_fixed(base, size, Perm::RWX, "valloc").is_err() {
                 self.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
                 return Ok(0);
@@ -228,6 +277,33 @@ impl WinOs {
     pub(crate) fn map_anywhere(&mut self, mem: &mut dyn Memory, size: u64, perm: exemu_core::Perm, name: &str) -> Option<u64> {
         let base = self.vm_find_free(mem, size);
         mem.map_fixed(base, size, perm, name).ok().map(|()| base)
+    }
+
+    /// Find a free, 64 KiB-aligned base for at least `size` bytes ending at or
+    /// below `max_addr`, or `None` if the constrained space is exhausted.
+    /// Unconstrained requests take the ordinary bump arena; a ceiling makes the
+    /// scan start at [`LOW_ARENA_BASE`] and walk up over the already-mapped
+    /// regions (each successful allocation maps its own region, so the scan
+    /// naturally steps past prior ones without a second hint).
+    fn vm_find_free_below(&mut self, mem: &dyn Memory, size: u64, max_addr: u64) -> Option<u64> {
+        if max_addr == u64::MAX {
+            return Some(self.vm_find_free(mem, size));
+        }
+        let mut base = LOW_ARENA_BASE;
+        loop {
+            if base.checked_add(size)? - 1 > max_addr {
+                return None;
+            }
+            match mem.next_region(base) {
+                None => return Some(base),
+                Some((rb, rsize, _)) => {
+                    if rb >= base + size {
+                        return Some(base);
+                    }
+                    base = align_up(rb + rsize, GRAN);
+                }
+            }
+        }
     }
 
     /// Find a free, 64 KiB-aligned base for at least `size` bytes at/above the
@@ -351,6 +427,7 @@ impl WinOs {
         mem: &mut dyn Memory,
     ) -> Result<u32> {
         let base_ptr = self.syscall_arg(cpu, mem, 1)?;
+        let zero_bits = self.syscall_arg(cpu, mem, 2)?;
         let size_ptr = self.syscall_arg(cpu, mem, 3)?;
         let alloc_type = self.syscall_arg(cpu, mem, 4)? as u32;
         let protect = self.syscall_arg(cpu, mem, 5)? as u32;
@@ -360,7 +437,12 @@ impl WinOs {
         // IN/OUT: the caller's requested base (may be 0 = "you pick") and size.
         let addr_req = mem.read_u64(base_ptr)?;
         let size_req = mem.read_u64(size_ptr)?;
-        let base = self.vm_alloc_region(mem, addr_req, size_req, alloc_type, protect)?;
+        // `ZeroBits` caps where a kernel-picked base may land. WoW64 leans on
+        // this: `wow64.dll` passes `0x7fffffff` so the 64-bit result still fits
+        // the 32-bit guest's `*BaseAddress` cell (roadmap W5.3).
+        let max_addr = zero_bits_ceiling(zero_bits);
+        let base =
+            self.vm_alloc_region_below(mem, addr_req, size_req, alloc_type, protect, max_addr)?;
         if base == 0 {
             return Ok(STATUS_NO_MEMORY);
         }
@@ -489,3 +571,60 @@ pub(crate) fn ssdt_nt_protect_virtual_memory(
 pub(crate) const SSDT_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x18;
 pub(crate) const SSDT_NT_FREE_VIRTUAL_MEMORY: u32 = 0x1e;
 pub(crate) const SSDT_NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x50;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WinConfig;
+    use exemu_memory::VirtualMemory;
+
+    /// The two documented `ZeroBits` forms: a leading-zero-bit *count* below 32,
+    /// a highest-acceptable-*address* mask at or above it (the WoW64 form).
+    #[test]
+    fn zero_bits_ceiling_covers_both_documented_forms() {
+        assert_eq!(zero_bits_ceiling(0), u64::MAX, "0 = unconstrained");
+        assert_eq!(zero_bits_ceiling(32), 32, "≥32 is a highest-address mask, not a bit count");
+        // The value wow64.dll substitutes for a 32-bit guest's ZeroBits = 0.
+        assert_eq!(zero_bits_ceiling(0x7fff_ffff), 0x7fff_ffff, "the WoW64 low-2 GiB ceiling");
+        // A bit count: 33 leading zeros ⇒ the address fits in 31 bits.
+        assert_eq!(zero_bits_ceiling(33) >> 31, 0, "33 leading zero bits ⇒ a 31-bit address");
+        assert_eq!(zero_bits_ceiling(1), u64::MAX >> 1, "1 leading zero bit");
+    }
+
+    /// A `ZeroBits` ceiling moves a kernel-picked base out of the 256 GiB bump
+    /// arena and into the low address space — the allocation a WoW64 32-bit
+    /// guest can actually address (roadmap W5.3).
+    #[test]
+    fn zero_bits_ceiling_places_the_allocation_low() {
+        let mut mem = VirtualMemory::new();
+        let mut os = WinOs::new(WinConfig { is_64bit: true, echo: false, ..WinConfig::default() });
+
+        // Unconstrained: the ordinary arena, far above 4 GiB.
+        let high = os.vm_alloc_region(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04).unwrap();
+        assert!(high > u32::MAX as u64, "the default arena is above 4 GiB (got {high:#x})");
+
+        // Constrained the way wow64.dll constrains it.
+        let low = os
+            .vm_alloc_region_below(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04, 0x7fff_ffff)
+            .unwrap();
+        assert_ne!(low, 0, "the constrained allocation succeeded");
+        assert!(low >= LOW_ARENA_BASE, "clear of the null-guard window");
+        assert!(low + 0x2000 - 1 <= 0x7fff_ffff, "the whole region is under the ceiling");
+        assert_eq!(low & (GRAN - 1), 0, "64 KiB aligned");
+        mem.write_u32(low, 0xC0FFEE).unwrap();
+
+        // A second constrained allocation steps past the first, never overlaps.
+        let low2 = os
+            .vm_alloc_region_below(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04, 0x7fff_ffff)
+            .unwrap();
+        assert!(low2 >= low + 0x2000 || low2 + 0x2000 <= low, "the two regions are disjoint");
+        assert_eq!(mem.read_u32(low).unwrap(), 0xC0FFEE, "the first region survived");
+
+        // A ceiling nothing fits under is out-of-memory, not a bogus base.
+        assert_eq!(
+            os.vm_alloc_region_below(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04, 0x1000).unwrap(),
+            0,
+            "an impossible ceiling reports out-of-memory",
+        );
+    }
+}
