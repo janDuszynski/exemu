@@ -26,6 +26,54 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 496, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### Interpreter performance (W8.1)
+- **7-Zip installs in 27.5 s instead of ~65 s — 2.4× faster, with byte-identical
+  behaviour** (both the pre- and post-change binaries execute exactly
+  496,505,786 instructions on the same sandbox state).
+- Profile-driven, not guesswork: sampling the 496M-instruction run showed the
+  **guest-memory path taking ~51% of the total**. Three fixes: every access was
+  resolving its region *twice* (`locate` searched, discarded the reference, then
+  `read`/`write` searched again); `EmuError::Unmapped` was constructed *eagerly*
+  on every successful access via `ok_or`; and instruction decode issued one
+  `Memory::fetch` **per byte** — a dynamic dispatch, region lookup and permission
+  test each time. Decode now takes a single 16-byte window (x86-64 caps an
+  instruction at 15 bytes), falling back to the per-byte path when the window
+  cannot be fetched.
+- **The boundaries the oracle structurally cannot see are pinned directly.** The
+  differential fuzzer assembles every trial at the base of a 4 KiB page with one
+  region per purpose, so the prefetch window always fits and the region cache is
+  never stale. Explicit tests cover an instruction ending exactly at a region's
+  last byte, an 11-byte `movabs` straddling the window-to-slow-path transition,
+  an immediate lying in a readable-but-not-executable neighbour (which must still
+  fault — the prefetch must not paper over a real fetch fault), and a `map` that
+  shifts every region index under a warm cache entry.
+- A separate win: `Hooks::intercept` runs before every guest instruction and led
+  with a hash lookup on `rip`. Thunk addresses are allocated strictly linearly
+  from a known base, so a range compare is *equivalent* to the lookup — turning
+  ~5×10⁸ hashes into ~5×10⁸ predictable compares.
+- `#![forbid(unsafe_code)]` is preserved throughout; relaxing it is a separate,
+  later step scoped to a dedicated codegen crate.
+
+### Licensing compliance is now mechanical (W9.1)
+- **A CI licence gate**, deliberately split in two: `deny.toml` covers the
+  *shipping closure* with **zero licence exceptions**, so "no copyleft in what we
+  distribute" is a checked claim rather than a promise; `deny.dev.toml` covers the
+  full graph and records the single exception — `unicorn-engine` is GPL-2.0 and is
+  admissible only because it sits behind the differential oracle's off-by-default
+  feature in a `publish = false` crate. If Unicorn ever leaks into the
+  default-feature graph, the shipping policy fails with nothing to hide behind.
+- **A reproducible SBOM** plus a mechanical **separability check** — the central
+  diligence claim is that no Wine code is in exemu's compiled output, and that is
+  now asserted by CI (verified against the real release binary: it links only
+  Apple system frameworks plus `libSystem`/`libiconv`/`libobjc`).
+- `docs/COMPLIANCE.md` — the LGPL redistribution checklist, explicitly marked as
+  requiring review by counsel before any release.
+- **Two findings recorded rather than smoothed over:** (1) `THIRD_PARTY_LICENSES`
+  does not exist, so **any binary distribution of exemu today already fails its
+  own permissive dependencies' notice requirements — independently of Wine**;
+  (2) whether the project's chosen licence satisfies LGPL-2.1 §6 is a live
+  question for counsel, not something the tooling can settle.
+
 ### CPU coverage for Wine's own binaries (W1)
 - **x87 FPU**: ST0–ST7 with real 80-bit storage, control/status/tag words, the
   load/store/arithmetic/compare families, `FSQRT`/`FSCALE`/`FPREM`/`FRNDINT`, the
@@ -119,6 +167,29 @@ end-to-end on the default path.
   `ZeroBits`, and its allocation arena starts well above 4 GiB — so a WoW64
   guest was handed a truncated, unmapped base. Now honoured.
 - *Still to come:* loading wow64 into a real process boot.
+
+### COM arrives as guest code (W6.3 / W6.4)
+- **`CoCreateInstance` genuinely succeeds on Wine's COM core.** A generated
+  console program calls `CoInitializeEx` → `CoCreateInstance` → a method through
+  the returned interface's vtable → `Release`, and gets back a real object with a
+  real refcount. Wine's ole32 → combase → rpcrt4/advapi32/user32/gdi32 all boot
+  as guest code; the CLSID resolves through exemu's registry to an
+  `InprocServer32`, the in-proc server is loaded, and its `DllGetClassObject` is
+  called. **There is no native COM anywhere in exemu** — and the emulated path is
+  the control that proves it: exemu's own `CoCreateInstance` is an unsupported
+  stub that leaves the out-pointer NULL, so the sample fails there and succeeds
+  only under `--wine-boot`.
+- **Registry fixes this required**, each a real bug: the hive was an exact-match
+  map, but the Windows registry is case-insensitive/case-preserving, and Wine's
+  kernelbase reaches `HKCR` as `\Registry\Machine\Software\Classes` while exemu
+  seeded `HKLM\SOFTWARE\…` — so lookups silently missed. `HKEY_CLASSES_ROOT` is
+  now a *view* onto `HKLM\SOFTWARE\Classes` rather than its own hive, so the
+  Win32 seam, the NT syscalls and the seeds all meet on one subtree. Plus
+  `NtOpenKeyEx`, `NtEnumerateValueKey`, `NtDeleteKey`, `NtDeleteValueKey`,
+  `NtFlushKey`.
+- Worth recording: **in Wine 11 the COM core is `combase.dll`, not `ole32`** —
+  ole32 exports `CoInitializeEx`/`CoCreateInstance`/… as *forwarders* to combase
+  and imports 67 more symbols from it.
 
 ### comctl32 / uxtheme / comdlg32 as guest code (W6.1)
 - The pivot's central efficiency claim — that these DLLs cost exemu almost

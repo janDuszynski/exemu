@@ -329,6 +329,25 @@ Extraction is compute-heavy (LZMA), so a real installer needs a raised step
 budget: `exemu run --max-steps 800000000 installer.exe`. Files land under
 `$TMPDIR/exemu-sandbox`.
 
+> **Note on reproducing these numbers.** The sandbox **persists across runs**, and
+> an installer enumerates and overwrites what is already there — so the
+> instruction count genuinely shifts if you run the same binary twice without
+> clearing `$TMPDIR/exemu-sandbox`. Clear it first if you want to reproduce a
+> count exactly.
+
+### Speed
+
+The 7-Zip install above — 496,505,786 emulated instructions — takes about
+**27 seconds** on an M-series Mac (~18M instructions/second). That is a pure
+software interpreter: no JIT yet.
+
+Interpreter speed is the next real wall, and the Wine path makes it urgent
+rather than academic: running Wine's own DLLs as guest code means every Win32
+call is real PE code being interpreted, multiplying the instruction count per
+app-visible action. A block JIT is the planned answer; the current interpreter
+has had its measured hot spots (guest-memory region lookup, per-byte instruction
+fetch, per-instruction hook dispatch) removed first.
+
 ## Running on Wine's PE personality (`--wine-boot`)
 
 Everything above is exemu's **hand-written** Windows personality — the default
@@ -372,7 +391,8 @@ What is verified today:
 | Guest faults delivered as Windows exceptions | **works** — via `KiUserExceptionDispatcher`, resumed through `NtContinue` |
 | **WoW64** (32-bit guests on the 64-bit Wine set) | **the syscall path works, process boot is next** — a 32-bit guest reaches exemu's real NT syscall table through Wine's own `wow64cpu.dll` + `wow64.dll`, which do the 32→64 marshalling themselves (exemu marshals nothing). Verified end to end for `NtQuerySystemTime` and `NtAllocateVirtualMemory`. The pinned Wine set has no 32-bit `ntdll`, so the 32-bit caller is a synthesized stub of the documented shape: this pins the mechanism, not Wine's own 32-bit ntdll bytes. Loading wow64 into a *real* process boot is the remaining work |
 | **comctl32 / uxtheme / comdlg32** | **arrive as guest code** — a sample that statically imports `comctl32!InitCommonControlsEx` runs to completion on the Wine boot, and Wine's own comctl32 registers `msctls_progress32` as a real window class. exemu implements no progress bar. Two measured gaps are pinned as tests: the built-in `BUTTON` class is not registered by exemu's win32k, and child windows do not paint yet |
-| COM / MSI / multimedia / networking | **not yet** — these are Wine PE DLLs, so they arrive as guest code once the boundary carries them |
+| **COM** (`ole32` / `combase` / `oleaut32`) | **works** — `CoCreateInstance` genuinely succeeds: the CLSID resolves through exemu's registry to an `InprocServer32`, the in-proc server loads, and the guest calls a method through the returned vtable. No native COM in exemu; the emulated path is the control that proves it |
+| MSI / multimedia / networking | **not yet** — these are Wine PE DLLs, so they arrive as guest code once the boundary carries them |
 
 **exemu does not ship Wine's DLLs.** You point `--wine-boot` at a set you already
 have. They are loaded as separate guest image files and are never linked or
