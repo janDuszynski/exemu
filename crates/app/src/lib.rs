@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cab;
 pub mod comctl_sample;
 pub mod gui_sample;
 pub mod sample;
