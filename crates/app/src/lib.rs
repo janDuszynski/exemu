@@ -18,6 +18,7 @@ pub mod cab;
 pub mod comctl_sample;
 pub mod gui_sample;
 pub mod sample;
+pub mod shell_sample;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
