@@ -23,6 +23,7 @@ mod apiset;
 mod boot;
 mod dll;
 mod exc;
+pub mod folders;
 mod fs;
 mod gdi;
 mod msg;
