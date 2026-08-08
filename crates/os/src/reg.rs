@@ -223,6 +223,99 @@ impl WinOs {
             self.reg_value_set(&canon, name, val.clone());
         }
         self.reg_seed_classes();
+        self.reg_seed_shell_folders();
+    }
+
+    /// Seed `…\Explorer\Shell Folders` and `User Shell Folders` from the
+    /// [`crate::folders`] table (roadmap W6.6).
+    ///
+    /// **Why the registry rather than a syscall.** On the Wine path *Wine's own*
+    /// `shell32` implements `SHGetFolderPathW`; exemu never sees the call. Wine
+    /// resolves a `CSIDL` by reading these keys first, so the registry is the seam
+    /// where exemu's folder table actually reaches it — wiring the table to an
+    /// exemu-side `SHGetFolderPathW` would have had no effect on the Wine path at
+    /// all.
+    ///
+    /// **The observed symptom this fixes.** Without these keys Wine falls back to
+    /// building paths from its own default profile root and returns
+    /// `C:\users\AppData\Roaming` — note the lowercase `users` and the *empty*
+    /// user component, where exemu's profile is `C:\Users\exemu`. The lowercase
+    /// spelling is what identifies it as Wine's own default rather than an
+    /// expansion of exemu's `USERPROFILE`: Wine has no way to learn the user name,
+    /// because exemu implements no token surface (`NtOpenProcessToken` /
+    /// `TokenUser`) and seeded no `ProfileList`. Seeding the resolved paths
+    /// directly sidesteps that entirely.
+    ///
+    /// Both key spellings are written because shell code reads either: the
+    /// `User Shell Folders` variant conventionally holds `REG_EXPAND_SZ` values
+    /// with `%USERPROFILE%`-style indirection, while `Shell Folders` holds the
+    /// resolved `REG_SZ`. exemu writes *resolved* paths to both — there is no
+    /// expansion step to get wrong, and the table is already absolute.
+    fn reg_seed_shell_folders(&mut self) {
+        use crate::folders::csidl;
+        // (registry value name, CSIDL) — the names Windows uses for these folders.
+        const NAMED: &[(&str, u32)] = &[
+            ("AppData", csidl::APPDATA),
+            ("Local AppData", csidl::LOCAL_APPDATA),
+            ("Personal", csidl::PERSONAL),
+            ("Desktop", csidl::DESKTOPDIRECTORY),
+            ("My Pictures", csidl::MYPICTURES),
+            ("My Music", csidl::MYMUSIC),
+            ("My Video", csidl::MYVIDEO),
+            ("Favorites", csidl::FAVORITES),
+            ("Start Menu", csidl::STARTMENU),
+            ("Programs", csidl::PROGRAMS),
+            ("Startup", csidl::STARTUP),
+            ("Recent", csidl::RECENT),
+            ("SendTo", csidl::SENDTO),
+            ("Templates", csidl::TEMPLATES),
+            ("Cache", csidl::INTERNET_CACHE),
+            ("Cookies", csidl::COOKIES),
+            ("History", csidl::HISTORY),
+        ];
+        const COMMON: &[(&str, u32)] = &[
+            ("Common AppData", csidl::COMMON_APPDATA),
+            ("Common Desktop", csidl::COMMON_DESKTOPDIRECTORY),
+            ("Common Documents", csidl::COMMON_DOCUMENTS),
+            ("Common Start Menu", csidl::COMMON_STARTMENU),
+            ("Common Programs", csidl::COMMON_PROGRAMS),
+            ("Common Startup", csidl::COMMON_STARTUP),
+        ];
+
+        const USER_KEYS: [&str; 2] = [
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+        ];
+        const MACHINE_KEYS: [&str; 2] = [
+            "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+            "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+        ];
+
+        for key in USER_KEYS.iter().chain(MACHINE_KEYS.iter()) {
+            let canon = self.reg_key_create(key);
+            let is_machine = key.starts_with("HKLM");
+            // Per-user folders belong under HKCU; the common ones are machine-wide
+            // but shell code looks for them under both, so write both everywhere.
+            let set: &[(&str, u32)] = if is_machine { COMMON } else { NAMED };
+            for (name, csidl) in set {
+                if let Some(path) = crate::folders::csidl_path(*csidl) {
+                    self.reg_value_set(&canon, name, sz(path));
+                }
+            }
+            if !is_machine {
+                for (name, csidl) in COMMON {
+                    if let Some(path) = crate::folders::csidl_path(*csidl) {
+                        self.reg_value_set(&canon, name, sz(path));
+                    }
+                }
+            }
+        }
+
+        // The profile root itself, which shell code and installers both probe.
+        let pl = self.reg_key_create("HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList");
+        self.reg_value_set(&pl, "ProfilesDirectory", sz("C:\\Users"));
+        self.reg_value_set(&pl, "ProgramData", sz("C:\\ProgramData"));
+        self.reg_value_set(&pl, "Public", sz("C:\\Users\\Public"));
     }
 
     /// Seed the `HKEY_CLASSES_ROOT` subtree (roadmap W6.4).
@@ -571,14 +664,37 @@ fn map_nt_registry_root(nt: &str) -> Option<String> {
     }
     let hive = parts.next()?;
     let rest = parts.next().unwrap_or("");
-    let root = if hive.eq_ignore_ascii_case("Machine") {
-        "HKLM"
-    } else if hive.eq_ignore_ascii_case("User") {
-        "HKU"
-    } else {
+    if hive.eq_ignore_ascii_case("Machine") {
+        return Some(if rest.is_empty() { "HKLM".to_string() } else { format!("HKLM\\{rest}") });
+    }
+    if !hive.eq_ignore_ascii_case("User") {
         return None;
+    }
+    // `\Registry\User\<SID>\Software\…` — the NT spelling of the per-user hive.
+    //
+    // exemu models exactly one user, and supplies no token surface
+    // (`NtOpenProcessToken`/`TokenUser`), so a guest has no way to learn a SID
+    // from us and will use whatever it invented. Folding **any** SID onto the
+    // single `HKCU` subtree is therefore both correct for the model and the only
+    // way the two spellings can meet: previously `\Registry\User\<sid>\Software`
+    // became `HKU\<sid>\Software`, a different key from the `HKCU\Software` the
+    // Win32 seam and `reg_seed` write — so a per-user value seeded by exemu was
+    // invisible to any guest that opened it through NT, silently. This is the
+    // same defect class as `HKCR` before W6.4, and the same fix: one subtree.
+    //
+    // `\Registry\User\.DEFAULT` folds here too; with a single user there is no
+    // meaningful distinction, and a guest reading it wants *a* user hive.
+    let rest = if rest.is_empty() {
+        // `\Registry\User` itself, or `\Registry\User\<sid>` with nothing under it.
+        String::new()
+    } else {
+        // Drop the SID component; keep everything beneath it.
+        match rest.split_once('\\') {
+            Some((_sid, under)) => under.to_string(),
+            None => String::new(),
+        }
     };
-    Some(if rest.is_empty() { root.to_string() } else { format!("{root}\\{rest}") })
+    Some(if rest.is_empty() { "HKCU".to_string() } else { format!("HKCU\\{rest}") })
 }
 
 /// Write `s` as UTF-16LE code units at `addr`, at most `max_bytes` bytes (no
