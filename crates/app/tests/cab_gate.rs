@@ -23,11 +23,15 @@
 //!
 //! Skip-guarded on the git-ignored Wine DLL set.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use exemu_app::{cab, cab_sample, load_and_run, RunConfig};
 
 const WINE_DLLS: &str = "../../example_exe/wine-dlls/x86_64-windows";
+
+/// The W6.5 per-exe pin: Total Commander, which loads `cabinet.dll` during
+/// startup.
+const TCMD: &str = "../../example_exe/tcmd1156x64.exe";
 
 /// The archived name and contents the generated cabinet carries. The payload is
 /// printable so the extracted bytes can be asserted straight out of stdout, and
@@ -155,4 +159,126 @@ fn cab_sample_extracts_through_wine_cabinet() {
     // and said so with its distinguishing exit code.
     assert!(stdout.contains(cab_sample::OK_MESSAGE.trim_end()), "stdout:\n{stdout}");
     assert_eq!(run.exit_code, cab_sample::CAB_OK_EXIT, "stdout:\n{stdout}");
+}
+
+// ==========================================================================
+// The W6.5 per-exe pin: Total Commander
+// ==========================================================================
+
+/// Mirror the pinned prefix into `dir` as symlinks, **omitting** `omit`.
+///
+/// This is the control that turns "the app ran longer" into "the app loaded
+/// cabinet.dll": the two runs differ in exactly one file.
+fn prefix_without(dir: &Path, omit: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let src = std::fs::canonicalize(WINE_DLLS)?;
+    for entry in std::fs::read_dir(&src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().eq_ignore_ascii_case(omit) {
+            continue;
+        }
+        let link = dir.join(&name);
+        if !link.exists() {
+            std::os::unix::fs::symlink(entry.path(), link)?;
+        }
+    }
+    assert!(!dir.join(omit).exists(), "{omit} must be absent from the mirror");
+    Ok(())
+}
+
+/// Run `exe` and return `(exit_code, steps)`, treating a fault as a failure —
+/// this probe is about *where a real binary gets to*, so a fault must be loud.
+fn run_steps(exe: &[u8], wine_dir: Option<String>, max_steps: u64) -> (i32, u64) {
+    let r = load_and_run(
+        exe,
+        RunConfig {
+            echo: false,
+            max_steps,
+            wine_boot_dir: wine_dir,
+            ..RunConfig::default()
+        },
+    )
+    .expect("tcmd should run to a deliberate exit, not fault");
+    (r.exit_code, r.steps)
+}
+
+/// W6.5's per-exe pin, asserting **what is actually true today**.
+///
+/// Measured by this test:
+///
+/// | run | instructions | exit |
+/// | --- | --- | --- |
+/// | emulated (no Wine) | 22,033 | 1 |
+/// | Wine boot, prefix **without** cabinet.dll | 3,569,341 | 1 |
+/// | Wine boot, full prefix | 4,057,410 | 1 |
+///
+/// The totals move a little with the command line, the build profile and what
+/// exemu has seeded into the sandbox (the release CLI, with a different argv,
+/// gives 25,553 / 4,082,535 / 3,542,988) — which is why every assertion below
+/// is an inequality with a wide margin rather than an equality.
+///
+/// What that establishes:
+///
+/// * **`cabinet.dll` is no longer the wall.** The emulated path dies in the
+///   opening ~22k instructions; under the Wine boot the same binary runs ~180x
+///   further and terminates by calling `ExitProcess` itself (the innermost frame
+///   is `ntdll!RtlExitUserProcess`) — not a fault, not a decoder gap, not the
+///   step budget.
+/// * **cabinet.dll really loads and really runs.** Deleting that one file from
+///   the prefix costs half a million instructions of startup work (488k–540k
+///   across the profiles measured), the same order as the whole cabinet-sample
+///   boot above (~813k). A run that merely *failed* to find the DLL could not
+///   spend them.
+///
+/// **What it does NOT establish, and this is the honest gap:** Total Commander
+/// still exits 1 from its own startup path, with or without cabinet.dll. So the
+/// remaining blocker is downstream of W6.5 entirely — it is not CAB support.
+/// Nothing here has been forced to make the app "work"; the numbers are pinned
+/// as they are so that when the real blocker is fixed, this test fails and says
+/// so.
+#[test]
+fn total_commander_loads_wine_cabinet_but_still_exits_early() {
+    if !Path::new(TCMD).exists() || !Path::new(WINE_DLLS).join("cabinet.dll").exists() {
+        eprintln!("SKIP: {TCMD} / the Wine DLL set not present (both are git-ignored)");
+        return;
+    }
+    let exe = std::fs::read(TCMD).expect("read the pinned Total Commander binary");
+
+    // The emulated path barely starts: exemu has no cabinet.dll (nor most of
+    // what this app imports), so it gives up in the opening instructions.
+    let (emu_code, emu_steps) = run_steps(&exe, None, 5_000_000);
+    eprintln!("tcmd emulated:            exit {emu_code} after {emu_steps} steps");
+    assert!(emu_steps < 100_000, "the emulated path should stop early, got {emu_steps}");
+
+    // The Wine boot carries it two orders of magnitude further, to a deliberate
+    // exit rather than a fault.
+    let (wine_code, wine_steps) = run_steps(&exe, Some(WINE_DLLS.to_string()), 50_000_000);
+    eprintln!("tcmd wine-boot:           exit {wine_code} after {wine_steps} steps");
+    assert!(
+        wine_steps > 3_500_000,
+        "the Wine boot should carry tcmd millions of instructions in, got {wine_steps}"
+    );
+    assert!(wine_steps > emu_steps * 100, "{wine_steps} vs {emu_steps} emulated");
+
+    // THE DIFFERENTIAL: the same run against a prefix that differs in exactly
+    // one file. If cabinet.dll were merely *present* and never loaded, removing
+    // it could not change the instruction count.
+    let mirror: PathBuf = std::env::temp_dir().join(format!("exemu-w65-nocab-{}", std::process::id()));
+    prefix_without(&mirror, "cabinet.dll").expect("mirror the prefix without cabinet.dll");
+    let (nocab_code, nocab_steps) = run_steps(&exe, Some(mirror.to_string_lossy().into_owned()), 50_000_000);
+    let _ = std::fs::remove_dir_all(&mirror);
+    eprintln!("tcmd wine-boot, no cabinet: exit {nocab_code} after {nocab_steps} steps");
+
+    assert!(
+        wine_steps > nocab_steps + 100_000,
+        "removing cabinet.dll should cost real startup work: {wine_steps} with it, \
+         {nocab_steps} without — if these converge, cabinet.dll is not being loaded"
+    );
+
+    // THE GAP, pinned so that fixing it fails here and forces the notes to be
+    // updated: the app still exits 1 from its own startup, cabinet or no
+    // cabinet. Whatever blocks Total Commander is not CAB support.
+    assert_eq!(wine_code, 1, "tcmd still exits 1 on the Wine boot");
+    assert_eq!(nocab_code, 1, "…and exits 1 without cabinet.dll too");
 }
