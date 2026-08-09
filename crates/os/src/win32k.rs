@@ -112,6 +112,93 @@ const GDI_DC_OBJECT_SIZE: u64 = 0x100;
 /// The base of the Windows `RegisterClass` atom range (0xC000–0xFFFF).
 const CLASS_ATOM_BASE: u16 = 0xC000;
 
+// --- user32's built-in control WndProcs, via the client-PFN arrays (W6.2) ----
+// Wine's split leaves the built-in control classes (BUTTON / EDIT / STATIC /
+// LISTBOX / COMBOBOX / SCROLLBAR / …) to the *kernel* side: user32 holds the
+// WndProcs but never registers the classes, so a `CreateWindowExW(L"BUTTON", …)`
+// fails inside user32 unless win32k already knows the class. The WndProcs reach
+// the kernel through `NtUserInitializeClientPfnArrays`.
+//
+// **Recovered chain** (disassembly of the pinned `user32.dll` / `ntdll.dll`, plus
+// their own COFF symbol tables — no Wine source read):
+//
+// 1. user32's `winproc_init` (RVA 0x8f8b0) calls
+//    `RtlInitializeNtUserPfn(client_procsA, 0x88, client_procsW, 0x88,
+//    client_workers, 0x58)`. **0x88 bytes = 17 pointers per array**, which is
+//    where [`CLIENT_PFN_COUNT`] comes from; the workers array is 11 pointers and
+//    is entirely NULL in this build.
+// 2. ntdll's `RtlInitializeNtUserPfn` copies those arrays into its own
+//    `user_procs` block, and `RtlRetrieveNtUserPfn` hands back a *different*
+//    triple — ntdll's `user_funcs` (RVA 0x818c0) — which user32 then passes to
+//    `NtUserInitializeClientPfnArrays(funcsA, funcsW, workers, user32_module)`.
+// 3. Each `user_funcs` entry is a `jmp qword [rip+disp32]` thunk (`48 ff 25 …`,
+//    7 bytes) in ntdll's `.text`; the slot it jumps through is exactly
+//    `user_procs + index*8`. **Following the thunk therefore yields the real
+//    per-class WndProc inside user32's image**, index-for-index.
+//
+// The per-index identities below come from the pinned user32's own symbol table
+// (`client_procs` @ .rdata 0xe2e0): index 0 `ScrollBarWndProc`, 1
+// `MessageWndProc`, 2 `PopupMenuWndProc`, 3 `DesktopWndProc`, 4 `DefWindowProc`,
+// 5 `IconTitleWndProc`, 6 NULL, 7 `ButtonWndProc`, 8 `ComboWndProc`, 9/12
+// `ListBoxWndProc`, 10 `DialogWndProc`, 11 `EditWndProc`, 13 `MDIClientWndProc`,
+// 14 `StaticWndProc`, 15 `ImeWndProc`, 16 `DefWindowProc` (again).
+
+/// Entries in each client-PFN array — `0x88 / 8`, from the size user32's
+/// `winproc_init` passes to `RtlInitializeNtUserPfn`.
+const CLIENT_PFN_COUNT: usize = 17;
+/// Opcode of a client-PFN entry: `jmp qword [rip+disp32]`.
+const PFN_THUNK_JMP: [u8; 3] = [0x48, 0xFF, 0x25];
+/// Length of that thunk — the base the `disp32` is relative to.
+const PFN_THUNK_LEN: u64 = 7;
+
+// Client-PFN indices of the procs exemu registers a class for.
+const PFN_SCROLL_BAR: usize = 0;
+const PFN_MESSAGE: usize = 1;
+const PFN_POPUP_MENU: usize = 2;
+const PFN_DESKTOP: usize = 3;
+const PFN_ICON_TITLE: usize = 5;
+const PFN_BUTTON: usize = 7;
+const PFN_COMBO_BOX: usize = 8;
+/// The combo box's drop-down list — the same proc as [`PFN_LIST_BOX`].
+const PFN_COMBO_LBOX: usize = 9;
+const PFN_DIALOG: usize = 10;
+const PFN_EDIT: usize = 11;
+const PFN_LIST_BOX: usize = 12;
+const PFN_MDI_CLIENT: usize = 13;
+const PFN_STATIC: usize = 14;
+const PFN_IME: usize = 15;
+
+/// The built-in window classes win32k owns, and the client-PFN index whose
+/// WndProc backs each one. Registered as soon as user32 publishes the arrays
+/// (`NtUserInitializeClientPfnArrays`), which happens in user32's `DllMain` —
+/// long before any guest `CreateWindowExW`.
+///
+/// The `#3277x` names are the documented magic class names of the four classes
+/// Windows exposes only by atom (menu / desktop / dialog / icon-title); the rest
+/// are the documented control-class names. Comparison is case-insensitive
+/// ([`Win32kState::class_by_name`]), matching Windows' class lookup.
+const BUILTIN_CLASSES: [(&str, usize); 14] = [
+    ("BUTTON", PFN_BUTTON),
+    ("EDIT", PFN_EDIT),
+    ("STATIC", PFN_STATIC),
+    ("LISTBOX", PFN_LIST_BOX),
+    ("COMBOBOX", PFN_COMBO_BOX),
+    ("ComboLBox", PFN_COMBO_LBOX),
+    ("ScrollBar", PFN_SCROLL_BAR),
+    ("MDIClient", PFN_MDI_CLIENT),
+    ("IME", PFN_IME),
+    ("Message", PFN_MESSAGE),
+    ("#32768", PFN_POPUP_MENU), // PopupMenu
+    ("#32769", PFN_DESKTOP),    // Desktop
+    ("#32770", PFN_DIALOG),     // Dialog
+    ("#32772", PFN_ICON_TITLE), // IconTitle
+];
+
+/// `CS_GLOBALCLASS | CS_DBLCLKS | CS_PARENTDC` — the class style the built-ins
+/// are registered with. `CS_GLOBALCLASS` is the load-bearing bit: the classes
+/// belong to the system, not to one module's instance.
+const BUILTIN_CLASS_STYLE: u32 = 0x4000 | 0x0008 | 0x0080;
+
 /// `CW_USEDEFAULT` — the "let the manager choose" sentinel for x/y/cx/cy. Read
 /// as an i32 it is negative (0x80000000); substitute a sane default before
 /// storing the window and calling the driver, since a headless driver has no
@@ -212,6 +299,19 @@ pub(crate) struct Win32kState {
     /// `NtUserInitializeClientPfnArrays` — the guest WndProc-caller thunks the
     /// kernel→user callback path (roadmap W4.6) will jump to.
     client_pfn_table: u64,
+    /// The **resolved** per-index WndProcs of the Unicode client-PFN array
+    /// (roadmap W6.2): each entry is the user32 procedure the corresponding
+    /// `user_funcs` thunk jumps to. Index meanings: see [`BUILTIN_CLASSES`].
+    client_pfn_w: [u64; CLIENT_PFN_COUNT],
+    /// The same for the ANSI array. Recorded for the A-class registrations the
+    /// `RegisterClassExWOW` `ansi` flag will select once A/W WndProc pairing is
+    /// wired; unread today.
+    #[allow(dead_code)] // A-side pairing: W6.3.
+    client_pfn_a: [u64; CLIENT_PFN_COUNT],
+    /// user32's mapped image span `[base, base+SizeOfImage)` — arg3 of
+    /// `NtUserInitializeClientPfnArrays` plus the size read out of the mapped PE
+    /// header. Every resolved WndProc must land inside it to be trusted.
+    user32_image: (u64, u64),
     /// Registered classes, keyed by their assigned atom. The next atom is
     /// `CLASS_ATOM_BASE + classes.len()`.
     classes: Vec<(u16, Class)>,
@@ -379,16 +479,106 @@ fn honest_stub(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> R
     Ok(0)
 }
 
-/// `NtUserInitializeClientPfnArrays(client_procsW, client_procsA, client_worker,
-/// user32)` — user32's DllMain hands the kernel the client-side WndProc-caller
-/// table. Record arg0 for the kernel→user callback path (roadmap W4.6).
+/// Follow one client-PFN array entry to the user32 WndProc it stands for
+/// (roadmap W6.2). An entry is a `jmp qword [rip+disp32]` thunk: the WndProc is
+/// what its slot holds. A null entry stays null; an entry that is *not* that
+/// thunk shape is taken to be the procedure address itself (a future Wine build
+/// could publish the pointers directly — resolving would then be a no-op rather
+/// than a silent misread).
+fn resolve_client_pfn(mem: &dyn Memory, entry: u64) -> Result<u64> {
+    if entry == 0 {
+        return Ok(0);
+    }
+    let mut op = [0u8; 3];
+    for (i, b) in op.iter_mut().enumerate() {
+        *b = mem.read_u8(entry + i as u64)?;
+    }
+    if op != PFN_THUNK_JMP {
+        return Ok(entry);
+    }
+    let disp = mem.read_u32(entry + 3)? as i32 as i64;
+    let slot = (entry.wrapping_add(PFN_THUNK_LEN) as i64).wrapping_add(disp) as u64;
+    mem.read_u64(slot)
+}
+
+/// Read and resolve a whole [`CLIENT_PFN_COUNT`]-entry client-PFN array
+/// (roadmap W6.2). A null array pointer yields an all-zero table.
+fn read_client_pfn_array(mem: &dyn Memory, base: u64) -> Result<[u64; CLIENT_PFN_COUNT]> {
+    let mut out = [0u64; CLIENT_PFN_COUNT];
+    if base == 0 {
+        return Ok(out);
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = resolve_client_pfn(mem, mem.read_u64(base + (i as u64) * 8)?)?;
+    }
+    Ok(out)
+}
+
+/// `NtUserInitializeClientPfnArrays(client_procsA, client_procsW, client_worker,
+/// user32)` — user32's DllMain hands the kernel the client-side WndProc arrays.
+///
+/// Record arg0 for the kernel→user callback path (roadmap W4.6), **resolve both
+/// arrays through their thunks, and register user32's built-in control classes**
+/// against the recovered WndProcs (roadmap W6.2) — that is what makes
+/// `CreateWindowExW(L"BUTTON", …)` reach [`nt_user_create_window_ex`] instead of
+/// failing the class lookup inside user32.
 fn nt_user_initialize_client_pfn_arrays(
     os: &mut WinOs,
     cpu: &mut CpuState,
     mem: &mut dyn Memory,
 ) -> Result<u32> {
-    os.win32k_state.client_pfn_table = os.syscall_arg(cpu, mem, 0)?;
+    let procs_a = os.syscall_arg(cpu, mem, 0)?;
+    let procs_w = os.syscall_arg(cpu, mem, 1)?;
+    let user32 = os.syscall_arg(cpu, mem, 3)?;
+    os.win32k_state.client_pfn_table = procs_a;
+    os.win32k_state.user32_image = (user32, pe_image_size(mem, user32).unwrap_or(0));
+    // A malformed / unmapped array must not fault the guest: fall back to an
+    // all-zero table, which simply registers no built-ins (the pre-W6.2 state).
+    os.win32k_state.client_pfn_a = read_client_pfn_array(mem, procs_a).unwrap_or_default();
+    os.win32k_state.client_pfn_w = read_client_pfn_array(mem, procs_w).unwrap_or_default();
+    register_builtin_classes(os);
     Ok(STATUS_SUCCESS)
+}
+
+/// `SizeOfImage` of the PE mapped at `base`, read out of guest memory
+/// (`e_lfanew` @ +0x3C, then optional header +56). `None` when `base` is 0 or
+/// the MZ/PE signatures are absent, so a caller can decline to trust the span.
+fn pe_image_size(mem: &dyn Memory, base: u64) -> Option<u64> {
+    if base == 0 || mem.read_u16(base).ok()? != 0x5A4D {
+        return None;
+    }
+    let pe = base + mem.read_u32(base + 0x3C).ok()? as u64;
+    if mem.read_u32(pe).ok()? != 0x0000_4550 {
+        return None;
+    }
+    Some(mem.read_u32(pe + 24 + 56).ok()? as u64)
+}
+
+/// Register the built-in control classes ([`BUILTIN_CLASSES`]) against the
+/// resolved Unicode WndProcs (roadmap W6.2). Idempotent — a class whose name is
+/// already registered (a second `NtUserInitializeClientPfnArrays`, or a guest
+/// that got there first) is left alone. A class whose PFN slot resolved to 0, or
+/// to an address **outside user32's mapped image**, is skipped rather than
+/// registered with a WndProc that would not survive the first message.
+fn register_builtin_classes(os: &mut WinOs) {
+    let (u32_base, u32_size) = os.win32k_state.user32_image;
+    for (name, index) in BUILTIN_CLASSES {
+        let wndproc = os.win32k_state.client_pfn_w[index];
+        let in_user32 = u32_size == 0 || (wndproc >= u32_base && wndproc < u32_base + u32_size);
+        if wndproc == 0 || !in_user32 || os.win32k_state.class_by_name(name).is_some() {
+            continue;
+        }
+        let atom = CLASS_ATOM_BASE.wrapping_add(os.win32k_state.classes.len() as u16);
+        os.win32k_state.classes.push((
+            atom,
+            Class {
+                name: name.to_string(),
+                wndproc,
+                style: BUILTIN_CLASS_STYLE,
+                background: 0,
+            },
+        ));
+    }
 }
 
 /// `NtUserGetSystemDpiForProcess` → 96 (100% scaling; Retina/DPI is deferred).
@@ -1293,5 +1483,139 @@ mod tests {
         // Width and height are distinct 4-byte fields (a classic overlap bug).
         assert_ne!(DEVMODE_DMPELSWIDTH_OFF, DEVMODE_DMPELSHEIGHT_OFF);
         assert_eq!(DEVMODE_DMPELSHEIGHT_OFF - DEVMODE_DMPELSWIDTH_OFF, 4);
+    }
+
+    // ---- W6.2: the client-PFN arrays -> built-in class registry -------------
+
+    /// A synthetic stand-in for the pinned layout: a `user_procs` block of
+    /// [`CLIENT_PFN_COUNT`] procedure addresses, and a `user_funcs` array of
+    /// `jmp qword [rip+disp32]` thunks jumping through it index-for-index (with
+    /// index 6 left NULL, as the real build leaves it). Returns
+    /// `(memory, funcs_array, procs)`.
+    fn synth_client_pfn() -> (VirtualMemory, u64, [u64; CLIENT_PFN_COUNT]) {
+        const FUNCS: u64 = 0x2000_0000;
+        const SLOTS: u64 = 0x2000_1000;
+        const THUNKS: u64 = 0x2000_2000;
+        const USER32: u64 = 0x3000_0000;
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("pfn", FUNCS, 0x3000, Perm::RWX)).unwrap();
+
+        let mut procs = [0u64; CLIENT_PFN_COUNT];
+        for (i, entry) in procs.iter_mut().enumerate() {
+            if i == 6 {
+                mem.write_u64(FUNCS + (i as u64) * 8, 0).unwrap();
+                continue;
+            }
+            // The "WndProc" this index stands for, somewhere inside user32.
+            let proc_va = USER32 + 0x1000 + (i as u64) * 0x40;
+            *entry = proc_va;
+            let slot = SLOTS + (i as u64) * 8;
+            mem.write_u64(slot, proc_va).unwrap();
+            // `jmp qword [rip+disp32]` — disp is relative to the end of the
+            // 7-byte instruction.
+            let thunk = THUNKS + (i as u64) * 0x10;
+            let disp = (slot as i64 - (thunk as i64 + PFN_THUNK_LEN as i64)) as i32;
+            mem.write_u8(thunk, PFN_THUNK_JMP[0]).unwrap();
+            mem.write_u8(thunk + 1, PFN_THUNK_JMP[1]).unwrap();
+            mem.write_u8(thunk + 2, PFN_THUNK_JMP[2]).unwrap();
+            mem.write_u32(thunk + 3, disp as u32).unwrap();
+            mem.write_u64(FUNCS + (i as u64) * 8, thunk).unwrap();
+        }
+        (mem, FUNCS, procs)
+    }
+
+    /// Following a client-PFN entry's `jmp qword [rip+disp32]` thunk yields the
+    /// WndProc its slot holds, index-for-index, with the unpublished slot
+    /// staying null (roadmap W6.2).
+    #[test]
+    fn client_pfn_entries_resolve_through_their_thunks() {
+        let (mem, funcs, procs) = synth_client_pfn();
+        let resolved = read_client_pfn_array(&mem, funcs).unwrap();
+        assert_eq!(resolved, procs, "every published index resolves to its own proc");
+        assert_eq!(resolved[6], 0, "the unpublished index stays null");
+        // Distinct indices must not collapse onto one another (a displacement
+        // sign/base error would alias them).
+        assert_ne!(resolved[PFN_BUTTON], resolved[PFN_EDIT]);
+        assert_ne!(resolved[PFN_STATIC], resolved[PFN_LIST_BOX]);
+    }
+
+    /// A null array pointer, and an entry that is *not* a thunk, are handled
+    /// without inventing an address: the array reads as all-zero, and a direct
+    /// procedure pointer resolves to itself (roadmap W6.2).
+    #[test]
+    fn client_pfn_resolution_is_honest_about_non_thunks() {
+        let (mem, _, _) = synth_client_pfn();
+        assert_eq!(read_client_pfn_array(&mem, 0).unwrap(), [0u64; CLIENT_PFN_COUNT]);
+        assert_eq!(resolve_client_pfn(&mem, 0).unwrap(), 0);
+        // A direct pointer (no `48 ff 25` at it) is taken as the proc itself.
+        let direct = 0x2000_1000; // the slot block: qwords, not thunk opcodes
+        assert_eq!(resolve_client_pfn(&mem, direct).unwrap(), direct);
+    }
+
+    /// The built-in classes are registered against the resolved Unicode procs,
+    /// with distinct atoms, and re-registration is a no-op (roadmap W6.2).
+    #[test]
+    fn builtin_classes_register_against_the_recovered_wndprocs() {
+        let (_, _, procs) = synth_client_pfn();
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        os.win32k_state.client_pfn_w = procs;
+        os.win32k_state.user32_image = (0x3000_0000, 0x10_0000);
+        register_builtin_classes(&mut os);
+
+        let atom = os.win32k_state.class_by_name("BUTTON").expect("BUTTON registered");
+        let class = os.win32k_state.class_by_atom(atom).unwrap();
+        assert_eq!(class.wndproc, procs[PFN_BUTTON], "BUTTON is wired to index 7's proc");
+        assert_eq!(class.style & 0x4000, 0x4000, "built-ins are CS_GLOBALCLASS");
+        // Lookup is case-insensitive, as Windows' class lookup is.
+        assert_eq!(os.win32k_state.class_by_name("button"), Some(atom));
+        for (name, index) in BUILTIN_CLASSES {
+            let a = os.win32k_state.class_by_name(name).unwrap_or_else(|| panic!("{name} registered"));
+            assert_eq!(os.win32k_state.class_by_atom(a).unwrap().wndproc, procs[index]);
+        }
+        let atoms: std::collections::HashSet<u16> =
+            os.win32k_state.classes.iter().map(|(a, _)| *a).collect();
+        assert_eq!(atoms.len(), BUILTIN_CLASSES.len(), "every built-in got a distinct atom");
+
+        // Idempotent: a second publish does not duplicate or renumber.
+        register_builtin_classes(&mut os);
+        assert_eq!(os.win32k_state.classes.len(), BUILTIN_CLASSES.len());
+        assert_eq!(os.win32k_state.class_by_name("BUTTON"), Some(atom));
+    }
+
+    /// A proc that resolved *outside* user32's mapped image is refused rather
+    /// than registered — a WndProc that would fault on the first message is
+    /// worse than an unregistered class (roadmap W6.2).
+    #[test]
+    fn builtin_classes_refuse_procs_outside_user32() {
+        let (_, _, procs) = synth_client_pfn();
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        os.win32k_state.client_pfn_w = procs;
+        // An image span that excludes every synthetic proc.
+        os.win32k_state.user32_image = (0x9000_0000, 0x10_0000);
+        register_builtin_classes(&mut os);
+        assert!(os.win32k_state.classes.is_empty(), "no class trusts an out-of-image proc");
+
+        // A zero size means "SizeOfImage unreadable" — the span check is then
+        // skipped rather than silently rejecting everything.
+        os.win32k_state.user32_image = (0x9000_0000, 0);
+        register_builtin_classes(&mut os);
+        assert_eq!(os.win32k_state.classes.len(), BUILTIN_CLASSES.len());
+    }
+
+    /// `SizeOfImage` is read out of the mapped PE header, and a non-PE base is
+    /// reported as unknown rather than guessed (roadmap W6.2).
+    #[test]
+    fn pe_image_size_reads_the_mapped_header() {
+        let mut mem = VirtualMemory::new();
+        let base = 0x4000_0000u64;
+        mem.map(Region::new("img", base, 0x1000, Perm::RW)).unwrap();
+        assert_eq!(pe_image_size(&mem, 0), None, "a null base has no image");
+        assert_eq!(pe_image_size(&mem, base), None, "an unsigned page is not a PE");
+        mem.write_u16(base, 0x5A4D).unwrap(); // "MZ"
+        mem.write_u32(base + 0x3C, 0x80).unwrap(); // e_lfanew
+        assert_eq!(pe_image_size(&mem, base), None, "MZ alone is not enough");
+        mem.write_u32(base + 0x80, 0x0000_4550).unwrap(); // "PE\0\0"
+        mem.write_u32(base + 0x80 + 24 + 56, 0x2A6000).unwrap(); // SizeOfImage
+        assert_eq!(pe_image_size(&mem, base), Some(0x2A6000));
     }
 }
