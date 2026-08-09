@@ -48,10 +48,10 @@ pub(crate) struct CbFrame {
 }
 
 /// The resume state of a win32k syscall (e.g. `NtUserDispatchMessage`) that
-/// invoked one or more guest procedures via
-/// [`WinOs::call_wndproc_from_syscall`] / [`WinOs::call_guest_from_syscall`]
-/// (roadmap W4.6, extended in W6.3). When the last of them returns to the win32k
-/// driver thunk, the guest is put back exactly at the post-SYSCALL point.
+/// invoked one or more guest WndProcs via
+/// [`WinOs::call_wndprocs_from_syscall`] (roadmap W4.6/W6.2). When the last
+/// WndProc returns to the win32k driver thunk, the guest is put back exactly at
+/// the post-SYSCALL point.
 pub(crate) struct Win32kCbFrame {
     /// The instruction after the guest's `SYSCALL` (from rcx on entry).
     pub resume_rip: u64,
@@ -59,17 +59,19 @@ pub(crate) struct Win32kCbFrame {
     pub resume_rsp: u64,
     /// The guest RFLAGS the SYSCALL preserved in r11.
     pub resume_flags: u64,
-    /// Stack pointer each queued call is seated below. Usually `resume_rsp`; a
-    /// handler that had to build a struct for the callee (e.g.
-    /// `NtUserCreateWindowEx`'s `CREATESTRUCTW`) lowers it past that scratch.
-    pub call_rsp: u64,
-    /// Further `(func, args)` calls to make before resuming — the same
-    /// queue-then-resume shape [`CbFrame`] uses for `_initterm` / DllMain
-    /// (roadmap W6.3: `WM_NCCREATE` then `WM_CREATE`).
+    /// WndProc calls still to run before the syscall's caller resumes, as
+    /// `(func, args)`. A **sequence** is what lets a handler that must also
+    /// return a value of its own (`NtUserCreateWindowEx` → the HWND) drive the
+    /// `WM_NCCREATE`/`WM_CREATE` pair: the return-hijack alone could only
+    /// surface the last WndProc's LRESULT (roadmap W6.2).
     pub remaining: VecDeque<(u64, Vec<u64>)>,
-    /// Value to leave in the accumulator when the queue drains — the syscall's
-    /// own return value. `None` keeps whatever the last callee returned (the
-    /// `DispatchMessage` LRESULT).
+    /// The guest rsp each queued callback's frame is seated below. Normally the
+    /// resume rsp; a handler that parked a struct (a `CREATESTRUCTW`) in the
+    /// scratch below the syscall frame lowers it so the callbacks cannot
+    /// overwrite what they were handed.
+    pub call_base: u64,
+    /// What to leave in rax once the queue drains. `None` keeps the last
+    /// callback's own return value — the `DispatchMessage` LRESULT contract.
     pub result: Option<u64>,
 }
 
@@ -2996,38 +2998,36 @@ impl WinOs {
         wndproc: u64,
         msg: crate::msg::PostedMsg,
     ) -> Result<()> {
-        // SYSCALL left the return rip in rcx and the flags in r11; the guest rsp
-        // was captured before the unix-stack switch. These are the resume state.
         let args = vec![msg.hwnd, msg.message as u64, msg.wparam, msg.lparam];
-        let guest_rsp = self.syscall_guest_rsp;
-        self.call_guest_from_syscall(cpu, mem, vec![(wndproc, args)], None, guest_rsp)?;
+        self.call_wndprocs_from_syscall(cpu, mem, vec![(wndproc, args)], None, 0)?;
         Ok(())
     }
 
-    /// Call a *sequence* of guest procedures from inside a win32k syscall
-    /// handler, then resume that syscall's caller with `result` in the
-    /// accumulator (roadmap W6.3).
+    /// The general form of [`call_wndproc_from_syscall`](Self::call_wndproc_from_syscall):
+    /// run a **sequence** of guest callbacks from inside a win32k syscall
+    /// handler, then resume that syscall's caller with `result` in rax
+    /// (roadmap W6.2).
     ///
-    /// This is [`call_wndproc_from_syscall`](Self::call_wndproc_from_syscall)
-    /// generalised into the queue-then-resume shape
-    /// [`invoke_callbacks`](Self::invoke_callbacks) uses for `_initterm` / TLS
-    /// callbacks / DllMain: it is what lets a handler call the WndProc **and
-    /// then still return a value of its own** — `NtUserCreateWindowEx` sends
-    /// `WM_NCCREATE`/`WM_CREATE` and returns the HWND. `result: None` keeps the
-    /// last callee's return value (the `DispatchMessage` LRESULT).
+    /// This is what unblocks `NtUserCreateWindowEx`: it must call the class
+    /// WndProc twice (`WM_NCCREATE`, then `WM_CREATE`) **and** still return the
+    /// HWND to user32. The plain return-hijack cannot — it leaves whatever the
+    /// WndProc returned in rax. Passing `result = Some(hwnd)` makes the frame
+    /// carry the handler's own answer across the callbacks, the same shape
+    /// [`invoke_callbacks`](Self::invoke_callbacks) gives the intercepted-import
+    /// path (`_initterm`, TLS callbacks, `DllMain`).
     ///
-    /// `call_rsp` is the guest stack pointer the calls are seated below; pass
-    /// `syscall_guest_rsp` unless the handler built a struct for the callee on
-    /// the guest stack, in which case pass the address below it. Returns
-    /// `false` (nothing installed, handle the syscall normally) for an empty
-    /// queue.
-    pub(crate) fn call_guest_from_syscall(
+    /// `stack_reserve` bytes below the interrupted syscall's guest rsp are left
+    /// untouched by the callback frames — room for a struct the callbacks are
+    /// handed by pointer (`CREATESTRUCTW`). Returns whether a callback was
+    /// installed; `false` (an empty queue) means the caller should return its
+    /// status normally.
+    pub(crate) fn call_wndprocs_from_syscall(
         &mut self,
         cpu: &mut CpuState,
         mem: &mut dyn Memory,
         calls: Vec<(u64, Vec<u64>)>,
         result: Option<u64>,
-        call_rsp: u64,
+        stack_reserve: u64,
     ) -> Result<bool> {
         let mut remaining: VecDeque<(u64, Vec<u64>)> = calls.into();
         let Some((func, args)) = remaining.pop_front() else {
@@ -3035,30 +3035,31 @@ impl WinOs {
         };
         // SYSCALL left the return rip in rcx and the flags in r11; the guest rsp
         // was captured before the unix-stack switch. These are the resume state.
+        let resume_rsp = self.syscall_guest_rsp;
+        let call_base = resume_rsp.wrapping_sub(stack_reserve);
         self.win32k_cb.push(Win32kCbFrame {
             resume_rip: cpu.reg(Reg::Rcx),
-            resume_rsp: self.syscall_guest_rsp,
+            resume_rsp,
             resume_flags: cpu.reg(Reg::R11),
-            call_rsp,
             remaining,
+            call_base,
             result,
         });
         let driver = self.win32k_cb_driver;
-        self.setup_call_args(cpu, mem, func, &args, driver, call_rsp)?;
-        // dispatch_syscall must not restore/return: we've installed the callee.
+        self.setup_call_args(cpu, mem, func, &args, driver, call_base)?;
+        // dispatch_syscall must not restore/return: we've installed the WndProc.
         self.syscall_resume_as_is = true;
         Ok(true)
     }
 
-    /// A procedure invoked from a win32k syscall returned to the driver thunk:
-    /// run the next queued call, or resume the interrupted syscall's caller.
-    /// On resume the frame's `result` (e.g. `NtUserCreateWindowEx`'s HWND) goes
-    /// into rax; without one, whatever the last callee returned stays there
-    /// (= the `DispatchMessage` LRESULT).
+    /// A WndProc invoked from a win32k syscall returned to the driver thunk: run
+    /// the next queued callback, or resume the interrupted syscall's caller.
+    /// With no explicit `result` the WndProc's own return value stays in rax
+    /// (= the `DispatchMessage` LRESULT the loop ignores).
     fn win32k_cb_advance(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let next = self.win32k_cb.last_mut().and_then(|f| f.remaining.pop_front());
         if let Some((func, args)) = next {
-            let base = self.win32k_cb.last().expect("frame still on the stack").call_rsp;
+            let base = self.win32k_cb.last().expect("frame just read").call_base;
             let driver = self.win32k_cb_driver;
             self.setup_call_args(cpu, mem, func, &args, driver, base)?;
             return Ok(Outcome::Resume);
@@ -3067,8 +3068,8 @@ impl WinOs {
         cpu.rip = f.resume_rip;
         cpu.set_rsp(f.resume_rsp);
         cpu.rflags = f.resume_flags;
-        if let Some(v) = f.result {
-            cpu.set_reg(Reg::Rax, v);
+        if let Some(result) = f.result {
+            cpu.set_reg(Reg::Rax, result);
         }
         Ok(Outcome::Resume)
     }
@@ -3229,6 +3230,12 @@ impl WinOs {
         ret_thunk: u64,
         base_rsp: u64,
     ) -> Result<()> {
+        if std::env::var_os("EXEMU_DBG").is_some() {
+            eprintln!(
+                "[dbg] setup_call func={func:#x} ret_thunk={ret_thunk:#x} (cb={:#x} w32k={:#x} initterm={:#x})",
+                self.cb_driver, self.win32k_cb_driver, self.initterm_driver
+            );
+        }
         if self.cfg.is_64bit {
             for (i, &a) in args.iter().take(4).enumerate() {
                 cpu.set_reg([Reg::Rcx, Reg::Rdx, Reg::R8, Reg::R9][i], a);
@@ -3246,7 +3253,6 @@ impl WinOs {
             mem.write_u32(sp, ret_thunk as u32)?;
             cpu.set_rsp(sp);
         }
-        eprintln!("[dbg] setup_call_args func={func:#x} args={args:x?} ret={ret_thunk:#x} base={base_rsp:#x} newrsp={:#x}", cpu.rsp());
         cpu.rip = func;
         Ok(())
     }

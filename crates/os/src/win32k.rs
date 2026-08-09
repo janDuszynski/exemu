@@ -212,16 +212,16 @@ const DEFAULT_CY: i32 = 480;
 /// `WM_SETTEXT` — the message `SetWindowTextW` delivers via `NtUserMessageCall`
 /// (there is no dedicated `NtUserSetWindowText` syscall; recovered evidence).
 const WM_SETTEXT: u32 = 0x000c;
-/// `WM_NCCREATE` — the first message a window's own WndProc ever sees, before
-/// `WM_CREATE`. A control allocates its instance data here.
+/// `WM_NCCREATE` — the first message a window ever receives, ahead of
+/// `WM_CREATE` (roadmap W6.2).
 const WM_NCCREATE: u32 = 0x0081;
 
-// --- CREATESTRUCTW (64-bit) field offsets, the `lParam` of WM_NCCREATE/WM_CREATE
-// (documented Win32 layout; the win32k side builds it because no user32 code
-// runs between `NtUserCreateWindowEx` and the class WndProc).
+// --- CREATESTRUCTW (64-bit) field offsets ---------------------------------
+// The struct `WM_NCCREATE`/`WM_CREATE` carry in lParam. The `cy, cx, y, x`
+// ordering is the documented (counter-intuitive) Win32 layout, not a typo.
 const CS_LP_CREATE_PARAMS: u64 = 0x00;
-const CS_H_INSTANCE: u64 = 0x08;
-const CS_H_MENU: u64 = 0x10;
+const CS_HINSTANCE: u64 = 0x08;
+const CS_HMENU: u64 = 0x10;
 const CS_HWND_PARENT: u64 = 0x18;
 const CS_CY: u64 = 0x20;
 const CS_CX: u64 = 0x24;
@@ -231,11 +231,18 @@ const CS_STYLE: u64 = 0x30;
 const CS_LPSZ_NAME: u64 = 0x38;
 const CS_LPSZ_CLASS: u64 = 0x40;
 const CS_DW_EX_STYLE: u64 = 0x48;
-/// Bytes reserved below the interrupted syscall's guest RSP for the
-/// `CREATESTRUCTW` the create messages carry — the struct is 0x50 bytes; the
-/// slack keeps the callee's frame 16-byte aligned and clear of it. Win64 has no
-/// red zone, so everything below the guest RSP is free scratch.
-const CS_RESERVE: u64 = 0x80;
+/// `sizeof(CREATESTRUCTW)` on 64-bit.
+const CREATESTRUCT_SIZE: u64 = 0x50;
+
+/// Bytes reserved below the interrupted `NtUserCreateWindowEx` syscall's guest
+/// rsp to hold the `CREATESTRUCTW` plus NUL-terminated copies of the window and
+/// class names. The creation callbacks are seated *below* this, so they cannot
+/// overwrite the struct they were handed (and the reservation nests naturally
+/// when a WndProc creates a window of its own).
+const CREATE_SCRATCH: u64 = 0x200;
+/// Longest name copied into that scratch, in UTF-16 code units (excluding the
+/// terminator). Two of these plus the struct fit inside [`CREATE_SCRATCH`].
+const CREATE_NAME_MAX: usize = 96;
 
 // --- DEVMODEW field offsets (64-bit `_devicemodeW`, roadmap W4.7) ----------
 // `NtUserEnumDisplaySettings` fills these display fields; the rest of the
@@ -509,33 +516,44 @@ fn honest_stub(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> R
 /// thunk shape is taken to be the procedure address itself (a future Wine build
 /// could publish the pointers directly — resolving would then be a no-op rather
 /// than a silent misread).
-fn resolve_client_pfn(mem: &dyn Memory, entry: u64) -> Result<u64> {
+/// Returns `(wndproc, slot)` — the procedure, and **the address of the slot the
+/// thunk jumps through** (ntdll's `user_procs + index*8`). The slot address is
+/// what [`mirror_client_pfn_to_ntdll_copies`] needs; a non-thunk entry has no
+/// slot and reports 0.
+fn resolve_client_pfn(mem: &dyn Memory, entry: u64) -> Result<(u64, u64)> {
     if entry == 0 {
-        return Ok(0);
+        return Ok((0, 0));
     }
     let mut op = [0u8; 3];
     for (i, b) in op.iter_mut().enumerate() {
         *b = mem.read_u8(entry + i as u64)?;
     }
     if op != PFN_THUNK_JMP {
-        return Ok(entry);
+        return Ok((entry, 0));
     }
     let disp = mem.read_u32(entry + 3)? as i32 as i64;
     let slot = (entry.wrapping_add(PFN_THUNK_LEN) as i64).wrapping_add(disp) as u64;
-    mem.read_u64(slot)
+    Ok((mem.read_u64(slot)?, slot))
 }
 
 /// Read and resolve a whole [`CLIENT_PFN_COUNT`]-entry client-PFN array
-/// (roadmap W6.2). A null array pointer yields an all-zero table.
-fn read_client_pfn_array(mem: &dyn Memory, base: u64) -> Result<[u64; CLIENT_PFN_COUNT]> {
-    let mut out = [0u64; CLIENT_PFN_COUNT];
+/// (roadmap W6.2), as `(procs, slots)`. A null array pointer yields all zeros.
+#[allow(clippy::type_complexity)]
+fn read_client_pfn_array(
+    mem: &dyn Memory,
+    base: u64,
+) -> Result<([u64; CLIENT_PFN_COUNT], [u64; CLIENT_PFN_COUNT])> {
+    let mut procs = [0u64; CLIENT_PFN_COUNT];
+    let mut slots = [0u64; CLIENT_PFN_COUNT];
     if base == 0 {
-        return Ok(out);
+        return Ok((procs, slots));
     }
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = resolve_client_pfn(mem, mem.read_u64(base + (i as u64) * 8)?)?;
+    for i in 0..CLIENT_PFN_COUNT {
+        let (p, s) = resolve_client_pfn(mem, mem.read_u64(base + (i as u64) * 8)?)?;
+        procs[i] = p;
+        slots[i] = s;
     }
-    Ok(out)
+    Ok((procs, slots))
 }
 
 /// `NtUserInitializeClientPfnArrays(client_procsA, client_procsW, client_worker,
@@ -558,10 +576,108 @@ fn nt_user_initialize_client_pfn_arrays(
     os.win32k_state.user32_image = (user32, pe_image_size(mem, user32).unwrap_or(0));
     // A malformed / unmapped array must not fault the guest: fall back to an
     // all-zero table, which simply registers no built-ins (the pre-W6.2 state).
-    os.win32k_state.client_pfn_a = read_client_pfn_array(mem, procs_a).unwrap_or_default();
-    os.win32k_state.client_pfn_w = read_client_pfn_array(mem, procs_w).unwrap_or_default();
+    let (pfn_a, slots_a) = read_client_pfn_array(mem, procs_a).unwrap_or_default();
+    let (pfn_w, slots_w) = read_client_pfn_array(mem, procs_w).unwrap_or_default();
+    os.win32k_state.client_pfn_a = pfn_a;
+    os.win32k_state.client_pfn_w = pfn_w;
+    if let Some(ntdll) = os.module_base("ntdll.dll") {
+        mirror_client_pfn_to_ntdll_copies(mem, ntdll, &[(&slots_a, &pfn_a), (&slots_w, &pfn_w)]);
+    }
     register_builtin_classes(os);
     Ok(STATUS_SUCCESS)
+}
+
+/// Republish the resolved client-PFN procs into **every other mapped copy of
+/// ntdll** (roadmap W6.2).
+///
+/// **Why this is needed.** Wine's split routes `DefWindowProcW` through ntdll:
+/// `user32!DefWindowProcW` is a *forwarder* to `NTDLL.NtdllDefWindowProc_W`,
+/// which is nothing but `jmp qword [user_procs + 4*8 + 0x88]` — a jump through
+/// the very slot `RtlInitializeNtUserPfn` fills when user32 publishes its arrays.
+/// Under exemu's Wine boot the process ends up with **two** ntdll images: the one
+/// exemu pre-maps (the running image — the copy user32 binds to and therefore the
+/// only one whose `user_procs` is ever filled) and a second one Wine's own loader
+/// maps for the name `NTDLL.dll` while resolving forwarders. Modules bound after
+/// that second map — the exe itself, and comctl32 — reach `DefWindowProcW`
+/// through the *dead* copy, whose slot is still NULL, so the call tail-jumps to
+/// address 0. (Measured: the AV then never surfaces either, because ntdll's
+/// `call_seh_handlers` re-runs `virtual_unwind` until the frame reaches
+/// `TEB.StackBase`, and exemu's win32k callback-return thunk carries no `.pdata`,
+/// so the walk never terminates — the run spins instead of faulting.)
+///
+/// Mirroring the slots makes the WndProc table exemu recovered authoritative for
+/// every copy, so `DefWindowProc` works no matter which image a module was bound
+/// against. It does not fix the duplicate load itself — that is a loader-level
+/// gap, pinned in `crates/app/tests/comctl_gate.rs`.
+///
+/// A copy is identified structurally: a mapped region holding a PE whose export
+/// directory names `ntdll.dll` and whose `SizeOfImage` matches the running one.
+/// Failures are silent — an unmirrored copy is exactly the pre-existing state.
+fn mirror_client_pfn_to_ntdll_copies(
+    mem: &mut dyn Memory,
+    live: u64,
+    arrays: &[(&[u64; CLIENT_PFN_COUNT], &[u64; CLIENT_PFN_COUNT])],
+) {
+    let Some(live_size) = pe_image_size(mem, live) else { return };
+    for copy in ntdll_copies(mem, live, live_size) {
+        for (slots, procs) in arrays {
+            for (slot, proc) in slots.iter().zip(procs.iter()) {
+                // A slot inside the running ntdll maps to the same RVA in the copy.
+                if *slot < live || *slot >= live + live_size || *proc == 0 {
+                    continue;
+                }
+                let _ = mem.write_u64(copy + (slot - live), *proc);
+            }
+        }
+    }
+}
+
+/// Bases of every mapped image that is a **second copy of the running ntdll** —
+/// same `SizeOfImage`, export-directory name `ntdll.dll`, different base
+/// (roadmap W6.2). Walks the guest's mapped regions; a region that is not a PE
+/// is skipped.
+fn ntdll_copies(mem: &dyn Memory, live: u64, live_size: u64) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut addr = 0u64;
+    while let Some((base, size, _)) = mem.next_region(addr) {
+        addr = base.saturating_add(size.max(1));
+        if base == live || pe_image_size(mem, base) != Some(live_size) {
+            continue;
+        }
+        if pe_export_name(mem, base).is_some_and(|n| n.eq_ignore_ascii_case("ntdll.dll")) {
+            out.push(base);
+        }
+    }
+    out
+}
+
+/// The name in the export directory of the PE mapped at `base` (the DLL's own
+/// idea of what it is called), or `None` when `base` holds no PE with exports.
+fn pe_export_name(mem: &dyn Memory, base: u64) -> Option<String> {
+    if base == 0 || mem.read_u16(base).ok()? != 0x5A4D {
+        return None;
+    }
+    let pe = base + mem.read_u32(base + 0x3C).ok()? as u64;
+    if mem.read_u32(pe).ok()? != 0x0000_4550 {
+        return None;
+    }
+    // Optional header + data directory 0 (export) → the directory's Name RVA.
+    let export_rva = mem.read_u32(pe + 24 + 112).ok()? as u64;
+    if export_rva == 0 {
+        return None;
+    }
+    let name_rva = mem.read_u32(base + export_rva + 12).ok()? as u64;
+    if name_rva == 0 {
+        return None;
+    }
+    let mut s = String::new();
+    for i in 0..64u64 {
+        match mem.read_u8(base + name_rva + i).ok()? {
+            0 => break,
+            c => s.push(c as char),
+        }
+    }
+    Some(s)
 }
 
 /// `SizeOfImage` of the PE mapped at `base`, read out of guest memory
@@ -678,9 +794,17 @@ fn nt_user_register_class_ex_wow(
 /// window object, then drive the driver create sequence (§4 ordering:
 /// window_pos_changing → create_window → window_pos_changed).
 ///
-/// arg2 (class) and arg4 (window name) are POINTERS to UNICODE_STRING; the
-/// exStyle/style/x/y/cx/cy dwords are raw; parent is a raw handle. Stack args
-/// 5+ are read via `syscall_arg` relative to the captured guest RSP.
+/// arg1 (class) and arg3 (window name) are POINTERS to UNICODE_STRING; the
+/// exStyle/style/x/y/cx/cy dwords are raw; parent/menu/instance are raw handles
+/// and arg12 is the caller's `lpParam`. Stack args 5+ are read via `syscall_arg`
+/// relative to the captured guest RSP. **The instance/params/module slots were
+/// pinned by probing the pinned user32 with distinctive values** (a guest
+/// `CreateWindowExW(..., hInstance = 0x11112222, lpParam = 0x33334444)` lands in
+/// arg11 / arg12; arg14 repeats the instance and arg13 is a flags dword).
+///
+/// Finally the creation pair is dispatched to the class WndProc — see
+/// [`dispatch_create_messages`], which hijacks the syscall return so the HWND is
+/// still what user32 receives (roadmap W6.2).
 fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let ex_style = os.syscall_arg(cpu, mem, 0)? as u32;
     let class_ptr = os.syscall_arg(cpu, mem, 1)?;
@@ -691,6 +815,9 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     let cx = os.syscall_arg(cpu, mem, 7)? as i32;
     let cy = os.syscall_arg(cpu, mem, 8)? as i32;
     let parent = os.syscall_arg(cpu, mem, 9)? as u32;
+    let menu = os.syscall_arg(cpu, mem, 10)?;
+    let instance = os.syscall_arg(cpu, mem, 11)?;
+    let create_params = os.syscall_arg(cpu, mem, 12)?;
 
     let class_name = read_unicode_string(mem, class_ptr)?;
     let title = read_unicode_string(mem, window_name_ptr)?;
@@ -731,8 +858,8 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
 
     let params = WindowParams {
         class_atom,
-        class_name,
-        title,
+        class_name: class_name.clone(),
+        title: title.clone(),
         x: rect[0],
         y: rect[1],
         cx: rect[2],
@@ -746,99 +873,124 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     os.driver.create_window(hwnd, &params);
     os.driver.window_pos_changed(hwnd, rect);
 
-    // W6.3: the class WndProc must see WM_NCCREATE then WM_CREATE before the
-    // handle is handed back — that is where a control allocates its instance
-    // data. Both carry a CREATESTRUCTW built on the guest stack just below the
-    // interrupted syscall's RSP; the calls are queued on the win32k callback
-    // frame so the syscall can still return the HWND when they drain.
-    if wndproc != 0 && create_messages_enabled() {
-        let cs = (os.syscall_guest_rsp & !0xf).saturating_sub(CS_RESERVE);
-        if cs != 0 && write_create_struct(os, cpu, mem, cs, rect).is_ok() {
-            let calls = vec![
-                (wndproc, vec![hwnd as u64, WM_NCCREATE as u64, 0, cs]),
-                (wndproc, vec![hwnd as u64, crate::gdi::WM_CREATE, 0, cs]),
-            ];
-            // The HWND is the syscall's result whatever the WndProc returns:
-            // exemu does not honour a WM_NCCREATE veto (FALSE) yet — a control
-            // that refuses creation would need the window torn down here.
-            if os.call_guest_from_syscall(cpu, mem, calls, Some(hwnd as u64), cs)? {
-                return Ok(0); // ignored: the frame supplies rax on resume
-            }
-        }
-    }
-
+    // The creation pair. Installing it hijacks the syscall return, so the HWND
+    // travels in the callback frame instead of this handler's status.
+    dispatch_create_messages(
+        os,
+        cpu,
+        mem,
+        hwnd,
+        &CreateInfo {
+            create_params,
+            instance,
+            menu,
+            parent,
+            rect,
+            style,
+            ex_style,
+            title: &title,
+            class_name: &class_name,
+        },
+    )?;
     Ok(hwnd)
 }
 
-/// Opt-in switch for the `WM_NCCREATE`/`WM_CREATE` dispatch (roadmap W6.3),
-/// `EXEMU_W6_CREATE_MSGS` (same shape as `EXEMU_NO_DLLMAIN`).
-///
-/// The dispatch itself is complete and **measured working**: with it on, the
-/// guest's own WndProc, Wine's real `ButtonWndProcW` and comctl32's real
-/// progress-bar WndProc each receive `WM_NCCREATE` then `WM_CREATE` with a
-/// correct `CREATESTRUCTW`, and `NtUserCreateWindowEx` still returns the HWND.
-///
-/// It is **off by default** because of a *loader* defect it immediately trips
-/// over, measured on the comctl gate: `ntdll.dll` ends up mapped **twice** — the
-/// boot image exemu maps (the live one, whose `user_procs` user32 fills through
-/// `RtlInitializeNtUserPfn`) and a second copy the guest loader maps when it
-/// snaps the main image's imports. `user32!DefWindowProcW` is a forwarder to
-/// `NTDLL.NtdllDefWindowProc_W`, which is a `jmp qword [rip+disp32]` through
-/// `user_procs[4]` — and it binds into the **second, uninitialized** image, so
-/// its slot is 0. Any WndProc that defers to `DefWindowProcW` (which every real
-/// control does from `WM_NCCREATE`) therefore jumps to address 0; the resulting
-/// access violation puts Wine's SEH into an endless
-/// `virtual_unwind → unwind_builtin_dll` stack walk (this is the true cause of
-/// the "spins on an unserviced `WineUnixCall`" symptom recorded for W6). Fixing
-/// the duplicate ntdll load is what flips this default to on.
-fn create_messages_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("EXEMU_W6_CREATE_MSGS").is_some())
+/// Everything `WM_NCCREATE`/`WM_CREATE`'s `CREATESTRUCTW` carries, gathered from
+/// the `NtUserCreateWindowEx` argument slots (roadmap W6.2).
+struct CreateInfo<'a> {
+    create_params: u64,
+    instance: u64,
+    menu: u64,
+    parent: u32,
+    /// `[x, y, cx, cy]`, `CW_USEDEFAULT` already substituted.
+    rect: [i32; 4],
+    style: u32,
+    ex_style: u32,
+    title: &'a str,
+    class_name: &'a str,
 }
 
-/// Build the `CREATESTRUCTW` the create messages carry, at guest address `cs`
-/// (roadmap W6.3). The string fields point at the caller's own buffers — the
-/// `Buffer` of each `UNICODE_STRING` argument, which is live for the duration of
-/// the syscall — rather than at copies, so a WndProc that stores `lpszName`
-/// sees exactly what the guest passed.
-fn write_create_struct(
+/// Copy `s` to `at` as a NUL-terminated UTF-16 string (at most
+/// [`CREATE_NAME_MAX`] code units), returning the guest address of the copy —
+/// or 0 for an empty string, which is what `CREATESTRUCTW` uses for "no name".
+/// Returns the byte length written so the caller can bump its cursor.
+fn write_wstr_at(mem: &mut dyn Memory, at: u64, s: &str) -> Result<(u64, u64)> {
+    if s.is_empty() {
+        return Ok((0, 0));
+    }
+    let units: Vec<u16> = s.encode_utf16().take(CREATE_NAME_MAX).collect();
+    for (i, u) in units.iter().enumerate() {
+        mem.write_u16(at + (i as u64) * 2, *u)?;
+    }
+    mem.write_u16(at + (units.len() as u64) * 2, 0)?;
+    Ok((at, (units.len() as u64 + 1) * 2))
+}
+
+/// Build a `CREATESTRUCTW` in the scratch below the interrupted syscall's guest
+/// rsp and dispatch `WM_NCCREATE` then `WM_CREATE` to the class WndProc
+/// (roadmap W6.2). Without this a control never allocates its instance data, so
+/// nothing it is later asked to do can work.
+///
+/// **Why the callback queue and not the plain return-hijack:**
+/// `call_wndproc_from_syscall` leaves the WndProc's LRESULT in rax, which is
+/// exactly the register `NtUserCreateWindowEx` must return the HWND in. The
+/// queue form ([`WinOs::call_wndprocs_from_syscall`]) carries the handler's own
+/// result across both callbacks — the same re-entrant shape `_initterm`, the TLS
+/// callbacks and `DllMain` already use on the intercepted-import path.
+///
+/// The names are **copied** into the scratch rather than aliased from the
+/// caller's `UNICODE_STRING` buffers: those carry an explicit length and are not
+/// promised to be NUL-terminated, while `CREATESTRUCTW.lpsz*` are plain C
+/// strings.
+///
+/// Known simplification: Windows aborts creation when `WM_NCCREATE` returns
+/// FALSE (or `WM_CREATE` returns −1). exemu dispatches both and keeps the
+/// window; the LRESULTs are not inspected. Nothing in the current corpus refuses
+/// its own creation, and a half-created window would be a worse failure than a
+/// live one.
+///
+/// A class with no WndProc (never registered) is left alone — the handler then
+/// returns the HWND the ordinary way.
+fn dispatch_create_messages(
     os: &mut WinOs,
     cpu: &mut CpuState,
     mem: &mut dyn Memory,
-    cs: u64,
-    rect: [i32; 4],
-) -> Result<()> {
-    // UNICODE_STRING `Buffer` lives at +0x08; a null struct pointer yields null.
-    let buffer_of = |mem: &dyn Memory, p: u64| -> u64 {
-        if p == 0 {
-            0
-        } else {
-            mem.read_u64(p + 8).unwrap_or(0)
-        }
+    hwnd: u32,
+    info: &CreateInfo,
+) -> Result<bool> {
+    let wndproc = os.win32k_state.wndproc_for(hwnd);
+    if wndproc == 0 {
+        return Ok(false);
+    }
+    let scratch = os.syscall_guest_rsp.wrapping_sub(CREATE_SCRATCH);
+    let cs = scratch & !0xf;
+    let strings = cs + CREATESTRUCT_SIZE;
+    // A stack too shallow to hold the scratch is not worth faulting the guest
+    // over: skip the creation pair rather than corrupt memory.
+    let Ok((name_ptr, name_len)) = write_wstr_at(mem, strings, info.title) else {
+        return Ok(false);
     };
-    let class_ptr = os.syscall_arg(cpu, mem, 1)?;
-    let name_ptr = os.syscall_arg(cpu, mem, 3)?;
-    let ex_style = os.syscall_arg(cpu, mem, 0)? as u32;
-    let style = os.syscall_arg(cpu, mem, 4)? as u32;
-    let parent = os.syscall_arg(cpu, mem, 9)?;
-    let menu = os.syscall_arg(cpu, mem, 10)?;
-    let create_params = os.syscall_arg(cpu, mem, 12)?;
-    let instance = os.syscall_arg(cpu, mem, 14)?;
-    let (lpsz_class, lpsz_name) = (buffer_of(mem, class_ptr), buffer_of(mem, name_ptr));
+    let (class_ptr, _) = write_wstr_at(mem, strings + name_len, info.class_name)?;
 
-    mem.write_u64(cs + CS_LP_CREATE_PARAMS, create_params)?;
-    mem.write_u64(cs + CS_H_INSTANCE, instance)?;
-    mem.write_u64(cs + CS_H_MENU, menu)?;
-    mem.write_u64(cs + CS_HWND_PARENT, parent)?;
-    mem.write_u32(cs + CS_CY, rect[3] as u32)?;
-    mem.write_u32(cs + CS_CX, rect[2] as u32)?;
-    mem.write_u32(cs + CS_Y, rect[1] as u32)?;
-    mem.write_u32(cs + CS_X, rect[0] as u32)?;
-    mem.write_u32(cs + CS_STYLE, style)?;
-    mem.write_u64(cs + CS_LPSZ_NAME, lpsz_name)?;
-    mem.write_u64(cs + CS_LPSZ_CLASS, lpsz_class)?;
-    mem.write_u32(cs + CS_DW_EX_STYLE, ex_style)?;
-    Ok(())
+    mem.write_u64(cs + CS_LP_CREATE_PARAMS, info.create_params)?;
+    mem.write_u64(cs + CS_HINSTANCE, info.instance)?;
+    mem.write_u64(cs + CS_HMENU, info.menu)?;
+    mem.write_u64(cs + CS_HWND_PARENT, info.parent as u64)?;
+    mem.write_u32(cs + CS_CY, info.rect[3] as u32)?;
+    mem.write_u32(cs + CS_CX, info.rect[2] as u32)?;
+    mem.write_u32(cs + CS_Y, info.rect[1] as u32)?;
+    mem.write_u32(cs + CS_X, info.rect[0] as u32)?;
+    mem.write_u32(cs + CS_STYLE, info.style)?;
+    mem.write_u64(cs + CS_LPSZ_NAME, name_ptr)?;
+    mem.write_u64(cs + CS_LPSZ_CLASS, class_ptr)?;
+    mem.write_u32(cs + CS_DW_EX_STYLE, info.ex_style)?;
+
+    let hwnd = hwnd as u64;
+    let calls = vec![
+        (wndproc, vec![hwnd, WM_NCCREATE as u64, 0, cs]),
+        (wndproc, vec![hwnd, crate::gdi::WM_CREATE, 0, cs]),
+    ];
+    os.call_wndprocs_from_syscall(cpu, mem, calls, Some(hwnd), CREATE_SCRATCH)
 }
 
 /// `NtUserShowWindow(hwnd, cmd)` / `NtUserShowWindowAsync` — mark the window
@@ -1576,7 +1728,7 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exemu_core::{DisplayMode, Perm, Region};
+    use exemu_core::{DisplayMode, Perm, Reg, Region};
     use exemu_memory::VirtualMemory;
 
     /// `NtUserEnumDisplaySettings` writes the DEVMODEW display fields at their
@@ -1646,7 +1798,8 @@ mod tests {
     #[test]
     fn client_pfn_entries_resolve_through_their_thunks() {
         let (mem, funcs, procs) = synth_client_pfn();
-        let resolved = read_client_pfn_array(&mem, funcs).unwrap();
+        let (resolved, slots) = read_client_pfn_array(&mem, funcs).unwrap();
+        assert!(slots[PFN_BUTTON] != 0, "a thunked entry reports the slot it jumps through");
         assert_eq!(resolved, procs, "every published index resolves to its own proc");
         assert_eq!(resolved[6], 0, "the unpublished index stays null");
         // Distinct indices must not collapse onto one another (a displacement
@@ -1661,11 +1814,11 @@ mod tests {
     #[test]
     fn client_pfn_resolution_is_honest_about_non_thunks() {
         let (mem, _, _) = synth_client_pfn();
-        assert_eq!(read_client_pfn_array(&mem, 0).unwrap(), [0u64; CLIENT_PFN_COUNT]);
-        assert_eq!(resolve_client_pfn(&mem, 0).unwrap(), 0);
+        assert_eq!(read_client_pfn_array(&mem, 0).unwrap().0, [0u64; CLIENT_PFN_COUNT]);
+        assert_eq!(resolve_client_pfn(&mem, 0).unwrap(), (0, 0));
         // A direct pointer (no `48 ff 25` at it) is taken as the proc itself.
         let direct = 0x2000_1000; // the slot block: qwords, not thunk opcodes
-        assert_eq!(resolve_client_pfn(&mem, direct).unwrap(), direct);
+        assert_eq!(resolve_client_pfn(&mem, direct).unwrap(), (direct, 0));
     }
 
     /// The built-in classes are registered against the resolved Unicode procs,
@@ -1718,105 +1871,6 @@ mod tests {
         assert_eq!(os.win32k_state.classes.len(), BUILTIN_CLASSES.len());
     }
 
-    // ---- W6.3: the queue-then-resume win32k callback frame ------------------
-
-    /// A win32k syscall handler can call a **sequence** of guest procedures and
-    /// still return a value of its own (roadmap W6.3) — the shape
-    /// `NtUserCreateWindowEx` needs to send `WM_NCCREATE`/`WM_CREATE` and then
-    /// hand back the HWND. Drives the real frame through the real driver thunk:
-    /// each "return" is an `intercept` of that thunk, exactly as the guest's
-    /// `ret` produces.
-    #[test]
-    fn queued_guest_calls_run_in_order_then_resume_with_the_result() {
-        use exemu_core::{Hooks, Reg};
-        const STACK: u64 = 0x2_0000;
-        const RESUME_RIP: u64 = 0x1234_5000;
-        const FLAGS: u64 = 0x246;
-        let mut mem = VirtualMemory::new();
-        mem.map(Region::new("stack", STACK, 0x4000, Perm::RW)).unwrap();
-        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
-        let driver = os.win32k_cb_driver;
-        assert_ne!(driver, 0, "the win32k driver thunk is allocated at boot");
-
-        // Stand in for the state `dispatch_syscall` captures: SYSCALL leaves the
-        // return rip in rcx and the flags in r11, and the guest rsp was saved.
-        let guest_rsp = STACK + 0x2000;
-        let mut cpu = CpuState::new();
-        cpu.set_reg(Reg::Rcx, RESUME_RIP);
-        cpu.set_reg(Reg::R11, FLAGS);
-        os.syscall_guest_rsp = guest_rsp;
-
-        let calls = vec![(0xAAAA_0000u64, vec![1, 2, 3, 4]), (0xBBBB_0000u64, vec![5, 6, 7, 8])];
-        let installed = os
-            .call_guest_from_syscall(&mut cpu, &mut mem, calls, Some(0x99), guest_rsp)
-            .unwrap();
-        assert!(installed, "a non-empty queue installs the first call");
-        assert!(os.syscall_resume_as_is, "the dispatcher must not run its own return");
-
-        // First call: seated with its args and the driver thunk as return address.
-        assert_eq!(cpu.rip, 0xAAAA_0000);
-        assert_eq!(cpu.reg(Reg::Rcx), 1);
-        assert_eq!(cpu.reg(Reg::R9), 4);
-        assert_eq!(mem.read_u64(cpu.rsp()).unwrap(), driver, "returns to the driver thunk");
-
-        // It returns → the *second* call runs, from the same base rsp.
-        let first_rsp = cpu.rsp();
-        os.intercept(driver, &mut cpu, &mut mem).unwrap();
-        assert_eq!(cpu.rip, 0xBBBB_0000, "the queue advances in order");
-        assert_eq!(cpu.reg(Reg::Rcx), 5);
-        assert_eq!(cpu.reg(Reg::R9), 8);
-        assert_eq!(cpu.rsp(), first_rsp, "each queued call is seated at the same depth");
-
-        // It returns → the syscall's caller resumes, with the frame's result.
-        cpu.set_reg(Reg::Rax, 0xDEAD);
-        os.intercept(driver, &mut cpu, &mut mem).unwrap();
-        assert_eq!(cpu.rip, RESUME_RIP, "resumes at the instruction after the SYSCALL");
-        assert_eq!(cpu.rsp(), guest_rsp, "and at the guest rsp the syscall was taken on");
-        assert_eq!(cpu.rflags, FLAGS, "with the flags SYSCALL preserved in r11");
-        assert_eq!(cpu.reg(Reg::Rax), 0x99, "the handler's own result wins over the callee's");
-    }
-
-    /// With no result the last callee's return value stays in rax — the
-    /// `DispatchMessage` LRESULT contract the W4.6 path relies on (W6.3).
-    #[test]
-    fn a_resultless_frame_keeps_the_callees_return_value() {
-        use exemu_core::{Hooks, Reg};
-        const STACK: u64 = 0x2_0000;
-        let mut mem = VirtualMemory::new();
-        mem.map(Region::new("stack", STACK, 0x4000, Perm::RW)).unwrap();
-        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
-        let driver = os.win32k_cb_driver;
-        let guest_rsp = STACK + 0x2000;
-        let mut cpu = CpuState::new();
-        os.syscall_guest_rsp = guest_rsp;
-
-        assert!(!os
-            .call_guest_from_syscall(&mut cpu, &mut mem, Vec::new(), Some(7), guest_rsp)
-            .unwrap(), "an empty queue installs nothing");
-
-        os.call_guest_from_syscall(&mut cpu, &mut mem, vec![(0xC000, vec![0])], None, guest_rsp)
-            .unwrap();
-        cpu.set_reg(Reg::Rax, 0x4321);
-        os.intercept(driver, &mut cpu, &mut mem).unwrap();
-        assert_eq!(cpu.reg(Reg::Rax), 0x4321);
-    }
-
-    /// The `CREATESTRUCTW` a create message carries lands at its documented
-    /// offsets, with `cx`/`cy` and `x`/`y` distinct 4-byte fields in the right
-    /// order (a classic transposition bug) — roadmap W6.3.
-    #[test]
-    fn create_struct_fields_land_at_their_offsets() {
-        // The struct is 0x50 bytes and the reserve must clear it with room for
-        // the callee's own 16-byte-aligned frame base.
-        const {
-            assert!(CS_RESERVE >= CS_DW_EX_STYLE + 8); // covers the whole struct
-            assert!(CS_RESERVE % 16 == 0); // keeps the callee frame 16-byte aligned
-        }
-        assert_eq!(CS_CX - CS_CY, 4, "cy then cx, adjacent dwords");
-        assert_eq!(CS_X - CS_Y, 4, "y then x, adjacent dwords");
-        assert_eq!(WM_NCCREATE, 0x0081);
-    }
-
     /// `SizeOfImage` is read out of the mapped PE header, and a non-PE base is
     /// reported as unknown rather than guessed (roadmap W6.2).
     #[test]
@@ -1832,5 +1886,227 @@ mod tests {
         mem.write_u32(base + 0x80, 0x0000_4550).unwrap(); // "PE\0\0"
         mem.write_u32(base + 0x80 + 24 + 56, 0x2A6000).unwrap(); // SizeOfImage
         assert_eq!(pe_image_size(&mem, base), Some(0x2A6000));
+    }
+
+    // ---- W6.2: the CREATESTRUCTW the creation pair carries -------------------
+
+    /// A window `WinOs` can dispatch a creation pair for, plus a mapped guest
+    /// stack. Returns `(os, memory, hwnd, guest_rsp)`.
+    fn window_for_create(wndproc: u64) -> (WinOs, VirtualMemory, u32) {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        os.win32k_state.classes.push((
+            CLASS_ATOM_BASE,
+            Class { name: "TestClass".into(), wndproc, style: 0, background: 0 },
+        ));
+        let hwnd = alloc_handle(&mut os);
+        os.win32k_state.windows.push((
+            hwnd,
+            Window {
+                class_atom: CLASS_ATOM_BASE,
+                class_name: "TestClass".into(),
+                title: "Title".into(),
+                rect: [10, 20, 300, 200],
+                style: 0x5000_0000,
+                ex_style: 0x8,
+                parent: 0x1234,
+                shown: false,
+                wndproc,
+                needs_paint: false,
+                surface: None,
+            },
+        ));
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("stack", 0x10_0000, 0x10_000, Perm::RW)).unwrap();
+        (os, mem, hwnd)
+    }
+
+    /// The struct `WM_NCCREATE`/`WM_CREATE` carry lands at its documented
+    /// offsets, with **NUL-terminated copies** of the two names (the caller's
+    /// `UNICODE_STRING` buffers carry a length, not a terminator), and sits far
+    /// enough above the callbacks' own frames that they cannot overwrite it
+    /// (roadmap W6.2).
+    #[test]
+    fn create_struct_lands_at_its_abi_offsets() {
+        const WNDPROC: u64 = 0x1_4000_1000;
+        let (mut os, mut mem, hwnd) = window_for_create(WNDPROC);
+        let guest_rsp = 0x10_8000u64;
+        os.set_syscall_guest_rsp_for_test(guest_rsp);
+        let mut cpu = CpuState::default();
+
+        let info = CreateInfo {
+            create_params: 0xDEAD_BEEF,
+            instance: 0x1_4000_0000,
+            menu: 0x65,
+            parent: 0x1234,
+            rect: [10, 20, 300, 200],
+            style: 0x5000_0000,
+            ex_style: 0x8,
+            title: "Title",
+            class_name: "TestClass",
+        };
+        assert!(dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap());
+
+        let cs = (guest_rsp - CREATE_SCRATCH) & !0xf;
+        assert_eq!(mem.read_u64(cs + CS_LP_CREATE_PARAMS).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(mem.read_u64(cs + CS_HINSTANCE).unwrap(), 0x1_4000_0000);
+        assert_eq!(mem.read_u64(cs + CS_HMENU).unwrap(), 0x65);
+        assert_eq!(mem.read_u64(cs + CS_HWND_PARENT).unwrap(), 0x1234);
+        // The `cy, cx, y, x` ordering is the documented (inverted) Win32 layout.
+        assert_eq!(mem.read_u32(cs + CS_CY).unwrap(), 200);
+        assert_eq!(mem.read_u32(cs + CS_CX).unwrap(), 300);
+        assert_eq!(mem.read_u32(cs + CS_Y).unwrap(), 20);
+        assert_eq!(mem.read_u32(cs + CS_X).unwrap(), 10);
+        assert_eq!(mem.read_u32(cs + CS_STYLE).unwrap(), 0x5000_0000);
+        assert_eq!(mem.read_u32(cs + CS_DW_EX_STYLE).unwrap(), 0x8);
+
+        let read = |p: u64| {
+            let mut s = String::new();
+            for i in 0.. {
+                match mem.read_u16(p + i * 2).unwrap() {
+                    0 => break,
+                    c => s.push(char::from_u32(c as u32).unwrap()),
+                }
+            }
+            s
+        };
+        let name = mem.read_u64(cs + CS_LPSZ_NAME).unwrap();
+        let class = mem.read_u64(cs + CS_LPSZ_CLASS).unwrap();
+        assert_eq!(read(name), "Title", "lpszName is a NUL-terminated copy");
+        assert_eq!(read(class), "TestClass", "lpszClass is a NUL-terminated copy");
+        assert!(name >= cs + CREATESTRUCT_SIZE && class > name, "the names follow the struct");
+        assert!(
+            class < guest_rsp,
+            "the whole scratch stays below the interrupted syscall's stack pointer"
+        );
+
+        // The first callback is seated, and its frame is *below* the struct.
+        assert_eq!(cpu.rip, WNDPROC, "WM_NCCREATE goes to the class WndProc first");
+        assert_eq!(cpu.reg(Reg::Rcx), hwnd as u64);
+        assert_eq!(cpu.reg(Reg::Rdx), WM_NCCREATE as u64);
+        assert_eq!(cpu.reg(Reg::R9), cs, "lParam is the CREATESTRUCTW");
+        assert!(cpu.rsp() < cs, "the callback frame cannot overwrite the struct");
+    }
+
+    /// An empty window name yields a NULL `lpszName` (Windows' "no name"), not a
+    /// pointer to an empty string that the class name then overlaps.
+    #[test]
+    fn create_struct_reports_a_missing_name_as_null() {
+        let (mut os, mut mem, hwnd) = window_for_create(0x1_4000_1000);
+        os.set_syscall_guest_rsp_for_test(0x10_8000);
+        let mut cpu = CpuState::default();
+        let info = CreateInfo {
+            create_params: 0,
+            instance: 0,
+            menu: 0,
+            parent: 0,
+            rect: [0, 0, 1, 1],
+            style: 0,
+            ex_style: 0,
+            title: "",
+            class_name: "msctls_progress32",
+        };
+        dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap();
+        let cs = (0x10_8000u64 - CREATE_SCRATCH) & !0xf;
+        assert_eq!(mem.read_u64(cs + CS_LPSZ_NAME).unwrap(), 0);
+        assert_eq!(
+            mem.read_u64(cs + CS_LPSZ_CLASS).unwrap(),
+            cs + CREATESTRUCT_SIZE,
+            "the class name takes the start of the string area when there is no window name"
+        );
+    }
+
+    /// A class with no WndProc gets no creation pair — the handler then returns
+    /// the HWND the ordinary way instead of hijacking the syscall return.
+    #[test]
+    fn a_classless_window_gets_no_creation_pair() {
+        let (mut os, mut mem, hwnd) = window_for_create(0);
+        os.set_syscall_guest_rsp_for_test(0x10_8000);
+        let mut cpu = CpuState::default();
+        let info = CreateInfo {
+            create_params: 0,
+            instance: 0,
+            menu: 0,
+            parent: 0,
+            rect: [0, 0, 1, 1],
+            style: 0,
+            ex_style: 0,
+            title: "",
+            class_name: "Unregistered",
+        };
+        assert!(!dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap());
+        assert_eq!(cpu.rip, 0, "nothing was seated");
+    }
+
+    /// A second copy of ntdll is recognised structurally (export-directory name
+    /// plus `SizeOfImage`), and the running image itself is never reported as its
+    /// own copy (roadmap W6.2).
+    #[test]
+    fn ntdll_copies_are_found_by_their_export_name() {
+        /// Lay a minimal PE at `base` whose export directory names `name`.
+        fn fake_pe(mem: &mut VirtualMemory, base: u64, name: &str, size_of_image: u32) {
+            mem.map(Region::new("img", base, 0x2000, Perm::RW)).unwrap();
+            mem.write_u16(base, 0x5A4D).unwrap();
+            mem.write_u32(base + 0x3C, 0x80).unwrap();
+            mem.write_u32(base + 0x80, 0x0000_4550).unwrap();
+            mem.write_u32(base + 0x80 + 24 + 56, size_of_image).unwrap();
+            mem.write_u32(base + 0x80 + 24 + 112, 0x1000).unwrap(); // export dir RVA
+            mem.write_u32(base + 0x1000 + 12, 0x1100).unwrap(); // Name RVA
+            for (i, b) in name.bytes().enumerate() {
+                mem.write_u8(base + 0x1100 + i as u64, b).unwrap();
+            }
+            mem.write_u8(base + 0x1100 + name.len() as u64, 0).unwrap();
+        }
+
+        let mut mem = VirtualMemory::new();
+        fake_pe(&mut mem, 0x1_0000, "ntdll.dll", 0x3EE000); // the running image
+        fake_pe(&mut mem, 0x2_0000, "NTDLL.dll", 0x3EE000); // the duplicate
+        fake_pe(&mut mem, 0x3_0000, "user32.dll", 0x3EE000); // same size, other DLL
+        fake_pe(&mut mem, 0x4_0000, "ntdll.dll", 0x10_0000); // same name, other size
+
+        assert_eq!(
+            ntdll_copies(&mem, 0x1_0000, 0x3EE000),
+            vec![0x2_0000],
+            "only a same-size image that calls itself ntdll, and never the running one"
+        );
+        assert_eq!(pe_export_name(&mem, 0x3_0000).as_deref(), Some("user32.dll"));
+        assert_eq!(pe_export_name(&mem, 0), None, "a null base names nothing");
+    }
+
+    /// Mirroring rewrites the duplicate's `user_procs` slot at the same RVA the
+    /// running image's slot sits at, leaving unrelated memory alone
+    /// (roadmap W6.2).
+    #[test]
+    fn client_pfn_mirroring_writes_the_same_rva_in_every_copy() {
+        let mut mem = VirtualMemory::new();
+        // A live "ntdll" at 0x1_0000 and a duplicate at 0x2_0000, both 0x3EE000.
+        for base in [0x1_0000u64, 0x2_0000] {
+            let name = "ntdll.dll";
+            mem.map(Region::new("img", base, 0x2000, Perm::RW)).unwrap();
+            mem.write_u16(base, 0x5A4D).unwrap();
+            mem.write_u32(base + 0x3C, 0x80).unwrap();
+            mem.write_u32(base + 0x80, 0x0000_4550).unwrap();
+            mem.write_u32(base + 0x80 + 24 + 56, 0x3EE000).unwrap();
+            mem.write_u32(base + 0x80 + 24 + 112, 0x1000).unwrap();
+            mem.write_u32(base + 0x1000 + 12, 0x1100).unwrap();
+            for (i, b) in name.bytes().enumerate() {
+                mem.write_u8(base + 0x1100 + i as u64, b).unwrap();
+            }
+        }
+
+        let mut slots = [0u64; CLIENT_PFN_COUNT];
+        let mut procs = [0u64; CLIENT_PFN_COUNT];
+        slots[PFN_BUTTON] = 0x1_0000 + 0x1800; // a slot inside the running image
+        procs[PFN_BUTTON] = 0xABCD_1234;
+        // An out-of-image slot must be ignored rather than mirrored blindly.
+        slots[PFN_EDIT] = 0x9_9000;
+        procs[PFN_EDIT] = 0xFFFF;
+
+        mirror_client_pfn_to_ntdll_copies(&mut mem, 0x1_0000, &[(&slots, &procs)]);
+        assert_eq!(
+            mem.read_u64(0x2_0000 + 0x1800).unwrap(),
+            0xABCD_1234,
+            "the duplicate's slot now holds the proc user32 published"
+        );
+        assert_eq!(mem.read_u64(0x1_0000 + 0x1800).unwrap(), 0, "the running image is untouched");
     }
 }
