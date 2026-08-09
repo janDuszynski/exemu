@@ -160,6 +160,31 @@ end-to-end on the default path.
   now observes the `BUTTON` child created at its requested geometry with its own
   atom, beside comctl32's `msctls_progress32`.
 
+### `WM_NCCREATE`/`WM_CREATE` from a win32k syscall (W6.3)
+- A win32k syscall handler can now call a **sequence** of guest procedures and
+  *still return a value of its own* — the shape `NtUserCreateWindowEx` needs to
+  send `WM_NCCREATE` then `WM_CREATE` and hand back the HWND. The W4.6
+  return-hijack (`call_wndproc_from_syscall`) could only ever call *one* WndProc
+  and let its LRESULT be the syscall's result; the win32k callback frame now
+  carries a call queue and an optional result, the same queue-then-resume shape
+  `invoke_callbacks` uses for `_initterm` / TLS callbacks / DllMain.
+- `NtUserCreateWindowEx` builds a `CREATESTRUCTW` on the guest stack below the
+  interrupted syscall's RSP and dispatches both create messages through it.
+  Measured working: the guest's own WndProc, **Wine's real `ButtonWndProcW` and
+  comctl32's real progress-bar WndProc** each receive `WM_NCCREATE` then
+  `WM_CREATE` with a correct `CREATESTRUCTW`.
+- It ships **behind `EXEMU_W6_CREATE_MSGS`**, because it immediately trips over a
+  *loader* defect: `ntdll.dll` ends up mapped **twice** — the boot image (the
+  live one, whose `user_procs` user32 fills through `RtlInitializeNtUserPfn`) and
+  a second copy the guest loader maps while snapping the main image's imports.
+  `user32!DefWindowProcW` is a forwarder to `NTDLL.NtdllDefWindowProc_W`, a
+  `jmp qword [rip+disp32]` through `user_procs[4]`, and it binds into the
+  **second, uninitialized** image — so every WndProc that defers to
+  `DefWindowProcW` jumps to address 0, and the access violation puts Wine's SEH
+  into an endless `virtual_unwind → unwind_builtin_dll` stack walk. That walk is
+  the "control messaging spins on an unserviced `WineUnixCall`" symptom W6.1
+  recorded; the fix belongs in the loader, and flipping it turns this default on.
+
 ## v0.0.4 — the windowing substrate
 
 The last foundation layer *under* the GUI: a real USER32/GDI object model the
