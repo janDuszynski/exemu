@@ -14,11 +14,30 @@
 //!
 //! Skip-guarded on the git-ignored Wine DLL set.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use exemu_app::{load_and_run, shell_sample, RunConfig};
 
 const WINE_DLLS: &str = "../../example_exe/wine-dlls/x86_64-windows";
+
+/// A private, empty sandbox for one run.
+///
+/// The shared `$TMPDIR/exemu-sandbox` persists and accumulates across runs *and*
+/// across test binaries, and this gate's result depends on which folders exist —
+/// so sharing it makes the assertions read whatever a previous run happened to
+/// leave behind. A leftover 7-Zip corpus install already contains
+/// `C:\ProgramData\Microsoft\Windows\Start Menu\Programs`, which alone flips one
+/// folder from failing to succeeding; that produced a false failure once already.
+///
+/// The name carries the pid and a counter so parallel test threads never collide.
+fn private_sandbox(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("exemu-shell-gate-{}-{tag}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
 
 /// The control. exemu's own `SHGetFolderPathW` cannot fill the buffer, so the
 /// sample must report failure — this is what gives the Wine result its meaning.
@@ -30,6 +49,7 @@ fn emulated_path_cannot_resolve_known_folders() {
         RunConfig {
             echo: false,
             max_steps: 2_000_000,
+            sandbox_root: Some(private_sandbox("emulated")),
             ..RunConfig::default()
         },
     )
@@ -93,6 +113,7 @@ fn shell_sample_resolves_known_folders_on_wine() {
             echo: false,
             max_steps: 400_000_000,
             wine_boot_dir: Some(WINE_DLLS.to_string()),
+            sandbox_root: Some(private_sandbox("wine")),
             ..RunConfig::default()
         },
     )
@@ -135,9 +156,20 @@ fn shell_sample_resolves_known_folders_on_wine() {
     // GAP 2 — five of six still fail because the directory Wine names does not
     // exist; only COMMONPROGRAMS (C:\ProgramData\…), the one path exemu and Wine
     // agree on, resolves. Closing gap 1 should close this with it.
+    //
+    // This count is a function of **which folders exist**, so it is only
+    // meaningful against a known-empty sandbox — hence `private_sandbox` above.
+    // Sharing `$TMPDIR/exemu-sandbox` made it read whatever a previous run left
+    // behind: a leftover 7-Zip corpus install contains
+    // `C:\ProgramData\Microsoft\Windows\Start Menu\Programs`, which alone makes
+    // COMMONPROGRAMS succeed and cost one engineer a false failure here.
+    //
+    // The value was established by a controlled A/B with the sandbox deleted in
+    // both arms: without the profile tree 6 failures / 2,026,356 instructions,
+    // with it 5 / 2,025,637.
     assert_eq!(
         run.exit_code, 5,
-        "GAP 2 (absent directories) changed — if this dropped, gap 1 may be fixed \
-         too and both notes need updating; stdout:\n{stdout}"
+        "GAP 2 (absent directories) changed — gap 1 may be fixed too, in which \
+         case this test and the W6.6 notes both need updating; stdout:\n{stdout}"
     );
 }

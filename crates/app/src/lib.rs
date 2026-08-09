@@ -179,6 +179,27 @@ pub struct RunConfig {
     /// message pump, so `NtUserGetMessage` blocks until the user acts instead of
     /// quitting at once. `None` everywhere else (unchanged behaviour).
     pub input: Option<std::sync::mpsc::Receiver<exemu_core::InputEvent>>,
+    /// Root the guest filesystem here instead of the shared
+    /// `$TMPDIR/exemu-sandbox`.
+    ///
+    /// **Why this exists.** The shared sandbox **persists and accumulates across
+    /// runs and across test binaries**, and guests observe it: an installer
+    /// enumerates what it finds, and shell code checks whether a folder exists.
+    /// So a run's behaviour — including its exact instruction count — depends on
+    /// what previous runs left behind. That has bitten twice: the corpus pins
+    /// were mis-measured against a dirty sandbox (see `corpus.toml`), and
+    /// `shell_gate` produced a false failure because a leftover 7-Zip install
+    /// already contained one of the folders under test.
+    ///
+    /// A test that pins behaviour should therefore set this to a private
+    /// directory. The W9.6 corpus runner achieves the same isolation from the
+    /// outside by spawning a child process with its own `TMPDIR`; this field is
+    /// the in-process equivalent, and unlike an env var it is not racy when
+    /// cargo runs test threads in parallel.
+    ///
+    /// `None` keeps the shared sandbox, which is right for real CLI runs — a
+    /// user expects `exemu run` to write where the last one did.
+    pub sandbox_root: Option<std::path::PathBuf>,
 }
 
 impl Default for RunConfig {
@@ -195,6 +216,7 @@ impl Default for RunConfig {
             wine_boot_dir: None,
             driver: None,
             input: None,
+            sandbox_root: None,
         }
     }
 }
@@ -339,7 +361,10 @@ impl Process {
         mem.poke(cmd_w, &wide)?;
 
         // --- Sandbox directory rooting the guest filesystem ---------------
-        let sandbox = std::env::temp_dir().join("exemu-sandbox");
+        let sandbox = cfg
+            .sandbox_root
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("exemu-sandbox"));
         let _ = std::fs::create_dir_all(&sandbox);
         // Ensure the guest `C:\` drive root exists as a real directory so opening
         // it as the working directory succeeds (Wine's `loader_init` opens
