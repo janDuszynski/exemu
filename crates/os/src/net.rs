@@ -1286,6 +1286,61 @@ struct Request {
     out_len: u64,
 }
 
+// ===========================================================================
+// The ws2_32 unix side
+// ===========================================================================
+//
+// Wine's PE builtins are *halves*. `ws2_32.dll`'s `DllMain(DLL_PROCESS_ATTACH)`
+// does nothing but
+//
+//     NtQueryVirtualMemory(GetCurrentProcess(), <own image base>,
+//                          MemoryWineUnixFuncs, &handle, 8, NULL)
+//
+// and returns `status == 0` as its BOOL — so a ws2_32 with no registered unix
+// side **does not load at all**, and the whole boot dies with
+// STATUS_DLL_INIT_FAILED before a single socket call. exemu's unix sides are
+// native Rust ([`crate::unixlib`]), so the pairing is this table.
+//
+// What the table has to cover, recovered from the pinned binary: the handle
+// lands at `.bss:0x1f160` and is read by exactly five call sites, **all of them
+// name resolution** — code 0 from `getaddrinfo`'s core, 1 from `gethostbyaddr`,
+// 2 from `gethostbyname`, 3 from `gethostname`/`GetHostNameW`, 4 from
+// `getnameinfo`. Nothing on the socket path (socket/bind/connect/accept/send/
+// recv/select/closesocket) touches it. That is what makes honest stubs here
+// sufficient for W7.1: sockets work through AFD, and a guest that asks exemu to
+// resolve a name is told, truthfully, that it cannot.
+//
+// The return value is **not** an NTSTATUS: each call site writes it straight
+// into `TEB.LastErrorValue`, so these entries return Winsock error codes.
+
+use crate::unixlib::{UnixEntry, Unixlib};
+
+/// `WSAHOST_NOT_FOUND` — "host not found", the error a resolver returns when it
+/// has no answer. exemu resolves no names, so this is the truthful reply, and it
+/// is the one every caller of `gethostbyname`/`getaddrinfo` already handles.
+const WSAHOST_NOT_FOUND: u32 = 11001;
+
+/// Every ws2_32 unixlib entry: name resolution exemu does not perform.
+fn unix_unresolved(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory, _args: u64) -> Result<u32> {
+    Ok(WSAHOST_NOT_FOUND)
+}
+
+/// The five entries the pinned ws2_32 actually calls, in the order its call
+/// sites use.
+static WS2_32_UNIXLIB: &[UnixEntry] = &[
+    unix_unresolved, // 0 — getaddrinfo
+    unix_unresolved, // 1 — gethostbyaddr
+    unix_unresolved, // 2 — gethostbyname
+    unix_unresolved, // 3 — gethostname / GetHostNameW
+    unix_unresolved, // 4 — getnameinfo
+];
+
+/// The unix side [`crate::unixlib`] registers when Wine's `ws2_32.dll` asks for
+/// its half.
+pub(crate) fn ws2_32_unixlib() -> Unixlib {
+    Unixlib { name: "ws2_32", table: WS2_32_UNIXLIB }
+}
+
 /// The SSDT thunk.
 pub(crate) fn ssdt_nt_device_io_control_file(
     os: &mut WinOs,

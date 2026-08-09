@@ -249,6 +249,34 @@ impl WinOs {
         self.unixlib_of_module.get(&module_base).copied()
     }
 
+    /// Pair a PE builtin with its native unix side, on demand, at the moment the
+    /// PE half asks for it.
+    ///
+    /// ntdll's unixlib is registered eagerly by the loader, which maps ntdll
+    /// itself. Every *other* builtin is mapped by **Wine's own loader running as
+    /// guest code**, through `NtCreateSection`/`NtMapViewOfSection`, so exemu
+    /// gets no "module X loaded at Y" event to hang a registration off. The
+    /// query below is that event: the module identifies itself by base, and its
+    /// own name is readable from the image it has just mapped.
+    ///
+    /// This is not optional politeness. A Wine PE builtin with a unix half
+    /// treats a failed query as fatal — `ws2_32!DllMain` returns its status as
+    /// the BOOL — so a builtin exemu cannot pair with does not load at all.
+    /// Returning `None` for anything unrecognised keeps that honest: a DLL whose
+    /// unix side exemu has not written fails to initialise, rather than running
+    /// on top of a table of lies.
+    fn register_builtin_unixlib(&mut self, mem: &dyn Memory, base: u64) -> Option<u64> {
+        let name = module_name_at(mem, base)?;
+        let lib = match name.to_ascii_lowercase().as_str() {
+            // Sockets (roadmap W7.1): the PE half drives `\Device\Afd` through
+            // `NtDeviceIoControlFile`, and reaches its unix half only for name
+            // resolution. See [`crate::net`].
+            "ws2_32.dll" => crate::net::ws2_32_unixlib(),
+            _ => return None,
+        };
+        Some(self.register_unixlib(base, lib))
+    }
+
     /// The host trace sink for `wine_dbg_write` (ntdll unixlib entry 2). Wine's
     /// `TRACE`/`FIXME`/`ERR` channels funnel their formatted bytes here. Emit to
     /// host stderr when tracing is enabled; otherwise swallow them (a chatty
@@ -334,8 +362,14 @@ impl WinOs {
         if buffer == 0 || length < 8 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        let Some(handle) = self.unixlib_handle_of(base_address) else {
-            return Ok(STATUS_INVALID_ADDRESS);
+        let handle = match self.unixlib_handle_of(base_address) {
+            Some(h) => h,
+            // Not registered yet — it may be a PE builtin exemu has a native
+            // unix side for, asking for its half. See `register_builtin_unixlib`.
+            None => match self.register_builtin_unixlib(mem, base_address) {
+                Some(h) => h,
+                None => return Ok(STATUS_INVALID_ADDRESS),
+            },
         };
         mem.write_u64(buffer, handle)?;
         if return_length != 0 {
@@ -343,6 +377,37 @@ impl WinOs {
         }
         Ok(STATUS_SUCCESS)
     }
+}
+
+/// A mapped image's **own** name, read out of its export directory
+/// (`IMAGE_EXPORT_DIRECTORY.Name`), or `None` if `base` is not a mapped PE32+
+/// image with exports. This is the module's self-description, so it survives
+/// being loaded from anywhere under any file name.
+fn module_name_at(mem: &dyn Memory, base: u64) -> Option<String> {
+    if mem.read_u16(base).ok()? != 0x5A4D {
+        return None; // "MZ"
+    }
+    let e_lfanew = mem.read_u32(base + 0x3C).ok()? as u64;
+    if mem.read_u32(base + e_lfanew).ok()? != 0x0000_4550 {
+        return None; // "PE\0\0"
+    }
+    // OptionalHeader = PE signature (4) + COFF header (20).
+    let opt = base + e_lfanew + 24;
+    if mem.read_u16(opt).ok()? != 0x20B {
+        return None; // PE32+ only (the W2 pivot pins 64-bit builtins)
+    }
+    // DataDirectory[0] (Export) sits at PE32+ optional-header offset 112.
+    let export_rva = mem.read_u32(opt + 112).ok()? as u64;
+    if export_rva == 0 {
+        return None;
+    }
+    // IMAGE_EXPORT_DIRECTORY.Name is at +12.
+    let name_rva = mem.read_u32(base + export_rva + 12).ok()? as u64;
+    if name_rva == 0 {
+        return None;
+    }
+    let raw = mem.read_cstr(base + name_rva, 64).ok()?;
+    Some(String::from_utf8_lossy(&raw).into_owned())
 }
 
 /// The SSDT-shaped thunk for `NtQueryVirtualMemory` (index
