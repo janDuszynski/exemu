@@ -170,6 +170,43 @@ end-to-end on the default path.
   guest was handed a truncated, unmapped base. Now honoured.
 - *Still to come:* loading wow64 into a real process boot.
 
+### Sockets — Wine's ws2_32 reaches real BSD sockets (W7.1)
+- **A guest exchanges bytes with a real host socket.** A generated program calls
+  Wine's `ws2_32` to connect to a loopback listener the test itself creates,
+  sends 61 bytes and receives a 52-byte reply byte for byte. Hermetic — the
+  listener binds `127.0.0.1:0`, the port is baked in per run, no external host,
+  passes offline. The emulated path is the control: `SOCKET=0`, `SENT=0`,
+  `RECVD=0`.
+- **The boundary was recovered from the binary before anything was implemented,**
+  and `afd_abi.rs` re-derives every fact from the pinned `ws2_32.dll`/`ntdll.dll`
+  on each run, so a wrong constant fails there rather than three layers down. A
+  `SOCKET` is an NT file handle (`NtOpenFile` on `\Device\Afd`); every operation
+  is one `NtDeviceIoControlFile` (SSDT 0x07).
+- **The trap that pinning caught:** AFD control codes use *two* encodings — the
+  operations Windows' own AFD defines shift `FILE_DEVICE_NETWORK` by 12
+  (`0x0001_2xxx`), while the ones Wine adds for itself, all numbered above 200,
+  use the ordinary `CTL_CODE`'s 16 (`0x0012_0xxx`). Neither formula produces the
+  other block. The first draft used one shift for both, and the ABI test caught
+  it before an implementation existed.
+- **Blocking is real, not speculative.** A receive against a peer that stays
+  silent for 300 ms waits and then delivers the actual bytes — never a premature
+  zero-byte "graceful close". On would-block the handler rewinds the `SYSCALL`
+  exactly as `NtWaitForSingleObject` does and yields.
+- **Structural finding: Wine's PE builtins are *halves*.** `ws2_32`'s `DllMain`
+  does nothing but `NtQueryVirtualMemory(MemoryWineUnixFuncs)` and returns that
+  status as its `BOOL` — so without a registered unix side the DLL does not load
+  at all, and the first end-to-end attempt died with `STATUS_DLL_INIT_FAILED`
+  before a single socket call. Since every builtin except ntdll is mapped by
+  Wine's own loader running as guest code, there is no load event to register
+  against; exemu now pairs a builtin with its unix side at the moment the PE
+  half asks, identifying the module from its mapped export directory.
+- Scope is deliberate: `AF_INET`/`AF_INET6` × `SOCK_STREAM`/`SOCK_DGRAM` only,
+  everything else refused with `STATUS_NOT_IMPLEMENTED`. Address policy has a
+  single choke point for the future sandbox model. Name resolution is five
+  honest stubs returning `WSAHOST_NOT_FOUND` — the pinned binary shows that
+  handle is read by exactly five call sites, all name resolution, none on the
+  socket path.
+
 ### COM arrives as guest code (W6.3 / W6.4)
 - **`CoCreateInstance` genuinely succeeds on Wine's COM core.** A generated
   console program calls `CoInitializeEx` → `CoCreateInstance` → a method through

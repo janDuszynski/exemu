@@ -413,7 +413,8 @@ What is verified today:
 | **COM** (`ole32` / `combase` / `oleaut32`) | **works** — `CoCreateInstance` genuinely succeeds: the CLSID resolves through exemu's registry to an `InprocServer32`, the in-proc server loads, and the guest calls a method through the returned vtable. No native COM in exemu; the emulated path is the control that proves it |
 | **CAB extraction** (`cabinet`) | **works** — a guest extracts a real `.cab` through Wine's `FDICreate`/`FDICopy`, driven entirely by the guest's own FDI callbacks, and the bytes come back identical. exemu contributes a cabinet *writer* and no decoder, retiring the planned clean-room FDI |
 | **shell32 / shlwapi** | **partly** — known folders resolve through Wine's own shell32, but the profile path comes back without its user component; the gap is pinned as a test |
-| MSI / multimedia / networking | **not yet** — `msi`/`setupapi` load and bind cleanly (their whole 33-module dependency closure is present), but nothing drives them end to end yet |
+| **TCP/UDP sockets** (`ws2_32`) | **works** — a guest exchanges bytes with a real host socket through Wine's `ws2_32`. A `SOCKET` is an NT file handle on `\Device\Afd`; every operation is one `NtDeviceIoControlFile`, serviced by exemu over real BSD sockets. Blocking is real: a receive against a silent peer waits and then delivers the actual bytes, never a premature zero-byte close. `AF_INET`/`AF_INET6` × `SOCK_STREAM`/`SOCK_DGRAM` only; name resolution (`getaddrinfo`) is still a stub |
+| MSI / multimedia | **not yet** — `msi`/`setupapi` load and bind cleanly (their whole 33-module dependency closure is present), but nothing drives them end to end yet |
 
 **exemu does not ship Wine's DLLs.** You point `--wine-boot` at a set you already
 have. They are loaded as separate guest image files and are never linked or
