@@ -385,6 +385,8 @@ const FAST_SPINS: u32 = 64;
 const MAX_TRANSFER: u64 = 16 << 20;
 /// Ceiling on the number of sockets one `IOCTL_AFD_SELECT` may name.
 const MAX_POLL_ENTRIES: u32 = 4096;
+/// Ceiling on the number of `WSABUF`s one send/recv may gather across.
+const MAX_WSABUFS: u32 = 1024;
 
 // ===========================================================================
 // Socket objects
@@ -776,7 +778,7 @@ impl WinOs {
         }
         // Nobody else to run. The rewind above is undone by the dispatcher's
         // phase-4 restore, exactly as on `sync.rs`'s no-switch fallback.
-        let deadline = Instant::now() + BLOCKING_WAIT_LIMIT;
+        let deadline = Instant::now() + self.afd_wait_limit(mem, req)?;
         let mut spins = 0u32;
         loop {
             std::thread::sleep(if spins < FAST_SPINS { FAST_SLICE } else { SLOW_SLICE });
@@ -786,10 +788,49 @@ impl WinOs {
                 return Ok(status);
             }
             if Instant::now() >= deadline {
-                write_iosb(mem, iosb, STATUS_IO_TIMEOUT, 0)?;
-                return Ok(STATUS_IO_TIMEOUT);
+                return self.afd_wait_expired(mem, req, iosb);
             }
         }
+    }
+
+    /// How long a blocked operation may wait.
+    ///
+    /// Only `IOCTL_AFD_SELECT` carries a caller-supplied timeout, and honouring
+    /// it matters: a guest polling with a 100 ms timeout in a loop must get its
+    /// answer in 100 ms, not stall on [`BLOCKING_WAIT_LIMIT`]. The value is an NT
+    /// relative time — negative 100-ns units — and anything non-negative
+    /// (`WSAPoll` writes `i64::MAX`) means "forever", which exemu caps.
+    ///
+    /// The timeout binds only on this, the parked path. On the yield path the
+    /// whole syscall re-executes and the deadline restarts, so a guest with
+    /// another runnable thread keeps waiting — the same "no timed wakeups yet"
+    /// limitation the NT waits in `sync.rs` have.
+    fn afd_wait_limit(&self, mem: &dyn Memory, req: &Request) -> Result<Duration> {
+        if req.code != IOCTL_AFD_SELECT || req.in_buf == 0 {
+            return Ok(BLOCKING_WAIT_LIMIT);
+        }
+        let raw = mem.read_u64(req.in_buf)? as i64;
+        if raw >= 0 {
+            return Ok(BLOCKING_WAIT_LIMIT);
+        }
+        let nanos = raw.unsigned_abs().saturating_mul(100);
+        Ok(Duration::from_nanos(nanos).min(BLOCKING_WAIT_LIMIT))
+    }
+
+    /// What a blocked operation reports when its wait ran out.
+    ///
+    /// For everything but `select` that is `STATUS_IO_TIMEOUT` → `WSAETIMEDOUT`,
+    /// an honest failure. For `select` it is **success with no ready sockets**:
+    /// that is precisely what a `select` timeout means, and reporting an error
+    /// instead would turn a normal poll loop into a failure.
+    fn afd_wait_expired(&mut self, mem: &mut dyn Memory, req: &Request, iosb: u64) -> Result<u32> {
+        if req.code == IOCTL_AFD_SELECT && req.in_buf != 0 {
+            mem.write_u32(req.in_buf + POLL_PARAMS_COUNT_OFF, 0)?;
+            write_iosb(mem, iosb, STATUS_SUCCESS, POLL_PARAMS_HEADER)?;
+            return Ok(STATUS_SUCCESS);
+        }
+        write_iosb(mem, iosb, STATUS_IO_TIMEOUT, 0)?;
+        Ok(STATUS_IO_TIMEOUT)
     }
 
     /// One attempt at an AFD operation. Pure with respect to blocking: it either
@@ -1026,7 +1067,7 @@ impl WinOs {
             return Ok(OpResult::Done(STATUS_ACCESS_VIOLATION, 0));
         }
         let p = req.in_buf;
-        let count = mem.read_u32(p + RECVMSG_COUNT_OFF)?.min(MAX_POLL_ENTRIES);
+        let count = mem.read_u32(p + RECVMSG_COUNT_OFF)?.min(MAX_WSABUFS);
         let buffers = mem.read_u64(p + RECVMSG_BUFFERS_OFF)?;
         let addr_ptr = mem.read_u64(p + RECVMSG_ADDR_OFF)?;
         let addr_len_ptr = mem.read_u64(p + RECVMSG_ADDR_LEN_OFF)?;
@@ -1076,7 +1117,7 @@ impl WinOs {
             return Ok(OpResult::Done(STATUS_ACCESS_VIOLATION, 0));
         }
         let p = req.in_buf;
-        let count = mem.read_u32(p + SENDMSG_COUNT_OFF)?.min(MAX_POLL_ENTRIES);
+        let count = mem.read_u32(p + SENDMSG_COUNT_OFF)?.min(MAX_WSABUFS);
         let buffers = mem.read_u64(p + SENDMSG_BUFFERS_OFF)?;
         let addr_ptr = mem.read_u64(p + SENDMSG_ADDR_OFF)?;
         let addr_len = mem.read_u32(p + SENDMSG_ADDR_LEN_OFF)? as u64;
@@ -1195,9 +1236,9 @@ impl WinOs {
         }
 
         // Nothing yet: block unless the caller asked not to. A zero timeout is a
-        // poll; anything else waits (the value is an NT relative time, and exemu
-        // has no timed wakeups — see `sync.rs` — so the wait is bounded by the
-        // blocking path's own limit rather than by the guest's number).
+        // poll; anything else waits, bounded by the caller's own relative time
+        // (see [`WinOs::afd_wait_limit`]), and reports zero ready sockets when
+        // that runs out.
         if ready.is_empty() && timeout != 0 {
             return Ok(OpResult::WouldBlock);
         }

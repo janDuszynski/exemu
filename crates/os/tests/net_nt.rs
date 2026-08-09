@@ -478,7 +478,10 @@ fn select_polls_and_then_reports_a_socket_that_becomes_readable() {
     );
 
     // A real wait blocks until the peer writes, then names the socket.
-    poll(&mut mem, -1, net::AFD_POLL_READ | net::AFD_POLL_ALWAYS);
+    // `i64::MAX` is what `WSAPoll` writes for an infinite wait; a *negative*
+    // value would be an NT relative time (100-ns units), so -1 means 100
+    // nanoseconds, not "forever".
+    poll(&mut mem, i64::MAX, net::AFD_POLL_READ | net::AFD_POLL_ALWAYS);
     let start = Instant::now();
     let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_SELECT, IN_PTR, params_len, IN_PTR, params_len);
     assert_eq!(st, STATUS_SUCCESS);
@@ -491,6 +494,56 @@ fn select_polls_and_then_reports_a_socket_that_becomes_readable() {
         "reported readable"
     );
 
+    peer.join().unwrap();
+    assert_eq!(syscall(&mut os, &mut mem, NT_CLOSE, &[sock]), STATUS_SUCCESS);
+}
+
+/// A `select` whose timeout runs out reports **success with no ready sockets** —
+/// which is what `select` returning 0 means — and it honours the caller's own
+/// timeout rather than the blocking path's much longer safety limit. Getting
+/// this wrong turns an ordinary poll loop into a 20-second stall per iteration
+/// followed by a spurious `WSAETIMEDOUT`.
+#[test]
+fn a_select_timeout_reports_no_ready_sockets_on_the_callers_schedule() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Accept and then stay silent: the socket is connected but never readable.
+    let peer = std::thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        drop(s);
+    });
+
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert_eq!(connect(&mut os, &mut mem, sock, addr), STATUS_SUCCESS);
+
+    // 150 ms as an NT relative time: negative 100-ns units.
+    let timeout: i64 = -(150_000_000 / 100);
+    mem.write_u64(IN_PTR, timeout as u64).unwrap();
+    mem.write_u32(IN_PTR + net::POLL_PARAMS_COUNT_OFF, 1).unwrap();
+    mem.write_u32(IN_PTR + 0x0c, 0).unwrap();
+    let e = IN_PTR + net::POLL_PARAMS_HEADER;
+    mem.write_u64(e, sock).unwrap();
+    mem.write_u32(e + net::POLL_ENTRY_FLAGS_OFF, net::AFD_POLL_READ).unwrap();
+    mem.write_u32(e + net::POLL_ENTRY_STATUS_OFF, 0).unwrap();
+    let params_len = net::POLL_PARAMS_HEADER + net::POLL_ENTRY_STRIDE;
+
+    let start = Instant::now();
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_SELECT, IN_PTR, params_len, IN_PTR, params_len);
+    let waited = start.elapsed();
+
+    assert_eq!(st, STATUS_SUCCESS, "a select timeout is not an error");
+    assert_eq!(
+        mem.read_u32(IN_PTR + net::POLL_PARAMS_COUNT_OFF).unwrap(),
+        0,
+        "…it is zero ready sockets"
+    );
+    assert!(waited >= Duration::from_millis(140), "it waited the caller's timeout: {waited:?}");
+    assert!(
+        waited < Duration::from_secs(5),
+        "it must honour the caller's 150ms, not the blocking safety limit: {waited:?}"
+    );
     peer.join().unwrap();
     assert_eq!(syscall(&mut os, &mut mem, NT_CLOSE, &[sock]), STATUS_SUCCESS);
 }
