@@ -161,6 +161,35 @@ pub fn csidl_path(csidl: u32) -> Option<&'static str> {
     })
 }
 
+/// Every distinct guest path this module models, for a caller that wants to
+/// *materialise* the profile tree rather than merely name it.
+///
+/// A real Wine prefix is **created** with these directories present (that is
+/// what `wineboot` does on first run); exemu boots Wine's DLLs against a
+/// sandbox that has only `C:\windows\system32`. Shell code distinguishes
+/// "folder exists" from "folder is merely nameable" — `SHGetFolderPath` without
+/// `CSIDL_FLAG_CREATE` reports failure for an absent directory even while
+/// filling in the path — so the tree has to actually exist.
+///
+/// Order is unspecified; callers should create parents as needed (each path is
+/// absolute, so a recursive create handles nesting without sorting).
+pub fn all_guest_dirs() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = Vec::new();
+    for csidl in 0u32..=0x40 {
+        if let Some(p) = csidl_path(csidl) {
+            if !v.contains(&p) {
+                v.push(p);
+            }
+        }
+    }
+    // `Downloads` has no CSIDL but is part of a modern profile.
+    let downloads = concat!("C:\\Users\\exemu", "\\Downloads");
+    if !v.contains(&downloads) {
+        v.push(downloads);
+    }
+    v
+}
+
 /// A `KNOWNFOLDERID` GUID in its in-memory little-endian layout: `{u32, u16,
 /// u16, [u8; 8]}` — i.e. exactly the 16 bytes a guest passes by pointer.
 pub type KnownFolderId = [u8; 16];
