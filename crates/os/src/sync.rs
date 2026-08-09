@@ -680,7 +680,11 @@ impl WinOs {
     /// the re-executed `SYSCALL` re-reads identical arguments and re-dispatches to
     /// this same handler — which, now that the object is signaled, acquires and
     /// returns normally.
-    fn rewind_syscall(&self, cpu: &mut CpuState) {
+    ///
+    /// Shared with [`crate::net`], whose blocking socket operations rewind on
+    /// exactly the same terms: nothing consumed, every argument register
+    /// untouched, so the re-executed `SYSCALL` re-polls the same request.
+    pub(crate) fn rewind_syscall(&self, cpu: &mut CpuState) {
         let ret_rip = cpu.reg(Reg::Rcx);
         cpu.rip = ret_rip.wrapping_sub(SYSCALL_INSN_LEN);
         cpu.rflags = cpu.reg(Reg::R11);

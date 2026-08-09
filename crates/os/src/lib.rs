@@ -245,6 +245,10 @@ pub struct WinOs {
     /// `SEC_IMAGE` section over a DLL file, maps a view, and reads the image
     /// back through it (roadmap W2.7). See [`crate::section`].
     sections: HashMap<u64, section::Section>,
+    /// Open sockets by handle (roadmap W7.1). A `SOCKET` is an NT file handle on
+    /// `\Device\Afd`, so these share the one monotonic handle space `NtClose`
+    /// already routes by lookup. See [`crate::net`].
+    sockets: HashMap<u64, net::Socket>,
     next_handle: u64,
     /// Monotonic source of unique temp-file numbers.
     temp_counter: u32,
@@ -450,6 +454,7 @@ impl WinOs {
             file_dirs: std::collections::HashMap::new(),
             find_handles: std::collections::HashMap::new(),
             sections: HashMap::new(),
+            sockets: HashMap::new(),
             next_handle: 0x0000_1000,
             temp_counter: 0,
             crt_globals: std::collections::HashMap::new(),
@@ -554,6 +559,11 @@ impl WinOs {
         // routed by lookup through the shared handle space (files/dirs/finds +
         // wineserver kernel objects). Index recovered from the pinned guest stub.
         os.set_syscall_handler(fs::SSDT_NT_CLOSE, fs::ssdt_nt_close);
+        // Sockets (roadmap W7.1). One slot covers the whole networking boundary:
+        // Wine's ws2_32 drives bind/listen/connect/accept/send/recv/select
+        // through `NtDeviceIoControlFile` on a `\Device\Afd` handle. See
+        // [`crate::net`] for the recovered IOCTL map.
+        os.set_syscall_handler(net::SSDT_NT_DEVICE_IO_CONTROL_FILE, net::ssdt_nt_device_io_control_file);
         // NT thread/process syscalls (roadmap W2.9): the NTSTATUS face of the
         // P3.4 scheduler. Indices recovered from the pinned guest ntdll stubs.
         os.set_syscall_handler(thread::SSDT_NT_CREATE_THREAD_EX, thread::ssdt_nt_create_thread_ex);

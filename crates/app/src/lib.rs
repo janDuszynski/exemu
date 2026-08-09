@@ -20,6 +20,7 @@ pub mod comctl_sample;
 pub mod gui_sample;
 pub mod sample;
 pub mod shell_sample;
+pub mod socket_sample;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

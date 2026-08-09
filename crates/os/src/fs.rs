@@ -194,6 +194,12 @@ impl WinOs {
     }
 
     pub(crate) fn close_handle(&mut self, handle: u64) -> bool {
+        // Sockets share this handle space (roadmap W7.1): `closesocket` is
+        // `CloseHandle` → `NtClose`, so the socket table is one more thing this
+        // lookup routes to.
+        if self.close_socket(handle) {
+            return true;
+        }
         if self.kobjects.remove(&handle).is_some() {
             self.named_kobjects.retain(|_, &mut h| h != handle);
             return true;
@@ -826,6 +832,11 @@ impl WinOs {
         let Some(name) = self.nt_object_name(mem, objattr) else {
             return Ok(STATUS_INVALID_PARAMETER);
         };
+        // `\Device\Afd` is a device, not a file: opening it mints a socket
+        // (roadmap W7.1). This is how every `SOCKET` in the process is born.
+        if let Some(status) = self.nt_open_afd(mem, &name, handle_ptr, iosb_ptr)? {
+            return Ok(status);
+        }
         let Some(path) = self.host_path(&name) else {
             return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
         };
