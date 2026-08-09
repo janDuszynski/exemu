@@ -205,15 +205,18 @@ fn run_steps(exe: &[u8], wine_dir: Option<String>, max_steps: u64) -> (i32, u64)
 
 /// W6.5's per-exe pin, asserting **what is actually true today**.
 ///
-/// Measured by this test (debug; the release CLI gives 25,553 / 4,082,535 /
-/// 3,542,988 — the totals shift a little with the command line and build
-/// profile, which is why every assertion below is an inequality):
+/// Measured by this test:
 ///
 /// | run | instructions | exit |
 /// | --- | --- | --- |
 /// | emulated (no Wine) | 22,033 | 1 |
-/// | Wine boot, prefix **without** cabinet.dll | 3,526,709 | 1 |
-/// | Wine boot, full prefix | 4,065,829 | 1 |
+/// | Wine boot, prefix **without** cabinet.dll | 3,569,341 | 1 |
+/// | Wine boot, full prefix | 4,057,410 | 1 |
+///
+/// The totals move a little with the command line, the build profile and what
+/// exemu has seeded into the sandbox (the release CLI, with a different argv,
+/// gives 25,553 / 4,082,535 / 3,542,988) — which is why every assertion below
+/// is an inequality with a wide margin rather than an equality.
 ///
 /// What that establishes:
 ///
@@ -223,10 +226,10 @@ fn run_steps(exe: &[u8], wine_dir: Option<String>, max_steps: u64) -> (i32, u64)
 ///   is `ntdll!RtlExitUserProcess`) — not a fault, not a decoder gap, not the
 ///   step budget.
 /// * **cabinet.dll really loads and really runs.** Deleting that one file from
-///   the prefix costs ~539k instructions of startup work (539,120 debug /
-///   539,547 release — the differential is far steadier than the totals), the
-///   same order as the whole cabinet-sample boot above (~813k). A run that
-///   merely *failed* to find the DLL could not spend them.
+///   the prefix costs half a million instructions of startup work (488k–540k
+///   across the profiles measured), the same order as the whole cabinet-sample
+///   boot above (~813k). A run that merely *failed* to find the DLL could not
+///   spend them.
 ///
 /// **What it does NOT establish, and this is the honest gap:** Total Commander
 /// still exits 1 from its own startup path, with or without cabinet.dll. So the
