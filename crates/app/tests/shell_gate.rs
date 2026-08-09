@@ -59,11 +59,21 @@ fn emulated_path_cannot_resolve_known_folders() {
 ///    directory, which exemu has not seeded — so this is an exemu gap, not a Wine
 ///    one, and it is what wiring `SHGetFolderPathW` to [`exemu_os::folders`]
 ///    (whose table already spells the full `C:\Users\exemu\…`) exists to fix.
-/// 2. **Every call returns a non-zero HRESULT.** The sandbox has no
-///    `AppData`/`Documents`/… directories and the sample does not pass
-///    `CSIDL_FLAG_CREATE`, so Wine reports failure while still filling the buffer
-///    — standard `SHGetFolderPath` behaviour. The exit code is the failure count,
-///    hence 6 for 6 folders.
+/// 2. **Five of six calls still return a non-zero HRESULT** — because the
+///    directory Wine names does not exist. The sample does not pass
+///    `CSIDL_FLAG_CREATE`, so `SHGetFolderPath` reports failure for an absent
+///    folder while still filling the buffer. This is now *downstream of* gap 1:
+///    exemu materialises the profile tree it models (`C:\Users\exemu\…`), but
+///    Wine asks about `C:\users\…`, so only `COMMONPROGRAMS` — the one path both
+///    agree on (`C:\ProgramData\…`) — succeeds. Closing gap 1 should close this
+///    one with it.
+///
+/// **Evidence that directory existence is what matters here:** materialising the
+/// profile tree moved the run from 2,026,356 to 2,025,637 instructions and the
+/// failure count from 6 to 5. Before that, three separate changes (the
+/// `Shell Folders` keys, the HKCU namespace fix, the whole token surface) left
+/// the count *byte-identical*, proving Wine never executed those paths at all.
+/// The instruction count is a free oracle for "did the guest even go there".
 ///
 /// The assertions below therefore check the property that genuinely holds — real
 /// guest paths came back from Wine's own code — and pin both gaps by their
@@ -122,9 +132,12 @@ fn shell_sample_resolves_known_folders_on_wine() {
          the W6.6 notes. stdout:\n{stdout}"
     );
 
-    // GAP 2 — every call reports failure because the directories do not exist.
+    // GAP 2 — five of six still fail because the directory Wine names does not
+    // exist; only COMMONPROGRAMS (C:\ProgramData\…), the one path exemu and Wine
+    // agree on, resolves. Closing gap 1 should close this with it.
     assert_eq!(
-        run.exit_code, 6,
-        "GAP 2 (non-zero HRESULT for absent directories) changed; stdout:\n{stdout}"
+        run.exit_code, 5,
+        "GAP 2 (absent directories) changed — if this dropped, gap 1 may be fixed \
+         too and both notes need updating; stdout:\n{stdout}"
     );
 }

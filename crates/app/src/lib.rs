@@ -347,6 +347,24 @@ impl Process {
         // parent so a missing DLL resolves to OBJECT_NAME_NOT_FOUND (not
         // OBJECT_PATH_NOT_FOUND), matching what Wine's search loop expects.
         let _ = std::fs::create_dir_all(sandbox.join("C").join("windows").join("system32"));
+        // The user-profile tree, the way a real Wine prefix is *created* with it
+        // (that is what `wineboot` does on first run). exemu previously booted
+        // Wine's DLLs against a sandbox holding only `C:\windows\system32`, and
+        // shell code distinguishes "folder exists" from "folder is nameable" —
+        // `SHGetFolderPath` without `CSIDL_FLAG_CREATE` reports failure for an
+        // absent directory even while filling in the path. Cheap (a few dozen
+        // `mkdir -p`), and it makes the guest's view of its own profile real.
+        for guest in exemu_os::folders::all_guest_dirs() {
+            let mut host = sandbox.clone();
+            for comp in guest.split('\\') {
+                match comp {
+                    "" | "." | ".." => {}
+                    c if c.ends_with(':') => host.push(&c[..c.len() - 1]),
+                    c => host.push(c),
+                }
+            }
+            let _ = std::fs::create_dir_all(&host);
+        }
         // Guest module path (basename only) and its sandbox location. We copy
         // the executable itself into the sandbox so a program that opens its
         // own file (e.g. a self-extracting installer reading an appended
