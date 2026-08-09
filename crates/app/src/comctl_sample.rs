@@ -16,10 +16,10 @@
 //! **What this binary actually reaches today** (measured — see
 //! `tests/comctl_gate.rs`): Wine's comctl32 loads, `InitCommonControlsEx`
 //! succeeds, `msctls_progress32` is registered as a real class with a real
-//! WndProc, and the progress-bar child window is created with the right parent /
-//! geometry / style. Two gaps are pinned in the code below: the built-in
-//! `BUTTON` class is not registered by exemu's win32k, and sending a message to
-//! a comctl32 control does not terminate.
+//! WndProc, the progress-bar child window is created with the right parent /
+//! geometry / style, and (since W6.2) the built-in `BUTTON` child is created
+//! too. One gap is pinned in the code below: sending a message to a comctl32
+//! control does not terminate.
 //!
 //! The code is hand-assembled x86-64 with a small local assembler (`Asm`), the
 //! same shape [`crate::gui_sample`] and [`crate::sample`] use, so branch targets
@@ -358,11 +358,11 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.call_iat(r.slot("ShowWindow"));
 
     // ---- the common controls ----------------------------------------------
-    // A BUTTON child (user32's *built-in* control class). NOTE (verified W6.1
-    // gap): this one currently returns NULL without ever reaching
-    // `NtUserCreateWindowEx` — Wine's user32 leaves the built-in control classes
-    // (BUTTON/EDIT/STATIC/…) to the kernel side, and exemu's win32k class
-    // registry does not pre-register them, so the lookup fails in user32.
+    // A BUTTON child (user32's *built-in* control class). Wine's user32 leaves
+    // the built-in control classes (BUTTON/EDIT/STATIC/…) to the kernel side;
+    // since W6.2 exemu's win32k pre-registers them against the WndProcs user32
+    // publishes through `NtUserInitializeClientPfnArrays`, so this reaches
+    // `NtUserCreateWindowEx` and the driver sees a real child window.
     a.xor32(RCX);
     a.lea_rip(RDX, r.wstr(BUTTON_CLASS));
     a.lea_rip(R8, r.wstr(BUTTON_TEXT));

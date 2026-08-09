@@ -21,21 +21,23 @@
 //!    window — observed through the injected [`RecordingDriver`].
 //! 4. [`comctl_sample_first_frame_matches_golden_on_wine`] — the painted frame is
 //!    pinned against a committed golden PNG, in the style of the W4.10 gate.
+//! 5. [`wine_client_pfn_arrays_publish_the_builtin_wndprocs`] — **W6.2**: the
+//!    structure exemu recovers user32's built-in control WndProcs from, pinned
+//!    directly against the pinned `ntdll.dll` (entry counts, thunk shape, and the
+//!    index-ordered slot layout the resolver walks).
 //!
-//! **Two gaps are deliberately *not* papered over** (both asserted below so they
-//! are visible rather than assumed):
+//! **W6.2 closes the first of the three measured W6 blockers.** user32's built-in
+//! control classes (`BUTTON`/`EDIT`/`STATIC`/…) are the kernel side's
+//! responsibility in Wine's split; win32k now registers them against the WndProcs
+//! user32 publishes through `NtUserInitializeClientPfnArrays`, so
+//! `CreateWindowExW(L"BUTTON", …)` reaches `NtUserCreateWindowEx` and the driver
+//! sees the child window (asserted in the gate below).
 //!
-//! * user32's **built-in control classes** (`BUTTON`/`EDIT`/`STATIC`/…) are the
-//!   kernel side's responsibility in Wine's split, and exemu's win32k class
-//!   registry does not pre-register them — so `CreateWindowExW(L"BUTTON", …)`
-//!   fails inside user32 without ever reaching `NtUserCreateWindowEx`.
-//! * **child windows never paint.** win32k allocates one backing surface per
-//!   top-level window and `NtUserCreateWindowEx` does not dispatch
-//!   `WM_NCCREATE`/`WM_CREATE` to the class WndProc, so a comctl32 control never
-//!   allocates its instance data and never gets a `WM_PAINT`. Sending it a
-//!   message directly (`SendMessageW(hProgress, PBM_SETPOS, …)`) does not
-//!   terminate: the dispatch reaches comctl32's real WndProc, which then spins
-//!   on the unserviced `WineUnixCall` import thunk.
+//! **One gap is deliberately *not* papered over** (asserted below so it stays
+//! visible rather than assumed): messaging a comctl32 control
+//! (`SendMessageW(hProgress, PBM_SETPOS, …)`) does not terminate — the dispatch
+//! reaches comctl32's real WndProc, which then spins on the unserviced
+//! `WineUnixCall` import thunk.
 //!
 //! Everything here skip-guards on the git-ignored Wine DLL set.
 
@@ -403,14 +405,26 @@ fn comctl_sample_loads_wine_comctl32_on_wine() {
         "comctl32's class is a distinct registration, not a collision with the sample's"
     );
 
-    // PINNED GAP (see the module note): the built-in `BUTTON` class is not in
-    // exemu's win32k registry, so user32 fails the lookup and the window never
-    // reaches `NtUserCreateWindowEx`. Asserted so that implementing the built-in
-    // classes forces this expectation to be revisited rather than silently
-    // drifting.
-    assert!(
-        !creates.iter().any(|(_, p)| p.class_name.eq_ignore_ascii_case("BUTTON")),
-        "win32k does not yet register user32's built-in control classes"
+    // W6.2: the built-in `BUTTON` class is now in win32k's registry, wired to the
+    // WndProc user32 published through `NtUserInitializeClientPfnArrays`, so the
+    // class lookup inside user32 succeeds and the child reaches
+    // `NtUserCreateWindowEx`. Reaching the driver at all is the transitive proof
+    // that the recovered WndProc landed **inside user32's mapped image** — the
+    // registration is skipped outright for a proc that resolves anywhere else.
+    let (_, button) = creates
+        .iter()
+        .find(|(_, p)| p.class_name.eq_ignore_ascii_case("BUTTON"))
+        .expect("win32k registers user32's built-in BUTTON class and the guest creates one");
+    assert_eq!(button.parent, *main_hwnd, "the button is a child of the main window");
+    assert_eq!((button.cx, button.cy), (140, 32), "button geometry marshalled intact");
+    assert_ne!(button.class_atom, 0, "BUTTON carries a real class atom");
+    assert_ne!(
+        button.class_atom, progress.class_atom,
+        "the built-in BUTTON and comctl32's progress bar are distinct registrations"
+    );
+    assert_ne!(
+        button.class_atom, main.class_atom,
+        "the built-in BUTTON is not a collision with the sample's own class"
     );
 
     // The top-level window still paints: one surface at the client size, flushed
@@ -435,6 +449,124 @@ fn comctl_sample_loads_wine_comctl32_on_wine() {
         })
         .expect("the painted frame was presented");
     assert!(non_blank > 200, "the paint produced measurable content (non_blank={non_blank})");
+}
+
+// ==========================================================================
+// W6.2: the client-PFN arrays that carry user32's built-in control WndProcs.
+// ==========================================================================
+
+/// Entries in each client-PFN array (`0x88 / 8` — the size user32's
+/// `winproc_init` hands `RtlInitializeNtUserPfn`). Mirrors `CLIENT_PFN_COUNT`
+/// in `crates/os/src/win32k.rs`; pinned here so a drift in either shows up.
+const CLIENT_PFN_COUNT: usize = 17;
+/// Byte distance between the ANSI and Unicode arrays.
+const CLIENT_PFN_STRIDE: u64 = (CLIENT_PFN_COUNT * 8) as u64;
+/// The one index that is NULL in this build (no proc published for it).
+const CLIENT_PFN_NULL_INDEX: usize = 6;
+
+/// W6.2. **The recovery route for user32's built-in control WndProcs, pinned
+/// against the pinned binary itself.**
+///
+/// Wine's split leaves `BUTTON`/`EDIT`/`STATIC`/… to the kernel side: user32
+/// holds the WndProcs but registers no classes, so exemu has to learn them from
+/// the one place they cross the boundary — `NtUserInitializeClientPfnArrays`.
+/// The chain (all of it recovered by disassembling the pinned binaries, no Wine
+/// source read):
+///
+/// * user32's `winproc_init` publishes its `client_procs{A,W}` (0x88 bytes each
+///   = [`CLIENT_PFN_COUNT`] pointers) through ntdll's `RtlInitializeNtUserPfn`;
+/// * `RtlRetrieveNtUserPfn` hands back a **different** triple — ntdll's own
+///   `user_funcs`, reachable from that export's `lea rax, [rip+disp32]`;
+/// * each `user_funcs` entry is a 7-byte `jmp qword [rip+disp32]` thunk
+///   (`48 ff 25 …`) whose slot is exactly `user_procs + index*8`, i.e. the
+///   procedure user32 published at that index.
+///
+/// This test walks that chain over the mapped, **relocated** `ntdll.dll` and
+/// asserts the structure exemu's resolver depends on: the arrays are
+/// [`CLIENT_PFN_COUNT`] entries, every non-null entry is that exact thunk shape,
+/// the slots are strictly index-ordered inside ntdll's image, and the two arrays
+/// are [`CLIENT_PFN_STRIDE`] apart. (What each *index* means, and that the
+/// resolved procs live in user32, is exercised end-to-end by
+/// [`comctl_sample_loads_wine_comctl32_on_wine`], which only creates a `BUTTON`
+/// if the whole chain resolved to a real user32 procedure.)
+#[test]
+fn wine_client_pfn_arrays_publish_the_builtin_wndprocs() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} control DLLs not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let bytes = std::fs::read(Path::new(WINE_DLLS).join("ntdll.dll")).expect("read ntdll.dll");
+    let image_size = exemu_loader::parse(&bytes).expect("parses as PE32+").size_of_image as u64;
+    let mut mem = VirtualMemory::new();
+    let ntdll = load_dll(&mut mem, &bytes, DLL_BASE);
+    let (lo, hi) = (ntdll.base, ntdll.base + image_size);
+
+    // `RtlRetrieveNtUserPfn` is `mov eax,[rip+d]; test eax,eax; je …;
+    // lea rax,[rip+d] /* user_funcs */; mov [rcx],rax; …` — take the first
+    // `lea rax,[rip+disp32]` (48 8d 05) in its prologue.
+    let retrieve = ntdll.export("RtlRetrieveNtUserPfn");
+    let mut prologue = [0u8; 32];
+    mem.read(retrieve, &mut prologue).expect("the export is mapped");
+    let lea = prologue
+        .windows(3)
+        .position(|w| w == [0x48, 0x8D, 0x05])
+        .expect("RtlRetrieveNtUserPfn loads user_funcs with `lea rax, [rip+disp32]`");
+    let disp = i32::from_le_bytes(prologue[lea + 3..lea + 7].try_into().unwrap()) as i64;
+    let user_funcs = (retrieve as i64 + lea as i64 + 7 + disp) as u64;
+    assert!((lo..hi).contains(&user_funcs), "user_funcs lands inside ntdll's image");
+
+    // Walk both arrays. `procs_base` is discovered from index 0's thunk slot;
+    // every later slot must be exactly `procs_base + index*8`, which is what
+    // makes "array index == class identity" a sound recovery.
+    let mut bases = Vec::new();
+    for (label, array) in [("A", user_funcs), ("W", user_funcs + CLIENT_PFN_STRIDE)] {
+        let mut procs_base = 0u64;
+        let mut nulls = Vec::new();
+        for i in 0..CLIENT_PFN_COUNT {
+            let entry = mem.read_u64(array + (i as u64) * 8).expect("the array is mapped");
+            if entry == 0 {
+                nulls.push(i);
+                continue;
+            }
+            assert!((lo..hi).contains(&entry), "{label}[{i}] points inside ntdll's image");
+            let mut op = [0u8; 3];
+            mem.read(entry, &mut op).expect("the thunk is mapped");
+            assert_eq!(
+                op,
+                [0x48, 0xFF, 0x25],
+                "{label}[{i}] is a `jmp qword [rip+disp32]` thunk, not {op:02x?}"
+            );
+            let d = mem.read_u32(entry + 3).expect("the thunk displacement is mapped") as i32 as i64;
+            let slot = (entry as i64 + 7 + d) as u64;
+            assert!((lo..hi).contains(&slot), "{label}[{i}]'s slot lands inside ntdll's image");
+            if procs_base == 0 {
+                procs_base = slot - (i as u64) * 8;
+            }
+            assert_eq!(
+                slot,
+                procs_base + (i as u64) * 8,
+                "{label}[{i}]'s thunk jumps through the index-ordered slot"
+            );
+        }
+        assert_eq!(
+            nulls,
+            vec![CLIENT_PFN_NULL_INDEX],
+            "{label}: exactly one unpublished slot, at the recovered index"
+        );
+        assert_ne!(procs_base, 0, "{label}: at least one thunk resolved");
+        bases.push(procs_base);
+    }
+    assert_eq!(
+        bases[1] - bases[0],
+        CLIENT_PFN_STRIDE,
+        "the ANSI and Unicode proc arrays are {CLIENT_PFN_COUNT} entries apart"
+    );
+    eprintln!(
+        "client-PFN arrays: user_funcs=+{:#x}, procs A=+{:#x} W=+{:#x}, {CLIENT_PFN_COUNT} entries each",
+        user_funcs - lo,
+        bases[0] - lo,
+        bases[1] - lo
+    );
 }
 
 /// Decode an RGBA8 PNG into `(width, height, rgba_bytes)`.

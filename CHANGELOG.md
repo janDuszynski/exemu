@@ -133,11 +133,32 @@ end-to-end on the default path.
   have **every named import it declares** (309 / 139 / 279 of them) resolve to
   a real export of the pinned DLL it names, forwarders included; one export per
   DLL is then executed through the interpreter from the DLL's own bytes.
-- **Two measured gaps are pinned as tests** so they stay visible rather than
-  being worked around: the built-in `BUTTON` class never reaches
-  `NtUserCreateWindowEx` (user32 leaves the built-ins to the kernel side), and
-  child windows do not paint — win32k allocates one surface per *top-level*
-  window and `NtUserCreateWindowEx` dispatches no `WM_NCCREATE`/`WM_CREATE`.
+- **The measured gaps are pinned as tests** so they stay visible rather than
+  being worked around: child windows do not paint — win32k allocates one surface
+  per *top-level* window — and messaging a comctl32 control does not terminate
+  (its WndProc spins on an unserviced `WineUnixCall` import thunk).
+
+### user32's built-in control classes (W6.2)
+- `CreateWindowExW(L"BUTTON", …)` now **reaches `NtUserCreateWindowEx`**. Wine's
+  split leaves the built-in control classes (`BUTTON`/`EDIT`/`STATIC`/`LISTBOX`/
+  `COMBOBOX`/`ScrollBar`/`MDIClient`/…) to the *kernel* side: user32 holds the
+  WndProcs but registers no classes, so the lookup used to fail inside user32
+  without ever crossing the syscall boundary.
+- The WndProcs are **recovered at boot** from the one place they cross that
+  boundary. `NtUserInitializeClientPfnArrays` is handed ntdll's `user_funcs`
+  triple; each entry is a 7-byte `jmp qword [rip+disp32]` thunk whose slot holds
+  the procedure user32 published through `RtlInitializeNtUserPfn`, index for
+  index. win32k follows the thunks, checks each target really lands inside
+  user32's mapped image (`SizeOfImage` read from the mapped PE header), and
+  registers the 14 built-in classes against them. A target that resolves
+  anywhere else is refused rather than registered.
+- The whole chain is recovered by **disassembling the pinned binaries** (their
+  own COFF symbol tables identify the per-index procs); no Wine source was read.
+  The structure is pinned as a test against `ntdll.dll` itself — 17 entries per
+  array, the exact thunk opcode, index-ordered slots, and the ANSI/Unicode arrays
+  exactly one array apart — and end-to-end by the comctl gate, where the driver
+  now observes the `BUTTON` child created at its requested geometry with its own
+  atom, beside comctl32's `msctls_progress32`.
 
 ## v0.0.4 — the windowing substrate
 
