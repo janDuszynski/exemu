@@ -233,6 +233,44 @@ end-to-end on the default path.
   now observes the `BUTTON` child created at its requested geometry with its own
   atom, beside comctl32's `msctls_progress32`.
 
+### `WM_NCCREATE` / `WM_CREATE` dispatch (W6.2)
+- **A control finally runs its own creation handler.** `NtUserCreateWindowEx`
+  now sends `WM_NCCREATE` then `WM_CREATE` to the class WndProc — user32's real
+  `ButtonWndProc` and comctl32's real `ProgressWindowProc` included — so a
+  control allocates its instance data instead of being an empty handle.
+- The obstacle was structural, not a missing message. The existing WndProc
+  dispatch *hijacks the syscall return*, which leaves the WndProc's LRESULT in
+  the register `NtUserCreateWindowEx` must return the HWND in, and can only run
+  one callback. The win32k callback frame now carries a **queue** of callbacks
+  plus the handler's own result — the same re-entrant shape `_initterm`, the TLS
+  callbacks and `DllMain` already use on the intercepted-import path — so both
+  messages run and user32 still receives the handle.
+- The `CREATESTRUCTW` the pair carries is built in a reservation *below* the
+  interrupted syscall's stack pointer, with the callback frames seated below
+  that, so a WndProc cannot overwrite the struct it was handed (and a window
+  created from inside a WndProc nests naturally). The window and class names are
+  **copied** NUL-terminated: the caller's `UNICODE_STRING` buffers carry a
+  length, not a terminator. The `hInstance` / `lpParam` argument slots were
+  pinned by probing the pinned user32 with distinctive values.
+- The gate's proof is end-to-end and load-bearing: the sample's WndProc answers
+  `WM_CREATE` by reading `CREATESTRUCTW.lpCreateParams` and only reports the
+  creation — by setting the window text to `CREATESTRUCTW.lpszClass` — if the
+  magic it was created with round-tripped.
+- **A real boundary bug surfaced and is fixed.** The Wine boot ends up with
+  *two* ntdll images: the one exemu pre-maps (the running image, the only copy
+  whose `user_procs` user32 ever fills) and a second one Wine's own loader maps
+  for the name `NTDLL.dll` while resolving forwarders. `user32!DefWindowProcW`
+  is a forwarder to `NTDLL.NtdllDefWindowProc_W`, which is literally
+  `jmp qword [user_procs+0xa8]` — so every module bound after that second map
+  (the exe, comctl32) called `DefWindowProc` through a **NULL** slot and jumped
+  to address 0. Worse, the fault never surfaced: ntdll's `call_seh_handlers`
+  re-runs `virtual_unwind` until the frame reaches `TEB.StackBase`, and exemu's
+  win32k callback-return thunk carries no `.pdata`, so the walk never terminated
+  and the run spun instead of faulting. win32k now mirrors the recovered
+  client-PFN procs into every mapped ntdll copy, making the table it recovered
+  authoritative regardless of which image a module bound against. The duplicate
+  load itself remains a loader-level gap, recorded in the comctl gate.
+
 ## v0.0.4 — the windowing substrate
 
 The last foundation layer *under* the GUI: a real USER32/GDI object model the

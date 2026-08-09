@@ -26,18 +26,35 @@
 //!    directly against the pinned `ntdll.dll` (entry counts, thunk shape, and the
 //!    index-ordered slot layout the resolver walks).
 //!
-//! **W6.2 closes the first of the three measured W6 blockers.** user32's built-in
-//! control classes (`BUTTON`/`EDIT`/`STATIC`/…) are the kernel side's
-//! responsibility in Wine's split; win32k now registers them against the WndProcs
-//! user32 publishes through `NtUserInitializeClientPfnArrays`, so
-//! `CreateWindowExW(L"BUTTON", …)` reaches `NtUserCreateWindowEx` and the driver
-//! sees the child window (asserted in the gate below).
+//! **W6.2 closes the first two of the three measured W6 blockers.**
 //!
-//! **One gap is deliberately *not* papered over** (asserted below so it stays
-//! visible rather than assumed): messaging a comctl32 control
-//! (`SendMessageW(hProgress, PBM_SETPOS, …)`) does not terminate — the dispatch
-//! reaches comctl32's real WndProc, which then spins on the unserviced
-//! `WineUnixCall` import thunk.
+//! * user32's built-in control classes (`BUTTON`/`EDIT`/`STATIC`/…) are the
+//!   kernel side's responsibility in Wine's split; win32k now registers them
+//!   against the WndProcs user32 publishes through
+//!   `NtUserInitializeClientPfnArrays`, so `CreateWindowExW(L"BUTTON", …)`
+//!   reaches `NtUserCreateWindowEx` and the driver sees the child window.
+//! * `NtUserCreateWindowEx` now dispatches **`WM_NCCREATE` then `WM_CREATE`** to
+//!   the class WndProc and *still* returns the HWND, by queueing both callbacks
+//!   on the re-entrant win32k callback frame instead of hijacking the syscall
+//!   return for a single call. Both children's real WndProcs (user32's
+//!   `ButtonWndProc`, comctl32's `ProgressWindowProc`) run their creation
+//!   handlers, so a control finally allocates its instance data.
+//!
+//! **Two things are deliberately *not* papered over**, and are asserted below so
+//! they stay visible rather than assumed:
+//!
+//! * **The Wine boot maps ntdll twice.** exemu pre-maps ntdll (the running
+//!   image, and the only copy whose `user_procs` user32 ever fills), and Wine's
+//!   own loader then maps a *second* copy for the name `NTDLL.dll` while
+//!   resolving forwarders. Because `user32!DefWindowProcW` is a forwarder to
+//!   `NTDLL.NtdllDefWindowProc_W` — literally `jmp qword [user_procs+0xa8]` —
+//!   every module bound after that second map (the exe, comctl32) reached
+//!   `DefWindowProc` through a NULL slot. win32k now mirrors the recovered
+//!   client-PFN procs into every mapped ntdll copy, which fixes `DefWindowProc`;
+//!   the duplicate load itself is a loader-level gap that remains.
+//! * Messaging a comctl32 control (`SendMessageW(hProgress, PBM_SETPOS, …)`)
+//!   does not terminate — the dispatch reaches comctl32's real WndProc, which
+//!   then spins on the unserviced `WineUnixCall` import thunk.
 //!
 //! Everything here skip-guards on the git-ignored Wine DLL set.
 
@@ -425,6 +442,28 @@ fn comctl_sample_loads_wine_comctl32_on_wine() {
     assert_ne!(
         button.class_atom, main.class_atom,
         "the built-in BUTTON is not a collision with the sample's own class"
+    );
+
+    // W6.2: **the creation pair reaches the class WndProc.** The sample's WndProc
+    // answers `WM_CREATE` by reading `CREATESTRUCTW.lpCreateParams`, and only if
+    // it finds the magic the window was created with does it set the window text
+    // to `CREATESTRUCTW.lpszClass`. So this one driver call is proof of the whole
+    // chain: the message was dispatched, lParam pointed at a well-formed
+    // `CREATESTRUCTW`, `lpCreateParams` round-tripped through `NtUserCreateWindowEx`'s
+    // argument slots, and `lpszClass` is a readable NUL-terminated string —
+    // *while* `NtUserCreateWindowEx` still returned the HWND to user32 (the guest
+    // went on to create both children with this window as their parent).
+    let created = calls
+        .iter()
+        .find_map(|c| match c {
+            DriverCall::SetWindowText { hwnd, text } => Some((*hwnd, text.as_str())),
+            _ => None,
+        })
+        .expect("the sample's WM_CREATE handler ran and reported the creation");
+    assert_eq!(created.0, *main_hwnd, "WM_CREATE was delivered to the window being created");
+    assert_eq!(
+        created.1, "ExemuComctlClass",
+        "CREATESTRUCTW.lpCreateParams round-tripped and lpszClass names the class"
     );
 
     // The top-level window still paints: one surface at the client size, flushed

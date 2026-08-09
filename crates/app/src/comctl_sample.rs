@@ -17,9 +17,11 @@
 //! `tests/comctl_gate.rs`): Wine's comctl32 loads, `InitCommonControlsEx`
 //! succeeds, `msctls_progress32` is registered as a real class with a real
 //! WndProc, the progress-bar child window is created with the right parent /
-//! geometry / style, and (since W6.2) the built-in `BUTTON` child is created
-//! too. One gap is pinned in the code below: sending a message to a comctl32
-//! control does not terminate.
+//! geometry / style, and (since W6.2) the built-in `BUTTON` child is created too
+//! and **all three windows receive `WM_NCCREATE` + `WM_CREATE`** — the sample's
+//! own WndProc proves it by reading its `CREATESTRUCTW` back. One gap is pinned
+//! in the code below: sending a message to a comctl32 control does not
+//! terminate.
 //!
 //! The code is hand-assembled x86-64 with a small local assembler (`Asm`), the
 //! same shape [`crate::gui_sample`] and [`crate::sample`] use, so branch targets
@@ -57,6 +59,22 @@ const ICC_FLAGS: i32 = 0x0000_00FF | 0x0000_4000;
 /// The two child-control IDs (the `hMenu` argument of `CreateWindowExW`).
 const ID_BUTTON: i32 = 100;
 const ID_PROGRESS: i32 = 101;
+
+/// The `lpParam` the main window is created with, and therefore the value its
+/// `WM_CREATE` must find in `CREATESTRUCTW.lpCreateParams` (roadmap W6.2). The
+/// WndProc only reports the creation if this round-trips, so the gate's
+/// observation is proof the struct — not just the message — arrived intact.
+pub const CREATE_PARAM_MAGIC: i32 = 0x5A5A_1234;
+
+// --- CREATESTRUCTW (64-bit) field offsets the WndProc reads ------------------
+/// `lpCreateParams` — the `lpParam` passed to `CreateWindowExW`.
+const CS_LP_CREATE_PARAMS: i8 = 0x00;
+/// `lpszClass` — the class name, as a NUL-terminated `LPCWSTR`.
+const CS_LPSZ_CLASS: i8 = 0x40;
+
+// --- window messages the sample's WndProc handles ---------------------------
+const WM_CREATE: i32 = 0x0001;
+const WM_NCCREATE: i32 = 0x0081;
 
 
 /// Build the common-controls sample executable.
@@ -140,6 +158,7 @@ fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
                 "GetDC",
                 "ReleaseDC",
                 "SendMessageW",
+                "SetWindowTextW",
             ],
         ),
         ("gdi32.dll", vec!["TextOutW", "Rectangle"]),
@@ -349,7 +368,9 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.mov_at_rsp_imm(0x40, 0); // hWndParent
     a.mov_at_rsp_imm(0x48, 0); // hMenu
     a.mov_at_rsp_imm(0x50, 0); // hInstance
-    a.mov_at_rsp_imm(0x58, 0); // lpParam
+    // lpParam: the WM_CREATE proof value (roadmap W6.2) — the WndProc reports the
+    // creation only if it reads this back out of CREATESTRUCTW.lpCreateParams.
+    a.mov_at_rsp_imm(0x58, CREATE_PARAM_MAGIC);
     a.call_iat(r.slot("CreateWindowExW"));
     a.mov_reg_reg(RBX, RAX); // save hwnd
 
@@ -466,7 +487,36 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.je("paint");
     a.cmp_rdx_imm8(0x02); // WM_DESTROY
     a.je("destroy");
+    a.cmp_rdx_imm32(WM_NCCREATE);
+    a.je("nccreate");
+    a.cmp_rdx_imm32(WM_CREATE);
+    a.je("create");
     a.call_iat(r.slot("DefWindowProcW"));
+    a.jmp("wp_ret");
+
+    // WM_NCCREATE → TRUE ("keep creating me"), the documented contract. Handled
+    // here rather than deferred to DefWindowProcW **on purpose**: under the
+    // current Wine boot `user32!DefWindowProcW` forwards to
+    // `NTDLL.NtdllDefWindowProc_W`, which resolves into a *second*, dead ntdll
+    // image (see the module note in `tests/comctl_gate.rs`) and tail-jumps
+    // through a null slot. Every real WndProc handles its own WM_NCCREATE /
+    // WM_CREATE anyway, so this is ordinary Win32 code, not a workaround shape.
+    a.label("nccreate");
+    a.mov32(RAX, 1);
+    a.jmp("wp_ret");
+
+    // WM_CREATE → read CREATESTRUCTW.lpCreateParams (r9 = lParam); only if it
+    // carries the magic the window was created with does the WndProc report the
+    // creation, by setting the window text to CREATESTRUCTW.lpszClass. That one
+    // driver call is the gate's evidence that the whole struct arrived intact.
+    a.label("create");
+    a.cmp_at_r9_imm32(CS_LP_CREATE_PARAMS, CREATE_PARAM_MAGIC);
+    a.jne("create_done");
+    a.mov_rdx_at_r9(CS_LPSZ_CLASS); // lpszClass
+    a.mov_reg_at_rsp(RCX, WP_HWND);
+    a.call_iat(r.slot("SetWindowTextW"));
+    a.label("create_done");
+    a.xor32(RAX); // WM_CREATE: 0 = continue creation
     a.jmp("wp_ret");
 
     a.label("destroy");
@@ -635,6 +685,20 @@ impl Asm {
     fn cmp_rdx_imm8(&mut self, imm: i8) {
         self.code.extend_from_slice(&[0x48, 0x83, 0xFA, imm as u8]);
     }
+    /// `cmp rdx, imm32` — the message ids above 0x7F (`WM_NCCREATE` = 0x81).
+    fn cmp_rdx_imm32(&mut self, imm: i32) {
+        self.code.extend_from_slice(&[0x48, 0x81, 0xFA]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+    /// `cmp qword [r9+disp8], imm32` — test a field of the `CREATESTRUCTW` lParam.
+    fn cmp_at_r9_imm32(&mut self, disp: i8, imm: i32) {
+        self.code.extend_from_slice(&[0x49, 0x81, 0x79, disp as u8]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+    /// `mov rdx, qword [r9+disp8]` — load a `CREATESTRUCTW` field into an arg.
+    fn mov_rdx_at_r9(&mut self, disp: i8) {
+        self.code.extend_from_slice(&[0x49, 0x8B, 0x51, disp as u8]);
+    }
     fn int3(&mut self) {
         self.code.push(0xCC);
     }
@@ -644,6 +708,11 @@ impl Asm {
 
     fn je(&mut self, label: &str) {
         self.code.extend_from_slice(&[0x0F, 0x84]);
+        self.fixups.push((self.code.len(), label.to_string()));
+        self.code.extend_from_slice(&[0, 0, 0, 0]);
+    }
+    fn jne(&mut self, label: &str) {
+        self.code.extend_from_slice(&[0x0F, 0x85]);
         self.fixups.push((self.code.len(), label.to_string()));
         self.code.extend_from_slice(&[0, 0, 0, 0]);
     }
