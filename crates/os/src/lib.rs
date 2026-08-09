@@ -35,6 +35,7 @@ mod syscall;
 mod sync;
 mod thread;
 mod time;
+pub mod token;
 mod unixlib;
 mod vm;
 mod win;
@@ -597,6 +598,12 @@ impl WinOs {
         // NT time syscalls (roadmap W2.14).
         os.set_syscall_handler(time::SSDT_NT_QUERY_SYSTEM_TIME, time::ssdt_nt_query_system_time);
         os.set_syscall_handler(time::SSDT_NT_QUERY_PERFORMANCE_COUNTER, time::ssdt_nt_query_performance_counter);
+        // NT token syscalls (roadmap W6.6) — who the user is.
+        os.set_syscall_handler(token::SSDT_NT_OPEN_PROCESS_TOKEN, token::ssdt_nt_open_process_token);
+        os.set_syscall_handler(token::SSDT_NT_OPEN_PROCESS_TOKEN_EX, token::ssdt_nt_open_process_token_ex);
+        os.set_syscall_handler(token::SSDT_NT_OPEN_THREAD_TOKEN, token::ssdt_nt_open_thread_token);
+        os.set_syscall_handler(token::SSDT_NT_OPEN_THREAD_TOKEN_EX, token::ssdt_nt_open_thread_token_ex);
+        os.set_syscall_handler(token::SSDT_NT_QUERY_INFORMATION_TOKEN, token::ssdt_nt_query_information_token);
         // NLS data syscalls (roadmap W3.2): Wine's ntdll `locale_init` /
         // kernelbase `init_locale` ask the unix side for the unified `locale.nls`
         // (NtInitializeNlsFiles, behind RtlGetLocaleFileMappingAddress) and the

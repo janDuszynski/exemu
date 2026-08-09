@@ -25,6 +25,7 @@ use crate::WinOs;
 
 // Value types.
 const REG_SZ: u32 = 1;
+const REG_BINARY: u32 = 3;
 const REG_DWORD: u32 = 4;
 // Return codes.
 const ERROR_SUCCESS: u64 = 0;
@@ -316,6 +317,20 @@ impl WinOs {
         self.reg_value_set(&pl, "ProfilesDirectory", sz("C:\\Users"));
         self.reg_value_set(&pl, "ProgramData", sz("C:\\ProgramData"));
         self.reg_value_set(&pl, "Public", sz("C:\\Users\\Public"));
+
+        // …and this user's own profile, keyed by the **same** SID
+        // `crates/os/src/token.rs` reports through `NtQueryInformationToken`.
+        // The two must agree: a guest reads the binary SID from the token, spells
+        // it as text, and looks the profile up under that name — if they diverge
+        // the profile is simply never found, silently. `token::user_sid_string`
+        // is the single source of that spelling.
+        let sid = crate::token::user_sid_string();
+        let user = self.reg_key_create(&format!(
+            "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{sid}"
+        ));
+        self.reg_value_set(&user, "ProfileImagePath", sz("C:\\Users\\exemu"));
+        self.reg_value_set(&user, "Sid", (REG_BINARY, crate::token::user_sid()));
+        self.reg_value_set(&user, "Flags", dword(0));
     }
 
     /// Seed the `HKEY_CLASSES_ROOT` subtree (roadmap W6.4).
