@@ -27,6 +27,7 @@ pub mod folders;
 mod fs;
 mod gdi;
 mod msg;
+pub mod net;
 mod nls;
 mod reg;
 mod section;
