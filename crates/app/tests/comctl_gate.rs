@@ -33,11 +33,19 @@
 //! `CreateWindowExW(L"BUTTON", …)` reaches `NtUserCreateWindowEx` and the driver
 //! sees the child window (asserted in the gate below).
 //!
-//! **One gap is deliberately *not* papered over** (asserted below so it stays
-//! visible rather than assumed): messaging a comctl32 control
-//! (`SendMessageW(hProgress, PBM_SETPOS, …)`) does not terminate — the dispatch
-//! reaches comctl32's real WndProc, which then spins on the unserviced
-//! `WineUnixCall` import thunk.
+//! **One gap is deliberately *not* papered over**: driving a control's WndProc
+//! at all — `SendMessageW(hProgress, PBM_SETPOS, …)`, or the `WM_NCCREATE`/
+//! `WM_CREATE` dispatch W6.3 adds behind `EXEMU_W6_CREATE_MSGS` — does not
+//! terminate. **Root cause, measured (W6.3):** `ntdll.dll` is mapped *twice* (the
+//! boot image, whose `user_procs` user32 fills, and a second copy the guest
+//! loader maps when it snaps the main image's imports).
+//! `user32!DefWindowProcW` forwards to `NTDLL.NtdllDefWindowProc_W`, a
+//! `jmp qword [rip+disp32]` through `user_procs[4]`, and binds into the *second,
+//! uninitialized* image — so every WndProc that defers to `DefWindowProcW` jumps
+//! to address 0, and the resulting access violation puts Wine's SEH into an
+//! endless `virtual_unwind → unwind_builtin_dll` stack walk (that walk is the
+//! "spins on an unserviced `WineUnixCall`" symptom W6.1 recorded). The fix is in
+//! the loader, not in win32k.
 //!
 //! Everything here skip-guards on the git-ignored Wine DLL set.
 
