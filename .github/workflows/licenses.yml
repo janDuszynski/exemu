@@ -143,7 +143,20 @@ jobs:
             echo "Regenerate: .github/scripts/sbom.py --format markdown > docs/sbom/DEPENDENCIES.md"
             exit 1
           fi
-          echo "SBOM matches Cargo.lock"
+          # The attribution document is the one artefact that must physically
+          # accompany a binary distribution — every permissive licence in the
+          # shipping closure requires its text to travel with the binary.
+          # cargo-deny checks WHICH licences are present; only this checks that
+          # their texts are actually reproduced. Adding a dependency without
+          # regenerating it would silently ship an incomplete notices file.
+          python3 .github/scripts/sbom.py --format notices \
+            > /tmp/THIRD_PARTY_LICENSES.md
+          if ! diff -u THIRD_PARTY_LICENSES.md /tmp/THIRD_PARTY_LICENSES.md; then
+            echo "::error::THIRD_PARTY_LICENSES.md is stale."
+            echo "Regenerate: .github/scripts/sbom.py --format notices > THIRD_PARTY_LICENSES.md"
+            exit 1
+          fi
+          echo "SBOM and third-party notices match Cargo.lock"
 
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@v4

@@ -80,11 +80,26 @@ Run them locally with the commands given.
 
 - [ ] **A6. Third-party attribution ships with the artifact.** Every licence in
       the shipping closure (MIT, Apache-2.0, Zlib, 0BSD) requires the copyright
-      notice and licence text to accompany binary distribution. Generate
-      `THIRD_PARTY_LICENSES` from `docs/sbom/DEPENDENCIES.md` and place it in
-      the `.app` bundle's `Contents/Resources/`.
-      **Not yet automated — see "Known gaps" below. This is a real obligation
-      that is currently unmet for any binary distribution.**
+      notice and licence text to accompany binary distribution.
+      **Now automated:**
+
+      ```sh
+      .github/scripts/sbom.py --format notices > THIRD_PARTY_LICENSES.md
+      ```
+
+      The committed `THIRD_PARTY_LICENSES.md` reproduces each crate's own
+      vendored licence text verbatim, and CI regenerates and diffs it, so a
+      dependency cannot be added without the notices moving in the same PR.
+      **Copy it into the `.app` bundle's `Contents/Resources/`.**
+
+      **Residual obligation — 16 crates vendor no licence text.** The whole
+      `objc2` family (plus `block2` and `dispatch2`) declare their licence in
+      `Cargo.toml` but ship no copy of it. The generator lists them explicitly
+      under "Crates with no vendored licence text" rather than omitting them.
+      Their canonical texts must be obtained (from the upstream repository, or
+      the standard MIT/Apache-2.0/Zlib texts they name) and added before
+      distribution. An incomplete notices file that *looks* complete would be
+      worse than none.
 
 ### Two things a scanner will flag that are not problems
 
@@ -339,13 +354,16 @@ Recorded so nobody mistakes this checklist for a clearance.
 
 Stated plainly rather than left for a reader to discover.
 
-- **A6 (`THIRD_PARTY_LICENSES`) is not automated and not currently produced.**
-  Every permissive licence in the shipping closure requires its copyright
-  notice and licence text to accompany binary distribution. `cargo deny`
-  checks *which* licences are present; it does not gather their texts. Until a
-  generator exists, **any binary distribution of exemu is already out of
-  compliance with its permissive dependencies** — independently of anything to
-  do with Wine. This is the most immediately actionable item in this document.
+- **A6 (`THIRD_PARTY_LICENSES`) is now generated and CI-gated** —
+  `.github/scripts/sbom.py --format notices`, committed as
+  `THIRD_PARTY_LICENSES.md`, regenerated and diffed by the `licensing`
+  workflow. `cargo deny` checks *which* licences are present; this is what
+  gathers their texts.
+  **The remaining part of A6 is not automatable:** 16 crates (the `objc2`
+  family, `block2`, `dispatch2`) declare a licence but vendor no copy of it,
+  so their canonical texts must be sourced by hand before distribution. The
+  generator names them rather than quietly skipping them, so the gap is
+  visible in the artifact itself.
 - **The SBOM covers `aarch64-apple-darwin` only.** That is the shipping target.
   Pass `--target` to `.github/scripts/sbom.py` for others; nothing is committed
   for them.

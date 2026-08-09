@@ -437,9 +437,147 @@ def build_markdown(
     return "\n".join(lines) + "\n"
 
 
+# File names crates conventionally use for their licence text. Matched
+# case-insensitively against a `startswith`, so `LICENSE-MIT`, `LICENSE.md`,
+# `COPYING.LESSER` and friends are all picked up.
+LICENCE_FILE_PREFIXES = ("license", "licence", "copying", "notice", "unlicense")
+
+
+def licence_texts(pkg: dict) -> List[tuple]:
+    """Every licence text shipped inside a crate's own source directory.
+
+    Returns `(filename, text)` pairs, sorted by filename so the output is
+    byte-reproducible. Crates vendor these as `LICENSE-MIT` / `LICENSE-APACHE`
+    / `COPYING` next to `Cargo.toml`; `manifest_path` from `cargo metadata` is
+    the authoritative location of that directory.
+    """
+    manifest = pkg.get("manifest_path")
+    if not manifest:
+        return []
+    root = os.path.dirname(manifest)
+    found = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    for name in names:
+        low = name.lower()
+        if not low.startswith(LICENCE_FILE_PREFIXES):
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                found.append((name, fh.read().strip()))
+        except OSError:
+            continue
+    return found
+
+
+def build_notices(root_pkg: dict, ship_ids, pkgs: Dict[str, dict], target: str) -> str:
+    """The attribution document that must accompany a binary distribution.
+
+    Every permissive licence in the shipping closure (MIT, Apache-2.0, BSD,
+    Zlib, ISC…) requires its copyright notice and licence text to travel with
+    the binary. `cargo deny` checks *which* licences are present; it does not
+    check that their texts ship. This closes that gap by reproducing each
+    crate's own vendored licence files verbatim.
+
+    Crates whose source carries no licence file are listed explicitly rather
+    than omitted — an incomplete notices file that looks complete is worse than
+    one that names its own gaps.
+    """
+    def order(i):
+        return (pkgs[i]["name"].lower(), pkgs[i]["version"])
+
+    ids = [i for i in sorted(ship_ids, key=order) if not pkgs[i]["name"].startswith("exemu")]
+
+    out: List[str] = []
+    out.append("<!-- GENERATED FILE — do not edit by hand.")
+    out.append("     Regenerate with: .github/scripts/sbom.py --format notices \\")
+    out.append("                        > THIRD_PARTY_LICENSES.md")
+    out.append("     CI regenerates and diffs this file; a stale copy fails the build. -->")
+    out.append("")
+    out.append("# Third-party licences")
+    out.append("")
+    out.append(
+        f"`{root_pkg['name']}` v{root_pkg['version']} links the third-party Rust "
+        f"crates below on `{target}`. Their licences require that this "
+        "attribution accompany any binary distribution. The text of each is "
+        "reproduced verbatim from the crate's own source."
+    )
+    out.append("")
+    out.append(
+        "**This file covers exemu's cargo dependencies only.** Wine's PE builtin "
+        "DLLs are LGPL-2.1-or-later and are *not* cargo dependencies — they are "
+        "loaded at runtime as separate guest image files. Their obligations are "
+        "separate and are tracked in [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md), "
+        "which must be satisfied as well before shipping anything that bundles "
+        "them."
+    )
+    out.append("")
+    out.append(f"## Contents ({len(ids)} crates)")
+    out.append("")
+    for i in ids:
+        p = pkgs[i]
+        out.append(f"- `{p['name']}` {p['version']} — {license_of(p)}")
+    out.append("")
+
+    missing: List[str] = []
+    for i in ids:
+        p = pkgs[i]
+        texts = licence_texts(p)
+        out.append("---")
+        out.append("")
+        out.append(f"## `{p['name']}` {p['version']}")
+        out.append("")
+        out.append(f"SPDX: `{license_of(p)}`")
+        if p.get("repository"):
+            out.append("")
+            out.append(f"Source: {p['repository']}")
+        out.append("")
+        if not texts:
+            missing.append(f"{p['name']} {p['version']}")
+            out.append(
+                "> **No licence text is vendored in this crate's source.** The "
+                "SPDX expression above is its declared licence; the canonical "
+                "text must be obtained from the licence itself or from the "
+                "crate's repository before distributing."
+            )
+            out.append("")
+            continue
+        for name, text in texts:
+            out.append(f"### {name}")
+            out.append("")
+            out.append("```")
+            out.append(text)
+            out.append("```")
+            out.append("")
+
+    if missing:
+        out.append("---")
+        out.append("")
+        out.append("## Crates with no vendored licence text")
+        out.append("")
+        out.append(
+            "Listed so the gap is visible rather than silently absent. Each "
+            "declares a licence but ships no copy of it; obtain the canonical "
+            "text before distribution."
+        )
+        out.append("")
+        for m in missing:
+            out.append(f"- {m}")
+        out.append("")
+
+    return "\n".join(out) + "\n"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--format", choices=("cyclonedx", "markdown"), default="cyclonedx")
+    ap.add_argument(
+        "--format", choices=("cyclonedx", "markdown", "notices"), default="cyclonedx"
+    )
     ap.add_argument("--target", default=DEFAULT_TARGET)
     ap.add_argument("--root", default=DEFAULT_ROOT)
     ap.add_argument(
@@ -513,6 +651,8 @@ def main() -> int:
         doc = build_cyclonedx(root_pkg, with_build, ship_pkgs, args.target, args.timestamp)
         json.dump(doc, sys.stdout, indent=2, sort_keys=False)
         sys.stdout.write("\n")
+    elif args.format == "notices":
+        sys.stdout.write(build_notices(root_pkg, with_build, ship_pkgs, args.target))
     else:
         sys.stdout.write(
             build_markdown(
