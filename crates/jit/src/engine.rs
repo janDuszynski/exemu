@@ -69,6 +69,21 @@ impl JitStats {
 struct Block {
     code: Option<BlockCode>,
     insns: u32,
+    /// Guest address range the block was compiled from (handed to the store
+    /// helper so it can spot a store into the block's own instructions).
+    lo: u64,
+    hi: u64,
+    /// The (at most two) 4 KiB code pages the block covers, and the
+    /// `Memory::code_page_generation` each had when it was compiled.
+    page0: u64,
+    page1: u64,
+    gen0: u64,
+    gen1: u64,
+    /// `Memory::code_generation()` at the last moment this block was known
+    /// valid. While the global counter has not moved since, no per-page check is
+    /// needed at all — which is the common case, and keeps block entry to one
+    /// `u64` compare.
+    global_gen: u64,
 }
 
 /// Direct-mapped lookup in front of the block map: one compare on the hot path.
@@ -174,6 +189,19 @@ impl Jit {
             return idx;
         }
         let plan = Compiler::compile(mem, self.mode, rip, self.max_insns);
+        let lo = plan.start;
+        let hi = plan.end_rip.max(plan.start);
+        let page0 = lo & !(exemu_core::CODE_PAGE_SIZE - 1);
+        let page1 = hi.saturating_sub(1).max(lo) & !(exemu_core::CODE_PAGE_SIZE - 1);
+        let meta = (
+            lo,
+            hi,
+            page0,
+            page1,
+            mem.code_page_generation(page0),
+            mem.code_page_generation(page1),
+            mem.code_generation(),
+        );
         if let StopReason::Unsupported { opcode, rip: at, esc } = plan.stop {
             if at == rip {
                 // Nothing compiled here at all — remember the reason so the
@@ -182,14 +210,25 @@ impl Jit {
                 *self.stats.declined.entry(key).or_insert(0) += 1;
             }
         }
+        let mk = |code: Option<BlockCode>, insns: u32| Block {
+            code,
+            insns,
+            lo: meta.0,
+            hi: meta.1,
+            page0: meta.2,
+            page1: meta.3,
+            gen0: meta.4,
+            gen1: meta.5,
+            global_gen: meta.6,
+        };
         let block = if plan.insns == 0 {
-            Block { code: None, insns: 0 }
+            mk(None, 0)
         } else {
             match self.buffer.push(&plan.code) {
                 Ok(code) => {
                     self.stats.blocks_compiled += 1;
                     self.stats.peak_code_bytes = self.stats.peak_code_bytes.max(self.buffer.used());
-                    Block { code: Some(code), insns: plan.insns }
+                    mk(Some(code), plan.insns)
                 }
                 Err(_) => {
                     // Out of code space: drop everything and try once more, so a
@@ -199,9 +238,9 @@ impl Jit {
                     match self.buffer.push(&plan.code) {
                         Ok(code) => {
                             self.stats.blocks_compiled += 1;
-                            Block { code: Some(code), insns: plan.insns }
+                            mk(Some(code), plan.insns)
                         }
-                        Err(_) => Block { code: None, insns: 0 },
+                        Err(_) => mk(None, 0),
                     }
                 }
             }
@@ -213,21 +252,48 @@ impl Jit {
         idx
     }
 
+    /// Is the cached block still the code that is actually in guest memory?
+    ///
+    /// Cheap path: the global code-generation counter (roadmap W1.7) has not
+    /// moved since this block was last known good, so nothing executable
+    /// anywhere has changed. Otherwise fall back to the per-page generations for
+    /// the pages this block covers, and — if they are unchanged — re-stamp the
+    /// block so the next entry is cheap again.
+    ///
+    /// The distinction matters enormously in practice: exemu maps PE sections
+    /// RWX, so an ordinary store into the image's `.data` bumps the *global*
+    /// counter. Treating that as "code changed" throws the entire cache away on
+    /// almost every store, which measured **40× slower than the interpreter** on
+    /// SteamSetup (an NSIS installer that decompresses into its own image)
+    /// before this check was made page-precise.
+    fn validate(&mut self, idx: usize, mem: &dyn Memory) -> bool {
+        let cur = mem.code_generation();
+        let b = &self.blocks[idx];
+        if b.global_gen == cur {
+            return true;
+        }
+        let (p0, p1, g0, g1) = (b.page0, b.page1, b.gen0, b.gen1);
+        if mem.code_page_generation(p0) == g0 && mem.code_page_generation(p1) == g1 {
+            self.blocks[idx].global_gen = cur;
+            return true;
+        }
+        false
+    }
+
     /// Execute the block at `state.rip`, if there is one.
     pub fn run(&mut self, state: &mut CpuState, mem: &mut dyn Memory) -> Run {
-        // Guest code may have changed since the cache was built (roadmap W1.7).
-        // One `u64` compare answers "did *any* executable byte change?"; a
-        // change throws the cache away, which is coarse but always correct.
-        // (Per-page invalidation is W8.5.)
-        let gen = mem.code_generation();
-        if gen != self.code_gen {
-            self.flush();
-            self.code_gen = gen;
-        }
         let rip = state.rip;
-        let idx = self.block_at(rip, &*mem) as usize;
-        let (code, insns) = match &self.blocks[idx] {
-            Block { code: Some(c), insns } => (*c, *insns),
+        let mut idx = self.block_at(rip, &*mem) as usize;
+        if !self.validate(idx, &*mem) {
+            // The bytes under a cached block changed. Invalidation is still
+            // whole-cache (indexing pages back to the blocks that cover them is
+            // W8.5); what matters here is that it now happens only when guest
+            // *code* really changed.
+            self.flush();
+            idx = self.block_at(rip, &*mem) as usize;
+        }
+        let (code, insns, lo, hi) = match &self.blocks[idx] {
+            Block { code: Some(c), insns, lo, hi, .. } => (*c, *insns, *lo, *hi),
             _ => {
                 self.stats.not_compiled += 1;
                 return Run::NotCompiled;
@@ -237,7 +303,8 @@ impl Jit {
             let mut ctx = BlockCtx {
                 mem,
                 parity: PARITY.as_ptr(),
-                code_gen: gen,
+                code_lo: lo,
+                code_hi: hi,
                 read: jit_read,
                 write: jit_write,
             };
@@ -351,15 +418,16 @@ mod tests {
     }
 
     #[test]
-    fn a_store_into_code_stops_the_block() {
-        // mov byte [rip-relative code page], 0x90 — the store lands in the very
-        // page being executed, so the block must stop right after it rather than
-        // running instructions that may have just been rewritten.
+    fn a_store_into_this_blocks_own_code_stops_the_block() {
+        // The store lands in the very bytes this block was compiled from, so it
+        // must commit that instruction and stop rather than run instructions
+        // that may have just been rewritten underneath the compiled code.
         let mut mem = VirtualMemory::new();
         mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
         let code = [
             0xC6, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00, 0x90, // mov byte [0x1000], 0x90
             0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+            0xC3,
         ];
         mem.poke(CODE, &code).unwrap();
         let mut st = CpuState::new();
@@ -369,9 +437,57 @@ mod tests {
         assert_eq!(r, Run::Executed { insns: 1 }, "stopped after the self-modifying store");
         assert_eq!(st.rip, CODE + 8);
         assert_eq!(st.gpr[0], 0, "the instruction after the store did NOT run");
-        // And the next call recompiles from the modified bytes.
-        let before = jit.stats().flushes;
-        jit.run(&mut st, &mut mem);
-        assert!(jit.stats().flushes > before, "the cache was invalidated");
+    }
+
+    #[test]
+    fn a_store_into_another_block_invalidates_it() {
+        // Block B is cached; block A rewrites B's bytes; B must then be
+        // recompiled from what is actually in guest memory.
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
+        // A @ CODE: mov byte [CODE+0x41], 2 ; ret
+        let a = [0xC6, 0x04, 0x25, 0x41, 0x10, 0x00, 0x00, 0x02, 0xC3];
+        // B @ CODE+0x40: mov eax, 1 ; ret
+        let b = [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3];
+        mem.poke(CODE, &a).unwrap();
+        mem.poke(CODE + 0x40, &b).unwrap();
+        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
+
+        let mut st = CpuState::new();
+        st.rip = CODE + 0x40;
+        assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 1 });
+        assert_eq!(st.gpr[0], 1);
+
+        st.rip = CODE;
+        assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 1 });
+
+        let flushes = jit.stats().flushes;
+        st.rip = CODE + 0x40;
+        assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 1 });
+        assert_eq!(st.gpr[0], 2, "block B was recompiled from the rewritten bytes");
+        assert!(jit.stats().flushes > flushes, "the stale block was invalidated");
+    }
+
+    #[test]
+    fn a_data_store_does_not_invalidate_anything() {
+        // The regression this guards: exemu maps PE sections RWX, so an ordinary
+        // store into `.data` moves the *global* code-generation counter. Treating
+        // that as "code changed" throws the whole cache away on nearly every
+        // store — measured at 40x SLOWER than the interpreter on SteamSetup
+        // before the check was made page-precise.
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
+        mem.map(Region::new("data", DATA, 0x1000, Perm::RWX)).unwrap();
+        // mov byte [DATA], 1 ; ret
+        let code = [0xC6, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x01, 0xC3];
+        mem.poke(CODE, &code).unwrap();
+        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        for _ in 0..8 {
+            st.rip = CODE;
+            assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 1 });
+        }
+        assert_eq!(jit.stats().flushes, 0, "a data store must not invalidate the cache");
+        assert_eq!(jit.stats().blocks_compiled, 1, "and the block is compiled once");
     }
 }

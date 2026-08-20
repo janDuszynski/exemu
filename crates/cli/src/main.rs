@@ -58,7 +58,7 @@ fn print_help() {
         "exemu {} — run Windows x86-64 .exe files on Apple Silicon\n\
 \n\
 USAGE:\n\
-    exemu run <file.exe> [--trace] [--no-echo] [--virtual-clock] [--opcode-profile] [-- <args>...]\n\
+    exemu run <file.exe> [--trace] [--no-echo] [--virtual-clock] [--jit] [-- <args>...]\n\
     exemu info <file.exe>\n\
     exemu opcodes [--telemetry <path>] [--clear]\n\
     exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]\n\
@@ -99,6 +99,9 @@ RUN OPTIONS:\n\
                     at 10M instructions/second from a fixed 2026-01-01 epoch, so\n\
                     a run executes the SAME instruction count every time. Also\n\
                     settable with EXEMU_VIRTUAL_CLOCK=1 (roadmap W9.6)\n\
+    --jit           Run guest code through the block JIT where it can, and\n\
+                    report how much of the run went native (roadmap W8). Off by\n\
+                    default; also settable with EXEMU_JIT=1\n\
     --opcode-profile  Print a dynamic opcode-frequency profile of the run\n\
                     (roadmap W8.3). Needs an instrumented build:\n\
                     cargo build --release -p exemu-cli --features opcode-profile\n\
@@ -131,6 +134,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut wine_boot: Option<String> = None;
     let mut virtual_clock = false;
     let mut opcode_profile = false;
+    let mut jit = false;
     let mut guest_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -141,6 +145,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             "--gui" => gui = true,
             "--virtual-clock" => virtual_clock = true,
             "--opcode-profile" => opcode_profile = true,
+            "--jit" => jit = true,
             "--max-steps" => {
                 i += 1;
                 let v = rest.get(i).ok_or("--max-steps needs a value (0 = unlimited)")?;
@@ -187,8 +192,16 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut argv = vec![path.to_string()];
     argv.extend(guest_args);
 
-    let mut cfg =
-        RunConfig { args: argv, echo, trace, gui, load_base, virtual_clock, ..RunConfig::default() };
+    let mut cfg = RunConfig {
+        args: argv,
+        echo,
+        trace,
+        gui,
+        load_base,
+        virtual_clock,
+        jit,
+        ..RunConfig::default()
+    };
     if let Some(m) = max_steps {
         cfg.max_steps = m;
     }
@@ -206,8 +219,12 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         return run_live_cocoa(bytes, cfg, &sandbox);
     }
 
-    let proc = Process::load(&bytes, &mut cfg).map_err(|e| e.to_string())?;
-    let run = proc.run();
+    // Borrowed, not consuming: the JIT report is worth having on the *fault*
+    // path too — a binary that stops mid-run is exactly where "how much of this
+    // went native, and what stopped the blocks?" is most useful.
+    let mut proc = Process::load(&bytes, &mut cfg).map_err(|e| e.to_string())?;
+    let run = proc.run_borrowed();
+    let jit_report = proc.jit_report();
 
     report_sandbox(&sandbox);
     if opcode_profile {
@@ -220,9 +237,11 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
                 "\n[exemu] process exited with code {} after {} instructions",
                 result.exit_code, result.steps
             );
+            report_jit(&jit_report, result.steps);
             Ok(result.exit_code as u8)
         }
         Err(e) => {
+            report_jit(&jit_report, 0);
             // A run that dies on an instruction the decoder doesn't implement
             // is a data point for prioritizing the ISA (roadmap P0.5): record
             // it, then still surface the error. The run layer wraps faults in a
@@ -231,6 +250,42 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
                 record_decode_miss(telemetry.as_deref(), path, *rip, opcode);
             }
             Err(e.to_string())
+        }
+    }
+}
+
+/// Print what the block JIT did (roadmap W8), if the run used one.
+fn report_jit(report: &Option<exemu_app::JitReport>, steps: u64) {
+    if let Some(j) = report {
+        let total = if steps != 0 { steps } else { j.insns_executed + j.not_compiled };
+        let share = 100.0 * j.insns_executed as f64 / total.max(1) as f64;
+        eprintln!(
+            "[exemu] jit: {:.1}% of instructions native ({} of {}), {} blocks \
+             ({} KiB of code), {} block entries, {} rewinds, {} side-exits, {} flushes",
+            share,
+            j.insns_executed,
+            total,
+            j.blocks_compiled,
+            j.code_bytes / 1024,
+            j.blocks_executed,
+            j.faults,
+            j.not_compiled,
+            j.flushes
+        );
+        let top: Vec<String> = j
+            .declined
+            .iter()
+            .take(10)
+            .map(|(k, c)| {
+                if k & 0x100 != 0 {
+                    format!("0f{:02x}×{c}", k & 0xff)
+                } else {
+                    format!("{:02x}×{c}", k & 0xff)
+                }
+            })
+            .collect();
+        if !top.is_empty() {
+            eprintln!("[exemu] jit: blocks stopped by (opcode×times): {}", top.join(" "));
         }
     }
 }
@@ -289,6 +344,7 @@ fn run_live_cocoa(
                 "\n[exemu] process exited with code {} after {} instructions",
                 result.exit_code, result.steps
             );
+            report_jit(&result.jit, result.steps);
             Ok(result.exit_code as u8)
         }
         Err(e) => Err(e.to_string()),

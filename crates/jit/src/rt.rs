@@ -50,9 +50,13 @@ pub struct BlockCtx<'a> {
     /// `b` (1 when the byte has an even number of set bits). Compiled code
     /// computes PF with an `and`+`ldrb` instead of a five-instruction fold.
     pub parity: *const u8,
-    /// [`Memory::code_generation`] as of block entry. The store helper compares
-    /// against it to detect a store that landed in executable memory.
-    pub code_gen: u64,
+    /// The guest address range of the code the running block was compiled from.
+    /// The store helper compares against it to detect a store that rewrites the
+    /// block's own instructions — the only self-modification that can affect
+    /// code already executing. (Stores that hit *other* code pages are caught
+    /// between blocks, by the engine's per-page generation check.)
+    pub code_lo: u64,
+    pub code_hi: u64,
     /// Address of [`jit_read`], loaded and `blr`-ed by compiled code.
     pub read: unsafe extern "C" fn(*mut BlockCtx<'_>, u64, u32) -> ReadResult,
     /// Address of [`jit_write`].
@@ -101,13 +105,16 @@ pub unsafe extern "C" fn jit_read(ctx: *mut BlockCtx<'_>, addr: u64, size: u32) 
 pub unsafe extern "C" fn jit_write(ctx: *mut BlockCtx<'_>, addr: u64, size: u32, value: u64) -> u64 {
     // SAFETY: see `jit_read`.
     let ctx = unsafe { &mut *ctx };
+    // Does this store overlap the bytes the running block was compiled from? If
+    // so the instructions after it may have just changed, so the block must
+    // commit this one and stop. Two compares, no call into the memory
+    // implementation — the check has to be cheap, because a store is ~10% of a
+    // real instruction stream.
+    let hits_own_code = addr < ctx.code_hi && addr.saturating_add(size as u64) > ctx.code_lo;
     match ctx.mem.write_uint(addr, size as u8, value) {
         Err(_) => status::FAULT,
         Ok(()) => {
-            // The W1.7 seam: one counter compare tells us whether this store
-            // landed in executable memory, and therefore whether the rest of
-            // this block may have just been rewritten.
-            if ctx.mem.code_generation() != ctx.code_gen {
+            if hits_own_code {
                 status::WROTE_CODE
             } else {
                 status::OK
