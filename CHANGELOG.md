@@ -23,7 +23,7 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 496, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 609, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
 ### Interpreter performance (W8.1)
@@ -356,9 +356,62 @@ treat an HWND as a real, dereferenceable object with consistent per-window state
   different number of instructions against a dirty sandbox (7-Zip: 496,505,788
   instructions/110 files, 496,505,786/115, and 496,505,572/108 against a fresh
   one). Execution is deterministic *given* the sandbox state, not across a dirty
-  one. The gate resets the sandbox per entry; even then, runs repeat only to
-  about ±1 instruction because the emulator services the real host clock, which
-  is why the tolerances are small noise floors rather than zero.
+  one. The gate resets the sandbox per entry.
+
+### Deterministic guest clock (W9.6 follow-up)
+- **A corpus binary now executes the exact same number of instructions on every
+  run.** With the sandbox reset and `argv[0]` pinned, one source of drift was
+  left: exemu serviced the *real host clock*, so a guest comparing two timestamps
+  branched on how fast the host happened to be. `exemu run --virtual-clock` (or
+  `EXEMU_VIRTUAL_CLOCK=1`, or `RunConfig::virtual_clock`) replaces it with a
+  clock derived from the guest's own retired-instruction count. Measured through
+  the corpus runner:
+
+  | binary | host clock (3 runs) | virtual clock |
+  | --- | --- | --- |
+  | `Firefox Installer.exe` | 4,665,427 / 4,665,427 / 4,665,426 | **4,665,426 ×5** |
+  | `SteamSetup.exe` | 92,864,324 / 92,864,324 / 92,864,999 | **92,865,377 ×4** |
+  | `7z2602-x64.exe` | 496,505,572 | **496,505,572 ×3** (exit 0, 108 artifacts) |
+
+- **The model**: one retired instruction = one 100-ns tick, i.e. a nominal 10M
+  instructions/second machine, from a fixed 2026-01-01T00:00:00Z epoch. That rate
+  is roughly what a release build actually interprets at, so a guest is not
+  handed a machine orders of magnitude faster or slower than the one it was
+  seeing, and the units come out exact: the performance counter already runs at
+  10 MHz, so *the QPC value is the instruction count* and a `FILETIME` is the
+  epoch plus that count. `RDTSC` is a fixed 1 GHz multiple of the same time, so a
+  guest calibrating TSC against QPC gets a self-consistent answer instead of two
+  unrelated ramps. `Sleep(ms)` — a cooperative yield costing one instruction — is
+  credited the interval it asked for, so `Sleep`-paced timeout loops still
+  terminate in about as many iterations as on real hardware.
+- **Everything guest-visible goes through it**: `RDTSC`/`RDTSCP`,
+  `GetTickCount(64)`, `QueryPerformanceCounter`, `GetSystemTime(AsFileTime)` /
+  `GetLocalTime`, `NtQuerySystemTime`, `NtQueryPerformanceCounter`, the Wine-path
+  `RtlGetSystemTimePrecise` unix call, and registry `LastWriteTime` stamps.
+- **`KUSER_SHARED_DATA` too — the one with nothing to intercept.** A guest reads
+  `SystemTime`/`InterruptTime`/`TickCount` from that page with a *plain load*, so
+  the run loop rewrites them every 65,536 instructions (6.55 ms of virtual time,
+  finer than the 15.625 ms tick they are quantised to). A cadence keyed to the
+  instruction count, not to host time — anything else would reintroduce the
+  nondeterminism. `TickCountMultiplier` is also seeded now (0x0FA00000, the real
+  Windows value) on both paths: it was 0, which made a guest's inline
+  `GetTickCount` compute 0 forever.
+- **Not virtualised, said so explicitly and pinned as tests**: host filesystem
+  timestamps (`FindFirstFile`/`NtQueryDirectoryFile` report the real mtimes of
+  real files — making that deterministic *and* order-preserving needs a virtual-FS
+  metadata overlay) and real socket timeouts.
+- **The corpus tolerances tightened accordingly.** A `virtual_clock = true` entry
+  is pinned as an *equality* (`tolerance = 0`) — for the clean exit and for the
+  faults alike — so the gate now resolves a single instruction across a
+  496-million-instruction run. A noise floor that is no longer needed does not
+  stay in place. One entry deliberately stays on the host clock, on the same
+  binary as a virtual-clock entry, so the default path keeps being tested and a
+  behavioural difference between the two clocks would show up as a fault-identity
+  mismatch rather than as silence.
+- Off by default; the host-clock path is byte-identical to what shipped. This is
+  also the prerequisite for the planned JIT-vs-interpreter differential (W8.7),
+  which can only diff two engines instruction-for-instruction if a run replays
+  exactly.
 
 ## v0.0.3 — a real process
 
