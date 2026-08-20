@@ -73,6 +73,15 @@ pub(crate) struct Win32kCbFrame {
     /// What to leave in rax once the queue drains. `None` keeps the last
     /// callback's own return value — the `DispatchMessage` LRESULT contract.
     pub result: Option<u64>,
+    /// A kernel-side continuation to run when the queue drains, handed the last
+    /// callback's `LRESULT`. This is what makes a callback's *answer* usable by
+    /// the handler that queued it: `WM_NCHITTEST` is dispatched to a window's
+    /// WndProc and the code it returns decides which message the pump delivers
+    /// and to whom (roadmap W4.8 input routing). The continuation may queue more
+    /// callbacks (another hit-test round) and may override [`result`].
+    ///
+    /// [`result`]: Self::result
+    pub then: Option<crate::win32k::PendingHitTest>,
 }
 
 /// Every Windows symbol the emulator implements natively. Anything else
@@ -3037,30 +3046,49 @@ impl WinOs {
         Ok(Outcome::Resume)
     }
 
-    /// Invoke a guest `wndproc(hwnd, message, wParam, lParam)` from *inside* a
-    /// win32k syscall handler and resume that syscall's caller once it returns
-    /// (roadmap W4.6). This is the direct-call dispatch path — correct for the
-    /// scalar messages exemu originates (WM_PAINT/WM_LBUTTONDOWN/WM_KEYDOWN/
-    /// WM_DESTROY); the full `KiUserCallbackDispatcher` route is only needed when
-    /// message flow re-enters real user32.
+    /// Dispatch a `WM_NCHITTEST` whose **answer** the kernel needs (roadmap W4.8
+    /// input routing): the callback runs on the guest stack exactly like any
+    /// other, but the frame carries a `pending` continuation that
+    /// [`win32k::finish_hit_test`] runs with its `LRESULT` before the syscall's
+    /// caller is resumed.
     ///
-    /// It seats the WndProc on the *guest* stack with the win32k driver thunk as
-    /// its return address, records the interrupted syscall's resume state, and
-    /// sets [`syscall_resume_as_is`](Self::syscall_resume_as_is) so
-    /// `dispatch_syscall` does not run its own restore/return. When the WndProc
-    /// returns to the driver thunk, [`win32k_cb_advance`](Self::win32k_cb_advance)
-    /// restores the guest at the post-syscall point (the WndProc's LRESULT stays
-    /// in rax = what `DispatchMessage` returns).
-    pub(crate) fn call_wndproc_from_syscall(
+    /// [`win32k::finish_hit_test`]: crate::win32k::finish_hit_test
+    pub(crate) fn call_hit_test_from_syscall(
         &mut self,
         cpu: &mut CpuState,
         mem: &mut dyn Memory,
         wndproc: u64,
-        msg: crate::msg::PostedMsg,
+        args: Vec<u64>,
+        pending: crate::win32k::PendingHitTest,
     ) -> Result<()> {
-        let args = vec![msg.hwnd, msg.message as u64, msg.wparam, msg.lparam];
         self.call_wndprocs_from_syscall(cpu, mem, vec![(wndproc, args)], None, 0)?;
+        if let Some(frame) = self.win32k_cb.last_mut() {
+            frame.then = Some(pending);
+        }
         Ok(())
+    }
+
+    /// Queue another callback on the innermost win32k frame — used by a
+    /// continuation that needs a second round (a repeated `WM_NCHITTEST` after
+    /// an `HTTRANSPARENT`).
+    pub(crate) fn win32k_cb_queue(&mut self, func: u64, args: Vec<u64>) {
+        if let Some(frame) = self.win32k_cb.last_mut() {
+            frame.remaining.push_back((func, args));
+        }
+    }
+
+    /// Attach a continuation to the innermost win32k frame.
+    pub(crate) fn win32k_cb_set_then(&mut self, pending: crate::win32k::PendingHitTest) {
+        if let Some(frame) = self.win32k_cb.last_mut() {
+            frame.then = Some(pending);
+        }
+    }
+
+    /// Override what the innermost win32k frame leaves in rax when it drains.
+    pub(crate) fn win32k_cb_set_result(&mut self, result: u64) {
+        if let Some(frame) = self.win32k_cb.last_mut() {
+            frame.result = Some(result);
+        }
     }
 
     /// The general form of [`call_wndproc_from_syscall`](Self::call_wndproc_from_syscall):
@@ -3104,6 +3132,7 @@ impl WinOs {
             remaining,
             call_base,
             result,
+            then: None,
         });
         let driver = self.win32k_cb_driver;
         self.setup_call_args(cpu, mem, func, &args, driver, call_base)?;
@@ -3117,6 +3146,18 @@ impl WinOs {
     /// With no explicit `result` the WndProc's own return value stays in rax
     /// (= the `DispatchMessage` LRESULT the loop ignores).
     fn win32k_cb_advance(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
+        // A continuation runs when the queue drains, with the callback's LRESULT
+        // — the `WM_NCHITTEST` answer that decides where a mouse message goes.
+        // It may queue a further round, so this comes before the pop below.
+        let drained =
+            self.win32k_cb.last().is_some_and(|f| f.remaining.is_empty() && f.then.is_some());
+        if drained {
+            let pending = self.win32k_cb.last_mut().and_then(|f| f.then.take());
+            if let Some(pending) = pending {
+                let lresult = cpu.reg(Reg::Rax);
+                crate::win32k::finish_hit_test(self, cpu, mem, pending, lresult)?;
+            }
+        }
         let next = self.win32k_cb.last_mut().and_then(|f| f.remaining.pop_front());
         if let Some((func, args)) = next {
             let base = self.win32k_cb.last().expect("frame just read").call_base;
