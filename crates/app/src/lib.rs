@@ -1192,8 +1192,8 @@ mod tests {
         // The UTF-16 copy has 0xC00 bytes; twice the UTF-8 bound fits.
         let utf16_bytes = cut.encode_utf16().count() * 2 + 2;
         assert!(utf16_bytes <= 0xC00, "{utf16_bytes} UTF-16 bytes");
-        // …and the ASCII copy has 0x400.
-        assert!(cut.len() + 1 <= 0x400);
+        // …and the ASCII copy has 0x400, which must hold the bytes *and* a NUL.
+        assert!(cut.len() < 0x400, "{} bytes + NUL", cut.len());
     }
 
     #[test]
