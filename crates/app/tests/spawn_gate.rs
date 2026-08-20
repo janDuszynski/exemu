@@ -103,6 +103,12 @@ fn assert_spawn_succeeded(stdout: &str, exit_code: i32) {
     assert_eq!(exit_code, spawn_sample::PARENT_OK_EXIT, "stdout:\n{stdout}");
 }
 
+/// Exactly one child process was created — the emulator's own count, so a pass
+/// cannot come from the sample printing plausible numbers.
+fn assert_one_child(run: &exemu_app::RunResult) {
+    assert_eq!(run.children_created, 1, "exactly one child process was created");
+}
+
 /// The W3.5 gate: Wine's own kernel32/kernelbase creates the child, exemu runs
 /// it, and the parent reads its exit code back.
 #[test]
@@ -135,6 +141,7 @@ fn parent_spawns_child_through_wine_kernel32() {
     assert!(run.steps > 500_000, "expected a real Wine boot, got {} steps", run.steps);
 
     assert_spawn_succeeded(&stdout, run.exit_code);
+    assert_one_child(&run);
 }
 
 /// The control, from the other end of the OS layer: the same pair on exemu's own
@@ -159,6 +166,7 @@ fn parent_spawns_child_on_the_emulated_path() {
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
     eprintln!("spawn sample emulated: exit {} after {} steps\n{stdout}", run.exit_code, run.steps);
     assert_spawn_succeeded(&stdout, run.exit_code);
+    assert_one_child(&run);
 }
 
 /// The named gap, pinned so it cannot rot into a false claim: with **no child
@@ -195,5 +203,142 @@ fn a_missing_child_fails_the_create_rather_than_faking_it() {
         !stdout.contains(spawn_sample::CHILD_MESSAGE.trim_end()),
         "nothing should have run; stdout:\n{stdout}"
     );
+    assert_eq!(run.children_created, 0, "a refused create must leave no process behind");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ==========================================================================
+// The W3.5 per-exe probe: what child creation unlocks, and what it does not
+// ==========================================================================
+
+/// The two corpus installers that spawn children.
+const TCMD: &str = "../../example_exe/tcmd1156x64.exe";
+const STEAM: &str = "../../example_exe/SteamSetup.exe";
+
+/// **Total Commander does not get further.** Measured by this test and by the
+/// release CLI with a private sandbox:
+///
+/// | run | instructions | exit | children created |
+/// | --- | --- | --- | --- |
+/// | emulated (no Wine) | ~22,000 | 1 | **0** |
+/// | Wine boot, full prefix | ~4,060,000 | 1 | **0** |
+///
+/// The counts are the same band `cab_gate.rs` pinned for W6.5 (22,033 /
+/// 4,057,410 in this harness, 25,553 / 4,082,535 through the release CLI), which
+/// is the point: **W3.5 moves neither number**. Total Commander does spawn
+/// children in normal use, but it exits 1 from its own startup path long before
+/// it reaches one — the same blocker W6.5 already pinned, which is downstream of
+/// CAB support and downstream of process creation too.
+///
+/// `children_created` is what turns that from an inference into a measurement:
+/// it is a monotonic count of successful creates, so zero means the binary never
+/// called `CreateProcess` at all, whatever the instruction count did.
+///
+/// Every assertion is a wide-margin inequality, because the totals move with the
+/// command line, the build profile and what the sandbox already contains.
+#[test]
+fn total_commander_still_never_reaches_child_creation() {
+    if !Path::new(TCMD).exists() {
+        eprintln!("SKIP: {TCMD} not present (git-ignored)");
+        return;
+    }
+    let exe = std::fs::read(TCMD).expect("read the pinned Total Commander binary");
+
+    let run = |tag: &str, wine: Option<String>| {
+        let dir = std::env::temp_dir()
+            .join(format!("exemu-w35-probe-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let r = load_and_run(
+            &exe,
+            RunConfig {
+                echo: false,
+                max_steps: 50_000_000,
+                wine_boot_dir: wine,
+                sandbox_root: Some(dir.clone()),
+                ..RunConfig::default()
+            },
+        )
+        .expect("tcmd should run to a deliberate exit, not fault");
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    };
+
+    let emu = run("tcmd-emu", None);
+    eprintln!(
+        "tcmd emulated:  exit {} after {} steps, {} children",
+        emu.exit_code, emu.steps, emu.children_created
+    );
+    assert!(emu.steps < 100_000, "the emulated path should stop early, got {}", emu.steps);
+    assert_eq!(emu.exit_code, 1, "tcmd still exits 1 on the emulated path");
+    assert_eq!(emu.children_created, 0, "tcmd never reaches CreateProcess on the emulated path");
+
+    if !Path::new(WINE_DLLS).join("kernelbase.dll").exists() {
+        eprintln!("SKIP (Wine half): {WINE_DLLS} not present");
+        return;
+    }
+    let wine = run("tcmd-wine", Some(WINE_DLLS.to_string()));
+    eprintln!(
+        "tcmd wine-boot: exit {} after {} steps, {} children",
+        wine.exit_code, wine.steps, wine.children_created
+    );
+    assert!(
+        wine.steps > 3_500_000 && wine.steps < 10_000_000,
+        "the Wine boot should still carry tcmd into the millions, got {}",
+        wine.steps
+    );
+    assert!(wine.steps > emu.steps * 100, "{} vs {} emulated", wine.steps, emu.steps);
+    assert_eq!(wine.exit_code, 1, "tcmd still exits 1 on the Wine boot");
+    // THE GAP, pinned so that fixing it fails here: child creation is not what
+    // Total Commander is waiting for.
+    assert_eq!(
+        wine.children_created, 0,
+        "tcmd never reaches CreateProcess on the Wine boot either — W3.5 does not \
+         unblock it, and the day it does, this assertion is what says so"
+    );
+}
+
+/// **SteamSetup does not get further either, and cannot yet.** Two independent
+/// reasons, both cheap to state from the binary and from the corpus pin:
+///
+/// 1. **It is a PE32.** The Wine boot is x64-only until W5's 32-bit loader lands
+///    (`Process::load` only calls `load_wine_core` for a 64-bit image), so
+///    SteamSetup cannot reach Wine's `CreateProcessW` — or therefore
+///    `NtCreateUserProcess` — at all today. Asserted below straight off the
+///    image.
+/// 2. **On the emulated path it faults ~92.86M instructions in, before any
+///    `CreateProcess` call.** Measured with the release CLI and a private
+///    sandbox, tracing every intercepted API: `CreateProcessApi` and
+///    `GetExitCodeProcessApi` appear **zero** times in the whole trace, and the
+///    run ends at the same known NULL-stub fault (`rip=0x20001c2c`) it did
+///    before W3.5. The corpus gate re-measures that on every release run —
+///    4/4 pins matched after this change, SteamSetup Δ −1,385 against a 92,865
+///    tolerance, which is the clock jitter the manifest documents, not a
+///    behaviour change.
+///
+/// So the honest answer for W3.5 is: it unblocks the *mechanism*, and neither
+/// corpus installer is currently blocked on it. The full run is left to the
+/// corpus gate rather than repeated here — it costs 50 seconds in this profile
+/// and the manifest already pins it exactly.
+#[test]
+fn steam_setup_cannot_reach_wine_child_creation_because_it_is_32_bit() {
+    if !Path::new(STEAM).exists() {
+        eprintln!("SKIP: {STEAM} not present (git-ignored)");
+        return;
+    }
+    let bytes = std::fs::read(STEAM).expect("read the pinned SteamSetup binary");
+    let image = exemu_loader::parse(&bytes).expect("SteamSetup parses as a PE");
+    assert!(
+        !image.is_64bit,
+        "SteamSetup is a PE32 — if this ever becomes a 64-bit image the reasoning \
+         above no longer holds"
+    );
+    // It really would spawn a child if it got that far: NSIS drives the extracted
+    // payload through CreateProcess.
+    let imports_create_process = image.imports.iter().any(|i| {
+        matches!(&i.symbol, exemu_core::ImportSymbol::Named(n) if n.starts_with("CreateProcess"))
+    });
+    assert!(
+        imports_create_process,
+        "SteamSetup imports CreateProcess* — the reason it is a W3.5 target at all"
+    );
 }

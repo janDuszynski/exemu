@@ -429,6 +429,11 @@ pub struct WinOs {
     /// Why the last child run failed, when it did — surfaced to tests and to the
     /// parent's stderr so an emulator failure is never mistaken for a guest exit.
     child_failure: Option<String>,
+    /// How many child processes this process has successfully created, ever.
+    /// Monotonic (unlike `children`, which the guest prunes by closing handles),
+    /// so a probe can state "this binary never reached child creation" as a
+    /// measurement rather than an inference from an instruction count.
+    children_created: u32,
 }
 
 // Sentinel handle values returned by GetStdHandle and understood by WriteFile.
@@ -527,6 +532,7 @@ impl WinOs {
             spawner: Box::new(exemu_core::NoSpawner),
             spawn_depth: 0,
             child_failure: None,
+            children_created: 0,
         };
         // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);

@@ -400,6 +400,7 @@ impl WinOs {
         self.kobjects.insert(process_handle, KObject::Process { exited: false });
         self.kobjects.insert(thread_handle, KObject::Thread { exited: false });
 
+        self.children_created += 1;
         self.children.push(ChildProcess {
             pid,
             tid,
@@ -469,10 +470,13 @@ impl WinOs {
                     break; // the double NUL terminator
                 }
                 let s = String::from_utf16_lossy(&cur);
-                // `=C:=C:\dir` drive-cwd entries start with '='; keep them out of
-                // the name/value split, which would produce an empty name.
-                if let Some((k, v)) = s[1..].find('=').map(|i| s.split_at(i + 1)) {
-                    out.push((k.trim_end_matches('=').to_string(), v.to_string()));
+                // Split at the first '=' **after** position 0: Windows keeps
+                // per-drive current directories as `=C:=C:\dir` entries, whose
+                // leading '=' is part of the name, and splitting on it would
+                // produce an empty name for a real variable.
+                if let Some(rel) = s.get(1..).and_then(|rest| rest.find('=')) {
+                    let eq = rel + 1; // index of the separating '=' in `s`
+                    out.push((s[..eq].to_string(), s[eq + 1..].to_string()));
                 }
                 cur.clear();
             } else {
@@ -599,21 +603,20 @@ impl WinOs {
         let Some(req) = self.children[i].request.take() else {
             return;
         };
-        let inherit = req.inherit_handles;
         let outcome = self.spawner.spawn(&req);
         let exit_code = match outcome {
             Ok(ChildProcessOutcome { exit_code, stdout, stderr, .. }) => {
-                // The child shares the parent's console when its std handles were
-                // inherited, so its output belongs in the parent's stream. It ran
-                // with echo off, so this is the single point at which it is
-                // echoed — through the parent's own console policy.
-                if inherit || !stdout.is_empty() || !stderr.is_empty() {
-                    if !stdout.is_empty() {
-                        self.emit_child(false, &stdout);
-                    }
-                    if !stderr.is_empty() {
-                        self.emit_child(true, &stderr);
-                    }
+                // exemu hosts one console, and a child console app attaches to
+                // it exactly as it would on Windows (no `DETACHED_PROCESS` or
+                // `CREATE_NEW_CONSOLE` in this model), independently of
+                // `bInheritHandles`. The child ran with echo off, so this is the
+                // single point at which its output is emitted — through the
+                // parent's own console policy.
+                if !stdout.is_empty() {
+                    self.emit_child(false, &stdout);
+                }
+                if !stderr.is_empty() {
+                    self.emit_child(true, &stderr);
                 }
                 exit_code
             }
@@ -777,6 +780,7 @@ impl WinOs {
         let thread_handle = self.alloc_khandle();
         self.kobjects.insert(process_handle, KObject::Process { exited: false });
         self.kobjects.insert(thread_handle, KObject::Thread { exited: false });
+        self.children_created += 1;
         self.children.push(ChildProcess {
             pid,
             tid,
@@ -921,6 +925,14 @@ impl WinOs {
     /// that the guest still holds a handle to.
     pub fn child_count(&self) -> usize {
         self.children.len()
+    }
+
+    /// How many child processes this process has successfully created, ever —
+    /// monotonic, so closing a handle does not erase the fact. This is what lets
+    /// a per-exe probe say "this binary never reached child creation" as a
+    /// measurement instead of inferring it from an instruction count.
+    pub fn children_created(&self) -> u32 {
+        self.children_created
     }
 }
 
@@ -1329,12 +1341,24 @@ mod tests {
             crate::fs::read_unicode_string(&mem, params + pp::CURRENT_DIRECTORY).unwrap(),
             "C:\\"
         );
-        // The environment round-trips through the same decoder the child gets.
+        // The environment round-trips through the same decoder the child gets:
+        // the block this writer laid down decodes back to the pairs it was made
+        // from, name and value both.
         let env = os.read_environment_block(&mem, params).unwrap();
+        let system_root = env
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("SystemRoot"))
+            .unwrap_or_else(|| panic!("the decoded environment carries SystemRoot: {env:?}"));
         assert!(
-            env.iter().any(|(k, _)| k.eq_ignore_ascii_case("SystemRoot")),
-            "the decoded environment carries SystemRoot: {env:?}"
+            system_root.1.starts_with("C:"),
+            "SystemRoot decoded as {:?} — a leading '=' here means the name/value \
+             split ate the separator",
+            system_root.1
         );
         assert!(env.iter().all(|(k, _)| !k.is_empty()), "no empty names: {env:?}");
+        assert!(
+            env.iter().all(|(_, v)| !v.starts_with('=')),
+            "no value keeps the separator: {env:?}"
+        );
     }
 }

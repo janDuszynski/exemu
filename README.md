@@ -306,9 +306,11 @@ AVX-512, FMA3, and AVX gather/mask-move instructions (AVX/AVX2 VEX-encoded ops
 *are* implemented); native-themed / GDI+ / DirectX rendering (the
 GDI is a solid-fill/text subset); **COM** object creation; **preemptive** threads
 (the scheduler is cooperative — it yields at blocking points and on a timeslice,
-not on true OS preemption); and **registry persistence to disk** (the `Reg*`
-family round-trips through an in-memory hive with enumeration and seeded roots,
-but the hive is not yet saved across runs).
+not on true OS preemption); **concurrent** child processes (`CreateProcess`
+works and the handle/exit-code semantics are real, but the child runs to
+completion *inside* the create — see the Wine-boot table below); and **registry
+persistence to disk** (the `Reg*` family round-trips through an in-memory hive
+with enumeration and seeded roots, but the hive is not yet saved across runs).
 
 **x64 exceptions work:** the `.pdata`/`.xdata` unwind tables are parsed,
 `RtlCaptureContext`/`RtlLookupFunctionEntry`/`RtlVirtualUnwind`/`RtlUnwindEx`
@@ -414,6 +416,7 @@ What is verified today:
 | **CAB extraction** (`cabinet`) | **works** — a guest extracts a real `.cab` through Wine's `FDICreate`/`FDICopy`, driven entirely by the guest's own FDI callbacks, and the bytes come back identical. exemu contributes a cabinet *writer* and no decoder, retiring the planned clean-room FDI |
 | **shell32 / shlwapi** | **partly** — known folders resolve through Wine's own shell32, but the profile path comes back without its user component; the gap is pinned as a test |
 | **TCP/UDP sockets** (`ws2_32`) | **works** — a guest exchanges bytes with a real host socket through Wine's `ws2_32`. A `SOCKET` is an NT file handle on `\Device\Afd`; every operation is one `NtDeviceIoControlFile`, serviced by exemu over real BSD sockets. Blocking is real: a receive against a silent peer waits and then delivers the actual bytes, never a premature zero-byte close. `AF_INET`/`AF_INET6` × `SOCK_STREAM`/`SOCK_DGRAM` only; name resolution (`getaddrinfo`) is still a stub |
+| **Child processes** (`CreateProcessW`) | **works, synchronously** — a guest calls Wine's own `CreateProcessW`, which reaches exemu's `NtCreateUserProcess`; the child is a *second complete emulator instance* (its own address space, `WinOs` and interpreter) that starts when kernelbase resumes its initial thread, and the parent waits on the process handle and reads the child's real exit code back through `GetExitCodeProcess`. The child inherits the parent's console and environment. **The limit is that the run is synchronous**: parent and child are never alive at the same time, so a pipe handshake or a child that signals an event the parent waits on cannot work. Handle inheritance covers the std-stream sentinels only — a redirected `hStdOutput` is refused with `STATUS_NOT_SUPPORTED` rather than silently written to the console |
 | MSI / multimedia | **not yet** — `msi`/`setupapi` load and bind cleanly (their whole 33-module dependency closure is present), but nothing drives them end to end yet |
 
 **exemu does not ship Wine's DLLs.** You point `--wine-boot` at a set you already
