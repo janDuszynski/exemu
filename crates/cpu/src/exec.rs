@@ -45,7 +45,37 @@ pub struct CpuidFeature {
     pub probe: &'static [u8],
 }
 
+/// The flat WoW64 **64-bit** code selector (GDT index 6). A far transfer to a
+/// selector with `sel & 0xFFF8 == 0x30` puts the CPU in long mode (see the
+/// Group-5 `/5` and `iretq` handlers), so this is the value `mov r/m16, cs`
+/// must report while in 64-bit mode: `wow64cpu!BTCpuProcessInit` takes whatever
+/// `ntdll!RtlCaptureContext` stored for `CONTEXT.SegCs` and bakes it into the
+/// return BOP's far pointer, so reporting anything else would send the 32→64
+/// transition back into 32-bit mode.
+pub const SEL_CS64: u16 = 0x33;
+/// The flat WoW64 **32-bit** code selector (GDT index 4) — what `mov r/m16, cs`
+/// reports while in 32-bit compatibility mode.
+pub const SEL_CS32: u16 = 0x23;
+/// The flat WoW64 data/stack selector (GDT index 5), reported for ES/SS/DS/FS/GS
+/// in both modes. exemu has no GDT: these selectors carry no base or limit (the
+/// FS/GS bases come from the TEB setup), so only the *code* selector's 64-vs-32
+/// distinction is architecturally load-bearing.
+pub const SEL_DATA: u16 = 0x2b;
+
 impl Interpreter {
+    /// The selector a `mov r/m16, Sreg` store reports for ModRM `reg` field
+    /// `idx` (0=ES, 1=CS, 2=SS, 3=DS, 4=FS, 5=GS).
+    #[inline]
+    pub(crate) fn segment_selector(&self, idx: u8) -> u16 {
+        match idx {
+            1 => match self.bits {
+                Bits::B64 => SEL_CS64,
+                Bits::B32 => SEL_CS32,
+            },
+            _ => SEL_DATA,
+        }
+    }
+
     pub(crate) fn execute_one(&mut self, mem: &mut dyn Memory) -> Result<Exit> {
         let start = self.state.rip;
         // One wide fetch covers the whole instruction encoding (roadmap W8.1);
@@ -215,16 +245,17 @@ impl Interpreter {
             }
 
             // ---- MOV Sreg, r/m16 / MOV r/m16, Sreg ----------------------
-            // Segment-register moves. exemu is flat-model: segment *selectors*
-            // don't affect execution (ES/DS/SS bases are 0; the FS/GS *bases* are
-            // managed via the TEB setup / WRFSBASE, not derived from the loaded
-            // selector), so a load (`mov ds,eax`; wow64cpu's iretq path uses these)
-            // just consumes its 16-bit operand, and a store yields 0. The mode
-            // switch that WoW64 needs rides the CS *selector* through the far
-            // jmp / iretq handlers, not these moves.
+            // Segment-register moves. exemu is flat-model: segment *bases* are
+            // 0 (ES/DS/SS) or managed via the TEB setup / WRFSBASE (FS/GS), not
+            // derived from a loaded selector — so a load just consumes its
+            // 16-bit operand. A **store** reports the flat WoW64 selector for
+            // that segment (see [`Self::segment_selector`]); the mode switch
+            // itself still rides the CS selector through the far jmp / iretq
+            // handlers, not these moves.
             0x8C => {
                 self.read_modrm(&mut ctx, mem)?;
-                self.write_rm(&ctx, mem, 2, 0)?; // no meaningful selector in flat mode
+                let sel = self.segment_selector(ctx.reg & 7) as u64;
+                self.write_rm(&ctx, mem, 2, sel)?;
             }
             0x8E => {
                 self.read_modrm(&mut ctx, mem)?;

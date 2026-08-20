@@ -92,3 +92,50 @@ fn iretq_to_cs_0x33_stays_64bit() {
     assert_eq!(cpu.bits(), Bits::B64, "popped CS=0x33 → 64-bit long mode");
     assert_eq!(cpu.state().rip, 0x0040_1234);
 }
+
+// ==========================================================================
+// `mov r/m16, Sreg` (0x8C) — the selector a segment-register *store* reports.
+// ==========================================================================
+//
+// This is not cosmetic. `ntdll!RtlCaptureContext` fills `CONTEXT.SegCs` with
+// `mov word ptr [rcx+0x38], cs`, and `wow64cpu!BTCpuProcessInit` copies exactly
+// that word into the 32→64 return BOP's far pointer. Report the wrong CS and
+// the reverse WoW64 transition lands in the wrong mode — invisible until a
+// 32-bit guest's first syscall corrupts itself.
+
+/// Run `mov word ptr [rax], <sreg>` in `bits` and return the stored selector.
+/// `reg` is the ModRM reg field: 0=ES, 1=CS, 2=SS, 3=DS, 4=FS, 5=GS.
+fn store_sreg(bits: Bits, reg: u8) -> u16 {
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
+    mem.map(Region::new("data", DATA, 0x1000, Perm::RW)).unwrap();
+    mem.write(CODE, &[0x8C, reg << 3]).unwrap(); // mov [rax], sreg (mod=00, rm=000)
+    let mut cpu = Interpreter::with_bits(bits);
+    cpu.state_mut().rip = CODE;
+    cpu.state_mut().set_reg(Reg::Rax, DATA);
+    let mut hooks = NoHooks;
+    cpu.step(&mut mem, &mut hooks).expect("mov [rax], sreg executes");
+    mem.read_u16(DATA).unwrap()
+}
+
+#[test]
+fn mov_store_cs_reports_the_mode_selector() {
+    assert_eq!(store_sreg(Bits::B64, 1), exemu_cpu::SEL_CS64, "64-bit mode: cs = 0x33");
+    assert_eq!(store_sreg(Bits::B32, 1), exemu_cpu::SEL_CS32, "32-bit mode: cs = 0x23");
+    // The reported CS must round-trip through the far-jmp mode rule: the 64-bit
+    // value has to be one the `/5` handler maps back to B64 (`sel & 0xFFF8 ==
+    // 0x30`), or the BOP built from it would drop the CPU to 32-bit.
+    assert_eq!(exemu_cpu::SEL_CS64 & 0xFFF8, 0x30, "the reported 64-bit CS selects long mode");
+    assert_ne!(exemu_cpu::SEL_CS32 & 0xFFF8, 0x30, "the reported 32-bit CS selects compat mode");
+}
+
+#[test]
+fn mov_store_data_segments_report_the_flat_selector() {
+    for reg in [0u8, 2, 3, 4, 5] {
+        assert_eq!(
+            store_sreg(Bits::B64, reg),
+            exemu_cpu::SEL_DATA,
+            "flat data selector for sreg {reg} (ES/SS/DS/FS/GS carry no base here)",
+        );
+    }
+}
