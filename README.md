@@ -407,7 +407,7 @@ that is enforced two ways. A differential oracle
 ([below](#differential-cpu-oracle)) runs generated blocks through both engines
 and compares the entire architectural state — every GPR, every `rflags` bit
 including the ones x86 leaves undefined, `rip`, the vector file and every byte
-of memory — at **0 divergences in 3.3M trials per bitness**. And every corpus
+of memory — at **0 divergences in 8.3M trials per bitness**. And every corpus
 binary is run both ways: same exit code, same fault site, same artifacts, and
 the same exact instruction count, with only the wall time different.
 
@@ -700,8 +700,9 @@ but means an address is being computed wrongly).
 cargo run -p exemu-oracle --release -- jit --bits both --count 1M --chain 8
 ```
 
-Current result: **0 divergences in 3.3M trials per bitness** across four
-configurations (1, 8 and 32 instructions per block; four seeds).
+Current result: **0 divergences in 8.3M trials per bitness**, across ten
+configurations (1, 8, 24 and 32 instructions per block; ten seeds), of which
+2.5M per bitness were re-run against the final tree.
 
 ## Contributing
 

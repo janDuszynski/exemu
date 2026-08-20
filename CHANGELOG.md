@@ -64,7 +64,8 @@ end-to-end on the default path.
   state — every GPR, every `rflags` bit **including the ones x86 leaves
   undefined**, `rip`, XMM/YMM/x87, and every byte of guest memory. There is no
   defined-flags policy because the reference is the interpreter, not another
-  CPU. **0 divergences in 3.3M trials per bitness** across four configurations.
+  CPU. **0 divergences in 8.3M trials per bitness** across ten configurations
+  (1, 8, 24 and 32 instructions per block; ten seeds).
   It also proves that a declined block changes nothing, and that a block which
   faults rewound onto an instruction that really does fault. The harness was
   validated by injecting a one-bit AF bug, which it caught in 2,000 trials.
