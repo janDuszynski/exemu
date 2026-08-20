@@ -440,6 +440,10 @@ pub struct WinOs {
     /// satisfied. Cleared at the start of every unix-call dispatch and every
     /// `wine_server_call`.
     unix_call_blocked: bool,
+    /// Set per `__wine_unix_call` dispatch from the selected unixlib's
+    /// [`unixlib::Unixlib::wow64`] flag: the caller is a **32-bit** PE half, so
+    /// its `args` block uses 32-bit pointers (roadmap W5.3).
+    pub(crate) unix_call_wow64: bool,
 
     /// When `Some`, the process is exiting: after the currently-driven callback
     /// queue (the loaded DLLs' `DLL_PROCESS_DETACH` notifications) drains and no
@@ -476,6 +480,19 @@ pub struct WinOs {
     /// so a probe can state "this binary never reached child creation" as a
     /// measurement rather than an inference from an instruction count.
     children_created: u32,
+    /// The 32-bit `PEB` of a WoW64 process, or 0 when this process is not a
+    /// WoW64 one (roadmap W5.6). Set by the app's WoW64 boot; it is what
+    /// `NtQueryInformationProcess(ProcessWow64Information)` answers with, and
+    /// what makes `NtQuerySystemInformationEx(SystemSupportedProcessor-
+    /// Architectures)` report i386 as the *current* machine — the two queries
+    /// `wow64.dll`'s own process init uses to discover the process it is in.
+    wow64_peb32: u64,
+    /// Pre-mapped WoW64 modules (`wow64cpu.dll`, `wow64win.dll`) by lower-cased
+    /// base name → image base (roadmap W5.7). `wow64.dll` reaches them through
+    /// `LdrLoadDll`/`LdrGetDllHandle`, but Wine's own loader never ran on this
+    /// path — exemu mapped them, exactly as it stands in for the Unix side
+    /// elsewhere — so those two entry points answer out of this table.
+    wow64_modules: HashMap<String, u64>,
 }
 
 // Sentinel handle values returned by GetStdHandle and understood by WriteFile.
@@ -577,6 +594,7 @@ impl WinOs {
             unixlib_of_module: HashMap::new(),
             wine_unix_call_thunk: 0,
             unix_call_blocked: false,
+            unix_call_wow64: false,
             pending_process_exit: None,
             pending_syscall_exit: None,
             children: Vec::new(),
@@ -585,6 +603,8 @@ impl WinOs {
             spawn_depth: 0,
             child_failure: None,
             children_created: 0,
+            wow64_peb32: 0,
+            wow64_modules: HashMap::new(),
         };
         // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
@@ -676,9 +696,30 @@ impl WinOs {
             process::SSDT_NT_CREATE_USER_PROCESS,
             process::ssdt_nt_create_user_process,
         );
+        // It also answers the two classes `wow64.dll`'s own process init issues
+        // to discover it is running an i386 guest and to find the 32-bit PEB
+        // (roadmap W5.6) — W3.5 and W5.6 each grew a handler for index 0x19,
+        // and they are merged in `process::`, because a second registration
+        // here would silently replace the first.
         os.set_syscall_handler(
             process::SSDT_NT_QUERY_INFORMATION_PROCESS,
             process::ssdt_nt_query_information_process,
+        );
+        // The write half of `ThreadWow64Context` (roadmap W5.7): how every
+        // 32-bit context Wine's WoW64 layer installs — starting with the one
+        // that seats a thread on `ntdll32!LdrInitializeThunk` — reaches the
+        // CPU-reserved area.
+        os.set_syscall_handler(
+            thread::SSDT_NT_SET_INFORMATION_THREAD,
+            thread::ssdt_nt_set_information_thread,
+        );
+        os.set_syscall_handler(
+            thread::SSDT_NT_QUERY_SYSTEM_INFORMATION_EX,
+            thread::ssdt_nt_query_system_information_ex,
+        );
+        os.set_syscall_handler(
+            thread::SSDT_NT_QUERY_SYSTEM_INFORMATION,
+            thread::ssdt_nt_query_system_information,
         );
         // NT sync syscalls (roadmap W2.12): the NTSTATUS face of the P3.6 sync
         // objects + P3.4 scheduler (REAL blocking, not speculative WAIT_OBJECT_0).
@@ -737,6 +778,29 @@ impl WinOs {
         // `NtUser*`/`NtGdi*` results. See [`crate::win32k`].
         win32k::register(&mut os);
         os
+    }
+
+    /// Declare this process a **WoW64** one and publish its 32-bit `PEB`
+    /// (roadmap W5.6). Answers `NtQueryInformationProcess(ProcessWow64-
+    /// Information)` and flips `NtQuerySystemInformationEx`'s architecture
+    /// report to "i386 process on an x86-64 machine" — the pair of queries
+    /// `wow64.dll`'s process init uses to discover its own personality.
+    pub fn set_wow64_peb32(&mut self, peb32: u64) {
+        self.wow64_peb32 = peb32;
+    }
+
+    /// Register a pre-mapped WoW64 module so `wow64.dll`'s `LdrLoadDll` /
+    /// `LdrGetDllHandle` find it (roadmap W5.7). `name` is matched
+    /// case-insensitively against the *base* name of whatever path the caller
+    /// asks for, because `wow64.dll` builds a full `\??\C:\windows\system32\…`
+    /// path before loading.
+    pub fn register_wow64_module(&mut self, name: &str, base: u64) {
+        self.wow64_modules.insert(name.to_ascii_lowercase(), base);
+    }
+
+    /// The base of a registered WoW64 module, or `None`.
+    pub(crate) fn wow64_module(&self, name: &str) -> Option<u64> {
+        self.wow64_modules.get(&name.to_ascii_lowercase()).copied()
     }
 
     /// Install the process clock (roadmap W9.6) — the same handle the

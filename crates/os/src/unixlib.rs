@@ -92,6 +92,19 @@ pub struct Unixlib {
     pub name: &'static str,
     /// The ordered entry table; `code` indexes it directly.
     pub table: &'static [UnixEntry],
+    /// This handle belongs to a **32-bit** PE half, so its `args` block is laid
+    /// out with 32-bit pointers — Wine's `__wine_unix_call_wow64_funcs` shape
+    /// (roadmap W5.3).
+    ///
+    /// **Recovered, and it is the opposite of what the phase plan assumed.**
+    /// `wow64cpu`'s BOP handler (rva 0x1255) does
+    /// `mov rcx,[r14+4]; mov edx,[r14+0xc]; mov r8d,[r14+0x10];
+    /// call [__wine_unix_call_dispatcher]` — it zero-extends the guest's
+    /// **32-bit** `args` pointer and hands it to the *same* 64-bit dispatcher
+    /// the 64-bit ntdll uses. Nothing on the PE side widens the block, so the
+    /// unix side (exemu) is what must read it in 32-bit width. The discriminator
+    /// is the `unixlib_handle_t`: the 32-bit `ntdll` gets its own.
+    pub wow64: bool,
 }
 
 /// The fixed **8-entry** ntdll unixlib table (roadmap W2.5). The order is the
@@ -158,8 +171,13 @@ fn wine_dbg_write(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, arg
     if args == 0 {
         return Ok(0);
     }
-    let str_ptr = mem.read_u64(args)?;
-    let len = mem.read_u64(args + 8)? as usize;
+    // `{ const char *str; SIZE_T len; }` — 4-byte fields when the caller is the
+    // 32-bit ntdll of a WoW64 process (roadmap W5.3).
+    let (str_ptr, len) = if os.unix_call_wow64 {
+        (mem.read_u32(args)? as u64, mem.read_u32(args + 4)? as usize)
+    } else {
+        (mem.read_u64(args)?, mem.read_u64(args + 8)? as usize)
+    };
     if str_ptr == 0 || len == 0 {
         return Ok(0);
     }
@@ -240,7 +258,19 @@ impl WinOs {
     pub fn register_ntdll_unixlib(&mut self, ntdll_base: u64) -> u64 {
         self.register_unixlib(
             ntdll_base,
-            Unixlib { name: "ntdll", table: NTDLL_UNIXLIB },
+            Unixlib { name: "ntdll", table: NTDLL_UNIXLIB, wow64: false },
+        )
+    }
+
+    /// Register the **32-bit** ntdll's unixlib (roadmap W5.3). Same entry order
+    /// — the two ntdlls are the same source built twice — but every `args`
+    /// block is 32-bit. The returned handle is what the WoW64 boot publishes
+    /// into `ntdll32!__wine_unixlib_handle`, which is how a 32-bit
+    /// `__wine_unix_call` is told apart from a 64-bit one.
+    pub fn register_ntdll32_unixlib(&mut self, ntdll32_base: u64) -> u64 {
+        self.register_unixlib(
+            ntdll32_base,
+            Unixlib { name: "ntdll32", table: NTDLL_UNIXLIB, wow64: true },
         )
     }
 
@@ -318,14 +348,16 @@ impl WinOs {
             let name = self.unixlibs.get(handle as usize).map(|l| l.name).unwrap_or("?");
             eprintln!("[unixlib] {name}[{code}] args {args:#x}");
         }
-        let Some(entry) = self
-            .unixlibs
-            .get(handle as usize)
-            .and_then(|lib| lib.table.get(code as usize))
-            .copied()
-        else {
+        let Some(lib) = self.unixlibs.get(handle as usize) else {
             return Ok(STATUS_INVALID_PARAMETER);
         };
+        let wow64 = lib.wow64;
+        let Some(entry) = lib.table.get(code as usize).copied() else {
+            return Ok(STATUS_INVALID_PARAMETER);
+        };
+        // Publish the caller's pointer width for the entries whose `args` block
+        // contains pointers (roadmap W5.3).
+        self.unix_call_wow64 = wow64;
         entry(self, cpu, mem, args)
     }
 

@@ -486,3 +486,205 @@ fn wow64cpu_reads_the_cpu_area_and_wow64info_teb_slots() {
         );
     }
 }
+
+// ==========================================================================
+// (7) The 32-bit bootstrap contract, read out of the i386 ntdll
+// ==========================================================================
+
+/// **The i386 thread-start convention is NOT the 64-bit one.**
+///
+/// `ntdll32!RtlUserThreadStart` is three instructions —
+/// `mov [esp+8],ebx; mov [esp+4],eax; jmp <thread start>` — so a fresh 32-bit
+/// thread carries its entry point in **`Eax`** and its argument in **`Ebx`**,
+/// where the 64-bit one uses `Rcx`/`Rdx`. exemu's [`wow64::Start32`] seeds
+/// exactly those registers; getting it from the 64-bit shape would put the
+/// entry point nowhere.
+///
+/// And `LdrInitializeThunk` takes its `CONTEXT` as a **stack** argument
+/// (`mov ebx,[ebp+8]`), then hands `loader_init` a pointer to `context->Eax`
+/// (`lea eax,[ebx+0xb0]`) — which is both the second proof of the convention
+/// and the reason `CTX_EAX` must be 0xb0.
+#[test]
+fn ntdll32_thread_start_passes_the_entry_point_in_eax() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let n32 = load(&format!("{DLLS32}/ntdll.dll"));
+
+    let start = n32.at(n32.export("RtlUserThreadStart"), 12);
+    assert_eq!(
+        &start[..8],
+        // mov dword ptr [esp+8], ebx ; mov dword ptr [esp+4], eax
+        &[0x89, 0x5C, 0x24, 0x08, 0x89, 0x44, 0x24, 0x04],
+        "RtlUserThreadStart forwards (eax, ebx) as (EntryPoint, Arg): {start:02x?}",
+    );
+    assert_eq!(start[8], 0xE9, "…and tail-jumps to the thread start");
+
+    // LdrInitializeThunk(context): `push ebp; mov ebp,esp; push ebx;
+    // sub esp,0x18; mov ebx,[ebp+8]; lea eax,[ebx+0xb0]`.
+    let thunk = n32.at(n32.export("LdrInitializeThunk"), 16);
+    assert_eq!(&thunk[..2], &[0x55, 0x89], "LdrInitializeThunk opens with a frame: {thunk:02x?}");
+    let mut want_arg = vec![0x8B, 0x5D, 0x08]; // mov ebx, [ebp+8]  (the CONTEXT*)
+    want_arg.extend_from_slice(&[0x8D, 0x83]); // lea eax, [ebx+disp32]
+    want_arg.extend_from_slice(&(wow64::CTX_EAX as u32).to_le_bytes());
+    assert!(
+        thunk.windows(want_arg.len()).any(|w| w == want_arg),
+        "LdrInitializeThunk reads its CONTEXT off the stack and passes &CONTEXT.Eax \
+         (offset {:#x}) to loader_init: {thunk:02x?}",
+        wow64::CTX_EAX,
+    );
+}
+
+/// **`LdrSystemDllInitBlock` is how `wow64.dll` finds the 32-bit ntdll.**
+///
+/// Every offset exemu fills is a site in `wow64.dll` that reads it. The two
+/// load-bearing ones: `[block+0x18]` becomes a fresh 32-bit thread's `Eip`
+/// (per-thread init, rva 0x570e — this is what starts Wine's own 32-bit
+/// loader), and `[block+0x48]` is passed to `RtlFindExportedRoutineByName` as a
+/// module handle (process init, rva 0x4879) — so it is the ntdll32 **base**,
+/// not a routine.
+#[test]
+fn wow64_dll_reads_the_system_dll_init_block_fields_exemu_fills() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let w = load(&format!("{DLLS64}/wow64.dll"));
+    let n64 = load(&format!("{DLLS64}/ntdll.dll"));
+    assert!(n64.exports.contains_key("LdrSystemDllInitBlock"), "the 64-bit ntdll exports the block");
+
+    // `mov rax, qword ptr [rax + off]` for each field, then a 32-bit store of
+    // eax — the narrowing that requires every value to be 32-bit addressable.
+    for (name, off) in [
+        ("LdrInitializeThunk", wow64::SYSDLL_LDR_INITIALIZE_THUNK),
+        ("KiUserExceptionDispatcher", wow64::SYSDLL_KI_USER_EXCEPTION_DISPATCHER),
+        ("KiUserCallbackDispatcher", wow64::SYSDLL_KI_USER_CALLBACK_DISPATCHER),
+        ("ntdll32 base", wow64::SYSDLL_NTDLL32_BASE),
+    ] {
+        let load8 = vec![0x48, 0x8B, 0x40, off as u8]; // mov rax,[rax+off8]
+        let load_rcx = vec![0x48, 0x8B, 0x4A, off as u8]; // mov rcx,[rdx+off8]
+        let load_rdx = vec![0x48, 0x8B, 0x52, off as u8]; // mov rdx,[rdx+off8]
+        let load_rcx2 = vec![0x48, 0x8B, 0x48, off as u8]; // mov rcx,[rax+off8]
+        assert!(
+            [load8, load_rcx, load_rdx, load_rcx2]
+                .iter()
+                .any(|p| !find_text_all(&w, p).is_empty()),
+            "wow64.dll reads LdrSystemDllInitBlock+{off:#x} ({name})",
+        );
+    }
+    // The APC dispatcher slot uses a disp8 too, off rdx.
+    assert!(
+        !find_text_all(&w, &[0x48, 0x8B, 0x52, wow64::SYSDLL_KI_USER_APC_DISPATCHER as u8]).is_empty(),
+        "wow64.dll reads LdrSystemDllInitBlock+{:#x} (KiUserApcDispatcher)",
+        wow64::SYSDLL_KI_USER_APC_DISPATCHER,
+    );
+}
+
+/// **The win32k service descriptor is a verbatim 32-byte copy.**
+///
+/// `wow64.dll`'s process init resolves `wow64win!sdwhwin32` and copies it into
+/// its own table 1 with two `movdqu` loads and two `movups` stores. exemu never
+/// builds that descriptor — it runs this code. Pinned here so a prefix refresh
+/// that changes the copy (or the export name) fails by name.
+#[test]
+fn wow64_dll_movdqu_copies_the_win32k_descriptor_from_wow64win() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let w = load(&format!("{DLLS64}/wow64.dll"));
+    let win = load(&format!("{DLLS64}/wow64win.dll"));
+    assert!(win.exports.contains_key("sdwhwin32"), "wow64win exports the descriptor by name");
+    assert!(find_string(&w, "sdwhwin32").is_some(), "wow64.dll resolves it by that name");
+    assert!(find_string(&w, "wow64win.dll").is_none(), "…and loads the module by a *wide* name");
+
+    // movdqu xmm1,[rax] ; movdqu xmm2,[rax+0x10] ; movups [rip+d],xmm1 ; movups [rip+d],xmm2
+    let at = find_text(&w, &[0xF3, 0x0F, 0x6F, 0x08, 0xF3, 0x0F, 0x6F, 0x50, 0x10])
+        .expect("wow64.dll movdqu-loads the 32-byte descriptor");
+    let store = w.at(at + 9, 14);
+    assert_eq!(&store[..3], &[0x0F, 0x11, 0x0D], "…and movups-stores it rip-relative: {store:02x?}");
+    let disp = i32::from_le_bytes(store[3..7].try_into().unwrap());
+    let target = (at as i64 + 9 + 7 + disp as i64) as u32;
+    assert_eq!(
+        target, 0x160a0,
+        "the destination is the table-1 descriptor at rva 0x160a0 (table 0 is 0x16080)",
+    );
+}
+
+/// **`RtlWow64GetProcessMachines` / `RtlWow64SetThreadContext` pin two more
+/// service contracts exemu implements**, both read out of the stubs rather than
+/// chosen: the architecture query's class and the WoW64 context write's
+/// class + length.
+#[test]
+fn rtl_wow64_helpers_pin_the_machine_query_and_context_write() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let n64 = load(&format!("{DLLS64}/ntdll.dll"));
+
+    // RtlWow64GetProcessMachines → NtQuerySystemInformationEx(class = 0xb5).
+    let m = n64.at(n64.export("RtlWow64GetProcessMachines"), 0x40);
+    let mut want = vec![0xB9]; // mov ecx, imm32
+    want.extend_from_slice(&wow64::SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES.to_le_bytes());
+    assert!(
+        m.windows(want.len()).any(|x| x == want),
+        "RtlWow64GetProcessMachines asks for class {:#x}",
+        wow64::SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES,
+    );
+
+    // RtlWow64SetThreadContext is the mirror of the read side: `mov r9d,0x2cc;
+    // mov r8,rdx; mov edx,0x1d; jmp NtSetInformationThread`.
+    let s = n64.at(n64.export("RtlWow64SetThreadContext"), 0x14);
+    let mut len = vec![0x41, 0xB9];
+    len.extend_from_slice(&(wow64::WOW64_CONTEXT_SIZE as u32).to_le_bytes());
+    let mut class = vec![0xBA];
+    class.extend_from_slice(&wow64::THREAD_WOW64_CONTEXT.to_le_bytes());
+    assert!(
+        s.windows(len.len()).any(|x| x == len) && s.windows(class.len()).any(|x| x == class),
+        "RtlWow64SetThreadContext is NtSetInformationThread(_, {:#x}, _, {:#x}): {s:02x?}",
+        wow64::THREAD_WOW64_CONTEXT,
+        wow64::WOW64_CONTEXT_SIZE,
+    );
+    assert_eq!(s[0x0e], 0xE9, "…and tail-jumps into the stub");
+}
+
+/// **`__wine_unix_call` from a 32-bit guest arrives with a 32-bit `args`
+/// block** — the recovery behind [`exemu_os::unixlib`]'s wow64 variant
+/// (roadmap W5.3).
+///
+/// `wow64cpu`'s BOP handler does `mov rcx,[r14+4]; mov edx,[r14+0xc];
+/// **mov r8d,[r14+0x10]**; call [__wine_unix_call_dispatcher]`: the `args`
+/// pointer is loaded as a *dword* and zero-extended, and the very same 64-bit
+/// dispatcher the 64-bit ntdll uses is called. Nothing on the PE side widens
+/// the block — so the unix side is what has to read it in 32-bit width, keyed
+/// off the 32-bit ntdll's own `__wine_unixlib_handle`.
+#[test]
+fn wow64cpu_passes_a_32bit_args_pointer_to_the_unix_dispatcher() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let c = load(&format!("{DLLS64}/wow64cpu.dll"));
+    // mov rcx,[r14+4] ; mov edx,[r14+0xc] ; mov r8d,[r14+0x10]
+    let seq = [
+        0x49, 0x8B, 0x4E, 0x04, // mov rcx, qword ptr [r14+4]   — the 64-bit handle
+        0x41, 0x8B, 0x56, 0x0C, // mov edx, dword ptr [r14+0xc] — the code
+        0x45, 0x8B, 0x46, 0x10, // mov r8d, dword ptr [r14+0x10] — the 32-BIT args ptr
+    ];
+    let at = find_text(&c, &seq).expect("wow64cpu's unix-call path loads a 32-bit args pointer");
+    assert_eq!(
+        &c.at(at + seq.len() as u32, 2),
+        &[0xFF, 0x15],
+        "…and calls straight through the stored __wine_unix_call_dispatcher pointer",
+    );
+
+    // The 32-bit ntdll carries its own handle cell, which is what tells the two
+    // widths apart.
+    let n32 = load(&format!("{DLLS32}/ntdll.dll"));
+    assert!(
+        n32.exports.contains_key("__wine_unixlib_handle"),
+        "the 32-bit ntdll exports its own __wine_unixlib_handle",
+    );
+}

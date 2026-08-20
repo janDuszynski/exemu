@@ -119,14 +119,34 @@ impl WinOs {
     /// under system32 are deliberately not redirected (kept tight).
     fn wine_dll_redirect(&self, guest: &str) -> Option<PathBuf> {
         let dir = self.cfg.wine_dll_dir.as_ref()?;
+        // **The WoW64 file-system redirector.** In a WoW64 process,
+        // `C:\windows\system32` is the *32-bit* system directory: Windows
+        // rewrites it to `SysWOW64` behind the 32-bit program's back so a PE32
+        // that hard-codes `system32\foo.dll` gets the 32-bit `foo.dll`. exemu's
+        // pinned prefix keeps the two halves in sibling directories, so the
+        // redirect is a directory swap. Without it Wine's **32-bit** loader is
+        // handed x86_64 PEs and every import resolves to STATUS_DLL_NOT_FOUND.
+        let dir = if self.wow64_peb32 != 0 {
+            let sib = std::path::Path::new(dir)
+                .parent()
+                .map(|p| p.join("i386-windows"))
+                .unwrap_or_else(|| PathBuf::from("i386-windows"));
+            sib.to_string_lossy().into_owned()
+        } else {
+            dir.clone()
+        };
+        let dir = &dir;
         // Normalise: strip the NT/DOS prefix and drive letter, lower-case for the
         // marker search.
         let cleaned = strip_nt_prefix(guest).replace('/', "\\");
         let lower = cleaned.to_ascii_lowercase();
-        // Accept both `c:\windows\system32\` and a drive-less `\windows\system32\`.
-        let marker = "\\windows\\system32\\";
-        let pos = lower.find(marker)?;
-        let leaf = &cleaned[pos + marker.len()..];
+        // Accept both `c:\windows\system32\` and a drive-less `\windows\system32\`
+        // — plus `syswow64`, the name a WoW64-aware program uses to reach the
+        // 32-bit set explicitly.
+        let (pos, mlen) = ["\\windows\\system32\\", "\\windows\\syswow64\\"]
+            .iter()
+            .find_map(|m| lower.find(m).map(|p| (p, m.len())))?;
+        let leaf = &cleaned[pos + mlen..];
         // Only a bare leaf (no further separators) maps into the flat prefix.
         if leaf.is_empty() || leaf.contains('\\') {
             return None;

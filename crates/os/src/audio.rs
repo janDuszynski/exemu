@@ -1244,7 +1244,9 @@ static AUDIO_UNIXLIB: &[UnixEntry] = &[
 /// The unixlib [`crate::unixlib`] registers when the generated
 /// [`DRIVER_MODULE`] asks `MemoryWineUnixFuncs` for its handle.
 pub(crate) fn coreaudio_unixlib() -> Unixlib {
-    Unixlib { name: "winecoreaudio", table: AUDIO_UNIXLIB }
+    // `wow64: false` — mmdevapi's driver is only ever loaded by the 64-bit
+    // half, so every `args` block this table reads carries 64-bit pointers.
+    Unixlib { name: "winecoreaudio", table: AUDIO_UNIXLIB, wow64: false }
 }
 
 // ---------------------------------------------------------------------------

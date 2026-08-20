@@ -364,9 +364,21 @@ impl WinOs {
     /// Map a synthesized NLS blob into a fresh guest region and return its base
     /// (0 on failure). Reused by both NLS syscalls; the blob is copied into a
     /// committed RW region reserved from the VirtualAlloc arena.
+    ///
+    /// In a **WoW64** process the view is placed below 4 GiB (roadmap W5.7):
+    /// the 32-bit `ntdll`'s `RtlGetLocaleFileMappingAddress` caches the base in
+    /// a 32-bit cell, and `wow64.dll` narrows whatever the kernel returns into
+    /// it — so a high placement is truncated into an unmapped pointer instead of
+    /// failing. A 64-bit consumer can address the low view just as well, and the
+    /// mapping is cached, so one placement serves both halves.
     fn map_nls_blob(&mut self, mem: &mut dyn Memory, blob: &[u8], name: &str) -> u64 {
         let size = (blob.len() as u64 + 0xfff) & !0xfff;
-        match self.map_anywhere(mem, size, Perm::RW, name) {
+        let placed = if self.wow64_peb32 != 0 {
+            self.map_anywhere_low(mem, size, Perm::RW, name)
+        } else {
+            self.map_anywhere(mem, size, Perm::RW, name)
+        };
+        match placed {
             Some(base) => match mem.write(base, blob) {
                 Ok(()) => base,
                 Err(_) => 0,

@@ -653,7 +653,12 @@ fn drive_btcpusimulate_guest(resume: bool) -> u32 {
     // The CPU-reserved area (pointer at TEB+0x1488 → the WOW64_CONTEXT) the real
     // BTCpuSimulate reads, laid out by the production `exemu_os::wow64` helper.
     const CPU_AREA: u64 = SCRATCH + 0x1000;
-    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, GUEST_CODE as u32, GUEST_STACK as u32).unwrap();
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, exemu_os::wow64::Start32 {
+        eip: GUEST_CODE as u32,
+        esp: GUEST_STACK as u32,
+        eax: 0,
+        ebx: 0,
+    }).unwrap();
     if resume {
         mem.write_u32(CPU_AREA, 1).unwrap(); // set the resume bit → iretq forward path
     }
@@ -729,7 +734,12 @@ fn btcpusimulate_round_trips_32bit_to_64bit() {
     // lay out the WOW64_CONTEXT for the forward switch (as in the single-hop tests).
     run_wow64_process_init(&mut os, &mut mem, &wow64cpu);
     const CPU_AREA: u64 = SCRATCH + 0x1000;
-    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, GUEST_CODE as u32, GUEST_STACK as u32).unwrap();
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, exemu_os::wow64::Start32 {
+        eip: GUEST_CODE as u32,
+        esp: GUEST_STACK as u32,
+        eax: 0,
+        ebx: 0,
+    }).unwrap();
 
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
 
@@ -922,7 +932,12 @@ fn wow64_guest_syscall_round_trips_through_the_real_bop() {
 
     // Lay out the WOW64_CONTEXT (fast-entry: resume bit clear) and forward-switch.
     const CPU_AREA: u64 = SCRATCH + 0x1000;
-    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, GUEST_CODE as u32, GUEST_STACK as u32).unwrap();
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, exemu_os::wow64::Start32 {
+        eip: GUEST_CODE as u32,
+        esp: GUEST_STACK as u32,
+        eax: 0,
+        ebx: 0,
+    }).unwrap();
 
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
 
@@ -1076,7 +1091,12 @@ fn wow64_transition_routes_a_32bit_ntdll_stub_through_the_real_bop() {
     assert_eq!(mem.read_u32(G32_TRANSITION).unwrap(), bop as u32, "Wow64Transition holds the BOP VA");
 
     const CPU_AREA: u64 = SCRATCH + 0x1000;
-    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, G32_CALLER as u32, G32_STACK as u32).unwrap();
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, exemu_os::wow64::Start32 {
+        eip: G32_CALLER as u32,
+        esp: G32_STACK as u32,
+        eax: 0,
+        ebx: 0,
+    }).unwrap();
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
 
     assert_eq!(mem.read_u32(RECORD_INDEX).unwrap(), INDEX, "the service index reached Wow64SystemServiceEx");
@@ -1177,7 +1197,12 @@ fn wow64_32bit_guest_reaches_the_real_nt_ssdt() {
     build_wow64_syscall_guest(&mut mem, bop, index, &[G32_OUT as u32]);
 
     const CPU_AREA: u64 = SCRATCH + 0x1000;
-    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, G32_CALLER as u32, G32_STACK as u32).unwrap();
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, exemu_os::wow64::Start32 {
+        eip: G32_CALLER as u32,
+        esp: G32_STACK as u32,
+        eax: 0,
+        ebx: 0,
+    }).unwrap();
 
     let before = filetime_host_now();
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
@@ -1253,7 +1278,12 @@ fn wow64_32bit_guest_allocates_through_the_real_wow64_thunk() {
     mem.write_u32(G32_INOUT_B, 0x2000).unwrap(); // *RegionSize
 
     const CPU_AREA: u64 = SCRATCH + 0x1000;
-    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, G32_CALLER as u32, G32_STACK as u32).unwrap();
+    exemu_os::wow64::init_cpu_area(&mut mem, GS_BASE, CPU_AREA, exemu_os::wow64::Start32 {
+        eip: G32_CALLER as u32,
+        esp: G32_STACK as u32,
+        eax: 0,
+        ebx: 0,
+    }).unwrap();
     call_export(&mut os, &mut mem, wow64cpu.export("BTCpuSimulate"), &[]);
 
     assert_eq!(

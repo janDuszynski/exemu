@@ -714,6 +714,24 @@ impl WinOs {
         let buffer = self.syscall_arg(cpu, mem, 2)?;
         let length = self.syscall_arg(cpu, mem, 3)?;
         let return_length = self.syscall_arg(cpu, mem, 4)?;
+
+        // `ProcessWow64Information` (roadmap W5.6): `wow64.dll`'s own process
+        // init asks for exactly this (`mov edx,0x1a; mov r9d,8`) and treats the
+        // answer as `PEB32`, reading the `WOW64INFO` at `PEB32+0x480`. It is 0
+        // in a process that is not a WoW64 one, which is the documented "not
+        // WoW64" answer rather than a failure.
+        if class == crate::wow64::PROCESS_WOW64_INFORMATION {
+            let ptr: u64 = if self.cfg.is_64bit { 8 } else { 4 };
+            if buffer == 0 || length < ptr {
+                return Ok(STATUS_INFO_LENGTH_MISMATCH);
+            }
+            mem.write(buffer, &self.wow64_peb32.to_le_bytes()[..ptr as usize])?;
+            if return_length != 0 {
+                mem.write_u32(return_length, ptr as u32)?;
+            }
+            return Ok(STATUS_SUCCESS);
+        }
+
         if class != PROCESS_BASIC_INFORMATION {
             return Ok(STATUS_NOT_IMPLEMENTED);
         }

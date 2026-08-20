@@ -242,6 +242,13 @@ pub struct RunConfig {
     /// caller (e.g. the W3 gate test) can request the Wine boot hermetically
     /// without touching process-global env vars.
     pub wine_boot_dir: Option<String>,
+    /// Which WoW64 bring-up a 32-bit guest on the Wine set takes (roadmap
+    /// W5.7). The default is [`wow64_boot::Bringup::WineLoader`]: the process is
+    /// handed to `wow64!Wow64LdrpInitialize`, so Wine's own i386 loader binds
+    /// the guest's whole import graph — what a real application needs.
+    /// [`wow64_boot::Bringup::Direct`] is the shorter chain that skips the
+    /// 32-bit loader entirely. Ignored for anything that is not a WoW64 boot.
+    pub wow64_bringup: wow64_boot::Bringup,
     /// The main→interpreter input channel (roadmap W4.5c). `Some` on the live
     /// Cocoa path: native window events (close → `WM_QUIT`) reach the guest's
     /// message pump, so `NtUserGetMessage` blocks until the user acts instead of
@@ -306,6 +313,7 @@ impl Default for RunConfig {
             gui: false,
             load_base: None,
             wine_boot_dir: None,
+            wow64_bringup: wow64_boot::Bringup::default(),
             driver: None,
             audio_sink: None,
             input: None,
@@ -861,35 +869,98 @@ impl Process {
             let ntdll64 = exemu_os::wow64::image_view(&ntdll64_bytes, ntdll_base)?;
 
             let boot = wow64_boot::build(&mut mem, &dirs, &ntdll64, base)?;
-            // The 32-bit guest's imports bind to the **32-bit** ntdll.
-            let (bound, missing) =
-                wow64_boot::bind_guest_imports(&mut mem, base, &image.imports, &boot)?;
-            if !missing.is_empty() {
-                return Err(EmuError::Os(format!(
-                    "WoW64 boot: {} guest import(s) unresolved against the 32-bit Wine set: {}",
-                    missing.len(),
-                    missing.join(", ")
-                )));
+            // Who binds the guest's IAT depends on the bring-up. Under
+            // `WineLoader` **Wine's own i386 loader does** — that is the point
+            // of running it — so exemu must leave the slots alone. Under
+            // `Direct` there is no 32-bit loader at all, so exemu binds what it
+            // can against the 32-bit `ntdll` and refuses the boot if the program
+            // needs anything else, rather than leaving null IAT slots that fault
+            // later with no explanation.
+            if cfg.wow64_bringup == wow64_boot::Bringup::Direct {
+                let (bound, missing) =
+                    wow64_boot::bind_guest_imports(&mut mem, base, &image.imports, &boot)?;
+                if !missing.is_empty() {
+                    return Err(EmuError::Os(format!(
+                        "WoW64 boot (direct bring-up): {} guest import(s) unresolved against the \
+                         32-bit Wine set — this program needs the Wine-loader bring-up: {}",
+                        missing.len(),
+                        missing.join(", ")
+                    )));
+                }
+                let _ = bound;
             }
-            let _ = bound;
+
+            // `PEB32.ProcessParameters`. Wine's i386 `loader_init` dereferences
+            // it in its first few hundred instructions
+            // (`init_user_process_params`, ntdll32 rva 0x4fc00), so the 32-bit
+            // block has to exist before the guest half starts — the kernel's
+            // job, and the same one exemu already does for PEB64.
+            let pp32 = os
+                .build_wow64_process_parameters(&mut mem, wow64_boot::WOW64_PARAMS, wow64_boot::WOW64_PARAMS_SIZE)?
+                .ok_or_else(|| {
+                    EmuError::Os("WoW64 boot: the 32-bit process-parameter arena is too small".into())
+                })?;
+            mem.write_u32(boot.peb32 + exemu_os::wow64::peb32::PROCESS_PARAMETERS, pp32 as u32)?;
+
+            // The process is a WoW64 one: publish its 32-bit PEB so
+            // `NtQueryInformationProcess(ProcessWow64Information)` and the
+            // architecture report answer the way `wow64.dll`'s process init
+            // needs them to (roadmap W5.6).
+            os.set_wow64_peb32(boot.peb32);
+            // exemu mapped `wow64cpu`/`wow64win` itself (Wine's 64-bit
+            // `loader_init` never ran on this path), so the loader entry points
+            // `wow64.dll` uses to reach them answer out of exemu's own table.
+            os.register_wow64_module("wow64cpu.dll", boot.wow64cpu.base);
+            os.register_wow64_module("wow64win.dll", boot.wow64win.base);
+
+            // The 32-bit ntdll's own unixlib handle (roadmap W5.3). A 32-bit
+            // `__wine_unix_call` reaches the *same* 64-bit dispatcher as a
+            // 64-bit one — `wow64cpu`'s BOP handler (rva 0x1255) just
+            // zero-extends the guest's 32-bit `args` pointer into `r8d` — so the
+            // handle is the only thing that says "this block is 32-bit wide".
+            // Publishing it is the unix side's job, which is exemu's role here.
+            let h32 = os.register_ntdll32_unixlib(boot.ntdll32.base);
+            if let Some(slot) = boot.ntdll32.export("__wine_unixlib_handle") {
+                mem.write_u64(slot, h32)?;
+            }
 
             // `BTCpuProcessInit` calls `ntdll!LdrGetDllHandle` to find the
-            // 64-bit ntdll. Wine's own `LdrGetDllHandleEx` walks a module hash
-            // table only its `loader_init` fills, which this boot deliberately
-            // does not run — so that one slot is bound to exemu's native loader
-            // query instead (see `Api::LdrGetDllHandle`). Every other import of
-            // wow64cpu's process init is Wine's real 64-bit ntdll code.
-            let native_ldr_get = os.resolve_import(
-                "ntdll.dll",
-                &exemu_core::ImportSymbol::Named("LdrGetDllHandle".into()),
-            );
-            for (iat_rva, _dll, sym) in &boot.wow64cpu.imports {
-                if sym == "LdrGetDllHandle" {
-                    mem.write_u64(boot.wow64cpu.base + *iat_rva as u64, native_ldr_get)?;
+            // 64-bit ntdll, and `wow64.dll`'s process init calls
+            // `LdrGetDllHandle` + `LdrLoadDll` to reach ntdll / wow64cpu /
+            // wow64win. Wine's own loader entry points walk a module hash table
+            // only its `loader_init` fills, which this boot deliberately does
+            // not run — so those slots bind to exemu's native loader queries
+            // instead (see `Api::LdrGetDllHandle` / `Api::LdrLoadDll`). Every
+            // other import either DLL uses is Wine's real 64-bit ntdll code.
+            let native = |os: &mut exemu_os::WinOs, sym: &str| {
+                os.resolve_import("ntdll.dll", &exemu_core::ImportSymbol::Named(sym.into()))
+            };
+            let (ldr_get, ldr_load) = (native(&mut os, "LdrGetDllHandle"), native(&mut os, "LdrLoadDll"));
+            for img in [&boot.wow64cpu, &boot.wow64] {
+                for (iat_rva, _dll, sym) in &img.imports {
+                    let addr = match sym.as_str() {
+                        "LdrGetDllHandle" => ldr_get,
+                        "LdrLoadDll" => ldr_load,
+                        _ => continue,
+                    };
+                    mem.write_u64(img.base + *iat_rva as u64, addr)?;
                 }
             }
 
-            wow64_boot::seat(&mut cpu, &mut mem, &boot, image.entry_va(), stack_top)?;
+            match cfg.wow64_bringup {
+                wow64_boot::Bringup::Direct => {
+                    wow64_boot::seat_direct(&mut cpu, &mut mem, &boot, image.entry_va(), stack_top)?
+                }
+                wow64_boot::Bringup::WineLoader => wow64_boot::seat_wine_loader(
+                    &mut cpu,
+                    &mut mem,
+                    &boot,
+                    &ntdll64,
+                    lay.peb_addr,
+                    image.entry_va(),
+                    stack_top,
+                )?,
+            }
             wow64 = Some(boot);
         }
 
@@ -1082,6 +1153,17 @@ impl Process {
         let Some(ntdll_base) = self.os.module_base("ntdll.dll") else {
             return Ok(false);
         };
+        // A fault in **32-bit** WoW64 guest code cannot be delivered here: this
+        // path builds a 64-bit `CONTEXT` and seats rip on the *64-bit* ntdll's
+        // `KiUserExceptionDispatcher`, which a CPU in 32-bit mode truncates to a
+        // 32-bit address and then faults on again (roadmap W5.7). Wine routes it
+        // instead through `wow64.dll!Wow64PassExceptionToGuest` →
+        // `ntdll32!KiUserExceptionDispatcher`, which exemu does not drive yet —
+        // so decline, and let the fault reporter say where the guest really
+        // stopped. Pinned as `wow64_32bit_exception_is_not_delivered_to_the_guest`.
+        if self.wow64.is_some() && self.cpu.bits() == Bits::B32 {
+            return Ok(false);
+        }
         // Recursion guard: a fault while already dispatching (esp. a repeated
         // fault at the dispatcher entry) must not re-deliver forever.
         const MAX_EXC_DEPTH: u32 = 8;
