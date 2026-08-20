@@ -400,6 +400,48 @@ fn rdtsc_is_monotonic() {
     assert!(rax(&cpu) as u32 > 0, "TSC must advance between reads");
 }
 
+/// With the deterministic clock installed (roadmap W9.6) the TSC stops being a
+/// free-running counter and becomes a fixed 1 GHz ramp off the retired-
+/// instruction count. Two reads three instructions apart must therefore differ
+/// by exactly 3 × 100 ticks — and by the SAME amount on every run, which is the
+/// whole point: a guest that times itself with `RDTSC` can no longer observe how
+/// fast the host is.
+#[test]
+fn rdtsc_is_exactly_reproducible_under_the_virtual_clock() {
+    // rdtsc ; mov ecx,eax ; rdtsc ; sub eax,ecx ; hlt
+    let code = [
+        0x0F, 0x31, // rdtsc            (instruction 1)
+        0x89, 0xC1, // mov ecx, eax     (instruction 2)
+        0x0F, 0x31, // rdtsc            (instruction 3)
+        0x29, 0xC8, // sub eax, ecx
+        0xF4,
+    ];
+    let delta = |_: u32| {
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("code", CODE_BASE, 0x1_0000, Perm::RWX)).unwrap();
+        mem.map(Region::new("stack", 0x8_0000, 0x2_0000, Perm::RW)).unwrap();
+        mem.write(CODE_BASE, &code).unwrap();
+        let mut cpu = Interpreter::new();
+        cpu.set_clock(exemu_core::GuestClock::virtualized());
+        cpu.state_mut().rip = CODE_BASE;
+        cpu.state_mut().set_rsp(STACK_TOP);
+        let mut hooks = NoHooks;
+        loop {
+            match cpu.step(&mut mem, &mut hooks).unwrap() {
+                Exit::Continue => {}
+                Exit::Halted => break,
+                other => panic!("unexpected exit: {other:?}"),
+            }
+        }
+        rax(&cpu) as u32
+    };
+    // Two instructions elapse between the two reads (the `mov` and the second
+    // `rdtsc` itself), at 100 TSC ticks per instruction.
+    assert_eq!(delta(0), 200, "TSC delta is the instruction count, scaled");
+    assert_eq!(delta(1), delta(2), "and it repeats exactly");
+    assert_eq!(delta(1), 200);
+}
+
 #[test]
 fn movbe_load_byteswaps_from_memory() {
     // mov dword [rsp-8], 0x11223344 ; movbe eax, [rsp-8] ; hlt → 0x44332211

@@ -1414,10 +1414,11 @@ impl Interpreter {
 
             // CPUID: report an honest feature set (only what we execute).
             0xA2 => self.cpuid(),
-            // RDTSC: return the monotonic counter in EDX:EAX and advance it.
+            // RDTSC: return the monotonic counter in EDX:EAX. Host-clock path:
+            // a free-running counter advanced 64 per read. Virtual clock (W9.6):
+            // a 1 GHz ramp off the retired-instruction count.
             0x31 => {
-                let t = self.tsc;
-                self.tsc = self.tsc.wrapping_add(64);
+                let t = self.read_tsc();
                 self.state.gpr_write(0, 4, t & 0xffff_ffff);
                 self.state.gpr_write(2, 4, t >> 32);
             }
@@ -1430,12 +1431,11 @@ impl Interpreter {
                 let sub = ctx.u8(mem)?;
                 match sub {
                     // RDTSCP (0F 01 F9): EDX:EAX = TSC (identical to RDTSC
-                    // semantics — monotonic, wrapping_add(64) each call), and
-                    // ECX = IA32_TSC_AUX = 0 (processor id; 0 is correct for
-                    // the single-vCPU model).  No flags are touched.
+                    // semantics — the same monotonic counter, host-clock or
+                    // virtual), and ECX = IA32_TSC_AUX = 0 (processor id; 0 is
+                    // correct for the single-vCPU model). No flags are touched.
                     0xF9 => {
-                        let t = self.tsc;
-                        self.tsc = self.tsc.wrapping_add(64);
+                        let t = self.read_tsc();
                         self.state.gpr_write(0, 4, t & 0xffff_ffff); // EAX = TSC[31:0]
                         self.state.gpr_write(2, 4, t >> 32); // EDX = TSC[63:32]
                         self.state.gpr_write(1, 4, 0); // ECX = IA32_TSC_AUX (processor 0)

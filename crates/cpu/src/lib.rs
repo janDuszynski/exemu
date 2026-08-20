@@ -19,7 +19,7 @@
 mod alu;
 
 use exemu_core::cpu::flags;
-use exemu_core::{Cpu, CpuState, EmuError, Exit, Hooks, Memory, Result};
+use exemu_core::{Cpu, CpuState, EmuError, Exit, GuestClock, Hooks, Memory, Result};
 
 /// Processor operating mode: 32-bit (protected/IA-32) or 64-bit (long mode).
 /// Selects default operand/address size, REX-vs-inc/dec decoding, stack
@@ -36,9 +36,19 @@ pub enum Bits {
 pub struct Interpreter {
     state: CpuState,
     bits: Bits,
-    /// Monotonic time-stamp counter backing `RDTSC`. Advanced on each read so
-    /// spin loops that wait for the TSC to change make progress.
+    /// Monotonic time-stamp counter backing `RDTSC` on the **host-clock**
+    /// (default) path. Advanced on each read so spin loops that wait for the TSC
+    /// to change make progress. Unused once [`Interpreter::clock`] is
+    /// virtualised, where the TSC is derived from the retired-instruction count
+    /// instead (see [`GuestClock::tsc`]).
     tsc: u64,
+    /// The process clock (roadmap W9.6). Default [`GuestClock::host`], in which
+    /// case the interpreter neither counts instructions nor changes `RDTSC`'s
+    /// behaviour. When the deterministic clock is installed, [`Cpu::step`]
+    /// retires one instruction into it per step and `RDTSC`/`RDTSCP` read it —
+    /// which is what makes the guest's whole notion of time a function of its
+    /// own instruction stream.
+    clock: GuestClock,
     /// SSE control/status register (`MXCSR`), round-tripped by `LDMXCSR`/
     /// `STMXCSR`/`FXSAVE`/`FXRSTOR`. Default 0x1F80 (all exceptions masked,
     /// round-to-nearest). Only the round-nearest default currently affects
@@ -68,20 +78,58 @@ impl Default for Interpreter {
 impl Interpreter {
     /// A fresh 64-bit interpreter.
     pub fn new() -> Self {
-        Interpreter { state: CpuState::new(), bits: Bits::B64, tsc: 0, mxcsr: 0x1F80, xcr0: XCR0_SUPPORTED }
+        Interpreter::with_bits(Bits::B64)
     }
 
     /// A fresh interpreter in the given mode.
     pub fn with_bits(bits: Bits) -> Self {
-        Interpreter { state: CpuState::new(), bits, tsc: 0, mxcsr: 0x1F80, xcr0: XCR0_SUPPORTED }
+        Interpreter {
+            state: CpuState::new(),
+            bits,
+            tsc: 0,
+            mxcsr: 0x1F80,
+            xcr0: XCR0_SUPPORTED,
+            clock: GuestClock::host(),
+        }
     }
 
     pub fn with_state(state: CpuState) -> Self {
-        Interpreter { state, bits: Bits::B64, tsc: 0, mxcsr: 0x1F80, xcr0: XCR0_SUPPORTED }
+        Interpreter { state, ..Interpreter::with_bits(Bits::B64) }
     }
 
     pub fn bits(&self) -> Bits {
         self.bits
+    }
+
+    /// Install the process clock (roadmap W9.6). Called once at load time with
+    /// the same handle the OS layer holds, so `RDTSC` and the Win32/NT time APIs
+    /// report one consistent notion of "now".
+    pub fn set_clock(&mut self, clock: GuestClock) {
+        self.clock = clock;
+    }
+
+    /// The process clock this interpreter retires instructions into.
+    pub fn clock(&self) -> &GuestClock {
+        &self.clock
+    }
+
+    /// The next `RDTSC`/`RDTSCP` value, and the side-effect of reading it.
+    ///
+    /// Virtualised: a fixed multiple of the retired-instruction count, so two
+    /// reads separated by *n* instructions differ by exactly *n* × 100 ticks —
+    /// deterministic, and still strictly increasing because the `RDTSC` is
+    /// itself an instruction. Host-clock (default): the legacy free-running
+    /// counter that advances 64 per read.
+    #[inline]
+    fn read_tsc(&mut self) -> u64 {
+        match self.clock.tsc() {
+            Some(t) => t,
+            None => {
+                let t = self.tsc;
+                self.tsc = self.tsc.wrapping_add(64);
+                t
+            }
+        }
     }
 
     /// The SSE control/status register (`MXCSR`).
@@ -128,6 +176,11 @@ impl Cpu for Interpreter {
     }
 
     fn step(&mut self, mem: &mut dyn Memory, hooks: &mut dyn Hooks) -> Result<Exit> {
+        // Retire this step into the process clock (roadmap W9.6) BEFORE anything
+        // else, so an intercepted API thunk costs exactly the one instruction the
+        // run loop also counts for it, and so a handler that reads the clock sees
+        // its own call included. A no-op on the default host-clock path.
+        self.clock.retire_one();
         // Give the OS layer first refusal on this address (API thunks).
         if let Some(exit) = hooks.intercept(self.state.rip, &mut self.state, mem)? {
             return Ok(exit);
