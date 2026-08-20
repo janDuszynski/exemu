@@ -84,3 +84,105 @@ fn system_time_fields_are_valid() {
     assert!((1..=31).contains(&day), "day {day}");
     assert!(hour < 24 && minute < 60 && second < 60, "{hour}:{minute}:{second}");
 }
+
+// ---- the deterministic clock (roadmap W9.6) --------------------------------
+
+/// Every Win32 time API reads the SAME virtual clock, and each is exactly the
+/// documented function of the retired-instruction count — 10M instructions is
+/// one second, however long the host took to execute them.
+#[test]
+fn the_virtual_clock_drives_every_win32_time_api() {
+    let clock = exemu_core::GuestClock::virtualized();
+    let (mut os, mut mem) = setup();
+    os.set_clock(clock.clone());
+    let mut cpu = CpuState::default();
+
+    // Retire one virtual second's worth of guest instructions.
+    for _ in 0..exemu_core::VIRTUAL_INSTRUCTIONS_PER_SECOND {
+        clock.retire_one();
+    }
+
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetTickCount", 0), 1_000, "one virtual second");
+    call(&mut os, &mut mem, &mut cpu, "QueryPerformanceCounter", OUT);
+    assert_eq!(mem.read_u64(OUT).unwrap(), 10_000_000, "QPC ticks == instructions retired");
+    call(&mut os, &mut mem, &mut cpu, "QueryPerformanceFrequency", OUT);
+    assert_eq!(mem.read_u64(OUT).unwrap(), 10_000_000, "the QPC rate is unchanged");
+
+    call(&mut os, &mut mem, &mut cpu, "GetSystemTimeAsFileTime", OUT);
+    assert_eq!(
+        mem.read_u64(OUT).unwrap(),
+        exemu_core::VIRTUAL_EPOCH_FILETIME + 10_000_000,
+        "the wall clock is the fixed epoch plus the elapsed virtual time"
+    );
+
+    // …and the broken-out SYSTEMTIME agrees: 2026-01-01T00:00:01Z, a Thursday.
+    call(&mut os, &mut mem, &mut cpu, "GetSystemTime", OUT);
+    let f = |i: u64| mem.read_u16(OUT + i * 2).unwrap();
+    assert_eq!((f(0), f(1), f(3)), (2026, 1, 1), "2026-01-01");
+    assert_eq!(f(2), 4, "1 January 2026 is a Thursday");
+    assert_eq!((f(4), f(5), f(6), f(7)), (0, 0, 1, 0), "00:00:01.000");
+}
+
+/// The point of the exercise: replay. Two identical call sequences against two
+/// fresh virtual clocks produce byte-identical answers — so a guest that
+/// branches on a timestamp takes the same branch every run.
+#[test]
+fn the_virtual_clock_replays_exactly() {
+    let one_pass = || {
+        let clock = exemu_core::GuestClock::virtualized();
+        let (mut os, mut mem) = setup();
+        os.set_clock(clock.clone());
+        let mut cpu = CpuState::default();
+        let mut trace = Vec::new();
+        for i in 0..8u64 {
+            // A guest doing work between clock reads: the "work" is instructions.
+            for _ in 0..(1_000 * (i + 1)) {
+                clock.retire_one();
+            }
+            trace.push(call(&mut os, &mut mem, &mut cpu, "GetTickCount", 0));
+            call(&mut os, &mut mem, &mut cpu, "QueryPerformanceCounter", OUT);
+            trace.push(mem.read_u64(OUT).unwrap());
+            call(&mut os, &mut mem, &mut cpu, "GetSystemTimeAsFileTime", OUT);
+            trace.push(mem.read_u64(OUT).unwrap());
+        }
+        trace
+    };
+    assert_eq!(one_pass(), one_pass(), "the same guest run observes the same times");
+}
+
+/// `Sleep(ms)` is a cooperative yield that costs one instruction, so without a
+/// credit a `Sleep`-paced timeout loop would take 10^4 iterations per virtual
+/// millisecond to escape. Crediting the interval the guest asked for keeps such
+/// loops terminating — deterministically, since the interval is the guest's own
+/// argument (roadmap W9.6).
+#[test]
+fn a_slept_interval_advances_the_virtual_clock() {
+    let clock = exemu_core::GuestClock::virtualized();
+    let (mut os, mut mem) = setup();
+    os.set_clock(clock.clone());
+    let mut cpu = CpuState::default();
+
+    let t0 = call(&mut os, &mut mem, &mut cpu, "GetTickCount", 0);
+    call(&mut os, &mut mem, &mut cpu, "Sleep", 250);
+    let t1 = call(&mut os, &mut mem, &mut cpu, "GetTickCount", 0);
+    assert_eq!(t1 - t0, 250, "the guest observes the interval it asked to sleep");
+
+    // INFINITE names no interval, so it must not skip the clock forward.
+    call(&mut os, &mut mem, &mut cpu, "Sleep", 0xFFFF_FFFF);
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetTickCount", 0), t1);
+}
+
+/// The default is unchanged: the clock declines to answer and every API falls
+/// back to the host, so nothing about the shipped behaviour moves.
+#[test]
+fn the_host_clock_stays_the_default() {
+    let (mut os, mut mem) = setup();
+    assert!(!os.clock().is_virtual(), "host clock unless explicitly asked for");
+    let mut cpu = CpuState::default();
+    call(&mut os, &mut mem, &mut cpu, "GetSystemTimeAsFileTime", OUT);
+    let ft = mem.read_u64(OUT).unwrap();
+    assert!(
+        ft > exemu_core::VIRTUAL_EPOCH_FILETIME,
+        "the default path reports the real host clock, not the virtual epoch"
+    );
+}

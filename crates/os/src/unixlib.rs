@@ -208,11 +208,12 @@ fn spawnvp(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory, _args: u
 /// Entry 7 — `system_time_precise(params)`. `params` points at a single
 /// `LONGLONG` output (confirmed from `RtlGetSystemTimePrecise`: it passes
 /// `r8 = &out`, `edx = 7`, then reads the `LONGLONG` back from `[r8]`). Write the
-/// current wall-clock time as a FILETIME (100-ns ticks since 1601), the same
-/// host clock `os/time.rs` reports, and return success.
-fn system_time_precise(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
+/// current wall-clock time as a FILETIME (100-ns ticks since 1601) — the same
+/// process clock `os/time.rs` reports, so this Wine-path entry is virtualised
+/// with the rest of them (roadmap W9.6) — and return success.
+fn system_time_precise(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
     if args != 0 {
-        mem.write_u64(args, crate::time::filetime_now())?;
+        mem.write_u64(args, os.filetime_now())?;
     }
     Ok(STATUS_SUCCESS)
 }

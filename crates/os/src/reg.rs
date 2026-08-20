@@ -1028,7 +1028,7 @@ impl WinOs {
         if length < name_off {
             return Ok(STATUS_BUFFER_TOO_SMALL);
         }
-        let lwt = crate::time::filetime_now();
+        let lwt = self.filetime_now();
         mem.write_u64(buf, lwt)?; // LastWriteTime
         mem.write_u32(buf + 8, 0)?; // TitleIndex
         if class == KEY_NODE_INFORMATION {
@@ -1053,7 +1053,7 @@ impl WinOs {
         let Some(path) = self.reg_path_of(hkey) else {
             return Ok(STATUS_INVALID_HANDLE);
         };
-        let lwt = crate::time::filetime_now();
+        let lwt = self.filetime_now();
         match class {
             KEY_BASIC_INFORMATION | KEY_NODE_INFORMATION => {
                 let name = Self::reg_leaf(&path).to_string();
