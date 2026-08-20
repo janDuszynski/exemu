@@ -960,6 +960,65 @@ fn clicking_the_button_reaches_wine_button_wndproc_on_wine() {
     assert_eq!(px(pressed, rx, ry), BTNSHADOW, "pressed: the dark bottom-right edge lifts");
 }
 
+/// **Keyboard focus: space activates the focused button.**
+///
+/// The other half of input routing. `ButtonWndProc` calls `NtUserSetFocus` on
+/// itself when it is pressed, so after a click the keyboard belongs to the
+/// *child*, not to the top-level window — and Wine's button answers `VK_SPACE`
+/// by pushing itself on the key-down and running the whole click-notification
+/// path on the key-up (its `WM_KEYUP` arm jumps straight into the
+/// `WM_LBUTTONUP` one, skipping only the point-in-rect test).
+///
+/// Each notification makes the sample's WndProc set the button's text once, so
+/// the driver log counts them: a click alone gives one, a click followed by a
+/// space gives **two**. If keys still went to the top-level window — the
+/// pre-routing behaviour — the second never happens.
+#[test]
+fn space_activates_the_focused_button_on_wine() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} control DLLs not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    use exemu_core::{InputEvent, MouseButton};
+    /// `VK_SPACE`.
+    const VK_SPACE: u32 = 0x20;
+
+    let b = comctl_sample::BUTTON_RECT;
+    let (cx, cy) = (b[0] + b[2] / 2, b[1] + b[3] / 2);
+    let notifications = |events: Vec<InputEvent>| -> usize {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let exe = comctl_sample::build();
+        let res =
+            load_and_run(&exe, input_run_config(Box::new(RecordingDriver::new(Arc::clone(&log))), events))
+                .expect("the comctl sample runs its pump to completion");
+        assert_eq!(res.exit_code, 0, "the guest exits cleanly");
+        let calls = log.lock().unwrap();
+        calls
+            .iter()
+            .filter(|c| matches!(
+                c,
+                DriverCall::SetWindowText { text, .. } if text == comctl_sample::CLICKED_TEXT
+            ))
+            .count()
+    };
+
+    let click = vec![
+        InputEvent::MouseButton { button: MouseButton::Left, down: true, x: cx, y: cy },
+        InputEvent::MouseButton { button: MouseButton::Left, down: false, x: cx, y: cy },
+    ];
+    let mut click_then_space = click.clone();
+    click_then_space.push(InputEvent::Key { vk: VK_SPACE, down: true });
+    click_then_space.push(InputEvent::Key { vk: VK_SPACE, down: false });
+
+    assert_eq!(notifications(click), 1, "the click alone notifies once");
+    assert_eq!(
+        notifications(click_then_space),
+        2,
+        "VK_SPACE after the click did not reach the focused BUTTON — the keyboard is \
+         still going to the top-level window"
+    );
+}
+
 /// **The pressed button, pinned pixel-for-pixel.**
 ///
 /// The companion golden to [`comctl_painted_controls_match_golden_on_wine`],

@@ -57,6 +57,7 @@ const NT_USER_END_PAINT: u32 = 0x13bc;
 const NT_USER_GET_MESSAGE: u32 = 0x141b;
 const NT_USER_PEEK_MESSAGE: u32 = 0x14ca;
 const NT_USER_POST_QUIT_MESSAGE: u32 = 0x14d1;
+const NT_USER_TRANSLATE_MESSAGE: u32 = 0x15d8;
 const NT_USER_DISPATCH_MESSAGE: u32 = 0x138b;
 
 // --- cursor / display members (roadmap W4.7) ------------------------------
@@ -1137,6 +1138,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_GET_MESSAGE, nt_user_get_message);
     os.set_win32k_handler(NT_USER_PEEK_MESSAGE, nt_user_peek_message);
     os.set_win32k_handler(NT_USER_POST_QUIT_MESSAGE, nt_user_post_quit_message);
+    os.set_win32k_handler(NT_USER_TRANSLATE_MESSAGE, nt_user_translate_message);
     os.set_win32k_handler(NT_USER_DISPATCH_MESSAGE, nt_user_dispatch_message);
     // Cursor / display driver members (W4.7).
     os.set_win32k_handler(NT_USER_GET_CURSOR, nt_user_get_cursor);
@@ -3093,9 +3095,80 @@ fn nt_user_dispatch_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     dispatch_to_wndproc(os, cpu, mem, hwnd, message as u32, wparam, lparam, None)
 }
 
-/// `NtUserPeekMessage` → 0 (no message available).
-fn nt_user_peek_message(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
-    Ok(0)
+/// `NtUserPeekMessage(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg)` —
+/// the non-blocking half of the pump (`user32!PeekMessageW` is a bare thunk into
+/// it). Returns TRUE when a message was available.
+///
+/// With `PM_REMOVE` it does everything [`nt_user_get_message`] does short of
+/// parking — including routing a pending native event, which may run a
+/// `WM_NCHITTEST` callback before the message is written. With `PM_NOREMOVE` it
+/// only looks at what is already queued: routing an event *consumes* it, and a
+/// caller that asked not to remove anything must not lose it.
+///
+/// Without an input channel it keeps the W4.1 answer (0 = nothing), which is what
+/// every headless and emulated-corpus run sees.
+fn nt_user_peek_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    const PM_REMOVE: u32 = 0x0001;
+    if !os.has_input() {
+        return Ok(0);
+    }
+    let lp = os.syscall_arg(cpu, mem, 0)?;
+    let remove = os.syscall_arg(cpu, mem, 4)? as u32 & PM_REMOVE != 0;
+    os.drain_input();
+    synthesize_paint(os);
+    if !os.threads[os.current].msgs.is_empty() {
+        if let Some(m) = os.msg_peek(remove) {
+            os.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
+            return Ok(1);
+        }
+    }
+    if remove {
+        if let Some(ev) = os.win32k_state.raw_input.pop_front() {
+            if route_raw_input(os, cpu, mem, lp, ev)? {
+                return Ok(0); // ignored: the hit-test frame supplies rax
+            }
+            // Routed into the queue: hand it straight back.
+            if let Some(m) = os.msg_peek(true) {
+                os.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
+                return Ok(1);
+            }
+        }
+    }
+    match os.msg_peek(remove) {
+        Some(m) => {
+            os.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
+            Ok(1)
+        }
+        None => Ok(0),
+    }
+}
+
+/// `NtUserTranslateMessage(lpMsg, flags)` — turn a key-down into the character
+/// message that follows it (`user32!TranslateMessage` is `xor edx,edx; jmp`
+/// here). The `WM_CHAR` is *posted*, not delivered: it becomes the next message
+/// the pump hands out, which is the documented behaviour and what a text control
+/// relies on.
+fn nt_user_translate_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_SYSKEYDOWN: u32 = 0x0104;
+    const WM_CHAR: u32 = 0x0102;
+    const WM_SYSCHAR: u32 = 0x0106;
+    let lp = os.syscall_arg(cpu, mem, 0)?;
+    if lp == 0 {
+        return Ok(0);
+    }
+    let (hwnd, message, wparam, lparam) = os.read_msg(mem, lp)?;
+    let char_msg = match message as u32 {
+        WM_KEYDOWN => WM_CHAR,
+        WM_SYSKEYDOWN => WM_SYSCHAR,
+        _ => return Ok(0),
+    };
+    if let Some(ch) = crate::msg::vkey_to_char(wparam as u32) {
+        os.post_internal(hwnd, char_msg, ch as u64, lparam);
+    }
+    // TRUE means "this was a key message", whether or not it produced a
+    // character — the documented contract.
+    Ok(1)
 }
 
 /// `NtUserPostQuitMessage(nExitCode)` — mark the running thread to receive
@@ -3432,7 +3505,7 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 pub mod abi {
     /// win32u syscall indices, as `(export name, index)`. The index is the
     /// `mov eax, imm32` immediate in that export's stub.
-    pub const SYSCALLS: [(&str, u32); 34] = [
+    pub const SYSCALLS: [(&str, u32); 36] = [
         ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
         ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
         ("NtUserSetCapture", super::NT_USER_SET_CAPTURE),
@@ -3441,6 +3514,8 @@ pub mod abi {
         ("NtUserSetActiveWindow", super::NT_USER_SET_ACTIVE_WINDOW),
         ("NtUserGetThreadState", super::NT_USER_GET_THREAD_STATE),
         ("NtUserGetAncestor", super::NT_USER_GET_ANCESTOR),
+        ("NtUserPeekMessage", super::NT_USER_PEEK_MESSAGE),
+        ("NtUserTranslateMessage", super::NT_USER_TRANSLATE_MESSAGE),
         ("NtUserCreateWindowEx", super::NT_USER_CREATE_WINDOW_EX),
         ("NtUserShowWindow", super::NT_USER_SHOW_WINDOW),
         ("NtUserDestroyWindow", super::NT_USER_DESTROY_WINDOW),

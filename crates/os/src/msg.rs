@@ -156,7 +156,7 @@ impl WinOs {
 /// Map a virtual-key code to a character for `TranslateMessage`. Covers the
 /// printable ASCII range whose VK codes equal the uppercase character, plus
 /// space and return — enough for keyboard-driven text entry in a plain window.
-fn vkey_to_char(vk: u32) -> Option<char> {
+pub(crate) fn vkey_to_char(vk: u32) -> Option<char> {
     match vk {
         0x08 => Some('\u{8}'),  // VK_BACK
         0x09 => Some('\t'),     // VK_TAB
