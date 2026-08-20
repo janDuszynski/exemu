@@ -331,6 +331,36 @@ end-to-end on the default path.
   (`\users\` with no name) so a regression reads immediately as "the old bug is
   back".
 
+### IShellLink through COM (W6.6 stretch, partial)
+- **`CoCreateInstance(CLSID_ShellLink, IID_IShellLinkW)` resolves through
+  exemu's registry to shell32's own `IShellLinkW`** — the same
+  in-proc-server mechanism W6.3/W6.4 proved for the ole32 moniker classes,
+  now proved for a shell32-hosted one. A real vtable call through the
+  returned interface (`GetPath`, on a pristine link) returns **exactly**
+  `S_FALSE` — Microsoft's documented HRESULT for "successful call, no path
+  retrieved" — which is strong evidence the call reached Wine's *real*
+  `IShellLinkW::GetPath`, not coincidence: a wrong vtable slot would not
+  reproduce a specific documented result. `crates/os/src/reg.rs` seeds
+  `HKCR\CLSID\{CLSID_ShellLink}\InprocServer32 = shell32.dll`; new sample
+  `crates/app/src/shell_link_sample.rs` + gate
+  `crates/app/tests/shell_link_gate.rs`.
+- **`SetPath` crashes — a genuine, separate gap, deliberately left out of the
+  shipped sample rather than worked around.** Wine's own crash reporter names
+  it exactly: `Unhandled page fault on read access to 00000000000000BC` — a
+  NULL pointer plus a small struct-field offset, the same failure class
+  `knowledge/known-issues.know` already documents (a stubbed Win32 API
+  returns 0/NULL, real Wine code dereferences it later). Isolated
+  methodically: the `GetPath` slot (vtable+0x18) was proven correct and
+  callable first; a sweep of neighbouring slots showed vtable+0xA0
+  ("SetPath", correctly the last of `IShellLinkW`'s 21 documented slots)
+  holds a plausible, same-image function pointer immediately followed by the
+  vtable's true end (+0xA8/+0xB0 both `NULL`) — confirming the *offset* is
+  right; the `pszFile` argument was echoed back byte-for-byte correct before
+  the call. The fault is therefore inside Wine's real `SetPath`, hitting
+  some *other*, not-yet-identified stub — worth its own investigation. The
+  full "write a real `.lnk` into `CSIDL_PROGRAMS`" pin (the 7-Zip
+  start-menu-shortcut scenario) is therefore **not yet reached**.
+
 ## v0.0.4 — the windowing substrate
 
 The last foundation layer *under* the GUI: a real USER32/GDI object model the
