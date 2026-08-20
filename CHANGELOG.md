@@ -243,10 +243,10 @@ end-to-end on the default path.
   have **every named import it declares** (309 / 139 / 279 of them) resolve to
   a real export of the pinned DLL it names, forwarders included; one export per
   DLL is then executed through the interpreter from the DLL's own bytes.
-- **The measured gaps are pinned as tests** so they stay visible rather than
-  being worked around: child windows do not paint — win32k allocates one surface
-  per *top-level* window — and messaging a comctl32 control does not terminate
-  (its WndProc spins on an unserviced `WineUnixCall` import thunk).
+- **The measured gaps were pinned as tests** so they stayed visible rather than
+  being worked around: child windows did not paint — win32k allocated one surface
+  per *top-level* window — and messaging a comctl32 control did not terminate.
+  Both are closed in W4.8 below; the tests now assert the closed behaviour.
 
 ### user32's built-in control classes (W6.2)
 - `CreateWindowExW(L"BUTTON", …)` now **reaches `NtUserCreateWindowEx`**. Wine's
@@ -307,6 +307,92 @@ end-to-end on the default path.
   client-PFN procs into every mapped ntdll copy, making the table it recovered
   authoritative regardless of which image a module bound against. The duplicate
   load itself remains a loader-level gap, recorded in the comctl gate.
+
+### Wine's own controls actually paint (W4.8)
+- **A `BUTTON` and a `msctls_progress32` now appear as pixels, drawn by Wine's
+  own code.** The golden frame at `crates/app/tests/goldens/comctl_painted_controls.png`
+  shows user32's `ButtonWndProc` painting a bordered grey push button **with its
+  own "Push me" label** and comctl32's `ProgressWindowProc` painting a chunked
+  bar filled to the 60 % the guest set with `PBM_SETPOS`. exemu implements
+  neither control. The gate reads those pixels back: dark glyph pixels strictly
+  inside the button's border, and a fill fraction between 0.35 and 0.85 of the
+  bar — a control that ignored the message would be empty, one that ignored the
+  range would be full.
+- **A control's label needed the two measuring calls, not just the drawing one.**
+  `DrawTextW` asks for `NtGdiGetTextMetricsW` before it lays out and
+  `NtGdiGetTextExtentExW` before it positions; with both answering the honest 0
+  the button first drew no text at all, then drew it a million pixels
+  off-surface. Both are serviced now, with the extent coming from the same
+  rasterizer the draw uses so measure and draw agree.
+- **Child windows have no surface of their own** — that is the model Wine's
+  binaries dictate, not a shortcut. `NtUserGetDC`/`BeginPaint` bind a child's DC
+  to its **top-level ancestor's** surface with an origin offset and a clip rect,
+  and win32k applies both. That the *kernel* side must do it is recovered, not
+  assumed: bounding every gdi32 primitive by its `.pdata` entry shows
+  `Rectangle`, `PatBlt`, `BitBlt`, `LineTo`, `Ellipse`, `FillRgn`, `StretchBlt`
+  and `SetPixel` performing **zero** non-stack arithmetic before their syscall —
+  the app's raw logical coordinates cross the boundary untouched. The origin
+  itself is published into the shared DC object at `+0x48`/`+0x4c`, the two
+  dwords `gdi32!GetDCOrgEx` reads and nothing in gdi32 ever writes.
+- **The `NtUserCall*` fan-in enums are recovered.** Three win32u indices carry
+  whole families of tiny operations behind a call number that is public nowhere;
+  they were left as honest stubs, and a control's WndProc consequently gave up on
+  the first `IsWindow` that answered "no". Sweeping the pinned user32 for the
+  selector immediate each public wrapper loads before its win32u thunk yields the
+  lot — `IsWindow` = `NtUserCallHwnd(0xa)`, `GetClientRect` =
+  `NtUserCallHwndParam(0xe)` over a `{ RECT*, dpi_ctx }` block,
+  `GetSysColorBrush` = `NtUserCallOneParam(7)`, and so on. `user32!IsIconic`
+  pins the meaning of the one ambiguous selector: it asks for `GWL_STYLE` with
+  code `0xa` and tests bit 29, so `0xa` is `GetWindowLong`.
+- **Per-window extra bytes exist.** A Wine control keeps its instance pointer in
+  its class's `cbWndExtra` at offset 0 — `SetWindowLongPtr` on `WM_NCCREATE`,
+  `GetWindowLongPtr` on every message after. With no storage behind those the
+  progress bar re-read NULL forever. `NtUserSetWindowLong{,Ptr}` and the
+  `GetWindowLong*` selectors now share one slot model (the documented negative
+  offsets plus the extra block), and the syscall dispatcher grew a full-width
+  result path so a returned *pointer* is not truncated to 32 bits.
+- **The W4.8b brush wall is down, and the reason was a misread field.** The
+  earlier attempt found gdi32 looping on a bare brush handle and concluded the
+  handle needed an exotic client-side object. It does not: `gdi32!SelectObject`
+  computes the object type as `(byte[entry+0x0C] & 0x7f) << 16` — **the low byte
+  of the handle-table entry's generation word**, the very word that must already
+  equal `handle >> 16` — and dispatches `0x100000` to `NtGdiSelectBrush`. So a
+  GDI handle is simply `(type << 16) | slot`; the pre-existing HDC encoding was
+  that rule all along with `type = 1`. Naming it makes brushes (`0x10`), pens
+  (`0x30`), fonts (`0x0a`) and regions (`0x04`) fall straight out.
+- **Stock objects had to be published, or Wine crashes.** `gdi32!GetStockObject`
+  issues no syscall: it maps the index to a fixed table slot (`index + 0x20`,
+  plus paired high/low-DPI slots for the four system fonts), reads the entry
+  directly, and **executes `ud2` when the in-use byte is zero**. An unpopulated
+  stock table therefore does not return NULL — it takes down the first control
+  that asks for a stock brush mid-paint, which is exactly what happened.
+- The primitive set the controls actually use, recovered by tracing the win32u
+  boundary rather than guessed: `user32!FillRect` lowers to
+  `SelectObject(brush)` + `PatBlt(PATCOPY)` + restore, so `NtGdiPatBlt`,
+  `NtGdiSelectBrush`, `NtGdiCreateSolidBrush`, `NtGdiSelectPen/Font`,
+  `NtGdiCreateRectRgn`, `NtGdiDeleteObjectApp` and a real
+  `NtGdiIntersectClipRect` join the handler set. `SetTextColor`/`SetBkColor` are
+  **not** client-side stores: they are `NtGdiGetAndSetDCDword(0x66/0x64)`, so
+  text now renders in the DC's colour instead of always black.
+- **Messaging a control terminates.** `SendMessageW(hProgress, PBM_SETRANGE)`
+  then `PBM_SETPOS` returns and the guest runs on. The recorded diagnosis — "it
+  spins on an unserviced `WineUnixCall` import thunk" — was wrong and is
+  falsifiable straight from the binary: `comctl32.dll` imports no
+  `__wine_unix_call` and no `NtQueryVirtualMemory` at all, so it has no unix half
+  to pair. (That shape is real for `ws2_32`; it was never this.) The true cause
+  was the NULL `DefWindowProcW` forwarder slot fixed in W6.2.
+- **All of it is re-derived on every run.** `crates/app/tests/win32k_abi.rs` is
+  the `afd_abi.rs` treatment for the GUI boundary: 9 tests that read the 26
+  syscall indices, the three call-number enums, the `GetClientRect` parameter
+  block, the GDI handle-type rule, the stock-slot arithmetic and the `ud2` trap,
+  the DC_ATTR offsets and the `FillRect` lowering back out of the pinned
+  `win32u`/`user32`/`gdi32` bytes and assert them against the constants the
+  handlers use. A Wine bump that renumbers anything fails there, by name.
+- New debug seams: `EXEMU_W32K_TRACE` logs every win32u index with its first
+  three arguments (this is how the missing multiplexers were found), and
+  `EXEMU_FAULT_TRACE` reports every exception handed to the guest's own
+  dispatcher with the faulting instruction's bytes — without it, a Wine guest
+  that catches its own access violation shows up only as an exit code.
 
 ## v0.0.4 — the windowing substrate
 
