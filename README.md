@@ -122,7 +122,15 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   `EXEMU_TELEMETRY` env var, else `$TMPDIR/exemu-telemetry.log`).
   On a fault the report includes a register dump, the recent rip trail and —
   for 64-bit images with unwind data — a **call stack** recovered by virtually
-  unwinding the guest's frames.
+  unwinding the guest's frames. Every address in it is **module-attributed**:
+  `rip is 0x4000db8278 (ntdll.dll+0x48278)`, plus a loaded-module list, so a
+  fault inside a Wine DLL can be fed straight to a disassembler instead of
+  being an unattributable number. On the Wine boot exemu's own loader maps only
+  ntdll — every other module arrives through the guest loader's section
+  syscalls — and both are named. Setting `EXEMU_DBG=1` additionally prints that
+  whole report for an exception that is **delivered to the guest** rather than
+  fatal, which is the only way to see where an access violation Wine then
+  swallows actually came from.
 * `info` dumps headers, sections, imports and the x64 unwind data
   (`.pdata` runtime-function count).
 * `opcodes` reads that telemetry log and prints a **most-wanted ranking** of

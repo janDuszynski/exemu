@@ -949,7 +949,7 @@ impl Process {
                     // Wine-boot path a bridgeable CPU exception (#DE/#BP) becomes
                     // a guest EXCEPTION_RECORD delivered via
                     // KiUserExceptionDispatcher instead of terminating here.
-                    if self.try_deliver_hw_exception(ExcSource::Interrupt(n))? {
+                    if self.try_deliver_hw_exception(ExcSource::Interrupt(n), steps, &tail())? {
                         continue;
                     }
                     return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &tail()));
@@ -965,7 +965,7 @@ impl Process {
                     ));
                 }
                 Err(e) => {
-                    if self.try_deliver_hw_exception(ExcSource::Error(&e))? {
+                    if self.try_deliver_hw_exception(ExcSource::Error(&e), steps, &tail())? {
                         continue;
                     }
                     return Err(self.fault(e, steps, &tail()));
@@ -999,7 +999,7 @@ impl Process {
     /// `NtContinue` if handled. Returns `Ok(false)` when the exception should keep
     /// the existing fault-reporter path (no Wine core / non-bridgeable source /
     /// recursion bound hit).
-    fn try_deliver_hw_exception(&mut self, src: ExcSource<'_>) -> Result<bool> {
+    fn try_deliver_hw_exception(&mut self, src: ExcSource<'_>, steps: u64, recent: &[u64]) -> Result<bool> {
         // Guard: only on the Wine-boot path (real ntdll mapped). The emulated
         // corpus keeps its fault reporter, unchanged.
         let Some(ntdll_base) = self.os.module_base("ntdll.dll") else {
@@ -1043,6 +1043,25 @@ impl Process {
             ExcSource::Interrupt(_) => return Ok(false),
         };
 
+        // A bridged exception is *delivered to the guest*, so the emulator
+        // normally says nothing — which is right when the guest handles it, and
+        // useless when it does not (the process just dies with 0xC0000005 and no
+        // clue where). `EXEMU_DBG` prints the full fault report at the point of
+        // delivery, module-attributed, which is what makes an access violation
+        // inside Wine's own code diagnosable at all.
+        if std::env::var_os("EXEMU_DBG").is_some() {
+            eprintln!(
+                "[exemu] delivering exception {code:#010x} to the guest, faulting address {}\n{}",
+                self.addr_note(address),
+                self.fault_report(
+                    &format!("guest exception {code:#010x} (address {address:#x})"),
+                    None,
+                    steps,
+                    recent,
+                ),
+            );
+        }
+
         // For #BP the reported/CONTEXT Rip is fault+1: advance the live rip so
         // write_context captures it (address already computed as rip+1 above).
         if let ExcSource::Interrupt(3) = src {
@@ -1066,15 +1085,36 @@ impl Process {
     /// pointer, the bytes there (if fetchable), and the register file. This
     /// turns an opaque "unmapped memory access" into an actionable location.
     fn fault(&self, err: EmuError, steps: u64, recent: &[u64]) -> EmuError {
+        let report = self.fault_report(&err.to_string(), Some(&err), steps, recent);
+        // Keep the structured `err` as the cause so callers can still classify
+        // the fault (e.g. decode-miss telemetry, roadmap P0.5) — the report is
+        // only the human-facing rendering.
+        EmuError::Fault { report, cause: Box::new(err) }
+    }
+
+    /// Render `addr` as `0x… (module+0xrva)` when it lands in a loaded guest
+    /// image. A raw address is unactionable; `shell32.dll+0x39600` can be fed
+    /// straight to a disassembler over the pinned binary.
+    fn addr_note(&self, addr: u64) -> String {
+        match self.os.module_at(addr) {
+            Some((name, rva)) => format!("{addr:#x} ({name}+{rva:#x})"),
+            None => format!("{addr:#x}"),
+        }
+    }
+
+    /// The body of [`Self::fault`], reusable for a fault that is *not* fatal —
+    /// notably an access violation that the W3.3 bridge is about to hand to the
+    /// guest, where the emulator would otherwise print nothing at all.
+    fn fault_report(&self, headline: &str, err: Option<&EmuError>, steps: u64, recent: &[u64]) -> String {
         use std::fmt::Write;
         let s = self.cpu.state();
         let mut o = String::new();
-        let _ = writeln!(o, "{err}");
+        let _ = writeln!(o, "{headline}");
 
         // If the fault touched an import thunk, the guest is treating an
         // imported *function* slot as data — the tell-tale of a data export
         // (very common in the MSVCRT C runtime, e.g. _fmode/_commode).
-        if let EmuError::Unmapped { addr, .. } = &err {
+        if let Some(EmuError::Unmapped { addr, .. }) = &err {
             let (lo, hi) = self.os.thunk_range();
             if *addr >= lo && *addr < hi {
                 let sym = self.os.symbol_for_thunk(*addr).unwrap_or_else(|| "<unknown import>".into());
@@ -1097,6 +1137,7 @@ impl Process {
             s.reg(exemu_core::Reg::Rbp),
             s.rflags
         );
+        let _ = writeln!(o, "  rip is {}", self.addr_note(s.rip));
         for row in s.gpr.chunks(4).enumerate() {
             let (r, regs) = row;
             let _ = write!(o, "  ");
@@ -1124,6 +1165,12 @@ impl Process {
             for r in recent {
                 let _ = write!(o, " {r:#x}");
             }
+            // The same trail, module-attributed: the raw addresses show *how*
+            // the guest got here, the names show *whose* code it is.
+            let _ = write!(o, "\n  recent rip trail (named):");
+            for r in recent {
+                let _ = write!(o, " {}", self.os.describe_addr(*r));
+            }
         }
         // Call stack via the x64 unwind tables (roadmap P4.2) — turns the
         // faulting rip into the chain of callers that led there.
@@ -1137,16 +1184,21 @@ impl Process {
                 24,
             );
             if !frames.is_empty() {
-                let _ = write!(o, "\n  call stack (virtual unwind, innermost first): {:#x}", s.rip);
+                let _ = write!(o, "\n  call stack (virtual unwind, innermost first): {}", self.addr_note(s.rip));
                 for f in &frames {
-                    let _ = write!(o, " ← {f:#x}");
+                    let _ = write!(o, " ← {}", self.addr_note(*f));
                 }
             }
         }
-        // Keep the structured `err` as the cause so callers can still classify
-        // the fault (e.g. decode-miss telemetry, roadmap P0.5) — the report is
-        // only the human-facing rendering.
-        EmuError::Fault { report: o, cause: Box::new(err) }
+        let modules = self.os.loaded_modules();
+        if !modules.is_empty() {
+            let _ = write!(o, "\n  loaded modules:");
+            for (name, base, size) in &modules {
+                let _ = write!(o, " {name}@{base:#x}+{size:#x}");
+            }
+        }
+        o.push('\n');
+        o
     }
 }
 

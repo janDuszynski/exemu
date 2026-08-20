@@ -91,6 +91,22 @@ struct Module {
     attached: bool,
 }
 
+/// A PE image mapped into the address space by the **guest's own** loader, via
+/// `NtCreateSection(SEC_IMAGE)` + `NtMapViewOfSection`.
+///
+/// On the Wine boot only `ntdll.dll` is mapped by exemu's loader (it has to
+/// be — it is what runs the guest loader); every other DLL, Wine's and the
+/// app's alike, arrives through the section syscalls instead and so never
+/// enters [`Loader::modules`]. Recording the views here is what lets a fault
+/// report name `shell32.dll+0xb8278` instead of printing a bare address that
+/// belongs to no module exemu knows about.
+struct ImageView {
+    base: u64,
+    size: u64,
+    /// The module's own name from its export directory, when it has one.
+    name: Option<String>,
+}
+
 #[derive(Default)]
 pub(crate) struct Loader {
     /// Bump pointer into the DLL arena (0 until first use → cfg.dll_base).
@@ -102,6 +118,9 @@ pub(crate) struct Loader {
     /// Real loaded modules (main image first), in load order. The authoritative
     /// module table backing the `PEB.Ldr` lists and ref counting.
     modules: Vec<Module>,
+    /// Image views the *guest* loader mapped through the section syscalls, for
+    /// address→module attribution only (see [`ImageView`]).
+    image_views: Vec<ImageView>,
     /// Synthetic handle → emulated system DLL name.
     system: HashMap<u64, String>,
     /// Next synthetic handle for an emulated system DLL.
@@ -642,6 +661,62 @@ impl WinOs {
         // Only a real mapped image has an export table recorded; a synthetic
         // emulated-DLL handle does not (it lives in `system`, not `exports`).
         self.dll.exports.contains_key(&base).then_some(base)
+    }
+
+    /// Record an image view the guest loader just mapped (see [`ImageView`]).
+    pub(crate) fn record_image_view(&mut self, base: u64, size: u64, name: Option<String>) {
+        self.dll.image_views.retain(|v| v.base != base);
+        self.dll.image_views.push(ImageView { base, size, name });
+    }
+
+    /// Drop the record for the image view based at `base` (it was unmapped).
+    pub(crate) fn forget_image_view(&mut self, base: u64) {
+        self.dll.image_views.retain(|v| v.base != base);
+    }
+
+    /// The loaded guest module containing `addr`, as `(name, RVA within it)`, or
+    /// `None` when the address is outside every mapped image (stack, heap, thunk
+    /// arena, or plain garbage).
+    ///
+    /// This is what turns a raw address in a fault report into something a human
+    /// can disassemble: an rip of `0x4000db8278` means nothing on its own,
+    /// `shell32.dll+0xb8278` names a function in the pinned binary. Both loaders
+    /// are consulted — exemu's own [`Loader::modules`] and the image views the
+    /// guest loader mapped through the section syscalls — because on the Wine
+    /// boot almost every module arrives via the latter.
+    pub fn module_at(&self, addr: u64) -> Option<(&str, u64)> {
+        if let Some(m) = self.dll.modules.iter().find(|m| addr >= m.base && addr < m.base + m.size) {
+            return Some((m.name.as_str(), addr - m.base));
+        }
+        let v = self.dll.image_views.iter().find(|v| addr >= v.base && addr < v.base + v.size)?;
+        Some((v.name.as_deref().unwrap_or("<unnamed image>"), addr - v.base))
+    }
+
+    /// Every mapped guest image as `(name, base, size)`, sorted by base — both
+    /// the ones exemu's own loader mapped and the ones the guest loader mapped
+    /// through the section syscalls. The "loaded modules" block of a crash
+    /// report: it is what makes an unattributed address explicable.
+    pub fn loaded_modules(&self) -> Vec<(String, u64, u64)> {
+        let mut v: Vec<(String, u64, u64)> = self
+            .dll
+            .modules
+            .iter()
+            .map(|m| (m.name.clone(), m.base, m.size))
+            .chain(self.dll.image_views.iter().map(|i| {
+                (i.name.clone().unwrap_or_else(|| "<unnamed image>".into()), i.base, i.size)
+            }))
+            .collect();
+        v.sort_by_key(|(_, base, _)| *base);
+        v
+    }
+
+    /// Render `addr` as `"<module>+0x<rva>"` when it lands inside a loaded guest
+    /// image, else `"?"`. The human-facing form of [`Self::module_at`].
+    pub fn describe_addr(&self, addr: u64) -> String {
+        match self.module_at(addr) {
+            Some((name, rva)) => format!("{name}+{rva:#x}"),
+            None => "?".to_string(),
+        }
     }
 
     /// The absolute virtual address of `symbol` in the loaded `ntdll` image,
