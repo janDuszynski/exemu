@@ -260,6 +260,7 @@ version = "0.0.4"
 dependencies = [
  "exemu-core",
  "exemu-cpu",
+ "exemu-jit",
  "exemu-loader",
  "exemu-memory",
  "font8x8",

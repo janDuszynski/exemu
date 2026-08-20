@@ -317,10 +317,18 @@ impl WinOs {
     /// thread, yield so a CPU-bound thread can't starve the others. `cpu` holds
     /// the mid-code state to save. Returns whether a switch happened.
     pub(crate) fn preempt(&mut self, cpu: &mut CpuState) -> bool {
+        self.preempt_by(cpu, 1)
+    }
+
+    /// [`Self::preempt`] for `n` instructions at once — what the block JIT
+    /// reports after running a whole block natively (roadmap W8.3). Identical
+    /// accounting; only the granularity of the check differs, since the state
+    /// can only be saved at a block boundary rather than at any instruction.
+    pub(crate) fn preempt_by(&mut self, cpu: &mut CpuState, n: u64) -> bool {
         if self.threads.len() < 2 {
             return false;
         }
-        self.sched_ticks += 1;
+        self.sched_ticks += n;
         if self.sched_ticks < TIMESLICE {
             return false;
         }

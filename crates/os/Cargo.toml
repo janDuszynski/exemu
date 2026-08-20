@@ -18,6 +18,10 @@ exemu-loader = { workspace = true }
 font8x8 = "0.3"
 
 [dev-dependencies]
+# Dev-only: the scheduler's timeslice test has a JIT variant, because a compiled
+# block bypasses the per-instruction `intercept` that drives preemption
+# (roadmap W8.3). Nothing in the shipping library depends on the JIT.
+exemu-jit = { workspace = true }
 exemu-cpu = { workspace = true }
 exemu-memory = { workspace = true }
 exemu-loader = { workspace = true }

@@ -47,6 +47,27 @@ pub trait Hooks {
         let _ = index;
         Ok(Exit::Interrupt(0x80))
     }
+
+    /// Account for `n` guest instructions that ran **without** passing through
+    /// [`Hooks::intercept`] — which is what a compiled JIT block does (roadmap
+    /// W8.3): it executes a whole basic block natively and reports the count
+    /// afterwards.
+    ///
+    /// It exists because `intercept` is not only the thunk seam: the OS layer
+    /// also uses "called once per instruction" as its **timeslice clock**, and a
+    /// JIT that skipped it would let a compute-bound guest thread run
+    /// indefinitely without yielding — the JIT would change *scheduling*, not
+    /// just speed. Callers that run instructions outside the interpreter must
+    /// call this with the number they ran; the accounting is then identical,
+    /// only its granularity is a block instead of an instruction.
+    ///
+    /// Returns `Some(exit)` when the OS layer took an action the caller must
+    /// propagate (a thread switch reports [`Exit::Continue`]). Default: no-op,
+    /// which is correct for any hook with no notion of time.
+    fn retire(&mut self, n: u64, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Option<Exit>> {
+        let _ = (n, cpu, mem);
+        Ok(None)
+    }
 }
 
 /// A no-op hook, handy for tests that run raw machine code with no OS.

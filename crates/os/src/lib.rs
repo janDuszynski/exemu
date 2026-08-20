@@ -1238,6 +1238,17 @@ fn default_environment() -> Vec<(String, String)> {
 }
 
 impl Hooks for WinOs {
+    /// Timeslice accounting for instructions that ran outside the interpreter
+    /// (a JIT block — roadmap W8.3). Without it a compiled hot loop would never
+    /// reach the preemption check that [`Self::intercept`] performs per
+    /// instruction, and a compute-bound guest thread would starve the others.
+    fn retire(&mut self, n: u64, cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<Option<Exit>> {
+        if self.preempt_by(cpu, n) {
+            return Ok(Some(Exit::Continue));
+        }
+        Ok(None)
+    }
+
     fn intercept(&mut self, rip: u64, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Option<Exit>> {
         // Timeslice preemption (roadmap P3.4): with more than one thread, force
         // a yield every `TIMESLICE` instructions so a CPU-bound thread can't

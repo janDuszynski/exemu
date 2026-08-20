@@ -1023,6 +1023,17 @@ impl Process {
                 if insns != 0 {
                     self.clock.retire(insns as u64);
                     steps += insns as u64;
+                    // The OS layer counts instructions to drive timeslice
+                    // preemption, and a compiled block bypasses the per-
+                    // instruction `intercept` that does the counting — so tell
+                    // it how many ran. Without this the JIT would change guest
+                    // *scheduling*, not just speed.
+                    exemu_core::Hooks::retire(
+                        &mut self.os,
+                        insns as u64,
+                        self.cpu.state_mut(),
+                        &mut self.mem,
+                    )?;
                     if refresh_kuser && steps >= next_kuser_refresh {
                         refresh_kuser_time(&mut self.mem, &self.clock)?;
                         next_kuser_refresh =

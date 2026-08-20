@@ -255,3 +255,89 @@ fn spinning_main_is_preempted_so_worker_runs() {
     }
     assert_eq!(exit_code, Some(0x1234), "preemption never let the worker set the flag");
 }
+
+/// The same scenario driven by the **block JIT** (roadmap W8.3).
+///
+/// This is the regression that made `Hooks::retire` necessary. The spin loop is
+/// `cmp dword [FLAG], 0` + `je` — both instructions the JIT compiles — so with a
+/// JIT the loop runs entirely as native code and never reaches the
+/// per-instruction `intercept` that counts down the timeslice. Without the
+/// retire callback the main thread spins forever and the worker never runs: the
+/// JIT would have changed guest *scheduling*, not just speed.
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn a_jitted_spin_loop_is_still_preempted() {
+    use exemu_core::Hooks;
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("prog", REGION, 0x4000, Perm::RWX)).unwrap();
+    mem.map(Region::new("stack", STACK_BASE, 0x0020_0000, Perm::RW)).unwrap();
+
+    let mut os = WinOs::new(WinConfig {
+        is_64bit: false,
+        api_base: 0x7000_0000,
+        heap_base: 0x1000_0000,
+        heap_size: 0x0010_0000,
+        valloc_base: 0x3000_0000,
+        echo: false,
+        ..WinConfig::default()
+    });
+    let create = os.resolve_import("kernel32.dll", &exemu_core::ImportSymbol::Named("CreateThread".into()));
+    let exit_thunk = os.exit_thunk();
+    mem.write_u32(IAT_CREATE, create as u32).unwrap();
+
+    let mut main = Vec::new();
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0x68]); main.extend(le32(WORKER as u32));
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0x68]); main.extend(le32(0));
+    main.extend([0xFF, 0x15]); main.extend(le32(IAT_CREATE as u32));
+    main.extend([0x83, 0x3D]); main.extend(le32(FLAG as u32)); main.extend([0x00]);
+    main.extend([0x74, 0xF7]);
+    main.extend([0xA1]); main.extend(le32(FLAG as u32));
+    main.extend([0xC3]);
+    mem.write(MAIN, &main).unwrap();
+
+    let mut worker = Vec::new();
+    worker.extend([0xC7, 0x05]); worker.extend(le32(FLAG as u32)); worker.extend(le32(0x1234));
+    worker.extend([0xB8]); worker.extend(le32(0));
+    worker.extend([0xC2, 0x04, 0x00]);
+    mem.write(WORKER, &worker).unwrap();
+
+    let mut cpu = Interpreter::with_bits(Bits::B32);
+    mem.write_u32(STACK_TOP - 4, exit_thunk as u32).unwrap();
+    cpu.state_mut().set_rsp(STACK_TOP - 4);
+    cpu.state_mut().rip = MAIN;
+
+    let mut jit = exemu_jit::Jit::new(1 << 20).expect("JIT should be available here");
+    let mut exit_code = None;
+    let mut budget = 5_000_000i64;
+    while budget > 0 {
+        // The app's run loop in miniature: try a block, account for it, then
+        // fall back to the interpreter for anything the JIT declined.
+        match jit.run(cpu.state_mut(), &mut mem, exemu_jit::Mode::Protected) {
+            exemu_jit::Run::Executed { insns } if insns > 0 => {
+                budget -= insns as i64;
+                Hooks::retire(&mut os, insns as u64, cpu.state_mut(), &mut mem).unwrap();
+                continue;
+            }
+            _ => {}
+        }
+        budget -= 1;
+        match cpu.step(&mut mem, &mut os).unwrap() {
+            Exit::Continue => {}
+            Exit::ProcessExit(code) => {
+                exit_code = Some(code);
+                break;
+            }
+            other => panic!("unexpected exit: {other:?}"),
+        }
+    }
+    assert_eq!(
+        exit_code,
+        Some(0x1234),
+        "a JIT-compiled spin loop was never preempted, so the worker never ran"
+    );
+    assert!(jit.stats().insns_executed > 0, "the JIT executed nothing, so this proved nothing");
+}
