@@ -109,6 +109,17 @@ fn emulated_path_cannot_resolve_known_folders() {
 /// The assertions below now pin the *fixed* behaviour — exact paths, zero exit —
 /// so either gap reopening (a registry/token regression, or the profile tree
 /// silently no longer being materialised) fails this test loudly.
+///
+/// **The same defect was hit again, independently, from the audio side (roadmap
+/// W7.2)** — worth recording because it shows how wide the blast radius was.
+/// ntdll's own `RtlFormatCurrentUserKeyPath` asks for `TokenUser` on the same
+/// `(HANDLE)-6`, so `RtlOpenCurrentUser` failed and *its* caller proceeded with
+/// an **uninitialised** root handle. The whole of `HKEY_CURRENT_USER` was
+/// therefore unreachable from guest code — including the `Shell Folders` values
+/// exemu had carefully seeded. Wine's `mmdevapi` registers each audio endpoint's
+/// GUID under HKCU, so every `IMMDevice::Activate` failed with
+/// `AUDCLNT_E_DEVICE_INVALIDATED`. One rejected handle constant, two unrelated
+/// subsystems broken, both silently.
 #[test]
 fn shell_sample_resolves_known_folders_on_wine() {
     if !Path::new(WINE_DLLS).join("shell32.dll").exists() {
@@ -165,7 +176,30 @@ fn shell_sample_resolves_known_folders_on_wine() {
     // exports that tail-jump into kernelbase).
     assert!(stdout.contains("ROOT=C:\\"), "shlwapi!PathBuildRootW did not run; stdout:\n{stdout}");
 
-    // Both gaps closed: every folder resolved (HRESULT S_OK), so the sample's
-    // failure-counting exit code is zero.
-    assert_eq!(run.exit_code, 0, "expected every folder to resolve; stdout:\n{stdout}");
+    // The paths are exemu's own profile, user component and all — Wine read them
+    // out of the `Shell Folders` values exemu seeds under HKCU, which it can only
+    // reach through a working `RtlOpenCurrentUser`.
+    assert!(
+        stdout.contains("APPDATA=C:\\Users\\exemu\\AppData\\Roaming"),
+        "the profile's user component should be present; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("PERSONAL=C:\\Users\\exemu\\Documents"),
+        "…for every folder, not just AppData; stdout:\n{stdout}"
+    );
+
+    // Every call succeeded: the directory Wine names is now the directory exemu
+    // materialises, so no folder is reported absent. The exit code is the
+    // sample's own failure count.
+    //
+    // This count is a function of **which folders exist**, so it is only
+    // meaningful against a known-empty sandbox — hence `private_sandbox` above.
+    // Sharing `$TMPDIR/exemu-sandbox` made it read whatever a previous run left
+    // behind: a leftover 7-Zip corpus install contains
+    // `C:\ProgramData\Microsoft\Windows\Start Menu\Programs`, which alone makes
+    // COMMONPROGRAMS succeed and cost one engineer a false failure here.
+    assert_eq!(
+        run.exit_code, 0,
+        "every SHGetFolderPathW should now succeed; stdout:\n{stdout}"
+    );
 }

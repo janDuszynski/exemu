@@ -228,6 +228,24 @@ impl WinOs {
         }
     }
 
+    /// Signal an event object by handle, from a native handler that is **not**
+    /// an `Nt*`/Win32 entry point. Returns whether the handle named an event.
+    ///
+    /// Roadmap W7.2 needs this: `mmdevapi!main_loop_start` creates an event,
+    /// starts the driver's loop thread, and then blocks in
+    /// `WaitForSingleObject(event, INFINITE)` until the *driver* signals it. A
+    /// unix side that simply returns from its main loop without signalling
+    /// deadlocks the caller — so the audio unixlib signals it here.
+    pub(crate) fn signal_event_handle(&mut self, handle: u64) -> bool {
+        match self.kobjects.get_mut(&handle) {
+            Some(KObject::Event { signaled, .. } | KObject::Timer { signaled, .. }) => {
+                *signaled = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// SetEvent/ResetEvent/PulseEvent/ReleaseMutex/ReleaseSemaphore.
     pub(crate) fn signal_sync(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, op: SignalOp) -> Result<Outcome> {
         let handle = self.arg(cpu, mem, 0)?;

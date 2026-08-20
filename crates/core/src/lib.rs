@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod clock;
+pub mod audio;
 pub mod cpu;
 pub mod driver;
 pub mod error;
@@ -26,6 +27,7 @@ pub use clock::{
     GuestClock, QPC_FREQUENCY, TSC_TICKS_PER_100NS, VIRTUAL_EPOCH_FILETIME,
     VIRTUAL_INSTRUCTIONS_PER_SECOND,
 };
+pub use audio::{AudioFormat, AudioSink, NoAudio};
 pub use cpu::{Cpu, CpuState, Exit, Reg, X87, flags};
 pub use driver::{
     DisplayMode, InputEvent, MouseButton, NoDriver, TextBitmap, UserDriver, WindowParams,

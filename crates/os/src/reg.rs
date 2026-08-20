@@ -226,6 +226,7 @@ impl WinOs {
         self.reg_seed_classes();
         self.reg_seed_shell_folders();
         self.reg_seed_shell_classes();
+        self.reg_seed_audio_driver();
     }
 
     /// Seed `…\Explorer\Shell Folders` and `User Shell Folders` from the
@@ -332,6 +333,39 @@ impl WinOs {
         self.reg_value_set(&user, "ProfileImagePath", sz("C:\\Users\\exemu"));
         self.reg_value_set(&user, "Sid", (REG_BINARY, crate::token::user_sid()));
         self.reg_value_set(&user, "Flags", dword(0));
+    }
+
+    /// Seed the audio-driver selection Wine's `mmdevapi` reads (roadmap W7.2).
+    ///
+    /// `mmdevapi!init_driver` opens `HKEY_CURRENT_USER\Software\Wine\Drivers`
+    /// and takes the `Audio` value as a comma-separated list of driver names,
+    /// trying each as `wine<name>.drv` and keeping the one that reports the
+    /// highest priority. Its own fallback list — a literal in the pinned binary
+    /// — is `"pulse,alsa,oss,coreaudio"`, so exemu could in principle be found
+    /// without this seed; naming `coreaudio` outright means mmdevapi does not
+    /// first `LoadLibraryW` three Linux drivers whose PE stubs exemu cannot pair
+    /// a unix side with, and the trace stays honest about which driver won.
+    ///
+    /// The key is written under `HKCU`, which is where both the Win32 seam and
+    /// the NT path `\Registry\User\<sid>\Software\…` land (see
+    /// [`map_nt_registry_root`]) — a guest reaching it either way sees the same
+    /// value.
+    /// It also registers `CLSID_MMDeviceEnumerator` against `mmdevapi.dll`, the
+    /// in-proc server that actually implements it — that registration is what
+    /// turns a program's `CoCreateInstance(CLSID_MMDeviceEnumerator, …)` into
+    /// "load Wine's mmdevapi and call its `DllGetClassObject`", exactly as a real
+    /// prefix does. Without it COM answers `REGDB_E_CLASSNOTREG` and the audio
+    /// stack is never reached at all.
+    fn reg_seed_audio_driver(&mut self) {
+        let key = self.reg_key_create(&format!("HKCU\\{}", crate::audio::DRIVER_KEY));
+        self.reg_value_set(&key, crate::audio::DRIVER_VALUE, sz(crate::audio::DRIVER_NAME));
+
+        let root = Self::CLASSES_ROOT;
+        let clsid = self.reg_key_create(&format!("{root}\\CLSID\\{}", crate::audio::CLSID_MM_DEVICE_ENUMERATOR));
+        self.reg_value_set(&clsid, "", sz("MMDeviceEnumerator"));
+        let inproc = self.reg_key_create(&format!("{clsid}\\InprocServer32"));
+        self.reg_value_set(&inproc, "", sz("mmdevapi.dll"));
+        self.reg_value_set(&inproc, "ThreadingModel", sz("Both"));
     }
 
     /// Seed the `HKEY_CLASSES_ROOT` subtree (roadmap W6.4).

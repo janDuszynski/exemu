@@ -9,7 +9,7 @@
 
 **This file covers exemu's cargo dependencies only.** Wine's PE builtin DLLs are LGPL-2.1-or-later and are *not* cargo dependencies — they are loaded at runtime as separate guest image files. Their obligations are separate and are tracked in [`docs/COMPLIANCE.md`](docs/COMPLIANCE.md), which must be satisfied as well before shipping anything that bundles them.
 
-## Contents (33 crates)
+## Contents (35 crates)
 
 - `adler2` 2.0.1 — 0BSD OR MIT OR Apache-2.0
 - `bitflags` 1.3.2 — MIT OR Apache-2.0
@@ -28,7 +28,9 @@
 - `miniz_oxide` 0.8.9 — MIT OR Zlib OR Apache-2.0
 - `objc2` 0.6.4 — MIT
 - `objc2-app-kit` 0.3.2 — Zlib OR Apache-2.0 OR MIT
+- `objc2-audio-toolbox` 0.3.2 — Zlib OR Apache-2.0 OR MIT
 - `objc2-cloud-kit` 0.3.2 — Zlib OR Apache-2.0 OR MIT
+- `objc2-core-audio-types` 0.3.2 — Zlib OR Apache-2.0 OR MIT
 - `objc2-core-data` 0.3.2 — Zlib OR Apache-2.0 OR MIT
 - `objc2-core-foundation` 0.3.2 — Zlib OR Apache-2.0 OR MIT
 - `objc2-core-graphics` 0.3.2 — Zlib OR Apache-2.0 OR MIT
@@ -3059,7 +3061,27 @@ Source: https://github.com/madsmtm/objc2
 
 ---
 
+## `objc2-audio-toolbox` 0.3.2
+
+SPDX: `Zlib OR Apache-2.0 OR MIT`
+
+Source: https://github.com/madsmtm/objc2
+
+> **No licence text is vendored in this crate's source.** The SPDX expression above is its declared licence; the canonical text must be obtained from the licence itself or from the crate's repository before distributing.
+
+---
+
 ## `objc2-cloud-kit` 0.3.2
+
+SPDX: `Zlib OR Apache-2.0 OR MIT`
+
+Source: https://github.com/madsmtm/objc2
+
+> **No licence text is vendored in this crate's source.** The SPDX expression above is its declared licence; the canonical text must be obtained from the licence itself or from the crate's repository before distributing.
+
+---
+
+## `objc2-core-audio-types` 0.3.2
 
 SPDX: `Zlib OR Apache-2.0 OR MIT`
 
@@ -3748,7 +3770,9 @@ Listed so the gap is visible rather than silently absent. Each declares a licenc
 - dispatch2 0.3.1
 - objc2 0.6.4
 - objc2-app-kit 0.3.2
+- objc2-audio-toolbox 0.3.2
 - objc2-cloud-kit 0.3.2
+- objc2-core-audio-types 0.3.2
 - objc2-core-data 0.3.2
 - objc2-core-foundation 0.3.2
 - objc2-core-graphics 0.3.2

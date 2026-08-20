@@ -92,6 +92,22 @@ pub const TOKEN_PSEUDO_HANDLE: u64 = 0x0000_0000_0000_0100;
 // any of them interchangeably with a real opened handle; exemu's single-token,
 // no-impersonation model (see the module scope note) makes all four the same
 // object, so every one of them answers with exactly [`token_info`].
+//
+// **Accepting them is not cosmetic**, and two independent bring-ups proved it:
+//
+// * Wine's `shell32` asks for `TokenUser` on `(HANDLE)-6` with no preceding
+//   open, to learn the profile SID. Rejecting it made shell32 fall back from
+//   `HKEY_CURRENT_USER` to `HKEY_LOCAL_MACHINE`, so every known folder resolved
+//   with an empty user component (roadmap W6.6).
+// * ntdll's own `RtlFormatCurrentUserKeyPath` does the same, so
+//   `RtlOpenCurrentUser` failed and *its* caller proceeded with an
+//   uninitialised root handle — silently costing the guest the whole of
+//   `HKEY_CURRENT_USER`. Wine's `mmdevapi` registers each audio endpoint's GUID
+//   under HKCU, so every `IMMDevice::Activate` failed with
+//   `AUDCLNT_E_DEVICE_INVALIDATED` (roadmap W7.2).
+//
+// Both failures were silent and landed far from the cause — the same defect
+// class as a stub returning NULL.
 
 /// `NtCurrentProcessToken()` = `(HANDLE)-4`.
 pub const CURRENT_PROCESS_TOKEN: u64 = 0xFFFF_FFFF_FFFF_FFFC;

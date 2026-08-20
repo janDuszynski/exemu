@@ -67,6 +67,7 @@ orchestrates them.
 | `exemu-memory`   | Infrastructure | Region-based virtual memory with permissions               |
 | `exemu-cpu`      | Infrastructure | x86-64 decoder + interpreter                               |
 | `exemu-os`       | Infrastructure | PEB/TEB, import thunks, `kernel32` API implementations      |
+| `exemu-audio`    | Infrastructure | CoreAudio behind the `AudioSink` seam (macOS)              |
 | `exemu-app`      | Application    | Wire everything together and drive the fetch/exec loop     |
 | `exemu-cli`      | Presentation   | `exemu run <file.exe>` and friends                         |
 
@@ -97,13 +98,14 @@ Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
 
 ```
 exemu run <file.exe> [--trace] [--no-echo] [--gui] [--wine-boot <dir>]
-                     [--virtual-clock] [--max-steps N] [--load-base <hex>]
+                     [--virtual-clock] [--audio] [--max-steps N] [--load-base <hex>]
                      [--telemetry <path>] [-- <args>...]
 exemu info <file.exe>
 exemu opcodes [--telemetry <path>] [--clear]
 exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]
 exemu sample <out.exe>
 exemu gui-sample <out.exe>
+exemu audio-sample <out.exe>
 exemu cocoa-demo [--size WxH] [--hold SECS]
 ```
 
@@ -116,7 +118,10 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   ([below](#running-on-wines-pe-personality---wine-boot)); `--virtual-clock`
   (also `EXEMU_VIRTUAL_CLOCK=1`) replaces the host clock with a
   [deterministic one](#deterministic-guest-clock) driven by the instruction
-  counter, so a run replays with the exact same instruction count.
+  counter, so a run replays with the exact same instruction count; `--audio`
+  sends what the guest plays to the real CoreAudio device instead of dropping
+  it (it only does anything under `--wine-boot`, since the audio stack is
+  Wine's mmdevapi).
   If a run stops on an instruction the decoder doesn't implement, the opcode
   is appended to a telemetry log (`--telemetry <path>`, else the
   `EXEMU_TELEMETRY` env var, else `$TMPDIR/exemu-telemetry.log`).
@@ -135,7 +140,9 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   on any drift; `--update` re-blesses the manifest so refreshing a pin is a
   deliberate, reviewable diff. See [Corpus regression gate](#corpus-regression-gate).
 * `sample` writes the built-in Hello-World PE to disk; `gui-sample` writes a
-  small real-window PE (run it with `--gui`).
+  small real-window PE (run it with `--gui`); `audio-sample` writes a WASAPI PE
+  that plays a 100 ms tone through Wine's mmdevapi (run it with `--wine-boot`
+  and `--audio`).
 * `cocoa-demo` opens a live macOS **NSWindow** whose contents are a `CAMetalLayer`
   and blits a BGRA test frame through the same Metal path the Wine GUI will use —
   the from-scratch display presenter (macOS only). `--size WxH` sets the window
@@ -386,6 +393,7 @@ builtins and exemu boots *those* instead:
 ```sh
 exemu run --wine-boot /path/to/wine/x86_64-windows hello.exe
 exemu run --wine-boot /path/to/wine/x86_64-windows --gui app.exe   # native window
+exemu run --wine-boot /path/to/wine/x86_64-windows --audio app.exe # real sound
 ```
 
 The division of labour is the point. Wine's `ntdll`, `kernelbase`, `kernel32`,
@@ -420,10 +428,11 @@ What is verified today:
 | **comctl32 / uxtheme / comdlg32** | **arrive as guest code** — a sample that statically imports `comctl32!InitCommonControlsEx` runs to completion on the Wine boot, and Wine's own comctl32 registers `msctls_progress32` as a real window class. exemu implements no progress bar. user32's **built-in control classes** (`BUTTON`/`EDIT`/`STATIC`/…) are registered too: win32k recovers their WndProcs by following the `jmp qword [rip+disp32]` thunks in the client-PFN arrays user32 publishes at boot, so `CreateWindowExW(L"BUTTON", …)` reaches `NtUserCreateWindowEx`. One measured gap is pinned as a test: child windows do not paint yet |
 | **COM** (`ole32` / `combase` / `oleaut32`) | **works** — `CoCreateInstance` genuinely succeeds: the CLSID resolves through exemu's registry to an `InprocServer32`, the in-proc server loads, and the guest calls a method through the returned vtable. No native COM in exemu; the emulated path is the control that proves it |
 | **CAB extraction** (`cabinet`) | **works** — a guest extracts a real `.cab` through Wine's `FDICreate`/`FDICopy`, driven entirely by the guest's own FDI callbacks, and the bytes come back identical. exemu contributes a cabinet *writer* and no decoder, retiring the planned clean-room FDI |
-| **shell32 / shlwapi** | **works** — known folders (`SHGetFolderPathW`/`SHGetKnownFolderPath`) resolve through Wine's own shell32 to the correct, fully-qualified profile paths (e.g. `C:\Users\exemu\AppData\Roaming`) and every requested folder succeeds. exemu implements no shell32 |
+| **shell32 / shlwapi** | **works** — known folders (`SHGetFolderPathW`/`SHGetKnownFolderPath`) resolve through Wine's own shell32 to the correct, fully-qualified profile paths (`C:\Users\exemu\AppData\Roaming`, …), user component and all, and every requested folder succeeds. exemu implements no shell32. The long-standing gap turned out not to be a shell32 one at all: `NtQueryInformationToken` rejected the constant `(HANDLE)-6` pseudo-handle that both shell32 and ntdll's own `RtlOpenCurrentUser` use, which made the whole of `HKEY_CURRENT_USER` silently unreachable from guest code |
 | **IShellLink** (via COM) | **partly** — `CoCreateInstance(CLSID_ShellLink)` resolves through exemu's registry to shell32's own `IShellLinkW`, and a real vtable call (`GetPath`) returns exactly the documented `S_FALSE` for an unset link. `SetPath` crashes on a separate, unrelated NULL-pointer gap elsewhere in the Win32 surface (isolated, not yet fixed) — so writing an actual `.lnk` file does not work yet |
 | **TCP/UDP sockets** (`ws2_32`) | **works** — a guest exchanges bytes with a real host socket through Wine's `ws2_32`. A `SOCKET` is an NT file handle on `\Device\Afd`; every operation is one `NtDeviceIoControlFile`, serviced by exemu over real BSD sockets. Blocking is real: a receive against a silent peer waits and then delivers the actual bytes, never a premature zero-byte close. `AF_INET`/`AF_INET6` × `SOCK_STREAM`/`SOCK_DGRAM` only; name resolution (`getaddrinfo`) is still a stub |
-| MSI / multimedia | **not yet** — `msi`/`setupapi` load and bind cleanly (their whole 33-module dependency closure is present), but nothing drives them end to end yet |
+| **Audio render** (`mmdevapi` / WASAPI) | **works** — a guest plays a buffer through Wine's own `mmdevapi.dll`: `CoCreateInstance(CLSID_MMDeviceEnumerator)` → `IMMDevice` → `IAudioClient` → `IAudioRenderClient`, and the PCM it writes arrives at the host backend byte for byte. Wine's `*.drv` audio drivers ship no usable PE half (the pinned `winealsa.drv` and `winepulse.drv` are byte-identical, export-less stubs), so exemu generates **its own** `winecoreaudio.drv` and answers the 37-entry driver unixlib mmdevapi asks it for. Scope is one render endpoint, shared mode, 48 kHz stereo float; capture, exclusive mode, MIDI and the property store are refused with a real HRESULT |
+| MSI | **not yet** — `msi`/`setupapi` load and bind cleanly (their whole 33-module dependency closure is present), but nothing drives them end to end yet |
 
 **exemu does not ship Wine's DLLs.** You point `--wine-boot` at a set you already
 have. They are loaded as separate guest image files and are never linked or

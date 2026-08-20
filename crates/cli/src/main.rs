@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use std::path::PathBuf;
 
-use exemu_app::{gui_sample, sample, Process, RunConfig};
+use exemu_app::{audio_sample, gui_sample, sample, Process, RunConfig};
 use exemu_cli::corpus;
 use exemu_core::{rank_opcode_misses, EmuError, ImportSymbol, MissRecord};
 
@@ -40,6 +40,7 @@ fn run(args: Vec<String>) -> Result<u8, String> {
         Some("corpus") => corpus::cmd_corpus(it.as_slice()),
         Some("sample") => cmd_sample(it.as_slice()),
         Some("gui-sample") => cmd_gui_sample(it.as_slice()),
+        Some("audio-sample") => cmd_audio_sample(it.as_slice()),
         Some("cocoa-demo") => cmd_cocoa_demo(it.as_slice()),
         Some("-h") | Some("--help") | Some("help") | None => {
             print_help();
@@ -64,6 +65,7 @@ USAGE:\n\
     exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]\n\
     exemu sample <out.exe>\n\
     exemu gui-sample <out.exe>\n\
+    exemu audio-sample <out.exe>\n\
     exemu cocoa-demo [--size WxH] [--hold SECS]\n\
 \n\
 COMMANDS:\n\
@@ -73,6 +75,9 @@ COMMANDS:\n\
     corpus     Run the pinned corpus binaries and diff against the manifest\n\
     sample     Generate a console demo .exe (Hello World via kernel32)\n\
     gui-sample Generate a GUI demo .exe (a real window; run with --gui)\n\
+    audio-sample\n\
+               Generate a WASAPI demo .exe that plays a short tone\n\
+               (run with --wine-boot and --audio)\n\
     cocoa-demo Open a live macOS NSWindow/Metal window showing a test frame\n\
                through the W4.4 CocoaPresenter blit path (macOS only)\n\
 \n\
@@ -99,6 +104,9 @@ RUN OPTIONS:\n\
                     at 10M instructions/second from a fixed 2026-01-01 epoch, so\n\
                     a run executes the SAME instruction count every time. Also\n\
                     settable with EXEMU_VIRTUAL_CLOCK=1 (roadmap W9.6)\n\
+    --audio         Send what the guest plays to the real CoreAudio device.\n\
+                    Needs --wine-boot: audio arrives through Wine's mmdevapi.\n\
+                    Without it audio is accepted and dropped (roadmap W7.2)\n\
     --max-steps N   Instruction budget (0 = unlimited; default 2e9)\n\
     --load-base H   Map the image at hex address H instead of its preferred\n\
                     ImageBase and apply its base relocations (needs a .reloc)\n\
@@ -127,6 +135,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut load_base: Option<u64> = None;
     let mut wine_boot: Option<String> = None;
     let mut virtual_clock = false;
+    let mut audio = false;
     let mut guest_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -136,6 +145,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             "--no-echo" => echo = false,
             "--gui" => gui = true,
             "--virtual-clock" => virtual_clock = true,
+            "--audio" => audio = true,
             "--max-steps" => {
                 i += 1;
                 let v = rest.get(i).ok_or("--max-steps needs a value (0 = unlimited)")?;
@@ -188,6 +198,13 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         cfg.max_steps = m;
     }
     cfg.wine_boot_dir = wine_boot;
+    // Roadmap W7.2. Opt-in, because the default (`NoAudio`, accept and drop) is
+    // what keeps a headless run and a machine with no audio device working. On
+    // the emulated path there is no audio stack to reach it, so this only ever
+    // does anything under --wine-boot.
+    if audio {
+        cfg.audio_sink = Some(Box::new(exemu_audio::CoreAudioSink::new()));
+    }
 
     // The guest filesystem lives here regardless of how the run ends.
     let sandbox = std::env::temp_dir().join("exemu-sandbox");
@@ -545,6 +562,23 @@ fn cmd_gui_sample(rest: &[String]) -> Result<u8, String> {
     println!(
         "wrote {} bytes to {path} — a real GUI window; try:  exemu run --gui {path}",
         bytes.len()
+    );
+    Ok(0)
+}
+
+/// `audio-sample <out.exe>` — the roadmap W7.2 proof binary: a console program
+/// that plays a short tone through the ordinary WASAPI chain. It needs a Wine
+/// boot (the whole audio stack is Wine's `mmdevapi` as guest code) and `--audio`
+/// to reach a real device.
+fn cmd_audio_sample(rest: &[String]) -> Result<u8, String> {
+    let path = rest.first().ok_or("audio-sample: missing <out.exe>")?;
+    let bytes = audio_sample::build();
+    std::fs::write(path, &bytes).map_err(|e| format!("cannot write {path}: {e}"))?;
+    println!(
+        "wrote {} bytes to {path} — plays {} frames through Wine's mmdevapi; try:\n  \
+         exemu run --wine-boot <wine-dll-dir> --audio {path}",
+        bytes.len(),
+        audio_sample::PATTERN_FRAMES
     );
     Ok(0)
 }
