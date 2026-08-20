@@ -25,6 +25,13 @@
 //!    structure exemu recovers user32's built-in control WndProcs from, pinned
 //!    directly against the pinned `ntdll.dll` (entry counts, thunk shape, and the
 //!    index-ordered slot layout the resolver walks).
+//! 6. [`comctl_children_paint_into_the_parent_surface_on_wine`] — **W4.8**: the
+//!    controls are *painted*, by their own code, into the top-level window's
+//!    surface.
+//! 7. [`comctl_painted_controls_match_golden_on_wine`] — that frame pinned
+//!    pixel-for-pixel.
+//! 8. [`messaging_a_comctl32_control_terminates_on_wine`] — `SendMessageW` to a
+//!    comctl32 control returns.
 //!
 //! **W6.2 closes the first two of the three measured W6 blockers.**
 //!
@@ -40,21 +47,30 @@
 //!   `ButtonWndProc`, comctl32's `ProgressWindowProc`) run their creation
 //!   handlers, so a control finally allocates its instance data.
 //!
-//! **Two things are deliberately *not* papered over**, and are asserted below so
-//! they stay visible rather than assumed:
+//! **W4.8 closes the third, and the child-window painting gap with it.**
 //!
-//! * **The Wine boot maps ntdll twice.** exemu pre-maps ntdll (the running
-//!   image, and the only copy whose `user_procs` user32 ever fills), and Wine's
-//!   own loader then maps a *second* copy for the name `NTDLL.dll` while
-//!   resolving forwarders. Because `user32!DefWindowProcW` is a forwarder to
-//!   `NTDLL.NtdllDefWindowProc_W` — literally `jmp qword [user_procs+0xa8]` —
-//!   every module bound after that second map (the exe, comctl32) reached
-//!   `DefWindowProc` through a NULL slot. win32k now mirrors the recovered
-//!   client-PFN procs into every mapped ntdll copy, which fixes `DefWindowProc`;
-//!   the duplicate load itself is a loader-level gap that remains.
-//! * Messaging a comctl32 control (`SendMessageW(hProgress, PBM_SETPOS, …)`)
-//!   does not terminate — the dispatch reaches comctl32's real WndProc, which
-//!   then spins on the unserviced `WineUnixCall` import thunk.
+//! * `SendMessageW(hProgress, PBM_SETRANGE/PBM_SETPOS, …)` now returns. The
+//!   recorded diagnosis — "it spins on an unserviced `WineUnixCall` import
+//!   thunk" — was **wrong, and falsifiable straight from the pinned binary**:
+//!   `comctl32.dll` imports no `__wine_unix_call` and no `NtQueryVirtualMemory`
+//!   at all, so it has no unix half to pair (that shape is real for `ws2_32`,
+//!   not here). The actual cause was the NULL `DefWindowProcW` forwarder slot,
+//!   fixed in W6.2.
+//! * Child windows paint. win32k gives a backing surface to the **top-level
+//!   ancestor only** and binds a child's DC to it with an origin offset and a
+//!   clip rect, which is what Wine's gdi32 expects — it applies no coordinate
+//!   transform client-side at all.
+//!
+//! **One thing is deliberately *not* papered over**, and stays recorded here:
+//! **the Wine boot maps ntdll twice.** exemu pre-maps ntdll (the running image,
+//! and the only copy whose `user_procs` user32 ever fills), and Wine's own loader
+//! then maps a *second* copy for the name `NTDLL.dll` while resolving
+//! forwarders. Because `user32!DefWindowProcW` is a forwarder to
+//! `NTDLL.NtdllDefWindowProc_W` — literally `jmp qword [user_procs+0xa8]` —
+//! every module bound after that second map (the exe, comctl32) reached
+//! `DefWindowProc` through a NULL slot. win32k mirrors the recovered client-PFN
+//! procs into every mapped ntdll copy, which fixes `DefWindowProc`; the
+//! duplicate load itself is a loader-level gap that remains.
 //!
 //! Everything here skip-guards on the git-ignored Wine DLL set.
 
@@ -606,6 +622,365 @@ fn wine_client_pfn_arrays_publish_the_builtin_wndprocs() {
         bases[0] - lo,
         bases[1] - lo
     );
+}
+
+// ==========================================================================
+// W4.8: the two W6-measured gaps, closed and pinned.
+// ==========================================================================
+
+/// A [`RunConfig`] whose message pump is **deterministic and headless**.
+///
+/// `NtUserGetMessage` only runs its real pump when an input channel is attached
+/// — without one it answers `WM_QUIT` at once and no `WM_PAINT` is ever
+/// synthesized. Attaching a channel whose sender is dropped immediately gives
+/// the pump exactly what a golden gate needs: it drains input (a disconnected
+/// host counts as "close", so a `WM_QUIT` is armed), synthesizes one `WM_PAINT`
+/// per window still owing one — parent first, then each child — and only then
+/// delivers the `WM_QUIT` that ends the loop. No threads, no timing, no AppKit.
+fn pumped_run_config(driver: Box<dyn exemu_core::UserDriver>) -> RunConfig {
+    let (tx, rx) = std::sync::mpsc::channel::<exemu_core::InputEvent>();
+    drop(tx);
+    RunConfig {
+        echo: false,
+        max_steps: 60_000_000,
+        wine_boot_dir: Some(WINE_DLLS.to_string()),
+        driver: Some(driver),
+        input: Some(rx),
+        ..RunConfig::default()
+    }
+}
+
+/// **W4.8 gate — Wine's own controls are PAINTED, not merely created.**
+///
+/// The W6.1 measurement recorded that child windows never paint: win32k gave a
+/// backing surface to *top-level* windows only, so a control had nowhere to put
+/// pixels and no `WM_PAINT` route. This test is the closed form of that gap.
+///
+/// With the pump running, each of the three windows is handed a `WM_PAINT`.
+/// The two children are Wine's own code — user32's `ButtonWndProc` and
+/// comctl32's `ProgressWindowProc` — and they paint through `BeginPaint` into a
+/// DC that win32k binds to **the top-level window's** surface with the child's
+/// origin and clip rect. The assertions read the presented frame back and look
+/// for ink inside each control's rect: exemu draws nothing there itself, so any
+/// non-background pixel in those rects came from Wine's control code.
+#[test]
+fn comctl_children_paint_into_the_parent_surface_on_wine() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} control DLLs not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let exe = comctl_sample::build();
+    let res = load_and_run(
+        &exe,
+        pumped_run_config(Box::new(RecordingDriver::with_inner(
+            Arc::clone(&log),
+            Box::new(FrameCapture { frames: Arc::clone(&frames) }),
+        ))),
+    )
+    .expect("the comctl sample runs its pump to completion on the Wine boot");
+    assert_eq!(res.exit_code, 0, "the guest exits cleanly through the message pump");
+    eprintln!("comctl_sample pumped: exit={} steps={}", res.exit_code, res.steps);
+
+    let calls = log.lock().unwrap();
+    let hwnd_of = |class: &str| -> u32 {
+        calls
+            .iter()
+            .find_map(|c| match c {
+                DriverCall::CreateWindow { hwnd, params } if params.class_name.eq_ignore_ascii_case(class) => {
+                    Some(*hwnd)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no window of class {class} reached the driver"))
+    };
+    let main_hwnd = hwnd_of("ExemuComctlClass");
+
+    // THE STRUCTURAL CLAIM: exactly one surface exists and it belongs to the
+    // top-level window. A child getting its own surface would show up here.
+    let surfaces: Vec<(u32, u32, u32)> = calls
+        .iter()
+        .filter_map(|c| match c {
+            DriverCall::CreateWindowSurface { hwnd, w, h } => Some((*hwnd, *w, *h)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        surfaces.len(),
+        1,
+        "one surface for the whole window tree — children render into their ancestor's, \
+         got {surfaces:?}"
+    );
+    assert_eq!(surfaces[0].0, main_hwnd, "the surface belongs to the top-level window");
+    assert_eq!(
+        (surfaces[0].1 as i32, surfaces[0].2 as i32),
+        (comctl_sample::WINDOW_CX, comctl_sample::WINDOW_CY),
+        "the one surface is the top-level client rect"
+    );
+    // Every presented frame is the parent's surface, children included.
+    assert!(
+        calls
+            .iter()
+            .filter(|c| matches!(c, DriverCall::FlushSurface { .. }))
+            .all(|c| matches!(c, DriverCall::FlushSurface { hwnd, .. } if *hwnd == main_hwnd)),
+        "a child presents its ancestor's composed surface, never one of its own"
+    );
+    drop(calls);
+
+    // THE PIXEL CLAIM: read the last presented frame and require ink inside each
+    // control's rect. The sample paints only its two text lines (y≈16 and y≈44)
+    // and one frame rectangle (12,84)-(500,180); both control rects sit *below*
+    // that frame, so nothing the sample itself draws can reach them.
+    let frames = frames.lock().unwrap();
+    let (pixels, w, h) = frames.last().expect("at least one frame was presented").clone();
+    assert_eq!(
+        (w as i32, h as i32),
+        (comctl_sample::WINDOW_CX, comctl_sample::WINDOW_CY),
+        "the presented frame is the top-level client rect"
+    );
+
+    for (label, rect) in [
+        ("BUTTON", comctl_sample::BUTTON_RECT),
+        ("msctls_progress32", comctl_sample::PROGRESS_RECT),
+    ] {
+        let ink = ink_in_rect(&pixels, w, h, rect);
+        assert!(
+            ink > 0,
+            "{label} at {rect:?} is blank — Wine's control code drew nothing into the \
+             parent surface (child windows are not painting)"
+        );
+        eprintln!("{label} rect {rect:?}: {ink} non-background pixels");
+    }
+
+    // The BUTTON drew its own **label**, not just its background. user32's
+    // `ButtonWndProc` reads the window text through `NtUserInternalGetWindowText`,
+    // measures it (`NtGdiGetTextExtentExW`) and draws it (`NtGdiExtTextOutW`) —
+    // so black pixels strictly inside the button's border are glyphs. A blank
+    // button would be a uniform fill with a frame and score zero here.
+    let b = comctl_sample::BUTTON_RECT;
+    let interior = [b[0] + 3, b[1] + 3, b[2] - 6, b[3] - 6];
+    let glyphs = pixels_matching(&pixels, w, h, interior, |px| px[0] < 0x40 && px[1] < 0x40 && px[2] < 0x40);
+    assert!(
+        glyphs > 20,
+        "the BUTTON's own label is missing — only {glyphs} dark pixels inside {interior:?}"
+    );
+    eprintln!("BUTTON label: {glyphs} glyph pixels inside {interior:?}");
+
+    // The progress bar shows the **position the guest set**. It was told
+    // `PBM_SETRANGE(0, 100)` then `PBM_SETPOS(60)`, so its filled part must cover
+    // clearly more than a third and clearly less than all of the bar — a control
+    // that ignored the message would be empty, and one that ignored the range
+    // would be full.
+    // Blue-dominant, whatever the exact shade: the bar's filled chunks are the
+    // only blue thing on a white/grey frame. (`px` is BGRA, so `px[0]` is blue.)
+    let p = comctl_sample::PROGRESS_RECT;
+    let filled = pixels_matching(&pixels, w, h, p, |px| {
+        px[0] as i32 > px[1] as i32 + 0x40 && px[0] as i32 > px[2] as i32 + 0x40
+    });
+    let total = (p[2] * p[3]) as f32;
+    let frac = filled as f32 / total;
+    assert!(
+        (0.35..0.85).contains(&frac),
+        "the progress bar is {:.0}% filled; it was set to {}% of its range",
+        frac * 100.0,
+        comctl_sample::PROGRESS_POS
+    );
+    eprintln!("progress bar: {filled} filled px ({:.0}% of the bar)", frac * 100.0);
+
+    // And nothing leaked outside: the strip between the two controls belongs to
+    // neither, so the clip rects held.
+    let gap = [
+        comctl_sample::BUTTON_RECT[0] + comctl_sample::BUTTON_RECT[2] + 2,
+        comctl_sample::BUTTON_RECT[1],
+        comctl_sample::PROGRESS_RECT[0] - comctl_sample::BUTTON_RECT[0] - comctl_sample::BUTTON_RECT[2] - 4,
+        comctl_sample::BUTTON_RECT[3],
+    ];
+    assert_eq!(
+        ink_in_rect(&pixels, w, h, gap),
+        0,
+        "a control painted outside its own rect at {gap:?} — the DC clip rect is not holding"
+    );
+}
+
+/// **W4.8 gate — a control's WndProc runs to completion.**
+///
+/// The other W6.1-measured gap: `SendMessageW` to a comctl32 control did not
+/// terminate. (The recorded diagnosis, "it spins on an unserviced
+/// `WineUnixCall` import thunk", is falsifiable straight from the pinned binary
+/// and is **false** — `comctl32.dll` imports no `__wine_unix_call` and no
+/// `NtQueryVirtualMemory` at all, so it has no unix half to pair; that shape is
+/// real for `ws2_32`, not here. The true cause was a null `DefWindowProcW`
+/// forwarder slot, fixed in W6.2.)
+///
+/// The sample now sends `PBM_SETRANGE` then `PBM_SETPOS` to the progress bar and
+/// keeps running afterwards. That it reaches `ExitProcess` at all is the proof:
+/// a spinning WndProc would burn the step budget instead. The step count is
+/// pinned with generous headroom so a regression that reintroduces an unbounded
+/// loop fails loudly rather than merely getting slower.
+#[test]
+fn messaging_a_comctl32_control_terminates_on_wine() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} control DLLs not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exe = comctl_sample::build();
+    let res = load_and_run(
+        &exe,
+        RunConfig {
+            echo: false,
+            max_steps: 40_000_000,
+            wine_boot_dir: Some(WINE_DLLS.to_string()),
+            driver: Some(Box::new(RecordingDriver::new(Arc::clone(&log)))),
+            ..RunConfig::default()
+        },
+    )
+    .expect("the sample reaches ExitProcess after messaging the progress bar");
+    assert_eq!(res.exit_code, 0, "the guest exits cleanly after SendMessageW to the control");
+    assert!(
+        res.steps < 30_000_000,
+        "messaging the control cost {} instructions — that is the spin, not a WndProc call",
+        res.steps
+    );
+    eprintln!("comctl_sample SendMessageW gate: exit=0 steps={}", res.steps);
+
+    // The messages went to a real comctl32 control, not a dropped handle.
+    let calls = log.lock().unwrap();
+    assert!(
+        calls.iter().any(|c| matches!(
+            c,
+            DriverCall::CreateWindow { params, .. } if params.class_name.eq_ignore_ascii_case("msctls_progress32")
+        )),
+        "the progress bar the messages target was created by comctl32"
+    );
+}
+
+/// **W4.8 golden gate — the painted controls, pinned pixel-for-pixel.**
+///
+/// The companion to [`comctl_children_paint_into_the_parent_surface_on_wine`]:
+/// that one proves *something* was drawn inside each control's rect, this one
+/// pins *what*, in the W4.10 style. The frame is rendered headlessly through the
+/// deterministic [`OffscreenPresenter`] (the built-in `font8x8` stub rather than
+/// CoreText, so the golden is platform-independent) and compared on decoded
+/// pixels. Every pixel inside the two control rects comes from Wine's own
+/// `ButtonWndProc` / `ProgressWindowProc`, so a drift here is a change in how
+/// exemu services their GDI calls.
+///
+/// Set `EXEMU_BLESS=1` to re-bless after an intended rendering change.
+#[test]
+fn comctl_painted_controls_match_golden_on_wine() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} control DLLs not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let shot_dir = std::env::temp_dir().join(format!(
+        "exemu-w48-golden-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&shot_dir);
+
+    let presenter = OffscreenPresenter::with_dir(Some(shot_dir.clone()));
+    let exe = comctl_sample::build();
+    let res = load_and_run(&exe, pumped_run_config(Box::new(PresenterDriver::new(presenter))))
+        .expect("the comctl sample paints its controls");
+    assert_eq!(res.exit_code, 0, "the guest exits cleanly through the paint path");
+
+    // The pump paints parent then each child, so the *last* frame is the one
+    // with every control on it.
+    let mut frames: Vec<_> = std::fs::read_dir(&shot_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("png"))
+        .collect();
+    frames.sort();
+    let rendered = frames.last().expect("the presenter wrote frames").clone();
+
+    let golden =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/goldens/comctl_painted_controls.png");
+
+    if std::env::var_os("EXEMU_BLESS").is_some() {
+        std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+        std::fs::copy(&rendered, &golden).unwrap();
+        eprintln!("BLESSED golden: {} (from {})", golden.display(), rendered.display());
+        let _ = std::fs::remove_dir_all(&shot_dir);
+        return;
+    }
+    assert!(
+        golden.exists(),
+        "no golden at {} — run once with EXEMU_BLESS=1 to create it",
+        golden.display()
+    );
+
+    let (rw, rh, rpix) = decode_png(&rendered);
+    let (gw, gh, gpix) = decode_png(&golden);
+    let _ = std::fs::remove_dir_all(&shot_dir);
+
+    assert_eq!((rw, rh), (gw, gh), "painted-frame dimensions match the golden");
+    if rpix != gpix {
+        let diff = rpix.iter().zip(&gpix).filter(|(a, b)| a != b).count();
+        let first = rpix.iter().zip(&gpix).position(|(a, b)| a != b).unwrap_or(0);
+        panic!(
+            "the painted controls drifted from the golden: {diff}/{} bytes differ \
+             (first at byte {first}); set EXEMU_BLESS=1 to re-bless after an intended change",
+            rpix.len()
+        );
+    }
+}
+
+/// A [`exemu_core::UserDriver`] that keeps every presented frame's pixels, so a
+/// gate can assert on what was actually drawn. `RecordingDriver` deliberately
+/// stores only a cheap `non_blank` count; this is its pixel-keeping companion,
+/// used as the inner driver.
+struct FrameCapture {
+    frames: Arc<Mutex<Vec<Frame>>>,
+}
+
+/// One presented frame: top-down BGRA32 pixels plus its dimensions.
+type Frame = (Vec<u8>, u32, u32);
+
+impl exemu_core::UserDriver for FrameCapture {
+    fn flush_surface(&mut self, _hwnd: u32, pixels: &[u8], w: u32, h: u32) {
+        if let Ok(mut f) = self.frames.lock() {
+            f.push((pixels.to_vec(), w, h));
+        }
+    }
+}
+
+/// Count pixels inside `rect` (`[x, y, cx, cy]`) of a top-down BGRA32 frame that
+/// are **not** the surface's background white — i.e. ink somebody drew there.
+/// Out-of-frame parts of the rect are skipped rather than counted.
+fn ink_in_rect(pixels: &[u8], w: u32, h: u32, rect: [i32; 4]) -> u32 {
+    pixels_matching(pixels, w, h, rect, |px| px != [0xFF, 0xFF, 0xFF])
+}
+
+/// Count pixels inside `rect` (`[x, y, cx, cy]`) of a top-down BGRA32 frame whose
+/// `[B, G, R]` bytes satisfy `pred`. Out-of-frame parts of the rect are skipped.
+fn pixels_matching(
+    pixels: &[u8],
+    w: u32,
+    h: u32,
+    rect: [i32; 4],
+    pred: impl Fn([u8; 3]) -> bool,
+) -> u32 {
+    let mut n = 0;
+    for y in rect[1].max(0)..(rect[1] + rect[3]).min(h as i32) {
+        for x in rect[0].max(0)..(rect[0] + rect[2]).min(w as i32) {
+            let off = (y as usize * w as usize + x as usize) * 4;
+            if pred([pixels[off], pixels[off + 1], pixels[off + 2]]) {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// Decode an RGBA8 PNG into `(width, height, rgba_bytes)`.

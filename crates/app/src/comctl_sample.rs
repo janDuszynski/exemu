@@ -19,9 +19,10 @@
 //! WndProc, the progress-bar child window is created with the right parent /
 //! geometry / style, and (since W6.2) the built-in `BUTTON` child is created too
 //! and **all three windows receive `WM_NCCREATE` + `WM_CREATE`** — the sample's
-//! own WndProc proves it by reading its `CREATESTRUCTW` back. One gap is pinned
-//! in the code below: sending a message to a comctl32 control does not
-//! terminate.
+//! own WndProc proves it by reading its `CREATESTRUCTW` back. Since **W4.8** it
+//! also **messages the progress bar** (`PBM_SETRANGE` + `PBM_SETPOS`, which used
+//! to be the "does not terminate" blocker) and both children **paint themselves**
+//! into the top-level window's surface when the pump delivers their `WM_PAINT`.
 //!
 //! The code is hand-assembled x86-64 with a small local assembler (`Asm`), the
 //! same shape [`crate::gui_sample`] and [`crate::sample`] use, so branch targets
@@ -51,6 +52,12 @@ const PAINT_LINE2: &str = "InitCommonControlsEx + BUTTON + progress bar.";
 pub const WINDOW_CX: i32 = 520;
 pub const WINDOW_CY: i32 = 300;
 
+/// `BUTTON` child rect `[x, y, cx, cy]`, in the parent's client coordinates.
+/// Exported so the paint gate can sample exactly the pixels the control owns.
+pub const BUTTON_RECT: [i32; 4] = [24, 200, 140, 32];
+/// `msctls_progress32` child rect `[x, y, cx, cy]`, likewise.
+pub const PROGRESS_RECT: [i32; 4] = [184, 204, 300, 24];
+
 /// `INITCOMMONCONTROLSEX.dwICC` — `ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES`:
 /// the progress bar, toolbar/statusbar/trackbar/tooltip, tab, updown, listview,
 /// treeview, hotkey and animate classes plus the user32 standard set.
@@ -59,6 +66,17 @@ const ICC_FLAGS: i32 = 0x0000_00FF | 0x0000_4000;
 /// The two child-control IDs (the `hMenu` argument of `CreateWindowExW`).
 const ID_BUTTON: i32 = 100;
 const ID_PROGRESS: i32 = 101;
+
+// --- progress-bar control messages (documented `commctrl.h` values) ----------
+/// `PBM_SETRANGE` = `WM_USER + 1`. `lParam` = `MAKELPARAM(low, high)`.
+const PBM_SETRANGE: u32 = 0x0400 + 1;
+/// `PBM_SETPOS` = `WM_USER + 2`. `wParam` = the new position.
+const PBM_SETPOS: u32 = 0x0400 + 2;
+/// The range the sample sets: low 0, high 100, packed as `MAKELPARAM`.
+const PROGRESS_RANGE: u32 = 100 << 16;
+/// The position the sample sets — 60 % of the bar, so the filled part is a
+/// measurable fraction of its width in the painted frame.
+pub const PROGRESS_POS: u32 = 60;
 
 /// The `lpParam` the main window is created with, and therefore the value its
 /// `WM_CREATE` must find in `CREATESTRUCTW.lpCreateParams` (roadmap W6.2). The
@@ -388,10 +406,10 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.lea_rip(RDX, r.wstr(BUTTON_CLASS));
     a.lea_rip(R8, r.wstr(BUTTON_TEXT));
     a.mov32(R9, WS_CHILD_BUTTON);
-    a.mov_at_rsp_imm(0x20, 24); // X
-    a.mov_at_rsp_imm(0x28, 200); // Y
-    a.mov_at_rsp_imm(0x30, 140); // nWidth
-    a.mov_at_rsp_imm(0x38, 32); // nHeight
+    a.mov_at_rsp_imm(0x20, BUTTON_RECT[0]); // X
+    a.mov_at_rsp_imm(0x28, BUTTON_RECT[1]); // Y
+    a.mov_at_rsp_imm(0x30, BUTTON_RECT[2]); // nWidth
+    a.mov_at_rsp_imm(0x38, BUTTON_RECT[3]); // nHeight
     a.mov_at_rsp_reg(0x40, RBX); // hWndParent
     a.mov_at_rsp_imm(0x48, ID_BUTTON); // hMenu = control id
     a.mov_at_rsp_imm(0x50, 0);
@@ -404,10 +422,10 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.lea_rip(RDX, r.wstr(PROGRESS_CLASS));
     a.xor32(R8); // no window text
     a.mov32(R9, WS_CHILD_VISIBLE);
-    a.mov_at_rsp_imm(0x20, 184); // X
-    a.mov_at_rsp_imm(0x28, 204); // Y
-    a.mov_at_rsp_imm(0x30, 300); // nWidth
-    a.mov_at_rsp_imm(0x38, 24); // nHeight
+    a.mov_at_rsp_imm(0x20, PROGRESS_RECT[0]); // X
+    a.mov_at_rsp_imm(0x28, PROGRESS_RECT[1]); // Y
+    a.mov_at_rsp_imm(0x30, PROGRESS_RECT[2]); // nWidth
+    a.mov_at_rsp_imm(0x38, PROGRESS_RECT[3]); // nHeight
     a.mov_at_rsp_reg(0x40, RBX); // hWndParent
     a.mov_at_rsp_imm(0x48, ID_PROGRESS); // hMenu = control id
     a.mov_at_rsp_imm(0x50, 0);
@@ -415,14 +433,24 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.call_iat(r.slot("CreateWindowExW"));
     a.mov_at_rsp_reg(H_PROGRESS, RAX);
 
-    // NOTE (verified W6.1 blocker): driving the progress bar with
-    // `SendMessageW(hProgress, PBM_SETRANGE/PBM_SETPOS, …)` does **not**
-    // terminate today. The message reaches `NtUserMessageCall`, which dispatches
-    // to comctl32's real control WndProc; that path then spins forever calling
-    // the unserviced `WineUnixCall` import thunk (observed: >400M instructions,
-    // an endless `[exemu] call WineUnixCall` trace). So the sample creates the
-    // control but does not message it; `SendMessageW` stays imported so the
-    // binary keeps the shape a real app has.
+    // ---- drive the control -------------------------------------------------
+    // `SendMessageW(hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100))` then
+    // `PBM_SETPOS` — the ordinary way an app moves a progress bar, and the pair
+    // that used to be the W6 "messaging a control does not terminate" blocker.
+    // The message reaches `NtUserMessageCall`, which dispatches to **comctl32's
+    // own** `ProgressWindowProc`; that WndProc runs its range/position handler
+    // and returns, so control flow comes back here (see the terminates gate in
+    // `tests/comctl_gate.rs`).
+    a.mov_reg_at_rsp(RCX, H_PROGRESS);
+    a.mov32(RDX, PBM_SETRANGE);
+    a.xor32(R8);
+    a.mov32(R9, PROGRESS_RANGE);
+    a.call_iat(r.slot("SendMessageW"));
+    a.mov_reg_at_rsp(RCX, H_PROGRESS);
+    a.mov32(RDX, PBM_SETPOS);
+    a.mov32(R8, PROGRESS_POS);
+    a.xor32(R9);
+    a.call_iat(r.slot("SendMessageW"));
 
     // ---- direct paint ------------------------------------------------------
     // As in gui_sample: paint once without waiting for a message pump, so the

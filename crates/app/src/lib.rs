@@ -1072,6 +1072,21 @@ impl Process {
             ExcSource::Interrupt(_) => return Ok(false),
         };
 
+        // `EXEMU_FAULT_TRACE` — report every exception handed to the guest's own
+        // dispatcher. A Wine-boot guest catches its faults and can turn a real
+        // bug into a quiet `NtTerminateProcess(0xC0000005)`, so without this the
+        // only symptom is an exit code; with it, the faulting rip and address are
+        // visible and can be resolved against the module map.
+        if std::env::var_os("EXEMU_FAULT_TRACE").is_some() {
+            let rip = self.cpu.state().rip;
+            let mut bytes = [0u8; 16];
+            let _ = self.mem.read(rip, &mut bytes);
+            eprintln!(
+                "[exc] code={code:#x} at={address:#x} rip={rip:#x} {} bytes={bytes:02x?}",
+                self.os.module_for_addr(rip).unwrap_or_default()
+            );
+        }
+
         // For #BP the reported/CONTEXT Rip is fault+1: advance the live rip so
         // write_context captures it (address already computed as rip+1 above).
         if let ExcSource::Interrupt(3) = src {
