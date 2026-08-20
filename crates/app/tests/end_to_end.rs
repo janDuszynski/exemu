@@ -127,3 +127,35 @@ fn decode_miss_surfaces_structured_cause() {
         other => panic!("expected a structured Decode cause, got {other:?}"),
     }
 }
+
+/// The deterministic clock, end to end through `Process::load`/`run` (roadmap
+/// W9.6): the whole wiring — the shared `GuestClock` handle reaching both the
+/// interpreter and the OS layer, and the run loop's `KUSER_SHARED_DATA` refresh
+/// — must leave a normal program's behaviour untouched and its instruction count
+/// identical run to run.
+///
+/// The corpus gate is the *strong* proof of replay (496M instructions, Δ 0), but
+/// it needs the git-ignored installers and skips without them. This runs on a
+/// fresh checkout, so the plumbing cannot silently rot.
+#[test]
+fn the_virtual_clock_leaves_a_run_identical_and_repeatable() {
+    let bytes = sample::build();
+    let run_once = |virtual_clock: bool| {
+        let cfg = RunConfig { virtual_clock, ..silent_cfg() };
+        let r = load_and_run(&bytes, cfg).expect("sample should run");
+        (r.exit_code, r.steps, String::from_utf8_lossy(&r.stdout).into_owned())
+    };
+
+    let host = run_once(false);
+    let a = run_once(true);
+    let b = run_once(true);
+    let c = run_once(true);
+
+    assert_eq!(a.0, 0, "the program still exits cleanly with the clock virtualised");
+    assert_eq!(a, b, "two virtual-clock runs are identical");
+    assert_eq!(b, c, "…and a third");
+    assert_eq!(
+        host, a,
+        "the clock must not change what the program does, only where its time comes from"
+    );
+}

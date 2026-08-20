@@ -24,7 +24,7 @@ pub mod socket_sample;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use exemu_core::{Cpu, EmuError, Exit, Memory, Perm, Region, Result};
+use exemu_core::{Cpu, EmuError, Exit, GuestClock, Memory, Perm, Region, Result};
 use exemu_cpu::{Bits, Interpreter, FS_BASE_32, GS_BASE};
 use exemu_loader as loader;
 use exemu_memory::VirtualMemory;
@@ -59,10 +59,36 @@ const KUSER_SHARED_DATA_BASE: u64 = 0x7ffe_0000;
 const KUSER_DISPATCHER_PAGE: u64 = 0x7ffe_1000;
 
 /// `KUSER_SHARED_DATA` field offsets we seed (public winnt/ntddk layout).
+const KUSER_TICK_COUNT_MULTIPLIER: u64 = 0x004; // ULONG, ms = TickCount * mul >> 24
 const KUSER_INTERRUPT_TIME: u64 = 0x008; // KSYSTEM_TIME (Low/High/High2)
 const KUSER_SYSTEM_TIME: u64 = 0x014; // KSYSTEM_TIME (Low/High/High2)
 const KUSER_SYSTEM_CALL: u64 = 0x308; // ULONG syscall-entry selector
 const KUSER_TICK_COUNT: u64 = 0x320; // KSYSTEM_TIME TickCount
+
+/// The clock-interrupt period `KUSER_SHARED_DATA.TickCount` counts in, in 100-ns
+/// units: 15.625 ms, the standard Windows default `KeMaximumIncrement`.
+const KUSER_TICK_PERIOD_100NS: u64 = 156_250;
+
+/// `KUSER_SHARED_DATA.TickCountMultiplier` — the scale a guest applies to turn
+/// `TickCount` into milliseconds (`ms = TickCount * multiplier >> 24`). For a
+/// 15.625 ms tick that is `15.625 * 2^24` = 0x0FA0_0000, the value real Windows
+/// publishes. Seeded on both clock paths: it is a *constant*, and leaving it 0
+/// (as exemu did) makes a guest's inline `GetTickCount` compute 0 forever.
+const KUSER_TICK_COUNT_MULTIPLIER_VALUE: u32 = 0x0FA0_0000;
+
+/// How often the run loop refreshes the `KUSER_SHARED_DATA` time fields from the
+/// virtual clock, in retired instructions.
+///
+/// Those fields are read by a **plain memory load** — a guest's inline
+/// `GetTickCount`/`NtGetTickCount` never issues a syscall — so there is nothing
+/// to intercept and the only way to virtualise them is to write them from
+/// outside on a schedule. The schedule must be a function of the instruction
+/// count, not of host time, or it reintroduces exactly the nondeterminism this
+/// is here to remove. 65,536 instructions is 6.55 ms of virtual time: finer than
+/// the 15.625 ms tick the fields are quantised to anyway, so the guest cannot
+/// tell it apart from a continuously-running clock, and cheap enough (three
+/// pokes per 65,536 instructions) to be invisible in the run loop.
+const KUSER_REFRESH_INSTRUCTIONS: u64 = 65_536;
 
 /// Where the various regions live, chosen per bitness so 32-bit processes
 /// stay entirely within the low 4 GiB.
@@ -201,6 +227,17 @@ pub struct RunConfig {
     /// `None` keeps the shared sandbox, which is right for real CLI runs — a
     /// user expects `exemu run` to write where the last one did.
     pub sandbox_root: Option<std::path::PathBuf>,
+    /// Virtualise the guest clock (roadmap W9.6): drive `RDTSC`, `GetTickCount`,
+    /// `QueryPerformanceCounter`, `NtQuerySystemTime` and `KUSER_SHARED_DATA`
+    /// from the retired-instruction count instead of the host clock, so a run
+    /// replays with the **exact same instruction count** every time.
+    ///
+    /// `false` (the default) keeps the host clock and the behaviour that
+    /// shipped before, byte for byte. Like [`RunConfig::wine_boot_dir`] this
+    /// takes precedence over the `EXEMU_VIRTUAL_CLOCK` env opt-in, so a test or
+    /// the corpus gate can request it hermetically without touching
+    /// process-global env vars.
+    pub virtual_clock: bool,
 }
 
 impl Default for RunConfig {
@@ -218,6 +255,7 @@ impl Default for RunConfig {
             driver: None,
             input: None,
             sandbox_root: None,
+            virtual_clock: false,
         }
     }
 }
@@ -246,6 +284,9 @@ pub struct Process {
     mem: VirtualMemory,
     cpu: Interpreter,
     os: WinOs,
+    /// The process clock (roadmap W9.6) — the same handle the interpreter and
+    /// the OS layer hold. The run loop reads it to refresh `KUSER_SHARED_DATA`.
+    clock: GuestClock,
     sandbox: String,
     entry: u64,
     max_steps: u64,
@@ -272,6 +313,15 @@ impl Process {
     pub fn load(pe_bytes: &[u8], cfg: &mut RunConfig) -> Result<Process> {
         let mut image = loader::parse(pe_bytes)?;
         let mut mem = VirtualMemory::new();
+
+        // --- The process clock (roadmap W9.6, opt-in) ---------------------
+        // One handle, shared by the interpreter (RDTSC), the OS layer (every
+        // Win32/NT time API) and this run loop (the KUSER_SHARED_DATA refresh),
+        // so the guest sees a single consistent notion of "now". Explicit config
+        // wins; otherwise `EXEMU_VIRTUAL_CLOCK` (any non-empty value that is not
+        // "0") opts in, matching how `EXEMU_WINE_BOOT` is done. Default: host
+        // clock, i.e. exactly the behaviour that shipped before.
+        let clock = GuestClock::new(cfg.virtual_clock || env_opt_in("EXEMU_VIRTUAL_CLOCK"));
 
         // --- Choose a load base and relocate if it differs from preferred --
         // `cfg.load_base` lets a caller deliberately map the image away from
@@ -344,7 +394,7 @@ impl Process {
         // --- KUSER_SHARED_DATA @ 0x7ffe0000 + dispatcher landing page -----
         // Fixed-address kernel page every process reads directly; also reserves
         // the syscall-dispatcher landing page one page above it (roadmap W2.1).
-        map_kuser_shared_data(&mut mem)?;
+        map_kuser_shared_data(&mut mem, &clock)?;
 
         // --- Command line (ASCII + UTF-16) in the env region --------------
         mem.map(Region::new("env", lay.env_base, ENV_SIZE, Perm::RW))?;
@@ -561,6 +611,9 @@ impl Process {
 
         // --- Initial CPU state --------------------------------------------
         let mut cpu = Interpreter::with_bits(if image.is_64bit { Bits::B64 } else { Bits::B32 });
+        // Both halves of the emulator share the one clock handle (W9.6).
+        cpu.set_clock(clock.clone());
+        os.set_clock(clock.clone());
         // Align the stack, then push the sentinel return address so the entry
         // sees the stack exactly as a real `call entry` would leave it.
         let exit_thunk = os.exit_thunk();
@@ -643,6 +696,7 @@ impl Process {
             mem,
             cpu,
             os,
+            clock,
             sandbox: sandbox.to_string_lossy().into_owned(),
             entry: image.entry_va(),
             max_steps: cfg.max_steps,
@@ -669,6 +723,11 @@ impl Process {
     /// Run until the process exits (or the step cap / a fault is hit).
     pub fn run(mut self) -> Result<RunResult> {
         let mut steps: u64 = 0;
+        // `KUSER_SHARED_DATA`'s time fields are read by a plain guest load, so
+        // the only way to virtualise them is to write them from out here on a
+        // schedule keyed to the instruction count (roadmap W9.6). Off entirely
+        // on the host-clock path, where the page keeps its load-time snapshot.
+        let refresh_kuser = self.clock.is_virtual();
         // Rolling window of the most recent instruction pointers, for the
         // fault report (helps trace how a bad jump was reached).
         const TAIL: usize = 24;
@@ -693,6 +752,9 @@ impl Process {
             match outcome {
                 Ok(Exit::Continue) => {
                     steps += 1;
+                    if refresh_kuser && steps % KUSER_REFRESH_INSTRUCTIONS == 0 {
+                        refresh_kuser_time(&mut self.mem, &self.clock)?;
+                    }
                     // Guest made forward progress off the exception-dispatcher
                     // entry — a subsequent, unrelated fault is a fresh delivery.
                     // (A tight fault-at-entry loop never reaches here off-entry,
@@ -921,12 +983,23 @@ pub fn load_and_run(pe_bytes: &[u8], cfg: RunConfig) -> Result<RunResult> {
 /// 64-bit fields the guest reads directly, plus reserve the syscall-dispatcher
 /// landing page one page above it (roadmap W2.1).
 ///
-/// The `SystemTime`/`InterruptTime`/`TickCount` fields are point-in-time
-/// snapshots taken at process load; they are not driven forward here (the
-/// clock-backed `Nt*`/Win32 time APIs remain authoritative). `SystemCall` is
-/// set nonzero so the guest selects the `SYSCALL` entry shape the dispatcher
-/// will implement, rather than the legacy `int 2Eh` path.
-fn map_kuser_shared_data(mem: &mut VirtualMemory) -> Result<()> {
+/// `SystemCall` is set nonzero so the guest selects the `SYSCALL` entry shape
+/// the dispatcher will implement, rather than the legacy `int 2Eh` path.
+/// `TickCountMultiplier` gets its real Windows value on both paths — it is a
+/// constant, and 0 would make a guest's inline `GetTickCount` compute 0 forever.
+///
+/// The `SystemTime`/`InterruptTime`/`TickCount` fields depend on `clock`:
+///
+/// * **Host clock** — point-in-time snapshots taken at process load, exactly as
+///   before: `SystemTime` from the host, `InterruptTime`/`TickCount` anchored at
+///   0. They are not driven forward (the clock-backed `Nt*`/Win32 time APIs
+///   remain authoritative). Keeping the page frozen here is what makes the
+///   default path byte-identical.
+/// * **Virtual clock (W9.6)** — seeded from the virtual clock at instruction 0
+///   and then refreshed by the run loop every
+///   [`KUSER_REFRESH_INSTRUCTIONS`] instructions ([`refresh_kuser_time`]), which
+///   is the only way to virtualise a field the guest reads by plain load.
+fn map_kuser_shared_data(mem: &mut VirtualMemory, clock: &GuestClock) -> Result<()> {
     // Two contiguous pages: KUSER_SHARED_DATA itself and the reserved
     // dispatcher landing page directly above it.
     mem.map(Region::new(
@@ -942,29 +1015,66 @@ fn map_kuser_shared_data(mem: &mut VirtualMemory) -> Result<()> {
         Perm::RWX,
     ))?;
 
-    // Seed the time fields as KSYSTEM_TIME triples (LowPart, High1Time,
-    // High2Time) so a guest reading either half sees a consistent value.
-    let now_100ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let system_time = (now_100ns.as_secs() + KUSER_FILETIME_EPOCH_DIFF_SECS) * 10_000_000
-        + now_100ns.subsec_nanos() as u64 / 100;
-    let write_ksystem_time = |mem: &mut VirtualMemory, off: u64, val: u64| -> Result<()> {
-        let low = (val & 0xFFFF_FFFF) as u32;
-        let high = (val >> 32) as u32;
-        mem.poke(KUSER_SHARED_DATA_BASE + off, &low.to_le_bytes())?;
-        mem.poke(KUSER_SHARED_DATA_BASE + off + 4, &high.to_le_bytes())?; // High1Time
-        mem.poke(KUSER_SHARED_DATA_BASE + off + 8, &high.to_le_bytes()) // High2Time
-    };
-    write_ksystem_time(mem, KUSER_SYSTEM_TIME, system_time)?;
-    // InterruptTime/TickCount both count from boot; we anchor them at 0 (a
-    // freshly booted system) — they advance via the clock-backed time APIs.
-    write_ksystem_time(mem, KUSER_INTERRUPT_TIME, 0)?;
-    write_ksystem_time(mem, KUSER_TICK_COUNT, 0)?;
+    if clock.is_virtual() {
+        refresh_kuser_time(mem, clock)?;
+    } else {
+        // Seed the time fields as KSYSTEM_TIME triples (LowPart, High1Time,
+        // High2Time) so a guest reading either half sees a consistent value.
+        let now_100ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let system_time = (now_100ns.as_secs() + KUSER_FILETIME_EPOCH_DIFF_SECS) * 10_000_000
+            + now_100ns.subsec_nanos() as u64 / 100;
+        write_ksystem_time(mem, KUSER_SYSTEM_TIME, system_time)?;
+        // InterruptTime/TickCount both count from boot; we anchor them at 0 (a
+        // freshly booted system) — they advance via the clock-backed time APIs.
+        write_ksystem_time(mem, KUSER_INTERRUPT_TIME, 0)?;
+        write_ksystem_time(mem, KUSER_TICK_COUNT, 0)?;
+    }
 
+    mem.poke(
+        KUSER_SHARED_DATA_BASE + KUSER_TICK_COUNT_MULTIPLIER,
+        &KUSER_TICK_COUNT_MULTIPLIER_VALUE.to_le_bytes(),
+    )?;
     // SystemCall selector: nonzero ⇒ altered view (steer onto the SYSCALL path).
     mem.poke(KUSER_SHARED_DATA_BASE + KUSER_SYSTEM_CALL, &1u32.to_le_bytes())?;
     Ok(())
+}
+
+/// Write one `KSYSTEM_TIME` triple (LowPart, High1Time, High2Time) so a guest
+/// that reads the halves separately and re-checks `High2Time` sees a consistent
+/// value. `poke` bypasses the page's guest-READ-only permission.
+fn write_ksystem_time(mem: &mut VirtualMemory, off: u64, val: u64) -> Result<()> {
+    let low = (val & 0xFFFF_FFFF) as u32;
+    let high = (val >> 32) as u32;
+    mem.poke(KUSER_SHARED_DATA_BASE + off, &low.to_le_bytes())?;
+    mem.poke(KUSER_SHARED_DATA_BASE + off + 4, &high.to_le_bytes())?; // High1Time
+    mem.poke(KUSER_SHARED_DATA_BASE + off + 8, &high.to_le_bytes()) // High2Time
+}
+
+/// Drive `KUSER_SHARED_DATA`'s three time fields forward from the virtual clock
+/// (roadmap W9.6). Called at load and then every [`KUSER_REFRESH_INSTRUCTIONS`]
+/// retired instructions by [`Process::run`].
+///
+/// * `SystemTime` — the virtual wall clock as a FILETIME.
+/// * `InterruptTime` — 100-ns units since (virtual) boot, i.e. the monotonic
+///   virtual time itself; the process start *is* the boot for our purposes.
+/// * `TickCount` — the same time expressed in 15.625 ms clock interrupts, which
+///   is the unit a guest converts with `TickCountMultiplier`.
+fn refresh_kuser_time(mem: &mut VirtualMemory, clock: &GuestClock) -> Result<()> {
+    let Some(monotonic) = clock.monotonic_100ns() else { return Ok(()) };
+    let Some(filetime) = clock.filetime() else { return Ok(()) };
+    write_ksystem_time(mem, KUSER_SYSTEM_TIME, filetime)?;
+    write_ksystem_time(mem, KUSER_INTERRUPT_TIME, monotonic)?;
+    write_ksystem_time(mem, KUSER_TICK_COUNT, monotonic / KUSER_TICK_PERIOD_100NS)
+}
+
+/// An `EXEMU_*` boolean env opt-in: set and not `0`/empty.
+fn env_opt_in(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
 }
 
 /// Map the zeroed scratch pages Wine's ntdll touches through its debug (TRACE)
@@ -1067,7 +1177,7 @@ mod tests {
     #[test]
     fn kuser_shared_data_fields_readable() {
         let mut mem = VirtualMemory::new();
-        map_kuser_shared_data(&mut mem).expect("map KUSER_SHARED_DATA");
+        map_kuser_shared_data(&mut mem, &GuestClock::host()).expect("map KUSER_SHARED_DATA");
 
         // The page is mapped at the fixed kernel address.
         assert_eq!(KUSER_SHARED_DATA_BASE, 0x7ffe_0000);
@@ -1106,6 +1216,58 @@ mod tests {
         assert_eq!(KUSER_DISPATCHER_PAGE, KUSER_SHARED_DATA_BASE + PAGE);
         mem.read_u8(KUSER_DISPATCHER_PAGE)
             .expect("dispatcher landing page is mapped");
+
+        // TickCountMultiplier is the real Windows constant on BOTH clock paths —
+        // 0 would make a guest's inline GetTickCount compute 0 forever.
+        assert_eq!(
+            mem.read_u32(KUSER_SHARED_DATA_BASE + KUSER_TICK_COUNT_MULTIPLIER)
+                .expect("read TickCountMultiplier"),
+            KUSER_TICK_COUNT_MULTIPLIER_VALUE
+        );
+    }
+
+    /// `KUSER_SHARED_DATA` is the one time source with no call to intercept —
+    /// the guest reads it with a plain load. Under the virtual clock (roadmap
+    /// W9.6) it must therefore be *written* from the instruction counter, both
+    /// at load and as the run proceeds, and never from the host.
+    #[test]
+    fn kuser_time_fields_track_the_virtual_clock() {
+        let read_ksystem_time = |mem: &VirtualMemory, off: u64| -> u64 {
+            let lo = mem.read_u32(KUSER_SHARED_DATA_BASE + off).unwrap() as u64;
+            let hi = mem.read_u32(KUSER_SHARED_DATA_BASE + off + 4).unwrap() as u64;
+            (hi << 32) | lo
+        };
+
+        let clock = GuestClock::virtualized();
+        let mut mem = VirtualMemory::new();
+        map_kuser_shared_data(&mut mem, &clock).expect("map KUSER_SHARED_DATA");
+
+        // At instruction 0 the machine has just booted: no uptime, and a wall
+        // clock sitting exactly on the fixed epoch.
+        assert_eq!(read_ksystem_time(&mem, KUSER_INTERRUPT_TIME), 0);
+        assert_eq!(read_ksystem_time(&mem, KUSER_TICK_COUNT), 0);
+        assert_eq!(
+            read_ksystem_time(&mem, KUSER_SYSTEM_TIME),
+            exemu_core::VIRTUAL_EPOCH_FILETIME,
+            "the wall clock starts at the fixed virtual epoch, not at the host's now"
+        );
+
+        // Retire one virtual second (10M instructions) and refresh.
+        for _ in 0..exemu_core::VIRTUAL_INSTRUCTIONS_PER_SECOND {
+            clock.retire_one();
+        }
+        refresh_kuser_time(&mut mem, &clock).expect("refresh");
+        assert_eq!(read_ksystem_time(&mem, KUSER_INTERRUPT_TIME), 10_000_000);
+        assert_eq!(
+            read_ksystem_time(&mem, KUSER_SYSTEM_TIME),
+            exemu_core::VIRTUAL_EPOCH_FILETIME + 10_000_000
+        );
+        // TickCount counts 15.625 ms clock interrupts, so one second is 64 of
+        // them — and `ms = TickCount * TickCountMultiplier >> 24` recovers 1000.
+        let ticks = read_ksystem_time(&mem, KUSER_TICK_COUNT);
+        assert_eq!(ticks, 64);
+        let ms = (ticks * u64::from(KUSER_TICK_COUNT_MULTIPLIER_VALUE)) >> 24;
+        assert_eq!(ms, 1_000, "the guest's own tick→ms conversion agrees");
     }
 
     #[test]
