@@ -69,6 +69,85 @@ const NT_USER_CHANGE_DISPLAY_SETTINGS: u32 = 0x1342;
 const NT_USER_ENUM_DISPLAY_SETTINGS: u32 = 0x13c1;
 const NT_USER_MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX: u32 = 0x14bb;
 
+// --- input routing: hit-testing, capture, focus (roadmap W4.8 follow-up) -----
+// Recovered the same way as every other index — the `mov eax, imm32` in that
+// export's win32u stub — and cross-checked against the user32 wrapper that
+// issues it (see [`abi`] and `crates/app/tests/win32k_abi.rs`):
+//
+//   user32!WindowFromPoint  @ 0x560a0: mov rax,rcx; shr rax,0x20; mov edx,eax;
+//                                      jmp NtUserWindowFromPoint
+//     — the whole body. **Hit-testing belongs to the kernel side**: user32 only
+//       unpacks the by-value POINT into (x in ecx, y in edx) and tail-jumps.
+//   user32!SetCapture / ReleaseCapture / SetFocus: bare `jmp` thunks.
+//   user32!GetFocus  @ 0x2f4f0: xor ecx,ecx     ; jmp NtUserGetThreadState
+//   user32!GetActiveWindow @ 0x2e330: mov ecx,1 ; jmp NtUserGetThreadState
+//   user32!GetCapture      @ 0x2e5a0: mov ecx,2 ; jmp NtUserGetThreadState
+const NT_USER_WINDOW_FROM_POINT: u32 = 0x15ff;
+const NT_USER_CHILD_WINDOW_FROM_POINT_EX: u32 = 0x134b;
+const NT_USER_SET_CAPTURE: u32 = 0x153a;
+const NT_USER_RELEASE_CAPTURE: u32 = 0x1508;
+const NT_USER_SET_FOCUS: u32 = 0x1557;
+const NT_USER_SET_ACTIVE_WINDOW: u32 = 0x1532;
+const NT_USER_GET_THREAD_STATE: u32 = 0x144e;
+const NT_USER_GET_ANCESTOR: u32 = 0x13ce;
+
+/// `NtUserGetThreadState(index)` selectors, recovered from the three user32
+/// one-liners above.
+mod thread_state {
+    /// `GetFocus`.
+    pub const FOCUS: u64 = 0;
+    /// `GetActiveWindow`.
+    pub const ACTIVE: u64 = 1;
+    /// `GetCapture`.
+    pub const CAPTURE: u64 = 2;
+}
+
+/// `NtUserMessageCall`'s **type** argument (the 6th slot). One syscall carries
+/// the whole `SendMessage`/`DefWindowProc`/`CallWindowProc`/dispatch family, and
+/// the type is what says which — recovered from the immediate each user32
+/// wrapper stores at `[rsp+0x28]` right before the win32u thunk:
+///
+/// ```text
+///   SendMessageW         mov [rsp+0x28], 0x2b1
+///   SendMessageTimeoutW  mov [rsp+0x28], 0x2b3
+///   SendNotifyMessageW   mov [rsp+0x28], 0x2b7
+///   SendMessageCallbackW mov [rsp+0x28], 0x2b8
+///   CallWindowProcW      mov [rsp+0x28], 0x2ab
+///   DefWindowProcW       mov [rsp+0x28], 0x29e
+///   (internal) dispatch_message, the tail of DispatchMessageW:
+///                        mov [rsp+0x28], 0x3001
+/// ```
+///
+/// **Getting this wrong is not cosmetic.** `DefWindowProcW` is *nothing but*
+/// this syscall — the pinned user32 handles only five IME/syscommand messages
+/// client-side and forwards everything else, `WM_NCHITTEST` included — so a
+/// handler that re-dispatches type `0x29e` to the window's own WndProc calls the
+/// proc that just called `DefWindowProc`, for ever.
+mod message_call {
+    /// `DefWindowProc{A,W}` — the kernel-side default window procedure.
+    pub const DEF_WINDOW_PROC: u64 = 0x29e;
+    /// `CallWindowProc{A,W}` — `resultInfo` arrives with the proc at offset 0.
+    pub const CALL_WINDOW_PROC: u64 = 0x2ab;
+    /// `SendMessage{A,W}`.
+    pub const SEND_MESSAGE: u64 = 0x2b1;
+    /// `SendMessageTimeout{A,W}`.
+    pub const SEND_MESSAGE_TIMEOUT: u64 = 0x2b3;
+    /// `SendNotifyMessage{A,W}`.
+    pub const SEND_NOTIFY_MESSAGE: u64 = 0x2b7;
+    /// `SendMessageCallback{A,W}`.
+    pub const SEND_MESSAGE_CALLBACK: u64 = 0x2b8;
+    /// The internal `dispatch_message` every `DispatchMessage{A,W}` that is not
+    /// `WM_PAINT`/`WM_TIMER` lowers to.
+    pub const DISPATCH_MESSAGE: u64 = 0x3001;
+}
+
+/// `CallWindowProc`'s `resultInfo` block starts with the procedure to call —
+/// `user32!CallWindowProcW` stores its `lpPrevWndFunc` argument at offset 0 of
+/// the block it hands the syscall (`mov [rsp+0x40], rax`, then
+/// `lea rbx,[rsp+0x40]` as `resultInfo`). Nothing else in the block is filled by
+/// the caller.
+const WIN_PROC_PARAMS_FUNC: u64 = 0x00;
+
 // --- NtGdi* indices (the win32u.dll `mov eax,IDX` immediates; spot-verified
 //     against the pinned build's stubs — see the W4.3 static gdi32 contract).
 //     gdi32!TextOutW→ExtTextOutW lowers to NtGdiExtTextOutW; gdi32!Rectangle
@@ -533,6 +612,69 @@ const WM_SETTEXT: u32 = 0x000c;
 /// `WM_CREATE` (roadmap W6.2).
 const WM_NCCREATE: u32 = 0x0081;
 
+// --- input routing (documented Win32 message ids and hit-test codes) --------
+/// `WM_SETFOCUS` — sent to the window gaining the keyboard focus; `wParam` is
+/// the window that lost it.
+const WM_SETFOCUS: u32 = 0x0007;
+/// `WM_KILLFOCUS` — sent to the window losing it; `wParam` is the winner.
+const WM_KILLFOCUS: u32 = 0x0008;
+/// `WM_GETTEXTLENGTH`.
+const WM_GETTEXTLENGTH: u32 = 0x000e;
+/// `WM_GETTEXT`.
+const WM_GETTEXT: u32 = 0x000d;
+/// `WM_CLOSE`.
+const WM_CLOSE: u32 = 0x0010;
+/// `WM_ERASEBKGND`.
+const WM_ERASEBKGND: u32 = 0x0014;
+/// `WM_NCCALCSIZE`.
+const WM_NCCALCSIZE: u32 = 0x0083;
+/// `WM_NCHITTEST` — "which part of you is this screen point over?". The one
+/// message whose *return value* routes every other mouse message.
+const WM_NCHITTEST: u32 = 0x0084;
+/// `WM_NCDESTROY`.
+const WM_NCDESTROY: u32 = 0x0082;
+/// `WM_SETCURSOR`.
+const WM_SETCURSOR: u32 = 0x0020;
+/// `WM_MOUSEACTIVATE`.
+const WM_MOUSEACTIVATE: u32 = 0x0021;
+/// `WM_CAPTURECHANGED` — sent to the window that just lost the mouse capture,
+/// `lParam` = the window that gained it. Wine's `ButtonWndProc` handles it (its
+/// `0x215` arm drops the pushed state), so it is load-bearing, not decoration.
+const WM_CAPTURECHANGED: u32 = 0x0215;
+/// The first mouse message (`WM_MOUSEMOVE`) and the first non-client mouse
+/// message (`WM_NCMOUSEMOVE`); their difference maps one family onto the other.
+const WM_MOUSEFIRST: u32 = 0x0200;
+const WM_NCMOUSEFIRST: u32 = 0x00a0;
+/// Distance from a client mouse message to its non-client twin.
+const NC_MOUSE_DELTA: u32 = WM_MOUSEFIRST - WM_NCMOUSEFIRST;
+/// The last mouse message that has a non-client twin (`WM_XBUTTONDBLCLK`).
+const WM_MOUSELAST_NC: u32 = 0x020d;
+
+/// `WM_NCHITTEST` results (documented `HT*` codes). Only the three exemu's own
+/// routing branches on are named.
+mod hit {
+    /// The point is over the client area — deliver the ordinary mouse message.
+    pub const CLIENT: i64 = 1;
+    /// Nothing there; deliver the non-client twin with this code in `wParam`.
+    pub const NOWHERE: i64 = 0;
+    /// "I am not here" — retry the hit test with this window excluded.
+    /// Wine's `ButtonWndProc` answers this for a `BS_GROUPBOX`.
+    pub const TRANSPARENT: i64 = -1;
+}
+
+/// `GetAncestor` flags (documented).
+mod ancestor {
+    pub const PARENT: u64 = 1;
+    pub const ROOT: u64 = 2;
+    pub const ROOTOWNER: u64 = 3;
+}
+
+/// How many `WM_NCHITTEST` rounds one native event may drive before the routing
+/// gives up and delivers to whatever it last found. Each `HTTRANSPARENT` costs
+/// one round; a pathological chain of transparent controls must not be able to
+/// keep the message pump inside the kernel for ever.
+const HIT_TEST_ROUNDS_MAX: usize = 8;
+
 // --- CREATESTRUCTW (64-bit) field offsets ---------------------------------
 // The struct `WM_NCCREATE`/`WM_CREATE` carry in lParam. The `cy, cx, y, x`
 // ordering is the documented (counter-intuitive) Win32 layout, not a typo.
@@ -744,6 +886,25 @@ pub(crate) struct Win32kState {
     /// The current cursor handle (`SetCursor`/`GetCursor`, roadmap W4.7). 0 = the
     /// default arrow / hidden.
     current_cursor: u64,
+    /// Native events that have arrived but not yet been given a target window.
+    ///
+    /// **Routing happens at retrieval, not at arrival** — that is the whole
+    /// point of keeping a raw queue. A mouse event's target depends on the
+    /// capture, on the window tree *at the moment the app asks for a message*,
+    /// and on what the candidate window answers to `WM_NCHITTEST`; none of that
+    /// can be decided when the event is pulled off the channel, because
+    /// answering `WM_NCHITTEST` means running guest code.
+    raw_input: std::collections::VecDeque<exemu_core::InputEvent>,
+    /// The window holding the mouse capture (`SetCapture`), or 0. While it is
+    /// set every mouse event goes to it, hit-testing skipped, in **its** client
+    /// coordinates — which is what lets a pushed button track a drag that leaves
+    /// its rect and still see the matching button-up.
+    capture: u32,
+    /// The keyboard focus window (`SetFocus`), or 0 — the target of every key
+    /// message.
+    focus: u32,
+    /// The active window (`SetActiveWindow`/`GetActiveWindow`), or 0.
+    active: u32,
 }
 
 impl Win32kState {
@@ -887,6 +1048,59 @@ impl Win32kState {
     fn dc(&self, hdc: u32) -> Option<&Dc> {
         self.dcs.iter().find(|(h, _)| *h == hdc).map(|(_, d)| d)
     }
+
+    /// Does `hwnd`'s client rect contain the surface-space point `(x, y)`?
+    fn contains_point(&self, hwnd: u32, x: i32, y: i32) -> bool {
+        let (ox, oy) = self.client_origin(hwnd);
+        let Some(w) = self.window(hwnd) else { return false };
+        let (cx, cy) = client_size(w);
+        x >= ox && y >= oy && x < ox + cx as i32 && y < oy + cy as i32
+    }
+
+    /// **The hit test.** The deepest visible window containing the point, or 0.
+    ///
+    /// `user32!WindowFromPoint` is four instructions — unpack the by-value
+    /// `POINT` and tail-jump `NtUserWindowFromPoint` — so the window tree walk is
+    /// unambiguously the kernel side's job, and this is it. Siblings are searched
+    /// **newest first**, matching Windows' "a freshly created child goes to the
+    /// top of its siblings' Z-order"; `skip` carries the windows a previous
+    /// round's `HTTRANSPARENT` has already excluded.
+    fn window_from_point(&self, x: i32, y: i32, skip: &[u32]) -> u32 {
+        let Some(top) = self.shown_window() else { return 0 };
+        if skip.contains(&top) || !self.contains_point(top, x, y) {
+            return 0;
+        }
+        let mut cur = top;
+        for _ in 0..WINDOW_ANCESTRY_MAX {
+            let next = self
+                .windows
+                .iter()
+                .rev()
+                .find(|(h, w)| {
+                    w.parent == cur
+                        && w.shown
+                        && !skip.contains(h)
+                        && self.contains_point(*h, x, y)
+                })
+                .map(|(h, _)| *h);
+            match next {
+                Some(h) => cur = h,
+                None => return cur,
+            }
+        }
+        cur
+    }
+
+    /// The direct child of `parent` under the point, or `parent` itself — the
+    /// `ChildWindowFromPointEx` contract (one level, not the deepest).
+    fn child_window_from_point(&self, parent: u32, x: i32, y: i32) -> u32 {
+        self.windows
+            .iter()
+            .rev()
+            .find(|(h, w)| w.parent == parent && w.shown && self.contains_point(*h, x, y))
+            .map(|(h, _)| *h)
+            .unwrap_or(parent)
+    }
 }
 
 /// Install the win32k SSDT table: fill the whole win32u index range with
@@ -936,6 +1150,15 @@ pub(crate) fn register(os: &mut WinOs) {
         NT_USER_MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX,
         nt_user_msg_wait_for_multiple_objects_ex,
     );
+    // Input routing: hit-testing, capture, focus.
+    os.set_win32k_handler(NT_USER_WINDOW_FROM_POINT, nt_user_window_from_point);
+    os.set_win32k_handler(NT_USER_CHILD_WINDOW_FROM_POINT_EX, nt_user_child_window_from_point_ex);
+    os.set_win32k_handler(NT_USER_SET_CAPTURE, nt_user_set_capture);
+    os.set_win32k_handler(NT_USER_RELEASE_CAPTURE, nt_user_release_capture);
+    os.set_win32k_handler(NT_USER_SET_FOCUS, nt_user_set_focus);
+    os.set_win32k_handler(NT_USER_SET_ACTIVE_WINDOW, nt_user_set_active_window);
+    os.set_win32k_handler(NT_USER_GET_THREAD_STATE, nt_user_get_thread_state);
+    os.set_win32k_handler(NT_USER_GET_ANCESTOR, nt_user_get_ancestor);
     // The NtUserCall* fan-in multiplexers + the window-long store (W4.8) — what
     // a real control consults on every message it handles.
     os.set_win32k_handler(NT_USER_CALL_HWND, nt_user_call_hwnd);
@@ -1526,6 +1749,11 @@ fn nt_user_show_window(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
         }
         None => false,
     };
+    // Showing a top-level window activates it, which is what gives keyboard
+    // input somewhere to go before any `SetFocus` has run.
+    if cmd != 0 && os.win32k_state.surface_owner(hwnd) == hwnd {
+        os.win32k_state.active = hwnd;
+    }
     os.driver.show_window(hwnd, cmd);
     Ok(was_visible as u32)
 }
@@ -1535,12 +1763,25 @@ fn nt_user_show_window(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
 /// arg0 (recovered).
 fn nt_user_destroy_window(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    Ok(destroy_window(os, hwnd) as u32)
+}
+
+/// Drop a window object and notify the driver, clearing any input state that
+/// pointed at it — a destroyed window must not keep the capture or the focus.
+/// Returns whether it existed.
+fn destroy_window(os: &mut WinOs, hwnd: u32) -> bool {
     let existed = os.win32k_state.windows.iter().any(|(h, _)| *h == hwnd);
     os.win32k_state.windows.retain(|(h, _)| *h != hwnd);
     if existed {
+        let st = &mut os.win32k_state;
+        for slot in [&mut st.capture, &mut st.focus, &mut st.active] {
+            if *slot == hwnd {
+                *slot = 0;
+            }
+        }
         os.driver.destroy_window(hwnd);
     }
-    Ok(existed as u32)
+    existed
 }
 
 /// `NtUserSetWindowPos(hwnd, insertAfter, x, y, cx, cy, flags)` — update the
@@ -1580,33 +1821,216 @@ fn nt_user_set_window_pos(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memo
 }
 
 /// `NtUserMessageCall(hwnd, msg, wParam, lParam, resultInfo, type, ansi)` — the
-/// syscall user32's `SendMessageW` reaches, and the path Wine's `DispatchMessageW`
-/// lowers *input* messages (`WM_LBUTTONDOWN`/`WM_KEYDOWN`/…) into (`WM_PAINT` and
-/// other posted messages go via [`nt_user_dispatch_message`] instead — recovered
-/// by tracing gui_sample's pump). `WM_SETTEXT` keeps its native arm (there is no
-/// dedicated `NtUserSetWindowText` syscall — `SetWindowTextW` delivers it here):
-/// update the stored title and notify the driver. Every other message is
-/// dispatched to the window's WndProc, returning its LRESULT (roadmap W4.6).
+/// **whole message-delivery family behind one index**, selected by the `type`
+/// argument (see [`message_call`]).
+///
+/// * [`SEND_MESSAGE`](message_call::SEND_MESSAGE) and its notify/timeout/callback
+///   variants: deliver synchronously to the window's WndProc; the syscall's
+///   return value **is** the `LRESULT`. (`SendMessageW` zeroes `resultInfo+8`
+///   before the call and only re-dispatches client-side if the kernel filled it,
+///   which exemu never does — so returning the LRESULT is exactly the contract.)
+/// * [`DISPATCH_MESSAGE`](message_call::DISPATCH_MESSAGE): the tail of
+///   `DispatchMessage{A,W}` for every message that is not `WM_PAINT`/`WM_TIMER`
+///   — i.e. **this is how a mouse or key message reaches its window**. Same
+///   delivery, but the syscall must answer **zero**: a non-zero answer tells
+///   user32 to run `dispatch_win_proc_params` over a `resultInfo` block the
+///   caller never initialized.
+/// * [`DEF_WINDOW_PROC`](message_call::DEF_WINDOW_PROC): `DefWindowProc{A,W}` is
+///   *nothing but* this syscall, so it must run [`def_window_proc`] here.
+///   Re-dispatching it to the window's WndProc would call the procedure that
+///   just called `DefWindowProc`, without end.
+/// * [`CALL_WINDOW_PROC`](message_call::CALL_WINDOW_PROC): the procedure to call
+///   is at offset 0 of `resultInfo`.
+///
+/// `WM_SETTEXT` keeps its native arm on the send path (there is no dedicated
+/// `NtUserSetWindowText` syscall — `SetWindowTextW` delivers it here): update
+/// the stored title and notify the driver.
 fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
     let msg = os.syscall_arg(cpu, mem, 1)? as u32;
-    if msg == WM_SETTEXT {
-        let text_ptr = os.syscall_arg(cpu, mem, 3)?; // lParam = the text pointer
-        let ansi = os.syscall_arg(cpu, mem, 6)? != 0;
-        let text = if ansi {
-            crate::api::read_astr(mem, text_ptr)?
-        } else {
-            read_wstr(mem, text_ptr)?
-        };
-        if let Some(w) = os.win32k_state.window_mut(hwnd) {
-            w.title = text.clone();
-        }
-        os.driver.set_window_text(hwnd, &text);
-        return Ok(1);
-    }
     let wparam = os.syscall_arg(cpu, mem, 2)?;
     let lparam = os.syscall_arg(cpu, mem, 3)?;
-    dispatch_to_wndproc(os, cpu, mem, hwnd as u64, msg, wparam, lparam)
+    let result_info = os.syscall_arg(cpu, mem, 4)?;
+    let call_type = os.syscall_arg(cpu, mem, 5)?;
+    let ansi = os.syscall_arg(cpu, mem, 6)? != 0;
+
+    match call_type {
+        message_call::DEF_WINDOW_PROC => {
+            let r = def_window_proc(os, cpu, mem, hwnd, msg, wparam, lparam, ansi)?;
+            os.return_u64_from_syscall(r);
+            Ok(0) // ignored: the 64-bit LRESULT above is what reaches rax
+        }
+        message_call::CALL_WINDOW_PROC => {
+            // `resultInfo+0` is the `lpPrevWndFunc` the caller passed.
+            let proc = if result_info != 0 {
+                mem.read_u64(result_info + WIN_PROC_PARAMS_FUNC)?
+            } else {
+                0
+            };
+            if proc == 0 {
+                return Ok(0);
+            }
+            let m = crate::msg::PostedMsg { hwnd: hwnd as u64, message: msg, wparam, lparam };
+            // Zero: user32 must not walk the params block afterwards (exemu ran
+            // the procedure itself), which costs `CallWindowProc` its LRESULT.
+            os.call_wndprocs_from_syscall(cpu, mem, vec![(proc, m.into_args())], Some(0), 0)?;
+            Ok(0)
+        }
+        _ => {
+            if msg == WM_SETTEXT && call_type != message_call::DISPATCH_MESSAGE {
+                let text = read_text_param(mem, lparam, ansi)?;
+                if let Some(w) = os.win32k_state.window_mut(hwnd) {
+                    w.title = text.clone();
+                }
+                os.driver.set_window_text(hwnd, &text);
+                return Ok(1);
+            }
+            // `DispatchMessage` must see 0; a send wants the WndProc's LRESULT.
+            let forced = (call_type == message_call::DISPATCH_MESSAGE).then_some(0);
+            dispatch_to_wndproc(os, cpu, mem, hwnd as u64, msg, wparam, lparam, forced)
+        }
+    }
+}
+
+/// Read a `WM_SETTEXT`/`WM_GETTEXT`-style string parameter out of guest memory.
+fn read_text_param(mem: &dyn Memory, ptr: u64, ansi: bool) -> Result<String> {
+    if ptr == 0 {
+        return Ok(String::new());
+    }
+    if ansi {
+        crate::api::read_astr(mem, ptr)
+    } else {
+        read_wstr(mem, ptr)
+    }
+}
+
+/// **The kernel-side `DefWindowProc`** — what `user32!DefWindowProcW` actually
+/// is (roadmap W4.8 input routing).
+///
+/// The pinned `user32!DefWindowProcW` (RVA 0x1ddd0) handles five IME/syscommand
+/// messages itself and forwards **everything else** to `NtUserMessageCall` with
+/// type `0x29e`. There is no `WM_NCHITTEST` arm anywhere in user32, no
+/// `NC_HandleNCHitTest` in its symbol table: the default hit test is the kernel
+/// side's, which is why answering it here is what makes a click land.
+///
+/// Only the messages a real control's `DefWindowProc` chain depends on are
+/// answered; everything else is 0, the same honest "nothing happened" the rest
+/// of this module returns.
+#[allow(clippy::too_many_arguments)]
+fn def_window_proc(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+    hwnd: u32,
+    msg: u32,
+    wparam: u64,
+    lparam: u64,
+    ansi: bool,
+) -> Result<u64> {
+    match msg {
+        // The default hit test: inside the client area, or nowhere. exemu draws
+        // no non-client frame, so a window *is* its client area and there is no
+        // caption/border/sizing region to report.
+        WM_NCHITTEST => {
+            let (x, y) = (lo_word_i32(lparam), hi_word_i32(lparam));
+            Ok(if os.win32k_state.contains_point(hwnd, x, y) {
+                hit::CLIENT as u64
+            } else {
+                hit::NOWHERE as u64
+            })
+        }
+        // TRUE = "carry on creating me". A control that lets its DefWindowProc
+        // answer this and gets FALSE is being told its own creation failed.
+        WM_NCCREATE => Ok(1),
+        WM_SETTEXT => {
+            let text = read_text_param(mem, lparam, ansi)?;
+            if let Some(w) = os.win32k_state.window_mut(hwnd) {
+                w.title = text.clone();
+            }
+            os.driver.set_window_text(hwnd, &text);
+            Ok(1)
+        }
+        WM_GETTEXTLENGTH => {
+            Ok(os.win32k_state.window(hwnd).map(|w| w.title.chars().count() as u64).unwrap_or(0))
+        }
+        WM_GETTEXT => {
+            let max = wparam as usize;
+            if lparam == 0 || max == 0 {
+                return Ok(0);
+            }
+            let title = os.win32k_state.window(hwnd).map(|w| w.title.clone()).unwrap_or_default();
+            let units: Vec<u16> = title.encode_utf16().take(max.saturating_sub(1)).collect();
+            for (i, u) in units.iter().enumerate() {
+                mem.write_u16(lparam + (i as u64) * 2, *u)?;
+            }
+            mem.write_u16(lparam + (units.len() as u64) * 2, 0)?;
+            Ok(units.len() as u64)
+        }
+        // A click on an inactive window activates it and then delivers the
+        // message (`MA_ACTIVATE` = 1).
+        WM_MOUSEACTIVATE => Ok(1),
+        // "I set the cursor" — exemu has one shape, and saying FALSE makes a
+        // control keep asking its parent.
+        WM_SETCURSOR => Ok(1),
+        // The window is its own client area; nothing to subtract.
+        WM_NCCALCSIZE => Ok(0),
+        WM_ERASEBKGND => erase_background(os, mem, hwnd),
+        WM_CLOSE => {
+            destroy_window(os, hwnd);
+            Ok(0)
+        }
+        // Focus changes have already been applied by `NtUserSetFocus`; the
+        // default handler only needs to not object.
+        WM_SETFOCUS | WM_KILLFOCUS | WM_CAPTURECHANGED | WM_NCDESTROY => Ok(0),
+        _ => {
+            let _ = cpu;
+            Ok(0)
+        }
+    }
+}
+
+/// `WM_ERASEBKGND`'s default: fill the window's visible rect with its class
+/// background brush. Returns 1 when it painted (the documented "background is
+/// erased" answer), 0 when the class asked for no background at all.
+fn erase_background(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<u64> {
+    let atom = os.win32k_state.window(hwnd).map(|w| w.class_atom).unwrap_or(0);
+    let brush = os.win32k_state.class_by_atom(atom).map(|c| c.background).unwrap_or(0);
+    if brush == 0 {
+        return Ok(0);
+    }
+    // A class background is either a brush handle or `COLOR_x + 1`.
+    let color = match os.win32k_state.brushes.iter().find(|(h, _)| *h as u64 == brush) {
+        Some((_, c)) => *c,
+        None if brush <= 0x20 => sys_color(brush as u32 - 1),
+        None => return Ok(0),
+    };
+    let rect = os.win32k_state.window_visible_rect(hwnd);
+    let Some(surface) = os
+        .win32k_state
+        .window(os.win32k_state.surface_owner(hwnd))
+        .and_then(|w| w.surface)
+    else {
+        return Ok(0);
+    };
+    let target = DcTarget { surface, org: (0, 0), clip: rect };
+    fill_rect(
+        mem,
+        &target,
+        rect[0],
+        rect[1],
+        rect[2] - rect[0],
+        rect[3] - rect[1],
+        colorref_to_bgra(color),
+    )?;
+    Ok(1)
+}
+
+/// The low / high 16 bits of a packed `lParam` point, as signed coordinates.
+fn lo_word_i32(v: u64) -> i32 {
+    (v & 0xffff) as u16 as i16 as i32
+}
+fn hi_word_i32(v: u64) -> i32 {
+    ((v >> 16) & 0xffff) as u16 as i16 as i32
 }
 
 /// The system colour for a documented `COLOR_*` index, as a `COLORREF`
@@ -1679,9 +2103,13 @@ fn nt_user_call_hwnd(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
         call_hwnd::IS_WINDOW_VISIBLE => st.chain_visible(hwnd) as u32,
         call_hwnd::GET_PARENT => st.window(hwnd).map(|w| w.parent).unwrap_or(0),
         call_hwnd::GET_DPI_FOR_WINDOW => 96,
-        // Single-threaded guest: every window belongs to the calling thread, so
-        // `SetWindowTextW` sends `WM_SETTEXT` itself instead of failing.
-        call_hwnd::IS_SELF_THREAD => st.window(hwnd).is_some() as u32,
+        // **Not a boolean — the validated HWND.** `user32!WIN_IsCurrentProcess`
+        // is `mov edx,0x10; call NtUserCallHwnd; mov eax,eax; ret`, and
+        // `DefWindowProcW` uses what it returns *as the window handle* it passes
+        // on to `NtUserMessageCall` (`mov rbx, rax`). Answering 1 sent every
+        // `DefWindowProc` in the process to window number 1. Single-threaded
+        // guest, so a live window always belongs to the caller.
+        call_hwnd::IS_SELF_THREAD => st.window(hwnd).map(|_| hwnd).unwrap_or(0),
         _ => 0,
     })
 }
@@ -2173,9 +2601,27 @@ fn nt_user_get_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
         // A shown window owes an initial WM_PAINT; synthesize it when the queue
         // is otherwise empty (roadmap W4.6) so the guest's WM_PAINT handler runs.
         synthesize_paint(os);
+        // 1. Anything already posted, in order.
+        if !os.threads[os.current].msgs.is_empty() {
+            if let Some(m) = os.msg_next() {
+                os.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
+                return Ok(if m.message == crate::msg::WM_QUIT { 0 } else { 1 });
+            }
+        }
+        // 2. Then native input, **routed here** rather than when it arrived —
+        //    the target depends on the capture, the window tree and, for a
+        //    mouse event, on what the window under the cursor answers to
+        //    `WM_NCHITTEST`, which means running guest code.
+        if let Some(ev) = os.win32k_state.raw_input.pop_front() {
+            if route_raw_input(os, cpu, mem, lp, ev)? {
+                return Ok(0); // ignored: the hit-test frame supplies rax
+            }
+            continue;
+        }
+        // 3. `WM_QUIT` only once nothing else is pending, matching Windows'
+        //    "quit is the last message a queue ever delivers".
         if let Some(m) = os.msg_next() {
             os.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
-            // GetMessage returns 0 only for WM_QUIT (stop the loop).
             return Ok(if m.message == crate::msg::WM_QUIT { 0 } else { 1 });
         }
         os.wait_for_input(std::time::Duration::from_millis(50));
@@ -2194,48 +2640,411 @@ fn synthesize_paint(os: &mut WinOs) {
 }
 
 impl WinOs {
-    /// Translate a native [`InputEvent`](exemu_core::InputEvent) into the Win32
-    /// message the guest expects and post it to the shown window's queue (roadmap
-    /// W4.6). The [`NtUserDispatchMessage`](nt_user_dispatch_message) path then
-    /// routes it to the guest's WndProc. `Close` is handled by the caller (it
-    /// becomes `WM_QUIT`, not a window message), so it is a no-op here; input for
-    /// a guest with no shown window is dropped.
+    /// Queue a native [`InputEvent`](exemu_core::InputEvent) as **raw input**
+    /// (roadmap W4.8 input routing). Nothing is translated here: which window a
+    /// mouse event belongs to is decided at retrieval by [`route_raw_input`],
+    /// because it needs the capture state, the current window tree and — for a
+    /// mouse event over a control — the answer that control gives to
+    /// `WM_NCHITTEST`, which is guest code.
+    ///
+    /// `Close` is handled by the caller (it becomes `WM_QUIT`, not a window
+    /// message), so it is dropped here.
     pub(crate) fn post_input_event(&mut self, ev: exemu_core::InputEvent) {
-        use crate::gdi::{
-            MK_LBUTTON, MK_RBUTTON, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-            WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
-        };
-        use exemu_core::{InputEvent, MouseButton};
+        use exemu_core::InputEvent;
         // Track the cursor position from every pointer event so GetCursorPos
         // reports where the user last pointed (roadmap W4.7).
         match ev {
-            InputEvent::MouseMove { x, y }
-            | InputEvent::MouseButton { x, y, .. } => self.win32k_state.cursor_pos = (x, y),
+            InputEvent::MouseMove { x, y } | InputEvent::MouseButton { x, y, .. } => {
+                self.win32k_state.cursor_pos = (x, y)
+            }
+            InputEvent::Close => return,
             _ => {}
         }
-        let Some(hwnd) = self.win32k_state.shown_window() else { return };
-        // Mouse position packs into lParam as (x in low word, y in high word).
-        let pos = |x: i32, y: i32| (x as u32 as u64 & 0xffff) | ((y as u32 as u64 & 0xffff) << 16);
-        let (message, wparam, lparam) = match ev {
-            InputEvent::Close => return,
-            InputEvent::MouseMove { x, y } => (WM_MOUSEMOVE, 0, pos(x, y)),
-            InputEvent::MouseButton { button: MouseButton::Left, down: true, x, y } => {
-                (WM_LBUTTONDOWN, MK_LBUTTON, pos(x, y))
-            }
-            InputEvent::MouseButton { button: MouseButton::Left, down: false, x, y } => {
-                (WM_LBUTTONUP, 0, pos(x, y))
-            }
-            InputEvent::MouseButton { button: MouseButton::Right, down: true, x, y } => {
-                (WM_RBUTTONDOWN, MK_RBUTTON, pos(x, y))
-            }
-            InputEvent::MouseButton { button: MouseButton::Right, down: false, x, y } => {
-                (WM_RBUTTONUP, 0, pos(x, y))
-            }
-            InputEvent::Key { vk, down: true } => (WM_KEYDOWN, vk as u64, 0),
-            InputEvent::Key { vk, down: false } => (WM_KEYUP, vk as u64, 0),
-        };
-        self.post_internal(hwnd as u64, message as u32, wparam, lparam);
+        self.win32k_state.raw_input.push_back(ev);
     }
+}
+
+/// The Win32 message a native event becomes, as `(message, wParam)`. Mouse
+/// events carry their position separately because it still has to be rebased
+/// into the target window's client space.
+fn input_message(ev: exemu_core::InputEvent) -> Option<(u32, u64)> {
+    use crate::gdi::{
+        MK_LBUTTON, MK_RBUTTON, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+        WM_RBUTTONDOWN, WM_RBUTTONUP,
+    };
+    use exemu_core::{InputEvent, MouseButton};
+    let (msg, wparam) = match ev {
+        InputEvent::Close => return None,
+        InputEvent::MouseMove { .. } => (WM_MOUSEMOVE, 0),
+        InputEvent::MouseButton { button: MouseButton::Left, down: true, .. } => {
+            (WM_LBUTTONDOWN, MK_LBUTTON)
+        }
+        InputEvent::MouseButton { button: MouseButton::Left, down: false, .. } => (WM_LBUTTONUP, 0),
+        InputEvent::MouseButton { button: MouseButton::Right, down: true, .. } => {
+            (WM_RBUTTONDOWN, MK_RBUTTON)
+        }
+        InputEvent::MouseButton { button: MouseButton::Right, down: false, .. } => {
+            (WM_RBUTTONUP, 0)
+        }
+        InputEvent::Key { vk, down: true } => (WM_KEYDOWN, vk as u64),
+        InputEvent::Key { vk, down: false } => (WM_KEYUP, vk as u64),
+    };
+    Some((msg as u32, wparam))
+}
+
+/// The screen point of a native event, or `None` for a keyboard event.
+fn input_point(ev: exemu_core::InputEvent) -> Option<(i32, i32)> {
+    use exemu_core::InputEvent;
+    match ev {
+        InputEvent::MouseMove { x, y } | InputEvent::MouseButton { x, y, .. } => Some((x, y)),
+        _ => None,
+    }
+}
+
+/// Pack a point into an `lParam` (x in the low word, y in the high).
+fn pack_point(x: i32, y: i32) -> u64 {
+    (x as u32 as u64 & 0xffff) | ((y as u32 as u64 & 0xffff) << 16)
+}
+
+/// **Route one native event to a window** (roadmap W4.8 input routing).
+///
+/// Returns `true` when a `WM_NCHITTEST` callback was installed, in which case the
+/// syscall's caller is resumed by the callback frame and the delivered message
+/// has already been written into `lp` by [`finish_hit_test`]; `false` when the
+/// event was posted (or dropped) and the pump should carry on.
+///
+/// The order is Windows': **capture first, hit test second**. While a window
+/// holds the capture every mouse event goes to it in its own client coordinates
+/// with no hit test at all — that is what lets Wine's `ButtonWndProc`, which
+/// takes the capture on `WM_LBUTTONDOWN`, still receive the matching
+/// `WM_LBUTTONUP` after the pointer has left the button.
+fn route_raw_input(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+    lp: u64,
+    ev: exemu_core::InputEvent,
+) -> Result<bool> {
+    let Some((msg, wparam)) = input_message(ev) else { return Ok(false) };
+    let Some((x, y)) = input_point(ev) else {
+        // Keyboard: the focus window, or the active top-level as a fallback so a
+        // guest that never calls `SetFocus` still receives its keys.
+        let target = keyboard_target(os);
+        if target != 0 {
+            os.post_internal(target as u64, msg, wparam, 0);
+        }
+        return Ok(false);
+    };
+
+    let capture = os.win32k_state.capture;
+    if capture != 0 && os.win32k_state.window(capture).is_some() {
+        let (ox, oy) = os.win32k_state.client_origin(capture);
+        os.post_internal(capture as u64, msg, wparam, pack_point(x - ox, y - oy));
+        return Ok(false);
+    }
+
+    let target = os.win32k_state.window_from_point(x, y, &[]);
+    if target == 0 {
+        return Ok(false); // outside every window — nothing to deliver to
+    }
+    begin_hit_test(os, cpu, mem, lp, ev, msg, wparam, target, Vec::new())
+}
+
+/// The window a key message goes to: the focus window, else the active window,
+/// else the shown top-level.
+fn keyboard_target(os: &WinOs) -> u32 {
+    let st = &os.win32k_state;
+    for h in [st.focus, st.active] {
+        if h != 0 && st.window(h).is_some() {
+            return h;
+        }
+    }
+    st.shown_window().unwrap_or(0)
+}
+
+/// State carried across a `WM_NCHITTEST` callback so the answer can be turned
+/// into the message that is actually delivered.
+pub(crate) struct PendingHitTest {
+    /// The native event being routed.
+    ev: exemu_core::InputEvent,
+    /// The client message it maps to, and its `wParam`.
+    msg: u32,
+    wparam: u64,
+    /// The window being asked.
+    hwnd: u32,
+    /// The guest `MSG*` `GetMessage` was called with.
+    lp: u64,
+    /// Windows already excluded by an `HTTRANSPARENT` answer.
+    skipped: Vec<u32>,
+}
+
+/// Prepare one `WM_NCHITTEST` round for `hwnd`.
+///
+/// `Ok(Some((wndproc, args)))` — ask that window; `Ok(None)` — no ask was
+/// possible or warranted, and the message has already been delivered using the
+/// kernel's own answer. A window with no WndProc (one whose class was never
+/// registered) cannot answer, so the default applies straight away — which keeps
+/// a plain single-window guest on exactly the path it had before hit-testing
+/// existed.
+fn arm_hit_test(
+    os: &mut WinOs,
+    mem: &mut dyn Memory,
+    pending: &PendingHitTest,
+) -> Result<Option<(u64, Vec<u64>)>> {
+    let hwnd = pending.hwnd;
+    let wndproc = os.win32k_state.wndproc_for(hwnd);
+    let (x, y) = input_point(pending.ev).unwrap_or((0, 0));
+    if wndproc == 0 || pending.skipped.len() >= HIT_TEST_ROUNDS_MAX {
+        let code =
+            if os.win32k_state.contains_point(hwnd, x, y) { hit::CLIENT } else { hit::NOWHERE };
+        deliver_hit(os, mem, pending.lp, pending.ev, pending.msg, pending.wparam, hwnd, code)?;
+        return Ok(None);
+    }
+    Ok(Some((wndproc, vec![hwnd as u64, WM_NCHITTEST as u64, 0, pack_point(x, y)])))
+}
+
+/// Ask `hwnd` what part of itself the point is over, then deliver accordingly.
+/// Returns whether a callback was installed (see [`route_raw_input`]).
+#[allow(clippy::too_many_arguments)]
+fn begin_hit_test(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+    lp: u64,
+    ev: exemu_core::InputEvent,
+    msg: u32,
+    wparam: u64,
+    hwnd: u32,
+    skipped: Vec<u32>,
+) -> Result<bool> {
+    let pending = PendingHitTest { ev, msg, wparam, hwnd, lp, skipped };
+    match arm_hit_test(os, mem, &pending)? {
+        Some((wndproc, args)) => {
+            os.call_hit_test_from_syscall(cpu, mem, wndproc, args, pending)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// The `WM_NCHITTEST` answer came back: either retry with the transparent window
+/// excluded, or deliver the message the answer selects.
+///
+/// This runs from the win32k callback-driver thunk, **not** from a syscall
+/// handler, so a second round is queued onto the frame that is already open
+/// rather than opening a new one.
+pub(crate) fn finish_hit_test(
+    os: &mut WinOs,
+    _cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+    mut pending: PendingHitTest,
+    lresult: u64,
+) -> Result<()> {
+    let code = lresult as i64;
+    // The message is written straight into the guest's MSG buffer, so
+    // `GetMessage` answers TRUE — a zero would mean `WM_QUIT` and stop the loop.
+    os.win32k_cb_set_result(1);
+    if code == hit::TRANSPARENT {
+        // "I am not here": exclude this window and look again. Wine's
+        // `ButtonWndProc` answers exactly this for a `BS_GROUPBOX`, so a click
+        // inside a group box must reach whatever is underneath it.
+        pending.skipped.push(pending.hwnd);
+        let (x, y) = input_point(pending.ev).unwrap_or((0, 0));
+        let next = os.win32k_state.window_from_point(x, y, &pending.skipped);
+        if next != 0 && next != pending.hwnd {
+            pending.hwnd = next;
+            if let Some((wndproc, args)) = arm_hit_test(os, mem, &pending)? {
+                os.win32k_cb_queue(wndproc, args);
+                os.win32k_cb_set_then(pending);
+            }
+            return Ok(());
+        }
+        // Nothing underneath: the event has nowhere to go.
+        return write_null_message(os, mem, pending.lp);
+    }
+    deliver_hit(os, mem, pending.lp, pending.ev, pending.msg, pending.wparam, pending.hwnd, code)
+}
+
+/// Turn a hit-test answer into the delivered message and write it into the
+/// guest's `MSG` — or post it, when there is no `MSG` to fill (the pre-hit-test
+/// path that reached here without a callback frame).
+///
+/// `HTCLIENT` gives the ordinary client message with the point rebased into the
+/// window's client space; any other code gives the **non-client twin**
+/// (`WM_MOUSEMOVE` → `WM_NCMOUSEMOVE`, …) with the hit code in `wParam` and the
+/// screen point in `lParam`, which is the documented Win32 shape.
+#[allow(clippy::too_many_arguments)]
+fn deliver_hit(
+    os: &mut WinOs,
+    mem: &mut dyn Memory,
+    lp: u64,
+    ev: exemu_core::InputEvent,
+    msg: u32,
+    wparam: u64,
+    hwnd: u32,
+    code: i64,
+) -> Result<()> {
+    let (x, y) = input_point(ev).unwrap_or((0, 0));
+    let (msg, wparam, lparam) = if code == hit::CLIENT {
+        let (ox, oy) = os.win32k_state.client_origin(hwnd);
+        (msg, wparam, pack_point(x - ox, y - oy))
+    } else if (WM_MOUSEFIRST..=WM_MOUSELAST_NC).contains(&msg) {
+        (msg - NC_MOUSE_DELTA, code as u64, pack_point(x, y))
+    } else {
+        (msg, wparam, pack_point(x, y))
+    };
+    if lp == 0 {
+        os.post_internal(hwnd as u64, msg, wparam, lparam);
+        return Ok(());
+    }
+    os.write_msg_full(mem, lp, hwnd as u64, msg as u64, wparam, lparam)
+}
+
+/// Fill the guest's `MSG` with a benign `WM_NULL` for a window that is nowhere.
+/// `DispatchMessage` on a null hwnd is a documented no-op, so the pump keeps
+/// running instead of the kernel having to invent a target.
+fn write_null_message(os: &mut WinOs, mem: &mut dyn Memory, lp: u64) -> Result<()> {
+    if lp == 0 {
+        return Ok(());
+    }
+    os.write_msg_full(mem, lp, 0, 0, 0, 0)
+}
+
+// =================== W4.8 input routing: the syscall surface =================
+
+/// `NtUserWindowFromPoint(x, y)` — `user32!WindowFromPoint` is four instructions
+/// that unpack the by-value `POINT` (x in the low half of `rcx`, y shifted into
+/// `edx`) and tail-jump here, so the entire tree walk is the kernel's.
+fn nt_user_window_from_point(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let x = os.syscall_arg(cpu, mem, 0)? as i32;
+    let y = os.syscall_arg(cpu, mem, 1)? as i32;
+    Ok(os.win32k_state.window_from_point(x, y, &[]))
+}
+
+/// `NtUserChildWindowFromPointEx(hwnd, x, y, flags)` — the *direct* child of
+/// `hwnd` under the point (one level, unlike `WindowFromPoint`'s descent), or
+/// `hwnd` itself. `user32!ChildWindowFromPointEx` likewise only unpacks the
+/// `POINT` (`mov r8,rdx; shr r8,0x20`) and tail-jumps.
+fn nt_user_child_window_from_point_ex(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let parent = os.syscall_arg(cpu, mem, 0)? as u32;
+    let x = os.syscall_arg(cpu, mem, 1)? as i32;
+    let y = os.syscall_arg(cpu, mem, 2)? as i32;
+    if os.win32k_state.window(parent).is_none() {
+        return Ok(0);
+    }
+    // The point arrives in the parent's client coordinates.
+    let (ox, oy) = os.win32k_state.client_origin(parent);
+    Ok(os.win32k_state.child_window_from_point(parent, x + ox, y + oy))
+}
+
+/// `NtUserSetCapture(hwnd)` → the window that held the capture before, and
+/// `WM_CAPTURECHANGED` to it. `user32!SetCapture` is a bare thunk, so all of the
+/// semantics live here.
+fn nt_user_set_capture(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    set_capture(os, cpu, mem, hwnd)
+}
+
+/// `NtUserReleaseCapture()` → TRUE, releasing whatever held it.
+fn nt_user_release_capture(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    set_capture(os, cpu, mem, 0)?;
+    Ok(1)
+}
+
+/// Install (or drop, with `hwnd == 0`) the mouse capture, notifying the window
+/// that loses it. Returns the previous holder.
+///
+/// The notification matters: Wine's `ButtonWndProc` has a `WM_CAPTURECHANGED`
+/// arm that drops its pushed state, so a button whose capture is stolen
+/// un-presses itself instead of staying stuck down.
+fn set_capture(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory, hwnd: u32) -> Result<u32> {
+    let prev = os.win32k_state.capture;
+    if prev == hwnd {
+        return Ok(prev);
+    }
+    os.win32k_state.capture = if os.win32k_state.window(hwnd).is_some() { hwnd } else { 0 };
+    if prev != 0 {
+        let wndproc = os.win32k_state.wndproc_for(prev);
+        if wndproc != 0 {
+            let m = crate::msg::PostedMsg {
+                hwnd: prev as u64,
+                message: WM_CAPTURECHANGED,
+                wparam: 0,
+                lparam: hwnd as u64,
+            };
+            os.call_wndprocs_from_syscall(cpu, mem, vec![(wndproc, m.into_args())], Some(prev as u64), 0)?;
+        }
+    }
+    Ok(prev)
+}
+
+/// `NtUserSetFocus(hwnd)` → the previously focused window, with `WM_KILLFOCUS`
+/// to it and `WM_SETFOCUS` to the new one (documented order and `wParam`s).
+/// `user32!SetFocus` is a bare thunk into this.
+fn nt_user_set_focus(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let prev = os.win32k_state.focus;
+    if prev == hwnd || os.win32k_state.window(hwnd).is_none() {
+        return Ok(prev);
+    }
+    os.win32k_state.focus = hwnd;
+    let mut calls = Vec::new();
+    for (target, msg, wparam) in
+        [(prev, WM_KILLFOCUS, hwnd as u64), (hwnd, WM_SETFOCUS, prev as u64)]
+    {
+        let wndproc = os.win32k_state.wndproc_for(target);
+        if target != 0 && wndproc != 0 {
+            let m =
+                crate::msg::PostedMsg { hwnd: target as u64, message: msg, wparam, lparam: 0 };
+            calls.push((wndproc, m.into_args()));
+        }
+    }
+    os.call_wndprocs_from_syscall(cpu, mem, calls, Some(prev as u64), 0)?;
+    Ok(prev)
+}
+
+/// `NtUserSetActiveWindow(hwnd)` → the previously active window.
+fn nt_user_set_active_window(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let prev = os.win32k_state.active;
+    if os.win32k_state.window(hwnd).is_some() {
+        os.win32k_state.active = hwnd;
+    }
+    Ok(prev)
+}
+
+/// `NtUserGetThreadState(index)` — the read side of the per-thread input state.
+/// `GetFocus`/`GetActiveWindow`/`GetCapture` are one-line user32 wrappers that do
+/// nothing but load index 0/1/2 and tail-jump here.
+fn nt_user_get_thread_state(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let index = os.syscall_arg(cpu, mem, 0)?;
+    let st = &os.win32k_state;
+    Ok(match index {
+        thread_state::FOCUS => st.focus,
+        thread_state::ACTIVE => st.active,
+        thread_state::CAPTURE => st.capture,
+        _ => 0,
+    })
+}
+
+/// `NtUserGetAncestor(hwnd, type)` — `GA_PARENT` walks one link, `GA_ROOT` /
+/// `GA_ROOTOWNER` walk to the top-level window (which is also the window that
+/// owns the backing surface).
+fn nt_user_get_ancestor(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let kind = os.syscall_arg(cpu, mem, 1)?;
+    if os.win32k_state.window(hwnd).is_none() {
+        return Ok(0);
+    }
+    Ok(match kind {
+        ancestor::PARENT => os.win32k_state.window(hwnd).map(|w| w.parent).unwrap_or(0),
+        ancestor::ROOT | ancestor::ROOTOWNER => os.win32k_state.surface_owner(hwnd),
+        _ => 0,
+    })
 }
 
 /// Dispatch `(hwnd, msg, wParam, lParam)` to the target window's WndProc via the
@@ -2244,6 +3053,7 @@ impl WinOs {
 /// with the WndProc's LRESULT in rax. A message for an unknown / class-less
 /// window is a no-op (returns 0). Shared by `NtUserDispatchMessage` and the
 /// WndProc arm of `NtUserMessageCall`.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_to_wndproc(
     os: &mut WinOs,
     cpu: &mut CpuState,
@@ -2252,14 +3062,15 @@ fn dispatch_to_wndproc(
     msg: u32,
     wparam: u64,
     lparam: u64,
+    result: Option<u64>,
 ) -> Result<u32> {
     let wndproc = os.win32k_state.wndproc_for(hwnd as u32);
     if wndproc == 0 {
-        return Ok(0);
+        return Ok(result.unwrap_or(0) as u32);
     }
     let m = crate::msg::PostedMsg { hwnd, message: msg, wparam, lparam };
-    os.call_wndproc_from_syscall(cpu, mem, wndproc, m)?;
-    Ok(0) // ignored: call_wndproc_from_syscall sets syscall_resume_as_is
+    os.call_wndprocs_from_syscall(cpu, mem, vec![(wndproc, m.into_args())], result, 0)?;
+    Ok(0) // ignored: the callback frame supplies rax on resume
 }
 
 /// `NtUserDispatchMessage(lpMsg)` — invoke the target window's WndProc with the
@@ -2272,7 +3083,9 @@ fn nt_user_dispatch_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
         return Ok(0);
     }
     let (hwnd, message, wparam, lparam) = os.read_msg(mem, lp)?;
-    dispatch_to_wndproc(os, cpu, mem, hwnd, message as u32, wparam, lparam)
+    // `DispatchMessageW` returns this syscall's result verbatim, so the WndProc's
+    // own LRESULT is what belongs in rax.
+    dispatch_to_wndproc(os, cpu, mem, hwnd, message as u32, wparam, lparam, None)
 }
 
 /// `NtUserPeekMessage` → 0 (no message available).
@@ -2614,7 +3427,15 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 pub mod abi {
     /// win32u syscall indices, as `(export name, index)`. The index is the
     /// `mov eax, imm32` immediate in that export's stub.
-    pub const SYSCALLS: [(&str, u32); 26] = [
+    pub const SYSCALLS: [(&str, u32); 34] = [
+        ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
+        ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
+        ("NtUserSetCapture", super::NT_USER_SET_CAPTURE),
+        ("NtUserReleaseCapture", super::NT_USER_RELEASE_CAPTURE),
+        ("NtUserSetFocus", super::NT_USER_SET_FOCUS),
+        ("NtUserSetActiveWindow", super::NT_USER_SET_ACTIVE_WINDOW),
+        ("NtUserGetThreadState", super::NT_USER_GET_THREAD_STATE),
+        ("NtUserGetAncestor", super::NT_USER_GET_ANCESTOR),
         ("NtUserCreateWindowEx", super::NT_USER_CREATE_WINDOW_EX),
         ("NtUserShowWindow", super::NT_USER_SHOW_WINDOW),
         ("NtUserDestroyWindow", super::NT_USER_DESTROY_WINDOW),
@@ -2645,13 +3466,46 @@ pub mod abi {
 
     /// `NtUserCallHwnd(hwnd, code)` selectors, as `(user32 export that issues
     /// this code, code)`.
-    pub const CALL_HWND: [(&str, u64); 5] = [
+    pub const CALL_HWND: [(&str, u64); 6] = [
         ("IsWindow", super::call_hwnd::IS_WINDOW),
         ("IsWindowEnabled", super::call_hwnd::IS_WINDOW_ENABLED),
         ("IsWindowUnicode", super::call_hwnd::IS_WINDOW_UNICODE),
         ("IsWindowVisible", super::call_hwnd::IS_WINDOW_VISIBLE),
         ("GetParent", super::call_hwnd::GET_PARENT),
+        // `WIN_IsCurrentProcess`, which `SetWindowTextW` inlines the call to,
+        // and whose result `DefWindowProcW` uses as the window handle.
+        ("SetWindowTextW", super::call_hwnd::IS_SELF_THREAD),
     ];
+
+    /// `NtUserGetThreadState(index)` selectors, as `(user32 export, index)` —
+    /// each of those exports is a two-instruction wrapper around this syscall.
+    pub const THREAD_STATE: [(&str, u64); 3] = [
+        ("GetFocus", super::thread_state::FOCUS),
+        ("GetActiveWindow", super::thread_state::ACTIVE),
+        ("GetCapture", super::thread_state::CAPTURE),
+    ];
+
+    /// `NtUserMessageCall`'s `type` argument, as `(user32 export, type)`. The
+    /// immediate each wrapper stores in the syscall's 6th argument slot.
+    pub const MESSAGE_CALL_TYPES: [(&str, u64); 6] = [
+        ("SendMessageW", super::message_call::SEND_MESSAGE),
+        ("SendMessageTimeoutW", super::message_call::SEND_MESSAGE_TIMEOUT),
+        ("SendNotifyMessageW", super::message_call::SEND_NOTIFY_MESSAGE),
+        ("SendMessageCallbackW", super::message_call::SEND_MESSAGE_CALLBACK),
+        ("CallWindowProcW", super::message_call::CALL_WINDOW_PROC),
+        ("DefWindowProcW", super::message_call::DEF_WINDOW_PROC),
+    ];
+
+    /// The type the internal `dispatch_message` — the tail of
+    /// `DispatchMessage{A,W}` — passes. Not reachable by export name; the test
+    /// follows `DispatchMessageW`'s own call into it.
+    pub const MESSAGE_CALL_DISPATCH: u64 = super::message_call::DISPATCH_MESSAGE;
+
+    /// `WM_NCHITTEST`, and the `HTCLIENT`/`HTTRANSPARENT` codes exemu's routing
+    /// branches on.
+    pub const WM_NCHITTEST: u32 = super::WM_NCHITTEST;
+    pub const HT_CLIENT: i64 = super::hit::CLIENT;
+    pub const HT_TRANSPARENT: i64 = super::hit::TRANSPARENT;
 
     /// `NtUserCallHwndParam(hwnd, param, code)` selectors, likewise.
     pub const CALL_HWND_PARAM: [(&str, u64); 5] = [
@@ -3226,6 +4080,126 @@ mod tests {
         let gone = child(&mut os, panel, [500, 500, 20, 20]);
         let r = os.win32k_state.window_visible_rect(gone);
         assert!(r[2] <= r[0] || r[3] <= r[1], "a fully clipped child has an empty rect: {r:?}");
+    }
+
+    /// **The hit test.** `WindowFromPoint` descends to the *deepest* window
+    /// containing the point, searching siblings newest-first (a freshly created
+    /// child sits on top of its siblings' Z-order), and answers 0 outside the
+    /// top-level window entirely.
+    #[test]
+    fn window_from_point_finds_the_deepest_topmost_child() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let top = child(&mut os, 0, [0, 0, 400, 300]);
+        let panel = child(&mut os, top, [10, 20, 200, 150]);
+        let button = child(&mut os, panel, [5, 5, 60, 24]);
+        // A later sibling of `panel` overlapping it: newest wins.
+        let overlay = child(&mut os, top, [100, 100, 80, 40]);
+        let st = &os.win32k_state;
+
+        assert_eq!(st.window_from_point(300, 250, &[]), top, "bare client area → the window");
+        assert_eq!(st.window_from_point(150, 40, &[]), panel, "inside the panel → the panel");
+        assert_eq!(st.window_from_point(20, 30, &[]), button, "inside the button → the button");
+        assert_eq!(st.window_from_point(120, 110, &[]), overlay, "the newer sibling is on top");
+        assert_eq!(st.window_from_point(500, 500, &[]), 0, "outside every window → nothing");
+
+        // `HTTRANSPARENT` re-runs the search with the answering window excluded,
+        // which is how a click passes through a group box to what is under it.
+        assert_eq!(st.window_from_point(20, 30, &[button]), panel, "skip the button → the panel");
+        assert_eq!(
+            st.window_from_point(20, 30, &[button, panel]),
+            top,
+            "skip both → the top-level window"
+        );
+        // `ChildWindowFromPointEx` stops at one level, unlike the descent above.
+        assert_eq!(st.child_window_from_point(top, 20, 30), panel);
+        assert_eq!(st.child_window_from_point(panel, 20, 30), button);
+    }
+
+    /// A hidden window takes no input, and neither does a visible child of a
+    /// hidden parent.
+    #[test]
+    fn a_hidden_window_is_not_hit() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let top = child(&mut os, 0, [0, 0, 400, 300]);
+        let panel = child(&mut os, top, [10, 20, 200, 150]);
+        os.win32k_state.window_mut(panel).unwrap().shown = false;
+        assert_eq!(
+            os.win32k_state.window_from_point(150, 40, &[]),
+            top,
+            "a hidden child is skipped and the point lands on its parent"
+        );
+    }
+
+    /// A non-client hit code maps the mouse message onto its `WM_NC*` twin —
+    /// `WM_MOUSEMOVE`/`WM_LBUTTONDOWN`/`WM_LBUTTONUP` sit exactly
+    /// [`NC_MOUSE_DELTA`] above `WM_NCMOUSEMOVE`/`WM_NCLBUTTONDOWN`/`WM_NCLBUTTONUP`.
+    #[test]
+    fn client_mouse_messages_map_onto_their_non_client_twins() {
+        use crate::gdi::{WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE};
+        assert_eq!(WM_MOUSEMOVE as u32 - NC_MOUSE_DELTA, 0x00a0, "WM_NCMOUSEMOVE");
+        assert_eq!(WM_LBUTTONDOWN as u32 - NC_MOUSE_DELTA, 0x00a1, "WM_NCLBUTTONDOWN");
+        assert_eq!(WM_LBUTTONUP as u32 - NC_MOUSE_DELTA, 0x00a2, "WM_NCLBUTTONUP");
+        assert!((WM_MOUSEFIRST..=WM_MOUSELAST_NC).contains(&(WM_LBUTTONUP as u32)));
+    }
+
+    /// A packed mouse `lParam` round-trips through the low/high word helpers,
+    /// **including negative coordinates** — a drag that leaves a control to the
+    /// left reports x as a negative 16-bit value, and reading it unsigned would
+    /// put the pointer 65 000 pixels to the right instead.
+    #[test]
+    fn packed_points_survive_negative_coordinates() {
+        for (x, y) in [(0, 0), (150, 90), (-3, 7), (12, -40), (-1, -1)] {
+            let lp = pack_point(x, y);
+            assert_eq!((lo_word_i32(lp), hi_word_i32(lp)), (x, y), "round-trip ({x}, {y})");
+        }
+    }
+
+    /// The mouse capture overrides hit-testing: while it is held every mouse
+    /// event goes to the capture window, in **its** client coordinates. Without
+    /// this a pushed button never sees the button-up that releases it.
+    #[test]
+    fn the_capture_takes_the_mouse_regardless_of_the_point() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let top = child(&mut os, 0, [0, 0, 400, 300]);
+        let button = child(&mut os, top, [24, 200, 140, 32]);
+        os.win32k_state.capture = button;
+        let mut mem = VirtualMemory::new();
+        let mut cpu = CpuState::default();
+        // A point well outside the button — the drag left its rect.
+        let ev = exemu_core::InputEvent::MouseButton {
+            button: exemu_core::MouseButton::Left,
+            down: false,
+            x: 300,
+            y: 40,
+        };
+        let installed = route_raw_input(&mut os, &mut cpu, &mut mem, 0, ev).expect("routes");
+        assert!(!installed, "the capture path never asks WM_NCHITTEST");
+        let m = os.msg_next().expect("the button-up was posted");
+        assert_eq!(m.hwnd, button as u64, "…to the capture window, not the one under the cursor");
+        assert_eq!(m.message, crate::gdi::WM_LBUTTONUP as u32);
+        assert_eq!(
+            (lo_word_i32(m.lparam), hi_word_i32(m.lparam)),
+            (300 - 24, 40 - 200),
+            "in the capture window's own client coordinates"
+        );
+    }
+
+    /// A key message goes to the focus window, falling back to the active
+    /// top-level so a guest that never calls `SetFocus` still receives keys.
+    #[test]
+    fn keys_follow_the_focus_then_the_active_window() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let top = child(&mut os, 0, [0, 0, 400, 300]);
+        let edit = child(&mut os, top, [10, 10, 100, 20]);
+        assert_eq!(keyboard_target(&os), top, "no focus, no active → the shown top-level");
+        os.win32k_state.active = top;
+        assert_eq!(keyboard_target(&os), top);
+        os.win32k_state.focus = edit;
+        assert_eq!(keyboard_target(&os), edit, "the focus window wins");
+        // A destroyed focus window must not keep the keyboard.
+        destroy_window(&mut os, edit);
+        assert_eq!(os.win32k_state.focus, 0, "destroying the focus window clears it");
+        assert_eq!(keyboard_target(&os), top);
     }
 
     /// A cyclic parent link degrades to "treat it as top-level" instead of

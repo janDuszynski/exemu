@@ -28,6 +28,13 @@ pub(crate) struct PostedMsg {
     pub lparam: u64,
 }
 
+impl PostedMsg {
+    /// The four Win64 arguments a `WNDPROC` takes, in order.
+    pub(crate) fn into_args(self) -> Vec<u64> {
+        vec![self.hwnd, self.message as u64, self.wparam, self.lparam]
+    }
+}
+
 impl WinOs {
     /// The index of the thread that should receive a message for `hwnd`. Windows
     /// are single-threaded for now, so everything targets the running thread.
