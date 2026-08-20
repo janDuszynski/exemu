@@ -129,6 +129,47 @@ end-to-end on the default path.
   kernel32/kernelbase/ucrtbase** — correct stdout, file-I/O round-trip, and a
   propagated non-zero exit code — with none of exemu's emulated API thunks used.
 
+#### Child processes (W3.5)
+- **`CreateProcessW` works, through Wine's own kernel32/kernelbase.** The guest
+  path is entirely Wine's: `CreateProcessInternalW` →
+  `RtlCreateProcessParametersEx` → `create_nt_process` →
+  **`NtCreateUserProcess`** → `NtResumeThread`; exemu supplies the syscalls and
+  the run. `GetExitCodeProcess` is likewise Wine's, over exemu's new
+  `NtQueryInformationProcess(ProcessBasicInformation)`.
+- **A child is a second complete emulator instance** — its own address space,
+  `WinOs` and interpreter — *prepared* by `NtCreateUserProcess` and *started*
+  when its initial thread is resumed. That is the seam Wine actually uses:
+  kernelbase creates every child with `THREAD_CREATE_FLAGS_CREATE_SUSPENDED` and
+  resumes it as the last step, so `CREATE_SUSPENDED` and the plain case are both
+  correct without exemu guessing.
+- **The handle semantics are the real ones**: a process/thread handle pair from
+  the same space `CloseHandle` routes, `WaitForSingleObject` that is unsignaled
+  until the child exits, `PROCESS_INFORMATION.dwProcessId` from the output
+  `PsAttributeClientId`, and the child's own exit code read back. The child
+  inherits the parent's console and environment block.
+- **The honest limit:** the run is **synchronous**, so parent and child are never
+  alive at once — a pipe handshake or a cross-process event cannot work, and no
+  code pretends otherwise. Out-of-scope requests return a real NTSTATUS rather
+  than a plausible success: a debug port, a job list, a token
+  (`CreateProcessAsUser`), a foreign parent, a non-AMD64 machine type, an
+  explicit handle list, and std handles that are not the console sentinels a
+  fresh address space can honour. A child the *emulator* fails to run reports
+  `STATUS_UNSUCCESSFUL` plus a verbatim report on the parent's stderr — never an
+  invented exit code.
+- **GATE:** a generated parent PE calls `CreateProcessW` on a generated child PE,
+  waits on the handle and reads back the child's exit code (91, a value only the
+  child knows) — 563,877 instructions on the Wine boot, 1,654 on the emulated
+  path as the control, both `SPAWN OK`. Every offset, index and flag bit is
+  re-derived from the pinned binaries on every run by `process_abi.rs`.
+- **Measured, and honest about it: neither corpus installer is unblocked.**
+  Total Commander still exits 1 after ~4.06M instructions on the Wine boot
+  (~22k emulated) having created **zero** processes — the same numbers W6.5
+  pinned. SteamSetup is a PE32, so the x64-only Wine boot cannot reach Wine's
+  `CreateProcessW` for it at all, and on the emulated path it faults at the same
+  known site ~92.86M instructions in, with `CreateProcess` never called (verified
+  by tracing every intercepted API). The corpus gate is 4/4 after this change,
+  7-Zip byte-identical at 496,505,572.
+
 ### The first Wine-rendered window (W4)
 - A **second SSDT** for win32k (`NtUser*`/`NtGdi*`) and a `UserDriver`/`Presenter`
   seam: Wine's user32/gdi32/win32u run as guest code and push real

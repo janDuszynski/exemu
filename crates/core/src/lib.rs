@@ -20,6 +20,7 @@ pub mod gui;
 pub mod hooks;
 pub mod memory;
 pub mod pe;
+pub mod spawn;
 pub mod telemetry;
 pub mod unwind;
 
@@ -39,6 +40,9 @@ pub use memory::{Memory, Perm, Region, CODE_PAGE_SIZE};
 pub use pe::{
     ActivationContext, AssemblyIdentity, Export, Import, ImportSymbol, ManifestInfo, PeImage,
     Reloc, Section, Tls,
+};
+pub use spawn::{
+    ChildProcessOutcome, ChildProcessRequest, NoSpawner, ProcessSpawner, SpawnError,
 };
 pub use telemetry::{rank as rank_opcode_misses, MissRecord, OpcodeRank};
 pub use unwind::{FrameUnwind, HandlerType, UnwindCode, UnwindEntry, UnwindInfo, UnwindOp};

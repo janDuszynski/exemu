@@ -50,6 +50,13 @@ pub(crate) enum KObject {
     /// A thread handle (roadmap P3.4): signaled once the thread has exited, and
     /// stays signaled (manual, like a terminated-process object).
     Thread { exited: bool },
+    /// A **child process** handle (roadmap W3.5): unsignaled while the child has
+    /// not run or is running, signaled — permanently — once it has exited. The
+    /// same latch shape as `Thread`, and the reason `WaitForSingleObject` on the
+    /// handle `CreateProcessW` hands back means what it says. The child's exit
+    /// code lives in [`crate::process::ChildProcess`], not here, so a wait and a
+    /// `GetExitCodeProcess` cannot disagree.
+    Process { exited: bool },
 }
 
 impl KObject {
@@ -60,7 +67,7 @@ impl KObject {
             KObject::Event { signaled, .. } | KObject::Timer { signaled, .. } => *signaled,
             KObject::Semaphore { count, .. } => *count > 0,
             KObject::Mutex { owner, .. } => owner.is_none() || *owner == Some(tid),
-            KObject::Thread { exited } => *exited,
+            KObject::Thread { exited } | KObject::Process { exited } => *exited,
         }
     }
 
@@ -99,9 +106,9 @@ impl KObject {
                 }
                 Some(_) => false,
             },
-            // A thread object is a latch: waiting on an exited thread always
-            // succeeds and never consumes.
-            KObject::Thread { exited } => *exited,
+            // A thread or process object is a latch: waiting on one that has
+            // exited always succeeds and never consumes.
+            KObject::Thread { exited } | KObject::Process { exited } => *exited,
         }
     }
 }
@@ -740,6 +747,12 @@ impl WinOs {
             KObject::Mutex { owner, recursion } => KObject::Mutex { owner: *owner, recursion: *recursion },
             KObject::Semaphore { count, max } => KObject::Semaphore { count: *count, max: *max },
             KObject::Thread { exited } => KObject::Thread { exited: *exited },
+            // A duplicated latch is a *snapshot*: the copy will not learn that
+            // the thread/process later exited. Harmless today — `dup_handle` has
+            // no guest caller on any leg exemu runs (see [`crate::server`]) —
+            // and the day `NtDuplicateObject` grows a real implementation, a
+            // child's handle pair must be tracked per-child instead.
+            KObject::Process { exited } => KObject::Process { exited: *exited },
         };
         let h = self.alloc_khandle();
         self.kobjects.insert(h, dup);

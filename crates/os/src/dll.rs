@@ -945,6 +945,17 @@ impl WinOs {
         }
     }
 
+    /// Test-only: build a `RTL_USER_PROCESS_PARAMETERS` and return its address,
+    /// so the child-process reader (roadmap W3.5) can be proved to agree with
+    /// this W3.6 writer instead of re-deriving the same offsets a second time.
+    #[cfg(test)]
+    pub(crate) fn build_process_parameters_for_test(&mut self, mem: &mut dyn Memory) -> Result<u64> {
+        if self.dll.ldr_arena_next == 0 {
+            self.dll.ldr_arena_next = self.cfg.dll_base + self.cfg.dll_size;
+        }
+        self.build_process_parameters(mem)
+    }
+
     fn build_process_parameters_64(&mut self, mem: &mut dyn Memory) -> Result<u64> {
         // Total size: the 0x410-byte header (verified) plus a small tail so the
         // `+0x408` scalar and any incidental reads land inside the allocation.
