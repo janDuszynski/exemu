@@ -26,6 +26,66 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 609, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### The block JIT (W8.2 / W8.3 / W8.7)
+- **7-Zip installs in ~2.4 s instead of ~16.6 s — 7× faster — executing exactly
+  the same 496,505,572 instructions and producing the same 108 artifacts.**
+  `exemu run --jit` (or `EXEMU_JIT=1`) compiles guest basic blocks to native
+  ARM64; it is **off by default** and every corpus pin is still measured on the
+  interpreter. Whole-corpus A/B, same binary, virtual clock, two passes each:
+  7-Zip 19.7/16.6 s → 3.5/2.4 s, SteamSetup 3.3/3.4 s → 1.44/1.46 s, Firefox
+  Installer 0.19/0.17 s → 0.16/0.16 s. Every run matched the interpreter's exit
+  code, instruction count, fault site, register dump and artifact count exactly.
+- **The opcode slice was measured, not guessed.** A new feature-gated build
+  (`--features opcode-profile`, `exemu run --opcode-profile`) counts every
+  instruction *shape* — opcode, `0F` escape, `REX.W`/`66`, group sub-opcode —
+  that a real run executes. 7-Zip: 161 distinct shapes, top 20 = 72% of the
+  stream, top 60 = 99.8%; `mov r,r/m` alone is 12%, `shr imm` 7%, `jae rel8` 6%.
+  No SSE, no x87 and no push/pop in the top 60. The JIT compiles that head of
+  the distribution and **side-exits to the interpreter for everything else** —
+  which is why ~20 opcode families cover **99.3%** of the 7-Zip run.
+- Compiled: the integer ALU in all six operand forms, group 1, `test`, `mov`,
+  `lea`, `movzx`/`movsx`/`movsxd`, `imul`, constant-count `shl`/`shr`/`sar`,
+  `inc`/`dec`, `neg`, `not`, `cmov<cc>`, `push`/`pop`, and `j<cc>`/`jmp` as
+  compiled block terminators (so the hot loop never returns to the interpreter
+  for a branch). Deliberately **not** compiled: SSE/x87/AVX, `syscall`,
+  `call`/`ret`, string ops, `adc`/`sbb`, rotates, `mul`/`div`, `LOCK`/`REP`,
+  and `fs:` in 64-bit mode.
+- **Bit-for-bit or nothing.** A second differential oracle
+  (`exemu-oracle jit`, and in the ordinary test gate) runs generated blocks
+  through the JIT and the interpreter and compares the *entire* architectural
+  state — every GPR, every `rflags` bit **including the ones x86 leaves
+  undefined**, `rip`, XMM/YMM/x87, and every byte of guest memory. There is no
+  defined-flags policy because the reference is the interpreter, not another
+  CPU. **0 divergences in 3.3M trials per bitness** across four configurations.
+  It also proves that a declined block changes nothing, and that a block which
+  faults rewound onto an instruction that really does fault. The harness was
+  validated by injecting a one-bit AF bug, which it caught in 2,000 trials.
+- Two rules make faults exact with no error plumbing in compiled code: nothing
+  is committed to guest state before a faulting access, and a fault **rewinds**
+  — `rip` returns to the faulting instruction and the *interpreter* re-executes
+  it, raising the real `EmuError` with the same message, address and partial
+  state the fault reporter expects. SteamSetup's known fault reproduces through
+  this path exactly, register for register.
+- **First consumer of the W1.7 self-modifying-code seam.** A store into the
+  running block's own bytes commits that instruction and stops the block; between
+  blocks, cached blocks are validated against the *per-page* code generations.
+  The page precision is not an optimisation but a necessity: exemu maps PE
+  sections RWX, so an ordinary store into `.data` moves the global counter — and
+  treating that as "code changed" measured **40× slower than the interpreter**
+  on SteamSetup before the fix. Pinned by three tests.
+- **`crates/jit` is the only crate in the workspace that is not
+  `#![forbid(unsafe_code)]`**, and the relaxation is bounded on purpose: the
+  whole foreign surface is four declarations (`mmap`, `munmap`,
+  `pthread_jit_write_protect_np`, `sys_icache_invalidate`), each `unsafe` block
+  is one call with its precondition stated above it, every one is covered by a
+  test that *executes* the result, and `#![deny(clippy::undocumented_unsafe_blocks)]`
+  keeps it that way. The instruction encoder — where a codegen bug would live —
+  is ordinary safe Rust. Compiled code reaches guest memory only through the same
+  `Memory` implementation the interpreter uses, so it cannot touch a host address
+  the interpreter could not. `MAP_JIT` needs the
+  `com.apple.security.cs.allow-jit` entitlement once exemu ships as a notarized
+  `.app` (W9.7).
+
 ### Interpreter performance (W8.1)
 - **7-Zip installs in 27.5 s instead of ~65 s — 2.4× faster, with byte-identical
   behaviour.** Proven by A/B-ing the pre- and post-change binaries against the

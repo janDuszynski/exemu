@@ -50,7 +50,7 @@ orchestrates them.
         └───┬───────────┬───────────┬─────────────┬────┘
             │           │           │             │
        ┌────▼───┐  ┌────▼────┐  ┌───▼───┐   ┌─────▼────┐
-       │ loader │  │ memory  │  │  cpu  │   │    os    │   (infrastructure)
+       │ loader │  │ memory  │  │cpu/jit│   │    os    │   (infrastructure)
        │  (PE)  │  │(regions)│  │(x86-64│   │(kernel32)│
        └────┬───┘  └────┬────┘  └───┬───┘   └─────┬────┘
             └───────────┴─────┬─────┴─────────────┘
@@ -66,6 +66,7 @@ orchestrates them.
 | `exemu-loader`   | Infrastructure | Parse PE64 headers, sections and imports                   |
 | `exemu-memory`   | Infrastructure | Region-based virtual memory with permissions               |
 | `exemu-cpu`      | Infrastructure | x86-64 decoder + interpreter                               |
+| `exemu-jit`      | Infrastructure | Block JIT: guest x86/x86-64 → native ARM64 (opt-in)        |
 | `exemu-os`       | Infrastructure | PEB/TEB, import thunks, `kernel32` API implementations      |
 | `exemu-app`      | Application    | Wire everything together and drive the fetch/exec loop     |
 | `exemu-cli`      | Presentation   | `exemu run <file.exe>` and friends                         |
@@ -97,7 +98,7 @@ Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
 
 ```
 exemu run <file.exe> [--trace] [--no-echo] [--gui] [--wine-boot <dir>]
-                     [--virtual-clock] [--max-steps N] [--load-base <hex>]
+                     [--virtual-clock] [--jit] [--max-steps N] [--load-base <hex>]
                      [--telemetry <path>] [-- <args>...]
 exemu info <file.exe>
 exemu opcodes [--telemetry <path>] [--clear]
@@ -116,7 +117,9 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   ([below](#running-on-wines-pe-personality---wine-boot)); `--virtual-clock`
   (also `EXEMU_VIRTUAL_CLOCK=1`) replaces the host clock with a
   [deterministic one](#deterministic-guest-clock) driven by the instruction
-  counter, so a run replays with the exact same instruction count.
+  counter, so a run replays with the exact same instruction count. `--jit`
+  (also `EXEMU_JIT=1`) runs guest code through the [block JIT](#block-jit---jit)
+  where it can and reports how much of the run went native.
   If a run stops on an instruction the decoder doesn't implement, the opcode
   is appended to a telemetry log (`--telemetry <path>`, else the
   `EXEMU_TELEMETRY` env var, else `$TMPDIR/exemu-telemetry.log`).
@@ -364,16 +367,72 @@ budget: `exemu run --max-steps 800000000 installer.exe`. Files land under
 
 ### Speed
 
-The 7-Zip install above — ~4.97×10⁸ emulated instructions — takes about
-**27 seconds** on an M-series Mac (~18M instructions/second). That is a pure
-software interpreter: no JIT yet.
+The 7-Zip install above is ~4.97×10⁸ emulated instructions. Interpreted, that
+takes **16–27 seconds** on an M-series Mac depending on the machine's load;
+with `--jit` the *same run* — same instruction count, same output — takes about
+**3 seconds**.
 
-Interpreter speed is the next real wall, and the Wine path makes it urgent
+Interpreter speed was the next real wall, and the Wine path made it urgent
 rather than academic: running Wine's own DLLs as guest code means every Win32
 call is real PE code being interpreted, multiplying the instruction count per
-app-visible action. A block JIT is the planned answer; the current interpreter
-has had its measured hot spots (guest-memory region lookup, per-byte instruction
-fetch, per-instruction hook dispatch) removed first.
+app-visible action. The interpreter's measured hot spots (guest-memory region
+lookup, per-byte instruction fetch, per-instruction hook dispatch) were removed
+first; the block JIT below is the rest of the answer.
+
+### Block JIT (`--jit`)
+
+`exemu-jit` compiles guest **basic blocks** to native ARM64 and runs them
+against the same register file and memory the interpreter uses. It is **opt-in**
+(`--jit`, or `EXEMU_JIT=1`) and covers a deliberately small, measured slice of
+the instruction set:
+
+* integer ALU (`add`/`or`/`and`/`sub`/`xor`/`cmp`) in every operand form,
+  group 1, `test`, `mov`, `lea`, `movzx`/`movsx`/`movsxd`, `imul`,
+  constant-count `shl`/`shr`/`sar`, `inc`/`dec`, `neg`, `not`, `cmov<cc>`,
+  `push`/`pop`, and `j<cc>`/`jmp` as compiled block terminators;
+* **everything else side-exits to the interpreter** — every SSE/x87/AVX
+  instruction, `syscall`, `call`/`ret`, the string ops, `adc`/`sbb`, the
+  rotates, `mul`/`div`, the `LOCK`/`REP` prefixes. Deferring is always safe;
+  compiling something whose flag semantics are not proven is not.
+
+That slice was chosen by measuring, not guessing: an instrumented build
+(`--opcode-profile`) counts every instruction shape a real run executes. On
+7-Zip the top 20 shapes are 72% of the stream and the top 60 are 99.8%, and
+they are almost entirely the shapes above — which is why a small compiler
+covers **99.3%** of that run's instructions.
+
+The JIT is required to be **bit-for-bit identical to the interpreter**, and
+that is enforced two ways. A differential oracle
+([below](#differential-cpu-oracle)) runs generated blocks through both engines
+and compares the entire architectural state — every GPR, every `rflags` bit
+including the ones x86 leaves undefined, `rip`, the vector file and every byte
+of memory — at **0 divergences in 3.3M trials per bitness**. And every corpus
+binary is run both ways: same exit code, same fault site, same artifacts, and
+the same exact instruction count, with only the wall time different.
+
+Two rules keep faults exact without any error plumbing in compiled code:
+nothing is committed to guest state before a faulting access, and a faulting
+access **rewinds** — `rip` goes back to the faulting instruction and the
+*interpreter* re-executes it, raising the real error. Self-modifying code is
+handled from the other side: a store into the running block's own bytes stops
+the block, and between blocks the cache is validated against the per-page
+code-generation counters, so an ordinary store into a PE section's data (which
+exemu maps RWX) does not throw the cache away.
+
+`crates/jit` is the **only** crate in the workspace that is not
+`#![forbid(unsafe_code)]`, because a JIT cannot be. The relaxation is bounded:
+four foreign declarations (`mmap`, `munmap`, `pthread_jit_write_protect_np`,
+`sys_icache_invalidate`), an `unsafe` block per call with its precondition
+stated above it, and `#![deny(clippy::undocumented_unsafe_blocks)]` to keep it
+that way. The instruction encoder — where a codegen bug would actually live —
+is ordinary safe Rust with no pointers in it. Compiled code reaches guest
+memory only by calling back into the same `Memory` implementation the
+interpreter uses, so a block cannot touch a host address the interpreter
+could not.
+
+**Packaging note:** the W^X code buffer uses `MAP_JIT`, which works for an
+ad-hoc-signed binary but needs the `com.apple.security.cs.allow-jit`
+entitlement once exemu ships as a notarized `.app` with the hardened runtime.
 
 ## Running on Wine's PE personality (`--wine-boot`)
 
@@ -609,6 +668,23 @@ shift/rotate, multiply/divide, bit, and REP string families in both 32- and
 # default, so the normal workspace build and CI never require it.
 cargo run -p exemu-oracle --features unicorn --release -- fuzz --bits both --count 2M
 ```
+
+A second differential answers the other question — **is the JIT the same
+machine as the interpreter?** — and needs no reference emulator, so it runs in
+the ordinary `cargo test --workspace` gate. Because the reference *is* the
+interpreter there is no defined-flags policy: every bit of every GPR, `rflags`,
+`rip`, the XMM/YMM/x87 files and every byte of guest memory must match exactly.
+It also checks that a block the compiler declines leaves the state completely
+untouched, and that a block which faults really did rewind onto an instruction
+that faults on the interpreter (a *spurious* fault is invisible in a state diff
+but means an address is being computed wrongly).
+
+```sh
+cargo run -p exemu-oracle --release -- jit --bits both --count 1M --chain 8
+```
+
+Current result: **0 divergences in 3.3M trials per bitness** across four
+configurations (1, 8 and 32 instructions per block; four seeds).
 
 ## Contributing
 
