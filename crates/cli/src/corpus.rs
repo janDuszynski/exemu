@@ -38,53 +38,62 @@
 //!   faulted after 92883812 instructions
 //! ```
 //!
-//! # Tolerance policy — why it differs per outcome, and why it is never zero
+//! # The third source of drift, and how `virtual_clock` removes it
 //!
 //! An exact instruction count is the most precise behavioural fingerprint
 //! available for free: it summarises every branch the emulator took across
 //! hundreds of millions of instructions. With the sandbox isolation above in
-//! place, the obvious policy is therefore "tolerance 0 for a run that
-//! completes". **Measurement says not quite.** Three back-to-back runs of
-//! Firefox Installer through this runner — same binary, same arguments, same
-//! build, each with a freshly created sandbox — produced 4,665,427 /
-//! 4,665,426 / 4,665,427 instructions. Sandbox state is therefore the *large*
-//! source of irreproducibility but not the only one: the emulator also services
-//! the *real* host clock, so a guest that compares two timestamps takes a
-//! branch that depends on how fast the host happened to be. Guest execution is
-//! reproducible to about ±1 instruction, not exactly. A zero-tolerance pin
-//! would be a flaky gate, and a flaky gate gets re-blessed without being read —
-//! which destroys the pin. So every tolerance here is a **noise floor**, sized
-//! from that measurement, not a change budget.
+//! place, the obvious policy is "tolerance 0 for a run that completes" — and for
+//! a while **measurement said not quite**. Three back-to-back runs of Firefox
+//! Installer through this runner (same binary, same arguments, same build, each
+//! with a freshly created sandbox) produced 4,665,427 / 4,665,426 / 4,665,427
+//! instructions, and an independent full pass gave 7-Zip Δ 0, tcc Δ 0, Firefox
+//! Δ +1, **SteamSetup Δ −189**. Sandbox state was the large source of
+//! irreproducibility but not the only one: the emulator also serviced the *real
+//! host clock*, so a guest comparing two timestamps branched on how fast the
+//! host happened to be.
 //!
-//! An independent full pass after the pins were written confirms the shape of
-//! the noise: 7-Zip Δ 0, tcc Δ 0, Firefox Δ +1, SteamSetup Δ −189. The two runs
-//! that finish deterministically stay put; the two whose guests poll the clock
-//! wander, and the 93M-instruction one wanders by ~189 instructions — which is
-//! precisely why a fault's reach metric must not be pinned to zero.
+//! That third source is now removable. `virtual_clock = true` on an entry runs
+//! it with `--virtual-clock` (roadmap W9.6): `RDTSC`, `GetTickCount`,
+//! `QueryPerformanceCounter`, `NtQuerySystemTime` and `KUSER_SHARED_DATA` are
+//! all driven from the retired-instruction count at a nominal 10M
+//! instructions/second from a fixed epoch, so the guest's whole notion of time
+//! is a function of its own instruction stream. Measured through this runner,
+//! the two binaries that used to wander stop dead:
 //!
-//!   * **`outcome = "exit"` — 64 instructions.** The program reached a defined
-//!     end state, so the count is the complete trace length rather than a
-//!     progress marker: it is the strongest assertion in the manifest and is
-//!     kept as tight as the instrument allows. 64 is ~2 orders of magnitude
-//!     above the observed ±1 jitter and ~7 below any real behaviour change
-//!     these binaries can express, so in practice it is exact while never
-//!     firing on noise. A change to the emulator that alters a 496-million-
-//!     instruction run by less than 64 instructions is genuinely below this
-//!     instrument's resolution; the honest response is to say so rather than to
-//!     pretend the pin can see it.
-//!   * **`outcome = "fault"` — exact stop identity, `max(64, 0.1%)` on steps.**
-//!     The assertion that carries the meaning is *where and why it dies*: the
-//!     fault `rip` and the fault text are compared exactly, and no tolerance
-//!     applies to either. The step count is only a "how far did we get" reach
-//!     metric, and an unrelated improvement (one more CRT init step, a newly
-//!     implemented stub called during startup) shifts it slightly without
-//!     changing the defect. A real regression does not move it slightly: these
-//!     three faults live 728, 4.7M and 93M instructions apart, so anything that
-//!     matters moves the number by orders of magnitude.
+//! ```text
+//!                       host clock (3 runs)                 virtual clock
+//!   Firefox Installer   4,665,427 / …,427 / …,426           4,665,426 ×5
+//!   SteamSetup          92,864,324 / …,324 / 92,864,999     92,865,377 ×4
+//! ```
 //!
-//! Both defaults are written into the manifest as explicit numbers, so the
-//! tolerance a reviewer sees is the tolerance in force — not a formula hidden
-//! in this file.
+//! So the tolerance policy is now conditioned on the clock:
+//!
+//!   * **`virtual_clock = true` — tolerance 0, whatever the outcome.** There is
+//!     no host input left to jitter on, so the pin is an equality and the gate
+//!     resolves a single instruction. Keeping a noise floor here would throw
+//!     away exactly the resolution the mode was built to buy. This is also the
+//!     precondition for W8.7 (diffing a JIT against the interpreter
+//!     instruction-for-instruction needs exact replay).
+//!   * **Host clock, `outcome = "exit"` — 64 instructions.** The program reached
+//!     a defined end state, so the count is the complete trace length rather
+//!     than a progress marker: the strongest assertion available, kept as tight
+//!     as the instrument allows. 64 is ~2 orders of magnitude above the observed
+//!     ±1 jitter and ~7 below any real behaviour change these binaries can
+//!     express, so in practice it is exact while never firing on noise.
+//!   * **Host clock, `outcome = "fault"` — exact stop identity, `max(64, 0.1%)`
+//!     on steps.** The assertion that carries the meaning is *where and why it
+//!     dies*: the fault `rip` and the fault text are compared exactly, with no
+//!     tolerance, on **both** clock paths. The step count is only a "how far did
+//!     we get" reach metric, and an unrelated improvement (one more CRT init
+//!     step, a newly implemented stub called during startup) shifts it slightly
+//!     without changing the defect. A real regression does not move it slightly:
+//!     these three faults live 728, 4.7M and 93M instructions apart.
+//!
+//! All three are written into the manifest as explicit numbers, so the tolerance
+//! a reviewer sees is the tolerance in force — not a formula hidden in this file.
+//! The child never inherits `EXEMU_VIRTUAL_CLOCK` from the developer's shell:
+//! an entry runs in exactly the mode its pin was measured in.
 //!
 //! Artifact counts are compared exactly whenever the manifest states one: an
 //! installer that writes 107 of its 108 files has regressed even if it still
@@ -170,6 +179,13 @@ pub struct Entry {
     /// Run this entry in the cheap default tier. Long binaries are opt-in so
     /// `cargo test` stays fast; see [`Options::quick`].
     pub quick: bool,
+    /// Run this entry with the deterministic guest clock (`--virtual-clock`,
+    /// roadmap W9.6), so its instruction count does not depend on how fast the
+    /// host is. Per-entry rather than global because it is a *behavioural* mode:
+    /// an entry pinned under it must have its count re-measured under it, and an
+    /// entry left on the host clock keeps its host-clock pin. Turning it on is
+    /// what lets [`Entry::default_tolerance`] drop that entry's tolerance to 0.
+    pub virtual_clock: bool,
     /// Free prose kept verbatim across `--update` rewrites.
     pub note: Option<String>,
 }
@@ -340,6 +356,9 @@ impl Manifest {
                 let _ = writeln!(o, "note      = {}", quote(note));
             }
             let _ = writeln!(o, "quick     = {}", e.quick);
+            if e.virtual_clock {
+                let _ = writeln!(o, "virtual_clock = {}", e.virtual_clock);
+            }
             let _ = writeln!(o, "max_steps = {}", e.max_steps);
             let _ = writeln!(o, "outcome   = {}", quote(e.outcome.as_str()));
             if e.outcome == Outcome::Exit {
@@ -495,6 +514,7 @@ impl Entry {
                 _ => None,
             },
             quick: matches!(get("quick"), Some(Value::Bool(true))),
+            virtual_clock: matches!(get("virtual_clock"), Some(Value::Bool(true))),
             note: match get("note") {
                 Some(Value::Str(s)) => Some(s.clone()),
                 _ => None,
@@ -502,19 +522,31 @@ impl Entry {
         })
     }
 
-    /// Guest execution repeats to about ±1 instruction, not exactly — the
-    /// emulator services the real host clock, so a guest that compares two
-    /// timestamps can branch on how fast the host happened to be. Every
-    /// tolerance is therefore at least this noise floor: two orders of
-    /// magnitude above the measured jitter, and far below any behaviour change
-    /// worth catching.
+    /// On the **host clock**, guest execution repeats to about ±1 instruction,
+    /// not exactly: the emulator services the real host clock, so a guest that
+    /// compares two timestamps can branch on how fast the host happened to be.
+    /// A host-clock tolerance is therefore at least this noise floor: two orders
+    /// of magnitude above the measured jitter, and far below any behaviour
+    /// change worth catching. It does not apply to a `virtual_clock` entry,
+    /// which has no jitter to absorb.
     pub const JITTER_FLOOR: u64 = 64;
 
-    /// The tolerance `--update` writes for a freshly measured entry, following
-    /// the policy in the module docs: the bare noise floor for a clean exit
-    /// (whose count is a complete trace), `max(floor, 0.1%)` for the reach
-    /// metric of a fault.
-    pub fn default_tolerance(outcome: Outcome, steps: u64) -> u64 {
+    /// The tolerance `--update` writes for a freshly measured entry.
+    ///
+    /// * **`virtual_clock` — 0, for any outcome.** With the deterministic clock
+    ///   (roadmap W9.6) there is no host input left to jitter on: the count is
+    ///   the same on every run, on every machine, so the pin is an equality and
+    ///   the gate sees a one-instruction change. This is the point of the mode,
+    ///   and leaving a noise floor in place that is no longer needed would throw
+    ///   away the resolution it bought.
+    /// * **Host clock, `outcome = "exit"` — the bare noise floor**, because the
+    ///   count is a complete trace.
+    /// * **Host clock, a fault — `max(floor, 0.1%)`** on what is only a reach
+    ///   metric. See the module docs for the full policy.
+    pub fn default_tolerance(outcome: Outcome, steps: u64, virtual_clock: bool) -> u64 {
+        if virtual_clock {
+            return 0;
+        }
         match outcome {
             Outcome::Exit => Entry::JITTER_FLOOR,
             Outcome::Fault | Outcome::Budget => (steps / 1000).max(Entry::JITTER_FLOOR),
@@ -554,8 +586,8 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
     let leaf = exe.file_name().ok_or_else(|| format!("{}: not a file", exe.display()))?;
 
     let started = Instant::now();
-    let out = Command::new(&opts.exemu_bin)
-        .current_dir(&dir)
+    let mut cmd = Command::new(&opts.exemu_bin);
+    cmd.current_dir(&dir)
         .arg("run")
         .arg(leaf)
         .arg("--no-echo")
@@ -565,6 +597,13 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
         .arg("--telemetry")
         .arg(work.join("telemetry.log"))
         .env("TMPDIR", &work)
+        // Never inherit the developer's clock choice: an entry runs under
+        // exactly the mode its pin was measured in, whatever the shell says.
+        .env_remove("EXEMU_VIRTUAL_CLOCK");
+    if e.virtual_clock {
+        cmd.arg("--virtual-clock");
+    }
+    let out = cmd
         .output()
         .map_err(|err| format!("cannot spawn {}: {err}", opts.exemu_bin.display()))?;
     let elapsed = started.elapsed();
@@ -752,7 +791,7 @@ pub fn apply_update(m: &mut Manifest, verdicts: &[Verdict]) -> Vec<String> {
             changes.push(format!("{}: steps {} → {}", e.name, e.steps, o.steps));
             e.steps = o.steps;
         }
-        let tol = Entry::default_tolerance(o.outcome, o.steps);
+        let tol = Entry::default_tolerance(o.outcome, o.steps, e.virtual_clock);
         if e.tolerance != tol {
             changes.push(format!("{}: tolerance {} → {tol}", e.name, e.tolerance));
             e.tolerance = tol;
@@ -1107,12 +1146,47 @@ stop      = "unmapped memory access at 0x0000000000001010"
     fn tolerance_policy_is_the_noise_floor_for_exits_and_relative_for_faults() {
         // A completed trace is pinned as tightly as the instrument allows: the
         // bare jitter floor, independent of how long the run was.
-        assert_eq!(Entry::default_tolerance(Outcome::Exit, 496_505_788), 64);
-        assert_eq!(Entry::default_tolerance(Outcome::Exit, 1_000), 64);
+        assert_eq!(Entry::default_tolerance(Outcome::Exit, 496_505_788, false), 64);
+        assert_eq!(Entry::default_tolerance(Outcome::Exit, 1_000, false), 64);
         // A fault's step count is a reach metric: 0.1%…
-        assert_eq!(Entry::default_tolerance(Outcome::Fault, 92_883_812), 92_883);
+        assert_eq!(Entry::default_tolerance(Outcome::Fault, 92_883_812, false), 92_883);
         // …but never below the floor, or a short run would get a useless ±0.
-        assert_eq!(Entry::default_tolerance(Outcome::Fault, 728), 64);
+        assert_eq!(Entry::default_tolerance(Outcome::Fault, 728, false), 64);
+    }
+
+    /// The whole return on the W9.6 virtual clock: with the host clock out of
+    /// the loop there is no jitter to absorb, so the pin becomes an equality —
+    /// for a completed run *and* for a fault's reach metric.
+    #[test]
+    fn the_virtual_clock_removes_the_tolerance_entirely() {
+        assert_eq!(Entry::default_tolerance(Outcome::Exit, 496_505_788, true), 0);
+        assert_eq!(Entry::default_tolerance(Outcome::Fault, 92_883_812, true), 0);
+        assert_eq!(Entry::default_tolerance(Outcome::Budget, 300_000_000, true), 0);
+    }
+
+    /// A `virtual_clock` entry round-trips through the manifest, and the flag is
+    /// only emitted when set — so host-clock entries keep their existing shape.
+    #[test]
+    fn the_virtual_clock_flag_round_trips() {
+        const TEXT: &str = r#"[[binary]]
+path      = "example_exe/vc.exe"
+quick     = true
+virtual_clock = true
+max_steps = 1000
+outcome   = "exit"
+exit_code = 0
+steps     = 12345
+tolerance = 0
+"#;
+        let m = Manifest::parse(TEXT, PathBuf::from("/repo")).expect("parse");
+        assert!(m.entries[0].virtual_clock);
+        assert_eq!(m.entries[0].tolerance, 0);
+        let again = Manifest::parse(&m.to_toml(), PathBuf::from("/repo")).expect("reparse");
+        assert!(again.entries[0].virtual_clock, "the flag survives a rewrite");
+        // Absent means host clock, and the key is not written back.
+        let host = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
+        assert!(!host.entries[0].virtual_clock);
+        assert!(!host.to_toml().contains("virtual_clock"));
     }
 
     #[test]

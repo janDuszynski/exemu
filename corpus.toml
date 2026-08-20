@@ -15,114 +15,117 @@
 # none, so every consumer of this manifest skips cleanly instead of failing.
 #
 # Fields
-#   name       display name; defaults to the file name
-#   path       executable, resolved relative to this file
-#   note       prose, preserved verbatim across `--update`
-#   quick      run in the cheap default tier (seconds, not minutes)
-#   max_steps  instruction budget for the run; exhausting it is a failure
-#   outcome    "exit" (clean ExitProcess) | "fault" | "budget"
-#   exit_code  expected process exit code, outcome = "exit" only
-#   steps      expected instruction count
-#   tolerance  absolute slack on `steps` — the 64-instruction noise floor for
-#              an exit, max(floor, ~0.1%) for a fault
-#   artifacts  expected files in the guest sandbox (incl. the loader's copy of
-#              the .exe at C:\<name>), compared exactly
-#   rip, stop  fault site and fault text — a fault's identity, compared exactly
+#   name          display name; defaults to the file name
+#   path          executable, resolved relative to this file
+#   note          prose, preserved verbatim across `--update`
+#   quick         run in the cheap default tier (seconds, not minutes)
+#   virtual_clock run with `--virtual-clock` — the deterministic guest clock
+#   max_steps     instruction budget for the run; exhausting it is a failure
+#   outcome       "exit" (clean ExitProcess) | "fault" | "budget"
+#   exit_code     expected process exit code, outcome = "exit" only
+#   steps         expected instruction count
+#   tolerance     absolute slack on `steps`: 0 under the virtual clock, else the
+#                 64-instruction noise floor for an exit / max(floor, ~0.1%) for
+#                 a fault
+#   artifacts     expected files in the guest sandbox (incl. the loader's copy of
+#                 the .exe at C:\<name>), compared exactly
+#   rip, stop     fault site and fault text — a fault's identity, compared exactly
 #
-# REPRODUCIBILITY TRAP — read this before trusting any number below.
+# WHAT MAKES A COUNT REPRODUCIBLE — read this before trusting any number below.
 #
-#   The guest filesystem sandbox is `$TMPDIR/exemu-sandbox`, and it PERSISTS AND
-#   ACCUMULATES across runs. An installer enumerates and overwrites what it
-#   finds there, so the guest genuinely executes a different number of
-#   instructions depending on what earlier runs left behind. Measured on 7-Zip:
-#   the same binary reported 496,505,788 instructions / 110 files against one
-#   dirty sandbox and 496,505,786 / 115 files against another. Execution is
-#   deterministic GIVEN the sandbox state and non-deterministic across a dirty
-#   one — so an instruction count measured against a shared sandbox is measuring
-#   the sandbox, not the emulator.
+# Three separate things had to be nailed down, and all three are load-bearing.
 #
-#   The runner therefore gives every entry a private TMPDIR that it deletes and
-#   recreates first. Every count below was measured that way. Do not compare
-#   them against a number produced by a bare `exemu run`.
+#   1. A PRIVATE SANDBOX PER ENTRY. The guest filesystem sandbox is
+#      `$TMPDIR/exemu-sandbox`, and it PERSISTS AND ACCUMULATES across runs. An
+#      installer enumerates and overwrites what it finds there, so the guest
+#      genuinely executes a different number of instructions depending on what
+#      earlier runs left behind. Measured on 7-Zip: the same binary reported
+#      496,505,788 instructions / 110 files against one dirty sandbox and
+#      496,505,786 / 115 against another. The runner therefore gives every entry
+#      a private TMPDIR that it deletes and recreates first. Do not compare these
+#      numbers against a bare `exemu run`.
 #
-# Tolerance policy, and why no pin is exactly zero:
+#   2. A BARE `argv[0]`. The guest command line is built into guest memory where
+#      the CRT parses it, so a longer path costs real instructions (measured:
+#      936 of them on Firefox Installer). The runner always invokes the bare file
+#      name from the binary's own directory, which makes the counts a property of
+#      the emulator instead of of where the repo lives.
 #
-#   With the sandbox reset, the obvious policy for a run that completes is
-#   tolerance 0 — an exact instruction count is the most precise behavioural
-#   fingerprint available for free. Measurement says not quite. Three
-#   back-to-back runs of Firefox Installer THROUGH THIS RUNNER (so each with a
-#   freshly created sandbox) produced 4,665,427 / 4,665,426 / 4,665,427
-#   instructions. Sandbox state is the large source of irreproducibility, but
-#   not the only one: the emulator also services the REAL host clock, so a guest
-#   comparing two timestamps branches on how fast the host happened to be, and
-#   guest execution repeats to about ±1 instruction rather than exactly. A
-#   zero-tolerance pin would be flaky, and a flaky gate gets re-blessed without
-#   being read — which destroys the pin. So every tolerance below is a NOISE
-#   FLOOR sized from that measurement, not a change budget.
+#   3. A VIRTUAL CLOCK (`virtual_clock = true`). With 1 and 2 in place the
+#      counts STILL wandered, because the emulator serviced the real host clock
+#      and a guest comparing two timestamps branches on how fast the host
+#      happened to be. Three back-to-back Firefox runs through this runner gave
+#      4,665,427 / 4,665,426 / 4,665,427, and an independent full pass gave
+#      7-Zip Δ0, tcc Δ0, Firefox Δ+1, SteamSetup Δ−189. `--virtual-clock` drives
+#      RDTSC, GetTickCount, QueryPerformanceCounter, NtQuerySystemTime and
+#      KUSER_SHARED_DATA from the retired-instruction count instead (10M
+#      instructions per virtual second, from a fixed 2026-01-01 epoch), so the
+#      guest's whole notion of time is a function of its own instruction stream.
+#      Re-measured through this runner, the drift is gone:
 #
-#   Confirmed by an independent full pass after these pins were written, which
-#   was green on all four: 7-Zip Δ 0, tcc Δ 0, Firefox Δ +1, SteamSetup Δ −189.
-#   The two that finish deterministically stay put; the two whose guests poll
-#   the clock wander. A completed run has repeated EXACTLY on every clean-
-#   sandbox measurement so far — the floor is insurance, not slack — while a
-#   93M-instruction fault run drifting 189 instructions between passes is why a
-#   fault's reach metric must never be pinned to zero.
+#        binary               host clock (3 runs)              virtual clock
+#        Firefox Installer    4,665,427 / …,427 / …,426        4,665,426  ×5
+#        SteamSetup           92,864,324 / …,324 / 92,864,999  92,865,377 ×4
+#        7-Zip                496,505,572 (pin)                496,505,572 ×3
+#        tcc                  728                              728        ×3
 #
-#   A clean **exit** is a completed trace: the count is the whole trace length,
-#   not a progress marker, so it is the strongest assertion here and gets the
-#   bare 64-instruction floor — two orders of magnitude above the observed
-#   jitter and seven below any behaviour change these binaries can express.
-#   In practice that is exact, without ever firing on noise. A change that
-#   moves a 496-million-instruction run by under 64 instructions is genuinely
-#   below this instrument's resolution; saying so beats pretending otherwise.
+# TOLERANCE POLICY.
 #
-#   A **fault** pin says "this binary still dies here, for this reason". The
-#   identity — `rip` and `stop` — carries the meaning and is compared EXACTLY,
-#   with no tolerance at all. The step count is only a reach metric, and
-#   unrelated progress (one more CRT init step, a stub that starts doing real
-#   work) shifts it slightly without changing the defect; a genuine regression
-#   does not move it slightly. These three faults are 728, 4.7M and 93M
-#   instructions apart, so anything that matters moves the number by orders of
-#   magnitude. Hence max(64, ~0.1%), written out explicitly so the tolerance a
-#   reviewer sees is the tolerance in force.
+#   An exact instruction count is the most precise behavioural fingerprint
+#   available for free: it summarises every branch the emulator took across
+#   hundreds of millions of instructions. Under the virtual clock there is no
+#   host input left to jitter on, so the four pins below are EQUALITIES —
+#   `tolerance = 0`, for the clean exit and for the faults alike. A noise floor
+#   that is no longer needed does not stay in place; keeping one would throw away
+#   exactly the resolution the mode was built to buy. (It is also the
+#   precondition for W8.7: a JIT can only be diffed against the interpreter
+#   instruction-for-instruction if a run replays exactly.)
 #
-# Honest status, 2026-08-07: 7-Zip installs end to end; the other three all die
+#   A fault's identity — `rip` and `stop` — carries the meaning and is compared
+#   EXACTLY on both clock paths, with no tolerance at all, and always was.
+#
+#   The fifth entry deliberately keeps the HOST clock, on the same binary as the
+#   third. The host path is what a plain `exemu run` still does, so the gate has
+#   to keep exercising it; it is pinned with the old policy (a fault's reach
+#   metric gets max(64, ~0.1%)) because that is the resolution the host clock
+#   actually supports. If the two entries ever disagree about where or why
+#   Firefox dies, the clock changed behaviour rather than just removing jitter.
+#
+# Honest status, 2026-08-20: 7-Zip installs end to end; the other three all die
 # of the SAME defect class — a stubbed Win32 API returns NULL, the guest stores
 # it as a pointer, and faults far downstream. They are pinned as *known-bad*
 # so the day the Wine path (W5 WoW64) fixes them, this gate is what notices.
 #
 # The counts here are LOWER than the ad-hoc numbers in knowledge/known-issues.know
-# (7-Zip 496,505,572 vs 496,505,788; SteamSetup 92,865,709 vs 92,883,812). That
-# is not a regression: those were measured by invoking the exe through a long
-# absolute path, and the guest command line lives in guest memory where the CRT
-# parses it, so a longer argv[0] costs real instructions. This runner always
-# invokes the bare file name from the binary's own directory, which makes the
-# counts a property of the emulator instead of of where the repo lives.
-# Likewise 7-Zip's 108 artifacts vs the note's 110 (and a later 115): the old
-# numbers counted a SHARED sandbox holding files from earlier runs. 108 = the
-# 107 files 7-Zip extracts plus the loader's copy at C:\7z2602-x64.exe.
+# (7-Zip 496,505,572 vs 496,505,788; SteamSetup 92,865,377 vs 92,883,812): those
+# were measured through a long absolute path and against a shared sandbox — see
+# points 1 and 2 above. Likewise 7-Zip's 108 artifacts vs the note's 110 (and a
+# later 115): 108 = the 107 files 7-Zip extracts plus the loader's copy at
+# C:\7z2602-x64.exe.
 
 [[binary]]
 name      = "7z2602-x64.exe"
 path      = "example_exe/7z2602-x64.exe"
-note      = "64-bit MSVC GUI installer: drives its own dialog, clicks Install, LZMA-decompresses and writes its whole payload, exits 0. The only corpus binary that completes."
+note      = "64-bit MSVC GUI installer: drives its own dialog, clicks Install, LZMA-decompresses and writes its whole payload, exits 0. The only corpus binary that completes. Measured identical on 3 virtual-clock runs, and identical to its host-clock pin — the virtual clock changes nothing it does."
 quick     = false
+virtual_clock = true
 max_steps = 800000000
 outcome   = "exit"
 exit_code = 0
 steps     = 496505572
-tolerance = 64
+tolerance = 0
 artifacts = 108
 
 [[binary]]
 name      = "SteamSetup.exe"
 path      = "example_exe/SteamSetup.exe"
-note      = "32-bit NSIS installer. Decompresses and runs its archive, loads its plugins, builds its dialog, then stores a NULL from a stubbed API and writes through it."
+note      = "32-bit NSIS installer. Decompresses and runs its archive, loads its plugins, builds its dialog, then stores a NULL from a stubbed API and writes through it. The worst host-clock drifter in the corpus (Δ−189 across one pass, Δ+675 across another); 4 virtual-clock runs are identical."
 quick     = false
+virtual_clock = true
 max_steps = 300000000
 outcome   = "fault"
-steps     = 92865709
-tolerance = 92865
+steps     = 92865377
+tolerance = 0
 artifacts = 3
 rip       = "0x20001c2c"
 stop      = "unmapped memory access at 0x0000000000001010 (4 bytes)"
@@ -130,12 +133,13 @@ stop      = "unmapped memory access at 0x0000000000001010 (4 bytes)"
 [[binary]]
 name      = "Firefox Installer.exe"
 path      = "example_exe/Firefox Installer.exe"
-note      = "32-bit UPX-packed. The UPX stub self-decompresses and the IAT is reconstructed; the inner program runs CRT init, setup, SEH frame build and sync init before calling through a NULL function pointer."
+note      = "32-bit UPX-packed. The UPX stub self-decompresses and the IAT is reconstructed; the inner program runs CRT init, setup, SEH frame build and sync init before calling through a NULL function pointer. Used to repeat to ±1; 5 virtual-clock runs are identical."
 quick     = true
+virtual_clock = true
 max_steps = 300000000
 outcome   = "fault"
 steps     = 4665426
-tolerance = 4665
+tolerance = 0
 artifacts = 1
 rip       = "0x0"
 stop      = "unmapped memory access at 0x0000000000000000 (1 bytes)"
@@ -143,12 +147,26 @@ stop      = "unmapped memory access at 0x0000000000000000 (1 bytes)"
 [[binary]]
 name      = "tcc.exe"
 path      = "example_exe/tcc.exe"
-note      = "32-bit console (Tiny C Compiler). Dies almost immediately on the known VerifyVersionInfoW/VerSetConditionMask stub gap: the stub returns NULL and the guest calls it."
+note      = "32-bit console (Tiny C Compiler). Dies almost immediately on the known VerifyVersionInfoW/VerSetConditionMask stub gap: the stub returns NULL and the guest calls it. Too short to have ever drifted, but pinned exactly like the rest."
 quick     = true
+virtual_clock = true
 max_steps = 300000000
 outcome   = "fault"
 steps     = 728
-tolerance = 64
+tolerance = 0
+artifacts = 1
+rip       = "0x0"
+stop      = "unmapped memory access at 0x0000000000000000 (1 bytes)"
+
+[[binary]]
+name      = "Firefox Installer.exe (host clock)"
+path      = "example_exe/Firefox Installer.exe"
+note      = "The same binary on the DEFAULT host clock, so the gate keeps covering the path a plain `exemu run` takes. Same fault, same site, same artifacts — only the step count is allowed to wander, and only inside the old host-clock noise budget. A disagreement in rip/stop between this entry and the virtual-clock one would mean the clock changed behaviour instead of only removing jitter."
+quick     = true
+max_steps = 300000000
+outcome   = "fault"
+steps     = 4665426
+tolerance = 4665
 artifacts = 1
 rip       = "0x0"
 stop      = "unmapped memory access at 0x0000000000000000 (1 bytes)"

@@ -58,7 +58,7 @@ fn print_help() {
         "exemu {} — run Windows x86-64 .exe files on Apple Silicon\n\
 \n\
 USAGE:\n\
-    exemu run <file.exe> [--trace] [--no-echo] [-- <args>...]\n\
+    exemu run <file.exe> [--trace] [--no-echo] [--virtual-clock] [-- <args>...]\n\
     exemu info <file.exe>\n\
     exemu opcodes [--telemetry <path>] [--clear]\n\
     exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]\n\
@@ -93,6 +93,12 @@ RUN OPTIONS:\n\
     --gui           Render dialogs in a real window (drive them yourself)\n\
     --wine-boot D   Boot on Wine's PE DLL set in dir D; with --gui on macOS the\n\
                     guest's windows appear as native NSWindows (roadmap W4.5)\n\
+    --virtual-clock Drive every clock the guest can read (RDTSC, GetTickCount,\n\
+                    QueryPerformanceCounter, NtQuerySystemTime, KUSER_SHARED_\n\
+                    DATA) from the instruction count instead of the host clock,\n\
+                    at 10M instructions/second from a fixed 2026-01-01 epoch, so\n\
+                    a run executes the SAME instruction count every time. Also\n\
+                    settable with EXEMU_VIRTUAL_CLOCK=1 (roadmap W9.6)\n\
     --max-steps N   Instruction budget (0 = unlimited; default 2e9)\n\
     --load-base H   Map the image at hex address H instead of its preferred\n\
                     ImageBase and apply its base relocations (needs a .reloc)\n\
@@ -120,6 +126,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut telemetry: Option<String> = None;
     let mut load_base: Option<u64> = None;
     let mut wine_boot: Option<String> = None;
+    let mut virtual_clock = false;
     let mut guest_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -128,6 +135,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             "--trace" => trace = true,
             "--no-echo" => echo = false,
             "--gui" => gui = true,
+            "--virtual-clock" => virtual_clock = true,
             "--max-steps" => {
                 i += 1;
                 let v = rest.get(i).ok_or("--max-steps needs a value (0 = unlimited)")?;
@@ -174,7 +182,8 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut argv = vec![path.to_string()];
     argv.extend(guest_args);
 
-    let mut cfg = RunConfig { args: argv, echo, trace, gui, load_base, ..RunConfig::default() };
+    let mut cfg =
+        RunConfig { args: argv, echo, trace, gui, load_base, virtual_clock, ..RunConfig::default() };
     if let Some(m) = max_steps {
         cfg.max_steps = m;
     }
