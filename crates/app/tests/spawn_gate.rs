@@ -221,11 +221,18 @@ const STEAM: &str = "../../example_exe/SteamSetup.exe";
 /// | run | instructions | exit | children created |
 /// | --- | --- | --- | --- |
 /// | emulated (no Wine) | ~22,000 | 1 | **0** |
-/// | Wine boot, full prefix | ~4,060,000 | 1 | **0** |
+/// | Wine boot, full prefix | ~3,370,000 | 1 | **0** |
 ///
-/// The counts are the same band `cab_gate.rs` pinned for W6.5 (22,033 /
-/// 4,057,410 in this harness, 25,553 / 4,082,535 through the release CLI), which
-/// is the point: **W3.5 moves neither number**. Total Commander does spawn
+/// The counts are the same band `cab_gate.rs` pinned for W6.5, which is the
+/// point: **W3.5 moves neither number**.
+///
+/// **The Wine figure dropped from ~4,060,000 to ~3,370,000 on 2026-08-21, and
+/// not because of anything here.** The real NLS case tables (W6.6) stopped the
+/// boot mapping a redundant second 4 MB `ntdll` — a case-insensitive compare
+/// that had silently become case-sensitive was failing to match the uppercase
+/// `NTDLL.dll` a forwarder names against the already-loaded `ntdll.dll`. The
+/// exit code, the child count and the emulated figure are all unchanged, which
+/// is how you can tell it is a cheaper boot rather than different behaviour. Total Commander does spawn
 /// children in normal use, but it exits 1 from its own startup path long before
 /// it reaches one — the same blocker W6.5 already pinned, which is downstream of
 /// CAB support and downstream of process creation too.
@@ -282,7 +289,7 @@ fn total_commander_still_never_reaches_child_creation() {
         wine.exit_code, wine.steps, wine.children_created
     );
     assert!(
-        wine.steps > 3_500_000 && wine.steps < 10_000_000,
+        wine.steps > 2_000_000 && wine.steps < 10_000_000,
         "the Wine boot should still carry tcmd into the millions, got {}",
         wine.steps
     );
