@@ -607,8 +607,15 @@ fn nt_user_initialize_client_pfn_arrays(
 ///
 /// Mirroring the slots makes the WndProc table exemu recovered authoritative for
 /// every copy, so `DefWindowProc` works no matter which image a module was bound
-/// against. It does not fix the duplicate load itself — that is a loader-level
-/// gap, pinned in `crates/app/tests/comctl_gate.rs`.
+/// against.
+///
+/// **The duplicate load itself was fixed in W6.6** — it was caused by exemu
+/// answering `NtGetNlsSectionPtr(type 0xA)` with an all-zero case-mapping table,
+/// which turned every case-insensitive comparison in the process into a
+/// case-sensitive one, so the loader never matched the `NTDLL.dll` a forwarder
+/// named against the loaded `ntdll.dll` (see `crate::nls::build_casemap_nls`).
+/// This mirroring is kept as defence in depth: with one copy it is a no-op, and
+/// any future path that does map a second one stays safe.
 ///
 /// A copy is identified structurally: a mapped region holding a PE whose export
 /// directory names `ntdll.dll` and whose `SizeOfImage` matches the running one.

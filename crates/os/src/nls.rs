@@ -14,7 +14,8 @@
 //! * `NtGetNlsSectionPtr(ULONG type, ULONG id, void *unk, void **base,
 //!   SIZE_T *size)` (SSDT **0x9b**) returns a mapped view of one of the smaller
 //!   NLS section files, keyed by `type`: 9 = the "sortdefault" sort-key data,
-//!   0xa/0xc = the normalisation tables, 0xb = a codepage table (`C_####.nls`).
+//!   **0xa = the case-mapping tables (`l_intl.nls`)**, 0xb = a codepage table
+//!   (`C_####.nls`).
 //!
 //! Without these, `RtlGetLocaleFileMappingAddress` returns an error, the cached
 //! NLS pointer stays garbage, and the first consumer wild-reads `[base+0x2c]`
@@ -200,17 +201,159 @@ fn build_sort_nls() -> Vec<u8> {
     b
 }
 
-/// Build a codepage/normalisation section (types 0xa/0xb/0xc). `word[+0x02]`
-/// carries the codepage id; setting it to `CP_UTF8` makes `RtlInitCodePageTable`
-/// take its trivial init path (zero the output, read nothing else). The header
-/// `HeaderSize` word at +0x00 is set to the standard 0x000D; the rest is zero.
+/// Build a codepage section (type 0xb, and the fallback for anything else).
+/// `word[+0x02]` carries the codepage id; setting it to `CP_UTF8` makes
+/// `RtlInitCodePageTable` take its trivial init path (zero the output, read
+/// nothing else). The header `HeaderSize` word at +0x00 is set to the standard
+/// 0x000D; the rest is zero.
 fn build_codepage_nls() -> Vec<u8> {
     let mut b = vec![0u8; 0x100];
     b[0x00..0x02].copy_from_slice(&0x000Du16.to_le_bytes()); // HeaderSize (words)
     b[0x02..0x04].copy_from_slice(&CP_UTF8.to_le_bytes()); // CodePage = 65001
-    // For type 0xa/0xc (normalisation) callers only chase pointer offsets off
-    // the base; a zero-filled tail keeps those computations in-bounds.
+    // Callers that only chase pointer offsets off the base stay in-bounds on the
+    // zero-filled tail.
     b
+}
+
+// ---------------------------------------------------------------------------
+// The case-mapping section (NtGetNlsSectionPtr type 0xA) — `l_intl.nls`
+// ---------------------------------------------------------------------------
+
+/// The `NtGetNlsSectionPtr` section type ntdll asks for to obtain its **case
+/// tables**. Recovered from the pinned `ntdll.dll`: `locale_init` @ RVA 0x54fb0
+/// calls `ZwGetNlsSectionPtr(type=0xA, …)` @ 0x55190 and then installs the
+/// result at 0x55262–0x55277 as
+///
+/// ```text
+///   nls_uppercase_table (RVA 0x735e0) = section + 4
+///   nls_lowercase_table (RVA 0x735e8) = section + 4 + 2 * word[section + 2]
+/// ```
+///
+/// so `word[+0x02]` is the **upcase table length in WORDs** and the two tables
+/// are laid end to end from `+0x04`.
+pub(crate) const NLS_SECTION_CASEMAP: u32 = 0xA;
+
+/// Number of WORDs in one level of the sparse case table (a 4-bit index).
+const CASE_BLOCK: usize = 16;
+
+/// Build the case-mapping section handed back for [`NLS_SECTION_CASEMAP`].
+///
+/// **Why this exists.** exemu used to answer type 0xA with the same zero-filled
+/// codepage stub as everything else. ntdll dutifully installed it, and because
+/// the pointer was *non-NULL* every case-insensitive path in the whole process
+/// took the table branch instead of its ASCII fallback — with a table that maps
+/// every character to itself. Case-insensitive comparison silently became
+/// case-**sensitive**, which is how a `NTDLL.dll` forwarder failed to match the
+/// already-loaded `ntdll.dll`, the loader mapped a second (uninitialised) ntdll,
+/// and a shell32 delay-load stub bound to that copy later dereferenced a NULL
+/// list head. A plausible-looking zero is worse than a NULL.
+///
+/// **The table format**, recovered from the pinned `ntdll.dll`
+/// (`RtlCompareUnicodeStrings` @ RVA 0x1c9c0, `RtlHashUnicodeString` @ 0x27ea0
+/// — both index the installed table identically):
+///
+/// ```text
+///   delta = T[ T[ T[ch >> 8] + ((ch >> 4) & 0xF) ] + (ch & 0xF) ]
+///   mapped = (WORD)(ch + delta)
+/// ```
+///
+/// i.e. a three-level 8/4/4 sparse table of `u16`s where the first two levels
+/// hold **WORD indices into `T` itself** and the last holds the **delta** to add.
+/// Level 1 is 256 entries (the high byte), levels 2 and 3 are
+/// [`CASE_BLOCK`]-entry blocks.
+///
+/// The deltas come from Rust's own Unicode data (simple, 1:1 case mappings
+/// only — exactly what a table of per-character deltas can express; a mapping
+/// that is not a single BMP character contributes a zero delta, i.e. the
+/// character is left alone). Identical blocks are shared, so the whole BMP
+/// costs a few KiB.
+fn build_casemap_nls() -> Vec<u8> {
+    let upper = build_case_table(|c| c.to_uppercase());
+    let lower = build_case_table(|c| c.to_lowercase());
+    assert!(upper.len() <= u16::MAX as usize, "upcase table fits its WORD length field");
+
+    let mut b = Vec::with_capacity(4 + (upper.len() + lower.len()) * 2);
+    // +0x00: unread by any consumer in the pinned binary; carry the total WORD
+    // count so the blob is self-describing rather than mysteriously zero.
+    b.extend_from_slice(&((2 + upper.len() + lower.len()) as u16).to_le_bytes());
+    // +0x02: the upcase table's length in WORDs — what ntdll uses to find the
+    // downcase table that follows it.
+    b.extend_from_slice(&(upper.len() as u16).to_le_bytes());
+    for w in upper.iter().chain(lower.iter()) {
+        b.extend_from_slice(&w.to_le_bytes());
+    }
+    b
+}
+
+/// Compress the BMP-wide character map `f` into the three-level sparse delta
+/// table described on [`build_casemap_nls`].
+fn build_case_table<I: Iterator<Item = char>>(f: impl Fn(char) -> I) -> Vec<u16> {
+    // Per-character delta: `mapped - ch`, wrapping, and 0 whenever the simple
+    // mapping is not a single BMP character (the table cannot express those).
+    let delta = |ch: u16| -> u16 {
+        let Some(c) = char::from_u32(ch as u32) else { return 0 };
+        let mut it = f(c);
+        match (it.next(), it.next()) {
+            (Some(m), None) => u16::try_from(m as u32).map(|m| m.wrapping_sub(ch)).unwrap_or(0),
+            _ => 0,
+        }
+    };
+
+    // Level 3: one block per 16-character row, shared between identical rows.
+    let mut l3_blocks: Vec<[u16; CASE_BLOCK]> = Vec::new();
+    let mut l3_of_row: Vec<usize> = Vec::with_capacity(0x1000);
+    for row in 0..0x1000u32 {
+        let mut block = [0u16; CASE_BLOCK];
+        for (i, slot) in block.iter_mut().enumerate() {
+            *slot = delta((row * CASE_BLOCK as u32 + i as u32) as u16);
+        }
+        l3_of_row.push(match l3_blocks.iter().position(|b| *b == block) {
+            Some(i) => i,
+            None => {
+                l3_blocks.push(block);
+                l3_blocks.len() - 1
+            }
+        });
+    }
+
+    // Level 2: one block per 256-character page, holding the level-3 block ids
+    // of its 16 rows; again shared between identical pages.
+    let mut l2_blocks: Vec<[usize; CASE_BLOCK]> = Vec::new();
+    let mut l2_of_page: Vec<usize> = Vec::with_capacity(0x100);
+    for page in 0..0x100usize {
+        let mut block = [0usize; CASE_BLOCK];
+        for (i, slot) in block.iter_mut().enumerate() {
+            *slot = l3_of_row[page * CASE_BLOCK + i];
+        }
+        l2_of_page.push(match l2_blocks.iter().position(|b| *b == block) {
+            Some(i) => i,
+            None => {
+                l2_blocks.push(block);
+                l2_blocks.len() - 1
+            }
+        });
+    }
+
+    // Emit: [level 1 | level-2 blocks | level-3 blocks], with the first two
+    // levels rewritten as absolute WORD indices into the emitted table.
+    let l2_base = 0x100;
+    let l3_base = l2_base + l2_blocks.len() * CASE_BLOCK;
+    let total = l3_base + l3_blocks.len() * CASE_BLOCK;
+    assert!(total <= 0x8000, "case table indices stay positive as signed 32-bit");
+
+    let mut t = vec![0u16; total];
+    for (page, &b) in l2_of_page.iter().enumerate() {
+        t[page] = (l2_base + b * CASE_BLOCK) as u16;
+    }
+    for (i, block) in l2_blocks.iter().enumerate() {
+        for (j, &l3) in block.iter().enumerate() {
+            t[l2_base + i * CASE_BLOCK + j] = (l3_base + l3 * CASE_BLOCK) as u16;
+        }
+    }
+    for (i, block) in l3_blocks.iter().enumerate() {
+        t[l3_base + i * CASE_BLOCK..l3_base + (i + 1) * CASE_BLOCK].copy_from_slice(block);
+    }
+    t
 }
 
 // ---------------------------------------------------------------------------
@@ -268,8 +411,9 @@ impl WinOs {
 
     /// `NtGetNlsSectionPtr(ULONG type, ULONG id, void *unk, void **base,
     /// SIZE_T *size)` (SSDT 0x9b). Maps (and caches per section) a synthesized
-    /// NLS section keyed by `type`: 9 = sort data, 0xa/0xc = normalisation,
-    /// 0xb (and any other) = a UTF-8 codepage table.
+    /// NLS section keyed by `type`: 9 = sort data, **0xa = the case-mapping
+    /// tables** (see [`build_casemap_nls`]), 0xb (and any other) = a UTF-8
+    /// codepage table.
     fn nt_get_nls_section_ptr(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let sec_type = cpu.reg(Reg::R10) as u32; // arg0
         let base_out = cpu.reg(Reg::R9); //         arg3 (void **base)
@@ -280,6 +424,7 @@ impl WinOs {
             None => {
                 let blob = match sec_type {
                     9 => build_sort_nls(),
+                    NLS_SECTION_CASEMAP => build_casemap_nls(),
                     _ => build_codepage_nls(),
                 };
                 let base = self.map_nls_blob(mem, &blob, "nls-section");
@@ -331,6 +476,81 @@ mod tests {
     }
     fn rd16(b: &[u8], off: usize) -> u16 {
         u16::from_le_bytes(b[off..off + 2].try_into().unwrap())
+    }
+
+    /// The guest's own lookup, transcribed from the pinned `ntdll.dll`
+    /// (`RtlCompareUnicodeStrings` @ RVA 0x1c9c0):
+    /// `mapped = ch + T[T[T[ch>>8] + ((ch>>4)&0xF)] + (ch&0xF)]`.
+    fn guest_lookup(t: &[u16], ch: u16) -> u16 {
+        let l2 = t[(ch >> 8) as usize] as usize;
+        let l3 = t[l2 + ((ch >> 4) & 0xF) as usize] as usize;
+        ch.wrapping_add(t[l3 + (ch & 0xF) as usize])
+    }
+
+    /// Read the two case tables out of the section exactly the way ntdll's
+    /// `locale_init` does (upcase at `+4`, downcase at `+4 + 2*word[+2]`).
+    fn case_tables(b: &[u8]) -> (Vec<u16>, Vec<u16>) {
+        let words: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let up_len = words[1] as usize;
+        (words[2..2 + up_len].to_vec(), words[2 + up_len..].to_vec())
+    }
+
+    /// **The regression this module exists for.** The case-mapping section must
+    /// carry a table that actually *maps*: when it was a zero-filled codepage
+    /// stub, ntdll installed it (non-NULL, so the ASCII fallback was skipped) and
+    /// every case-insensitive comparison in the guest silently became
+    /// case-sensitive.
+    ///
+    /// Walking the table with the guest's own indexing must reproduce Rust's
+    /// simple case mappings across the whole BMP.
+    #[test]
+    fn casemap_section_upcases_and_downcases_the_whole_bmp() {
+        let b = build_casemap_nls();
+        let (up, down) = case_tables(&b);
+        assert_eq!(rd16(&b, 0), (2 + up.len() + down.len()) as u16, "self-describing WORD count");
+        assert_eq!(rd16(&b, 2), up.len() as u16, "upcase length is what ntdll splits on");
+
+        // The bug's exact signature: 'n' must upcase to 'N'.
+        assert_eq!(guest_lookup(&up, b'n' as u16), b'N' as u16);
+        assert_eq!(guest_lookup(&down, b'N' as u16), b'n' as u16);
+
+        let simple = |c: char, f: fn(char) -> Box<dyn Iterator<Item = char>>| -> Option<u16> {
+            let mut it = f(c);
+            match (it.next(), it.next()) {
+                (Some(m), None) => u16::try_from(m as u32).ok(),
+                _ => None,
+            }
+        };
+        let mut mapped = 0usize;
+        for ch in 0..=u16::MAX {
+            let Some(c) = char::from_u32(ch as u32) else {
+                assert_eq!(guest_lookup(&up, ch), ch, "unpaired surrogate {ch:#x} unchanged");
+                continue;
+            };
+            let want_up = simple(c, |c| Box::new(c.to_uppercase())).unwrap_or(ch);
+            let want_down = simple(c, |c| Box::new(c.to_lowercase())).unwrap_or(ch);
+            assert_eq!(guest_lookup(&up, ch), want_up, "upcase {ch:#x}");
+            assert_eq!(guest_lookup(&down, ch), want_down, "downcase {ch:#x}");
+            if want_up != ch {
+                mapped += 1;
+            }
+        }
+        // A sanity floor: the BMP has well over a thousand upper/lower pairs, so
+        // a table that "passes" by mapping nothing cannot slip through.
+        assert!(mapped > 1000, "only {mapped} characters upcase — the table is degenerate");
+    }
+
+    /// Sharing identical blocks must keep the table small enough that every
+    /// index stays a positive `i32` (the guest sign-extends them).
+    #[test]
+    fn casemap_section_stays_compact() {
+        let b = build_casemap_nls();
+        let (up, down) = case_tables(&b);
+        for t in [&up, &down] {
+            assert!(t.len() <= 0x8000, "table length {} keeps indices positive", t.len());
+            assert!(t.len() >= 0x100 + CASE_BLOCK, "at least level 1 plus one block");
+        }
+        assert!(b.len() < 64 * 1024, "the whole section is a few KiB, got {}", b.len());
     }
 
     /// The synthesized `locale.nls` header is walked by the guest exactly as the
