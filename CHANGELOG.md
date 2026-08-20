@@ -23,7 +23,7 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 609, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 634, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
 ### Interpreter performance (W8.1)
@@ -208,6 +208,72 @@ end-to-end on the default path.
   guest is not yet supported; only `ntdll` imports are bound for the 32-bit
   guest; and `BTCpuProcessInit`'s `LdrGetDllHandle` is serviced by exemu's own
   loader query rather than Wine's `LdrGetDllHandleEx`.
+- **Wine's own 32-bit loader now runs, and `Wow64LdrpInitialize` with it
+  (W5.6/W5.7/W5.8).** The default WoW64 bring-up no longer hand-assembles the
+  process's own setup: it calls `wow64!Wow64LdrpInitialize`, so Wine's process
+  init loads `wow64cpu`/`wow64win`, **`movdqu`-copies the win32k service
+  descriptor out of `wow64win!sdwhwin32` into its table 1** (the gap that was
+  pinned as failing-by-design), publishes the BOP into all three 32-bit cells
+  itself, and its per-thread init seats the 32-bit thread on
+  **`ntdll32!LdrInitializeThunk`**. Wine's i386 `loader_init` then maps 32-bit
+  DLLs off disk and binds the guest's whole import graph — exemu binds nothing.
+  Gate: the WoW64 sample exits with its own code after **841,235** instructions
+  (1,292 on the shorter `Bringup::Direct` path, which is kept and still pinned).
+- **The 32-bit bootstrap contract was recovered from the i386 binary, not
+  mirrored from the 64-bit one — and it differs.** `ntdll32!RtlUserThreadStart`
+  is `mov [esp+8],ebx; mov [esp+4],eax; jmp …`: a fresh 32-bit thread carries its
+  entry point in **`Eax`** and its argument in **`Ebx`**, where the 64-bit one
+  uses `Rcx`/`Rdx`; `LdrInitializeThunk` takes its `CONTEXT` as a *stack*
+  argument and hands `loader_init` a pointer to `context->Eax`.
+- **`ntdll!LdrSystemDllInitBlock` is the hand-off** the kernel/Unix side owes
+  `wow64.dll`: `+0x18` is the 32-bit `LdrInitializeThunk` (its per-thread init
+  stores it straight into the new thread's `Eip`), `+0x20`/`+0x28`/`+0x30` the
+  32-bit exception/APC/callback dispatchers, and `+0x48` the **ntdll32 image
+  base** (it is passed to `RtlFindExportedRoutineByName`, which is what proves it
+  is a module handle and not a routine). exemu fills it; every offset is
+  re-derived from `wow64.dll`'s own use sites on each test run.
+- **`__wine_unix_call` from a 32-bit guest arrives with a 32-bit `args` block.**
+  `wow64cpu`'s BOP handler zero-extends the guest's pointer into `r8d` and calls
+  the *same* 64-bit dispatcher the 64-bit ntdll uses — nothing on the PE side
+  widens it — so the unix side reads it in 32-bit width, keyed off the 32-bit
+  ntdll's own `__wine_unixlib_handle`. That is Wine's
+  `__wine_unix_call_wow64_funcs` contract, and the phase plan had it backwards.
+- **A real CPU bug, found by Wine's 32-bit ntdll:** the `moffs` form of `MOV`
+  (`A0`–`A3`) added a *fixed* segment base instead of the live, per-thread one,
+  so `mov fs:[0], eax` — how the i386 ntdll installs an SEH frame — stored
+  through the process-default FS base rather than the guest's TEB32.
+- New NT services behind the boot, each class/index read out of the caller's own
+  bytes: `NtQueryInformationProcess(ProcessWow64Information / Basic)`,
+  `NtQuerySystemInformationEx(SystemSupportedProcessorArchitectures)` (behind
+  `RtlWow64GetProcessMachines`), `NtQuerySystemInformation(SystemEmulation-
+  BasicInformation)` — whose single interesting field, `MaximumUserModeAddress`,
+  is what `wow64.dll` bounds-checks every 32-bit pointer against — and
+  `NtSetInformationThread(ThreadWow64Context)`, which also arms `BTCpuSimulate`'s
+  full-context reload bit.
+- **The WoW64 file-system redirector**: in a WoW64 process `\windows\system32`
+  resolves to the *32-bit* half of the pinned prefix (and `\windows\syswow64`
+  always does), so Wine's i386 loader is handed i386 PEs. Alongside it,
+  `NtQuerySection` now reports the image's **own** machine instead of a hardcoded
+  AMD64 (a PE32 was rejected with `STATUS_INVALID_IMAGE_FORMAT` before it was
+  ever mapped), and both PE32 section views and the NLS view are placed below
+  4 GiB, because `wow64.dll` narrows whatever base the kernel returns into a
+  32-bit cell.
+- `PEB32.ProcessParameters` is built too — Wine's i386
+  `init_user_process_params` reads `EnvironmentSize` at **`+0x290`**, mirroring
+  the 64-bit `+0x3f0` this project already pins, so the 32-bit header runs past
+  the public 0x290-byte stub.
+- *Measured, pinned as probes (W5.8):* on the WoW64 path `SteamSetup.exe` is
+  still running at a 60M-instruction budget and `Firefox Installer.exe` reaches
+  **11,462,340** instructions — past its UPX stub, into the inner program —
+  before an unmapped read. Neither completes; both numbers are floors with the
+  identity assertions (`PEB32.Ldr` published by Wine's own loader) that make
+  them attributable.
+- *Still open:* a 32-bit guest exception is not routed through
+  `wow64.dll!Wow64PassExceptionToGuest` to `ntdll32!KiUserExceptionDispatcher`
+  (exemu declines to deliver it and reports the fault instead, pinned as a
+  comment on the delivery path); the process is single-threaded; and
+  `LdrGetDllHandle`/`LdrLoadDll` for the WoW64 module set are serviced by
+  exemu's own loader query rather than Wine's.
 
 ### Sockets — Wine's ws2_32 reaches real BSD sockets (W7.1)
 - **A guest exchanges bytes with a real host socket.** A generated program calls
