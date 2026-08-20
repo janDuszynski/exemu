@@ -175,9 +175,12 @@ const SHARE_SHARED: u32 = 0;
 /// at 48 kHz is 9600 frames.
 const BUFFER_DURATION: u64 = 2_000_000;
 
-/// Frames the sample actually writes. 240 frames is 5 ms at 48 kHz — long enough
-/// that the byte pattern cannot be a coincidence, short enough to embed.
-pub const PATTERN_FRAMES: u32 = 240;
+/// Frames the sample actually writes: 4800, i.e. **100 ms** at 48 kHz. Long
+/// enough that a person running this from the CLI with `--audio` actually hears
+/// something, and that the byte pattern cannot be a coincidence; short enough
+/// that the PCM (38 400 bytes) embeds comfortably in `.rdata` and fits inside
+/// the 200 ms buffer `Initialize` asks for.
+pub const PATTERN_FRAMES: u32 = 4800;
 /// Bytes per frame in the mix format (stereo 32-bit float).
 pub const PATTERN_FRAME_BYTES: u32 = 8;
 /// Length of [`pattern`] in bytes.
@@ -191,7 +194,9 @@ pub fn pattern() -> Vec<u8> {
     let mut out = Vec::with_capacity(PATTERN_LEN as usize);
     for i in 0..PATTERN_FRAMES {
         let t = i as f32 / 48_000.0;
-        let s = (t * 480.0 * std::f32::consts::TAU).sin() * 0.25;
+        // A short fade in and out, so the CLI demo is a tone rather than two clicks.
+        let env = (t / 0.01).min(1.0).min((0.1 - t) / 0.01).max(0.0);
+        let s = (t * 480.0 * std::f32::consts::TAU).sin() * 0.25 * env;
         out.extend_from_slice(&s.to_le_bytes());
         out.extend_from_slice(&(-s).to_le_bytes());
     }

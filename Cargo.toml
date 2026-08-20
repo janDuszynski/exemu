@@ -5,6 +5,7 @@
 # dependencies:
 #
 #   cli ─▶ app ─▶ { loader, memory, cpu, os } ─▶ core
+#              └─▶ { gui, audio } ─▶ core   (host backends behind core's traits)
 #
 # `core` defines the domain types and the abstraction traits (Memory, Cpu,
 # Hooks). The outer crates provide concrete implementations. `app` wires
@@ -19,6 +20,7 @@ members = [
     "crates/cpu",
     "crates/os",
     "crates/gui",
+    "crates/audio",
     "crates/app",
     "crates/cli",
     "crates/oracle",
@@ -43,6 +45,7 @@ exemu-memory = { path = "crates/memory" }
 exemu-cpu = { path = "crates/cpu" }
 exemu-os = { path = "crates/os" }
 exemu-gui = { path = "crates/gui" }
+exemu-audio = { path = "crates/audio" }
 exemu-app = { path = "crates/app" }
 
 # Release profile tuned for a fast interpreter loop.

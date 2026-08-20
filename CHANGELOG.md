@@ -222,6 +222,15 @@ end-to-end on the default path.
   `Shell Folders` seeds, the HKCU namespace fix and the whole token surface each
   left the run **byte-identical** in instruction count. A change that moves
   nothing has fixed nothing.
+- **The host side is real CoreAudio.** A new `exemu-audio` crate implements the
+  sink over AudioToolbox's `AudioQueue` — the push-shaped output API, which is
+  the exact shape the `AudioSink` contract has — with a three-buffer ring and a
+  staging queue the refill callback drains, zero-padding on underrun so a starved
+  stream is silence rather than stale audio. Two new dependencies
+  (`objc2-audio-toolbox`, `objc2-core-audio-types`), both `Zlib OR Apache-2.0 OR
+  MIT`, from the objc2 family already in the shipping closure: no new licence
+  family. `exemu run --audio` opts in; `exemu audio-sample` writes a PE that
+  plays a 100 ms tone through the whole chain.
 - Scope is deliberate: one render endpoint, shared mode, a fixed 48 kHz stereo
   float mix format. Capture, exclusive mode, MIDI, aux, loopback, the property
   store and event-driven mode are refused with a real HRESULT, never a silent

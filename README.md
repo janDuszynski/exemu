@@ -67,6 +67,7 @@ orchestrates them.
 | `exemu-memory`   | Infrastructure | Region-based virtual memory with permissions               |
 | `exemu-cpu`      | Infrastructure | x86-64 decoder + interpreter                               |
 | `exemu-os`       | Infrastructure | PEB/TEB, import thunks, `kernel32` API implementations      |
+| `exemu-audio`    | Infrastructure | CoreAudio behind the `AudioSink` seam (macOS)              |
 | `exemu-app`      | Application    | Wire everything together and drive the fetch/exec loop     |
 | `exemu-cli`      | Presentation   | `exemu run <file.exe>` and friends                         |
 
@@ -97,13 +98,14 @@ Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
 
 ```
 exemu run <file.exe> [--trace] [--no-echo] [--gui] [--wine-boot <dir>]
-                     [--max-steps N] [--load-base <hex>]
+                     [--audio] [--max-steps N] [--load-base <hex>]
                      [--telemetry <path>] [-- <args>...]
 exemu info <file.exe>
 exemu opcodes [--telemetry <path>] [--clear]
 exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]
 exemu sample <out.exe>
 exemu gui-sample <out.exe>
+exemu audio-sample <out.exe>
 exemu cocoa-demo [--size WxH] [--hold SECS]
 ```
 
@@ -113,7 +115,9 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   `--max-steps N` sets the instruction budget (0 = unlimited); `--load-base`
   maps the image away from its preferred `ImageBase` and applies its base
   relocations. `--wine-boot <dir>` selects the Wine PE personality
-  ([below](#running-on-wines-pe-personality---wine-boot)).
+  ([below](#running-on-wines-pe-personality---wine-boot)); `--audio` sends what
+  the guest plays to the real CoreAudio device instead of dropping it (it only
+  does anything under `--wine-boot`, since the audio stack is Wine's mmdevapi).
   If a run stops on an instruction the decoder doesn't implement, the opcode
   is appended to a telemetry log (`--telemetry <path>`, else the
   `EXEMU_TELEMETRY` env var, else `$TMPDIR/exemu-telemetry.log`).
@@ -132,7 +136,9 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   on any drift; `--update` re-blesses the manifest so refreshing a pin is a
   deliberate, reviewable diff. See [Corpus regression gate](#corpus-regression-gate).
 * `sample` writes the built-in Hello-World PE to disk; `gui-sample` writes a
-  small real-window PE (run it with `--gui`).
+  small real-window PE (run it with `--gui`); `audio-sample` writes a WASAPI PE
+  that plays a 100 ms tone through Wine's mmdevapi (run it with `--wine-boot`
+  and `--audio`).
 * `cocoa-demo` opens a live macOS **NSWindow** whose contents are a `CAMetalLayer`
   and blits a BGRA test frame through the same Metal path the Wine GUI will use —
   the from-scratch display presenter (macOS only). `--size WxH` sets the window
@@ -378,6 +384,7 @@ builtins and exemu boots *those* instead:
 ```sh
 exemu run --wine-boot /path/to/wine/x86_64-windows hello.exe
 exemu run --wine-boot /path/to/wine/x86_64-windows --gui app.exe   # native window
+exemu run --wine-boot /path/to/wine/x86_64-windows --audio app.exe # real sound
 ```
 
 The division of labour is the point. Wine's `ntdll`, `kernelbase`, `kernel32`,

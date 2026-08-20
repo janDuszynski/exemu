@@ -715,6 +715,12 @@ fn the_result_field_offsets_are_where_mmdevapi_reads_them_back() {
         ("clock_GetPosition", audio::CODE_GET_POSITION, audio::POSITION_RESULT),
         ("stream_release", audio::CODE_RELEASE_STREAM, audio::RELEASE_STREAM_RESULT),
         ("client_SetEventHandle", audio::CODE_SET_EVENT_HANDLE, audio::EVENT_RESULT),
+        // The trap in this table: `set_sample_rate` looks like the
+        // `{stream, HRESULT}` family but carries a `float` in between, so its
+        // result sits at +0x0c. mmdevapi pre-seeds that slot with `E_NOTIMPL`,
+        // which means a driver writing +0x08 instead would *look* like it had
+        // answered — the failure would be silent.
+        ("AudioClockAdjustment_SetSampleRate", audio::CODE_SET_SAMPLE_RATE, audio::SAMPLE_RATE_RESULT),
     ];
     for (func, code, want) in rows {
         let site = m.site(func, *code);
@@ -789,6 +795,37 @@ fn the_render_path_input_offsets_are_where_mmdevapi_writes_them() {
             m.contains(b, e, &[0x48, 0x89, 0x5C, 0x24, disp]) || m.contains(b, e, &[0x48, 0x89, 0x74, 0x24, disp]),
             "{func}'s out-pointer sits at +{:#x}",
             audio::STREAM_OUT_PTR
+        );
+    }
+}
+
+/// The pre-seeded poison values. mmdevapi writes a failure HRESULT into two of
+/// these result slots *before* the call, so a driver that writes the wrong
+/// offset leaves the poison in place and looks like it answered. Pinning them
+/// makes the offsets above load-bearing rather than incidental.
+#[test]
+fn mmdevapi_pre_seeds_the_result_slots_it_expects_the_driver_to_overwrite() {
+    if skip() {
+        return;
+    }
+    let m = Mmdevapi::recover();
+    for (func, code, off, seed) in [
+        ("AudioClockAdjustment_SetSampleRate", audio::CODE_SET_SAMPLE_RATE, audio::SAMPLE_RATE_RESULT, audio::E_NOTIMPL),
+        ("load_driver", audio::CODE_TEST_CONNECT, audio::TEST_CONNECT_PRIORITY, audio::PRIORITY_NEUTRAL),
+    ] {
+        let site = m.site(func, code);
+        let (b, e) = m.func_of(site.call_rva);
+        let base = site.args_disp.expect("an args pointer");
+        // mov dword ptr [rsp+disp8], imm32
+        let needle = [
+            &[0xC7u8, 0x44, 0x24][..],
+            &[(base + off as u32) as u8],
+            &seed.to_le_bytes()[..],
+        ]
+        .concat();
+        assert!(
+            m.contains(b, e, &needle),
+            "{func} pre-seeds +{off:#x} with {seed:#x} — so that is where the answer goes"
         );
     }
 }

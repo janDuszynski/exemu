@@ -21,6 +21,7 @@ exemu-core = { workspace = true }
 exemu-loader = { workspace = true }
 exemu-app = { workspace = true }
 exemu-gui = { workspace = true }
+exemu-audio = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -445,6 +445,16 @@ pub const EVENT_HANDLE: u64 = 0x08;
 /// The HRESULT.
 pub const EVENT_RESULT: u64 = 0x10;
 
+/// `set_sample_rate` (26): `{ stream_handle stream; float new_rate;
+/// HRESULT result; }` — **not** the `{stream, HRESULT}` shape, which is the easy
+/// mistake: the result sits at +0x0c behind the float, and mmdevapi pre-seeds it
+/// with `E_NOTIMPL` so a driver that writes the wrong slot looks like it worked.
+pub const SAMPLE_RATE_STREAM: u64 = 0x00;
+/// The requested rate, as a `float`.
+pub const SAMPLE_RATE_RATE: u64 = 0x08;
+/// The HRESULT.
+pub const SAMPLE_RATE_RESULT: u64 = 0x0c;
+
 /// `main_loop` (2) and `timer_loop` (9) each take a single qword: the event the
 /// loop signals once it is running, and the stream to service, respectively.
 pub const LOOP_ARG: u64 = 0x00;
@@ -568,8 +578,6 @@ pub(crate) struct Stream {
     /// `Some` between a `GetBuffer` and its `ReleaseBuffer` — a second
     /// `GetBuffer` in that window is [`AUDCLNT_E_OUT_OF_ORDER`].
     held: Option<u32>,
-    /// Frames written and not yet consumed by the host sink.
-    padding: u32,
     /// Whether [`CODE_START`] has run and [`CODE_STOP`] has not.
     started: bool,
     /// Frames the sink has accepted since the stream was created — the
@@ -778,7 +786,6 @@ impl WinOs {
                 capacity,
                 buffer,
                 held: None,
-                padding: 0,
                 started: false,
                 position: 0,
             },
@@ -808,7 +815,7 @@ impl WinOs {
             mem.write_u32(args + RENDER_GET_RESULT, AUDCLNT_E_OUT_OF_ORDER)?;
             return Ok(S_OK);
         }
-        if frames > stream.capacity - stream.padding {
+        if frames > stream.capacity {
             mem.write_u32(args + RENDER_GET_RESULT, AUDCLNT_E_BUFFER_TOO_LARGE)?;
             return Ok(S_OK);
         }
@@ -873,7 +880,13 @@ impl WinOs {
         }
         match code {
             CODE_GET_BUFFER_SIZE => mem.write_u32(out, stream.capacity)?,
-            CODE_GET_CURRENT_PADDING => mem.write_u32(out, stream.padding)?,
+            // Always zero, and that is the honest answer rather than a
+            // placeholder: `release_render_buffer` hands the frames straight to
+            // the host sink, so nothing is ever queued *here* awaiting playback.
+            // A render loop reads this as "the buffer is empty, write more",
+            // which is what exemu wants it to do. Modelling a real drain would
+            // mean modelling the backend's clock, which nothing needs yet.
+            CODE_GET_CURRENT_PADDING => mem.write_u32(out, 0)?,
             CODE_GET_LATENCY => mem.write_u64(out, DEFAULT_PERIOD)?,
             // IAudioClock::GetFrequency, in the same units as GetPosition —
             // frames per second, since exemu's position counts frames.
@@ -915,7 +928,6 @@ impl WinOs {
                     // AUDCLNT_E_NOT_STOPPED; mmdevapi surfaces it verbatim.
                     0x8889_0005
                 } else {
-                    stream.padding = 0;
                     stream.position = 0;
                     stream.held = None;
                     self.audio_sink.reset();
@@ -952,8 +964,10 @@ fn entry_process_attach(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Mem
     Ok(STATUS_SUCCESS)
 }
 
-fn entry_process_detach(os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory, _args: u64) -> Result<u32> {
-    os.audio.streams.clear();
+fn entry_process_detach(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, _args: u64) -> Result<u32> {
+    for (_, stream) in std::mem::take(&mut os.audio.streams) {
+        let _ = mem.unmap(stream.buffer, stream.capacity as u64 * MIX_FRAME_BYTES as u64);
+    }
     os.audio_sink.close();
     Ok(STATUS_SUCCESS)
 }
@@ -995,7 +1009,13 @@ fn entry_create_stream(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory
 
 fn entry_release_stream(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
     let handle = mem.read_u64(args + RELEASE_STREAM_STREAM)?;
-    os.audio.streams.remove(&handle);
+    if let Some(stream) = os.audio.streams.remove(&handle) {
+        // Hand the staging buffer's address space back. A guest that opens and
+        // closes streams in a loop (a game switching devices, a test harness)
+        // would otherwise walk the allocator forward for the life of the
+        // process.
+        let _ = mem.unmap(stream.buffer, stream.capacity as u64 * MIX_FRAME_BYTES as u64);
+    }
     if os.audio.streams.is_empty() {
         os.audio_sink.close();
     }
@@ -1142,10 +1162,10 @@ fn entry_set_event_handle(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Me
     Ok(STATUS_SUCCESS)
 }
 
-/// Sample-rate adjustment (26) is out of scope; the block's result field sits
-/// where the `{stream, HRESULT}` family's does.
+/// Sample-rate adjustment (26) is out of scope. Its result field is at +0x0c,
+/// *behind a float* — see [`SAMPLE_RATE_RESULT`].
 fn entry_set_sample_rate(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    mem.write_u32(args + STREAM_ONLY_RESULT, E_NOTIMPL)?;
+    mem.write_u32(args + SAMPLE_RATE_RESULT, E_NOTIMPL)?;
     Ok(STATUS_SUCCESS)
 }
 

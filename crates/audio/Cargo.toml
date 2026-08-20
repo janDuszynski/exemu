@@ -1,0 +1,26 @@
+[package]
+name = "exemu-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Host audio backend for exemu — CoreAudio behind the exemu-core AudioSink seam"
+
+[dependencies]
+exemu-core = { workspace = true }
+
+# CoreAudio, through the same objc2 framework family `exemu-gui` already uses
+# (all MIT, already in the shipping closure — no new licence family). AudioQueue
+# is AudioToolbox's push-style output API, which is the exact shape the
+# `AudioSink` contract has.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-audio-toolbox = { version = "0.3", default-features = false, features = [
+    "std",
+    "AudioQueue",
+    "objc2-core-audio-types",
+    "objc2-core-foundation",
+] }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std"] }
