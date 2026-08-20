@@ -168,7 +168,46 @@ end-to-end on the default path.
 - **Bug found by that work:** exemu ignored `NtAllocateVirtualMemory`'s
   `ZeroBits`, and its allocation arena starts well above 4 GiB — so a WoW64
   guest was handed a truncated, unmapped base. Now honoured.
-- *Still to come:* loading wow64 into a real process boot.
+- **The real process boot (W5.4/W5.1/W5.3/W5.5).** `exemu run --wine-boot <dir>`
+  pointed at a **PE32** now builds a genuine WoW64 process: Wine's 32-bit
+  `ntdll` from the prefix's `i386-windows` half plus the 64-bit
+  `ntdll`/`wow64`/`wow64cpu`/`wow64win`, a dual **PEB32/PEB64**, a **TEB pair**
+  linked by `TEB64.WowTebOffset`, and the WoW64 CPU-reserved area. exemu then
+  hands off to Wine: a 64-bit bring-up trampoline calls the real
+  `BTCpuProcessInit`, the real `BTCpuGetBopCode`, publishes the result, and
+  enters `BTCpuSimulate`. **Gate: a 32-bit guest allocates memory through the
+  entire real chain and writes through the pointer it gets back** — 1,292
+  instructions, exit code produced by the guest itself. The synthesized 32-bit
+  caller is gone: the stub that runs is Wine's own i386 `ntdll`.
+- **The recovery that made it work — and would have been invisible if guessed.**
+  Wine's 32-bit `ntdll` does *not* route its syscall stubs through
+  `Wow64Transition`. All 526 of them are
+  `mov eax,<index>; mov edx,<helper>; call edx; ret <argbytes>`, and that one
+  shared helper is `jmp dword ptr [__wine_syscall_dispatcher]`; `wow64.dll`
+  publishes `BTCpuGetBopCode()` into **both** names *and* into
+  `TEB32.WOW32Reserved` (which the single `call dword ptr fs:[0xc0]` stub —
+  `NtQueryInformationProcess` — reads). Publishing only the famous name leaves
+  every stub jumping through a null pointer. Every fact here is re-derived from
+  the pinned binaries on each test run (`crates/app/tests/wow64_abi.rs`, in the
+  `afd_abi.rs` style), including `TEB64+0x180c` = the signed 32-bit
+  `WowTebOffset` and the shared 32-/64-bit SSDT index space (258 services
+  cross-checked).
+- `mov r/m16, Sreg` now reports the flat WoW64 selectors instead of zero.
+  `ntdll!RtlCaptureContext` fills `CONTEXT.SegCs` with `mov [rcx+0x38], cs` and
+  `BTCpuProcessInit` bakes that word into the return BOP — reporting `0` sent the
+  32→64 transition back into 32-bit mode. Mutation-checked: forcing the wrong
+  64-bit CS fails the gate.
+- New NT services behind the boot: `NtQueryInformationThread(ThreadWow64Context)`
+  (class `0x1d` and length `0x2cc` read out of `RtlWow64GetThreadContext`'s own
+  bytes) and a native `LdrGetDllHandle`.
+- Hardened: delivering a guest exception on a stack pointer below the
+  dispatcher-frame size used to *panic* (debug) or build the frame at a wild
+  address (release); it is now a reported error.
+- *Measured gaps, pinned as tests:* `wow64.dll`'s **table 1** (win32k) is never
+  registered because exemu does not run `Wow64LdrpInitialize`, so a 32-bit **GUI**
+  guest is not yet supported; only `ntdll` imports are bound for the 32-bit
+  guest; and `BTCpuProcessInit`'s `LdrGetDllHandle` is serviced by exemu's own
+  loader query rather than Wine's `LdrGetDllHandleEx`.
 
 ### Sockets — Wine's ws2_32 reaches real BSD sockets (W7.1)
 - **A guest exchanges bytes with a real host socket.** A generated program calls
