@@ -454,7 +454,7 @@ impl WinOs {
     ) -> Result<Vec<(String, String)>> {
         let base = mem.read_u64(params + pp::ENVIRONMENT)?;
         let size = mem.read_u64(params + pp::ENVIRONMENT_SIZE)?;
-        if base == 0 || size < 4 || size > MAX_ENVIRONMENT_BYTES {
+        if base == 0 || !(4..=MAX_ENVIRONMENT_BYTES).contains(&size) {
             return Ok(Vec::new());
         }
         let mut units = Vec::with_capacity((size / 2) as usize);
@@ -509,7 +509,7 @@ impl WinOs {
             let number = packed & ps_attr::NUMBER_MASK;
             match number {
                 ps_attr::IMAGE_NAME => {
-                    if value != 0 && size >= 2 && size <= 0x1000 {
+                    if value != 0 && (2..=0x1000).contains(&size) {
                         let mut units = Vec::with_capacity((size / 2) as usize);
                         for k in 0..size / 2 {
                             units.push(mem.read_u16(value + k * 2)?);
@@ -526,7 +526,7 @@ impl WinOs {
                     }
                 }
                 ps_attr::IMAGE_INFO => {
-                    if value != 0 && size >= 8 && size <= 0x200 {
+                    if value != 0 && (8..=0x200).contains(&size) {
                         out.image_info_out = Some((value, size & !7));
                         if return_length != 0 {
                             out.return_lengths.push((return_length, size));
@@ -564,10 +564,8 @@ impl WinOs {
                         return Ok(Err(STATUS_NOT_SUPPORTED));
                     }
                 }
-                ps_attr::MACHINE_TYPE => {
-                    if value != 0 && value != IMAGE_FILE_MACHINE_AMD64 {
-                        return Ok(Err(STATUS_INVALID_IMAGE_FORMAT));
-                    }
+                ps_attr::MACHINE_TYPE if value != 0 && value != IMAGE_FILE_MACHINE_AMD64 => {
+                    return Ok(Err(STATUS_INVALID_IMAGE_FORMAT));
                 }
                 // Any other attribute is unknown to this implementation rather
                 // than a feature it is declining: it is skipped, and the ABI test
