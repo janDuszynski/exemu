@@ -17,6 +17,7 @@ members = [
     "crates/loader",
     "crates/memory",
     "crates/cpu",
+    "crates/jit",
     "crates/os",
     "crates/gui",
     "crates/app",
@@ -41,6 +42,7 @@ exemu-core = { path = "crates/core" }
 exemu-loader = { path = "crates/loader" }
 exemu-memory = { path = "crates/memory" }
 exemu-cpu = { path = "crates/cpu" }
+exemu-jit = { path = "crates/jit" }
 exemu-os = { path = "crates/os" }
 exemu-gui = { path = "crates/gui" }
 exemu-app = { path = "crates/app" }

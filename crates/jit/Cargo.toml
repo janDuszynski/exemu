@@ -1,0 +1,23 @@
+[package]
+name = "exemu-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Block JIT: compiles guest x86/x86-64 basic blocks to native ARM64 (roadmap W8)."
+
+[dependencies]
+exemu-core = { workspace = true }
+
+[dev-dependencies]
+# The JIT's contract is "bit-identical to the interpreter", so its own tests
+# drive the interpreter as the reference. Dev-only: nothing in the compiled
+# library depends on the interpreter crate.
+exemu-cpu = { workspace = true }
+exemu-memory = { workspace = true }
+
+# NOTE: no `[lints.rust] unsafe_code = "forbid"` here — and only here. See the
+# crate docs in src/lib.rs for exactly why, and what is done to keep the
+# resulting audit surface small.
