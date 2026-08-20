@@ -291,6 +291,7 @@ fn wow64_guest_allocates_through_the_real_wine_chain() {
         wow64_sample::data_va(wow64_sample::data::READBACK),
     );
     let r = proc.run_borrowed().expect("the WoW64 guest ran");
+    eprintln!("W5.1 (direct bring-up) — the guest exited {} after {} instructions", r.exit_code, r.steps);
 
     let status = proc.peek_u32(status_cell).unwrap();
     let base = proc.peek_u32(base_cell).unwrap() as u64;

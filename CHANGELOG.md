@@ -23,7 +23,7 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 634, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 635, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
 ### Interpreter performance (W8.1)
