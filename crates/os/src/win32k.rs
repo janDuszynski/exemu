@@ -4189,6 +4189,47 @@ mod tests {
         );
     }
 
+    /// A mouse event over a window that **has** a WndProc is not delivered
+    /// straight away: the routing first asks it `WM_NCHITTEST` and lets the
+    /// answer choose the message. A window with no WndProc cannot answer, so the
+    /// kernel's own default applies immediately — the path a plain single-window
+    /// guest keeps.
+    #[test]
+    fn a_window_with_a_wndproc_is_asked_where_the_point_landed() {
+        let mut mem = VirtualMemory::new();
+        let mut cpu = CpuState::default();
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let top = child(&mut os, 0, [0, 0, 400, 300]);
+        let ev = exemu_core::InputEvent::MouseMove { x: 40, y: 40 };
+
+        // No WndProc: answered in-kernel and posted at once.
+        assert!(!route_raw_input(&mut os, &mut cpu, &mut mem, 0, ev).expect("routes"));
+        let m = os.msg_next().expect("the move was posted");
+        assert_eq!(m.hwnd, top as u64);
+        assert_eq!(m.message, crate::gdi::WM_MOUSEMOVE as u32);
+
+        // With one, the hit test is armed instead. (Driving the callback needs a
+        // real guest stack; the gate in `comctl_gate.rs` runs it end to end.)
+        os.win32k_state.window_mut(top).unwrap().wndproc = 0x1234_5678;
+        let pending = PendingHitTest {
+            ev,
+            msg: crate::gdi::WM_MOUSEMOVE as u32,
+            wparam: 0,
+            hwnd: top,
+            lp: 0,
+            skipped: Vec::new(),
+        };
+        let armed = arm_hit_test(&mut os, &mut mem, &pending).expect("arms");
+        let (proc, args) = armed.expect("a window with a WndProc is asked WM_NCHITTEST");
+        assert_eq!(proc, 0x1234_5678, "…its own WndProc");
+        assert_eq!(args[1], WM_NCHITTEST as u64, "…with WM_NCHITTEST");
+        assert_eq!(
+            (lo_word_i32(args[3]), hi_word_i32(args[3])),
+            (40, 40),
+            "…and the point in screen coordinates, not client"
+        );
+    }
+
     /// A key message goes to the focus window, falling back to the active
     /// top-level so a guest that never calls `SetFocus` still receives keys.
     #[test]

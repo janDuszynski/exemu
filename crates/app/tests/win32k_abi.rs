@@ -28,6 +28,22 @@
 //! 5. `GetStockObject` reads fixed slots directly and **executes `ud2`** on an
 //!    empty one, so those slots must be published.
 //! 6. The DC_ATTR offsets exemu writes (origin) and reads (text colour).
+//! 7. **Hit-testing, capture and focus belong to the kernel side.**
+//!    `user32!WindowFromPoint` is four instructions ending in a tail-jump;
+//!    `SetCapture`/`ReleaseCapture`/`SetFocus` are bare thunks; and
+//!    `GetFocus`/`GetActiveWindow`/`GetCapture` are the three
+//!    `NtUserGetThreadState` indices.
+//! 8. **`NtUserMessageCall` is a family selected by its `type` argument** — the
+//!    `mov dword ptr [rsp+0x28], imm32` each user32 wrapper issues, including
+//!    the internal `dispatch_message` behind `DispatchMessageW`. That the slot
+//!    is written as a *dword* is itself load-bearing: the upper half is stale.
+//! 9. **`DefWindowProc` is that syscall and nothing else** — no `WM_NCHITTEST`
+//!    arm anywhere in user32 — and the handle it forwards is whatever
+//!    `NtUserCallHwnd` code 0x10 returned, which therefore has to be the HWND.
+//!
+//! Where a routine has no export of its own (`DefWindowProcW`'s export is a
+//! forwarder into ntdll), it is reached through the **COFF symbol table** the
+//! pinned DLLs ship.
 //!
 //! Skip-guarded on the git-ignored Wine DLL set.
 
@@ -57,6 +73,9 @@ struct Dll {
     funcs: Vec<(u32, u32)>,
     /// Exported name → RVA (forwarders excluded).
     exports: BTreeMap<String, u32>,
+    /// COFF symbol name → RVA — the only route to a routine whose export is a
+    /// forwarder (`DefWindowProcW`).
+    symbols: BTreeMap<String, u32>,
     /// `dll!Symbol` → IAT slot RVA, for annotating indirect calls.
     imports: BTreeMap<u32, String>,
 }
@@ -81,6 +100,7 @@ impl Dll {
             code: text.data.clone(),
             text_rva: text.rva,
             funcs,
+            symbols: coff_symbols(&bytes),
             exports: image
                 .exports
                 .iter()
@@ -103,6 +123,16 @@ impl Dll {
             .exports
             .get(sym)
             .unwrap_or_else(|| panic!("{} exports {sym}", self.name))
+    }
+
+    /// The RVA of a routine's *code*: its export when it has one, otherwise its
+    /// COFF symbol (a forwarded export like `DefWindowProcW` has no export RVA).
+    fn code_rva(&self, sym: &str) -> u32 {
+        self.exports
+            .get(sym)
+            .or_else(|| self.symbols.get(sym))
+            .copied()
+            .unwrap_or_else(|| panic!("{} has neither an export nor a symbol for {sym}", self.name))
     }
 
     /// The IAT slot RVA of an imported symbol, matched on the bare name.
@@ -140,8 +170,10 @@ impl Dll {
 // call happened" reading a disassembler gives, done on raw bytes).
 // ---------------------------------------------------------------------------
 
-/// `mov <reg32>, imm32` — the `B8+rd` short form. Returns `(reg, imm)` with
-/// `reg` in the 0..7 encoding; a REX.B prefix bumps it to 8..15.
+/// `mov <reg32>, imm32` (the `B8+rd` short form) **or** `xor <reg32>, <same>` —
+/// which is how a wrapper passing selector 0 spells it (`user32!GetFocus` is
+/// `xor ecx, ecx`). Returns `(reg, value, length)` with `reg` in the 0..7
+/// encoding; a REX.B prefix bumps it to 8..15.
 fn mov_reg_imm32(code: &[u8], i: usize) -> Option<(u8, u32, usize)> {
     let (base, rex_b) = if code.get(i)? & 0xF8 == 0x40 {
         (i + 1, code[i] & 1)
@@ -149,11 +181,132 @@ fn mov_reg_imm32(code: &[u8], i: usize) -> Option<(u8, u32, usize)> {
         (i, 0)
     };
     let op = *code.get(base)?;
+    // `xor r32, r32` — 31 /r (or 33 /r) with mod=11 and reg == rm.
+    if (op == 0x31 || op == 0x33) && base + 2 <= code.len() {
+        let modrm = code[base + 1];
+        let (reg, rm) = ((modrm >> 3) & 7, modrm & 7);
+        if modrm >> 6 == 3 && reg == rm {
+            return Some((reg | (rex_b << 3), 0, base + 2 - i));
+        }
+    }
     if !(0xB8..=0xBF).contains(&op) || base + 5 > code.len() {
         return None;
     }
     let imm = u32::from_le_bytes(code[base + 1..base + 5].try_into().ok()?);
     Some(((op - 0xB8) | (rex_b << 3), imm, base + 5 - i))
+}
+
+/// `mov dword ptr [rsp+disp8], imm32` — `C7 44 24 disp8 imm32`. The form every
+/// user32 wrapper uses to fill `NtUserMessageCall`'s stack arguments, and the
+/// reason those slots must be read as **dwords**: the upper half of the qword is
+/// never written.
+fn mov_stack_imm32(code: &[u8], i: usize) -> Option<(u8, u32, usize)> {
+    if i + 8 > code.len() || code[i] != 0xC7 || code[i + 1] != 0x44 || code[i + 2] != 0x24 {
+        return None;
+    }
+    let disp = code[i + 3];
+    let imm = u32::from_le_bytes(code[i + 4..i + 8].try_into().ok()?);
+    Some((disp, imm, 8))
+}
+
+/// The immediate a function stores at `[rsp+slot]` before its first call/jmp
+/// through `iat_slot` — how `NtUserMessageCall`'s `type` argument is recovered.
+fn stack_imm_at_call(dll: &Dll, begin: u32, end: u32, iat_slot: u32, slot: u8) -> Option<u32> {
+    let body = dll.slice(begin, end);
+    let mut last: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut i = 0usize;
+    while i < body.len() {
+        let at = begin + i as u32;
+        if let Some((disp, imm, len)) = mov_stack_imm32(body, i) {
+            last.insert(disp, imm);
+            i += len;
+            continue;
+        }
+        if rip_indirect(body, i, dll.text_rva, at) == Some(iat_slot) {
+            return last.get(&slot).copied();
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Targets of the `call rel32`s (`E8`) inside `[begin, end)`, in order. A bare
+/// byte scan finds `E8` bytes that are really immediates, so only targets that
+/// land exactly on a `.pdata` function start are kept.
+fn direct_calls(dll: &Dll, begin: u32, end: u32) -> Vec<u32> {
+    let body = dll.slice(begin, end);
+    let mut out = Vec::new();
+    for i in 0..body.len().saturating_sub(5) {
+        if body[i] != 0xE8 {
+            continue;
+        }
+        let rel = i32::from_le_bytes(body[i + 1..i + 5].try_into().unwrap()) as i64;
+        let at = begin as i64 + i as i64 + 5 + rel;
+        if let Ok(t) = u32::try_from(at) {
+            if dll.funcs.binary_search_by_key(&t, |(b, _)| *b).is_ok() {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// The first `jmp qword [rip+disp32]` / `call qword [rip+disp32]` target inside a
+/// short export body (used for the bare-thunk wrappers, which carry no `.pdata`
+/// entry of their own).
+fn first_rip_indirect(dll: &Dll, rva: u32, len: u32) -> Option<u32> {
+    let body = dll.slice(rva, rva + len);
+    (0..body.len()).find_map(|i| rip_indirect(body, i, dll.text_rva, rva + i as u32))
+}
+
+/// The pinned DLLs ship a **COFF symbol table**, which is the only way to reach a
+/// routine that is not exported under its own name. `user32!DefWindowProcW` is
+/// exactly that case: the export is a *forwarder* to `NTDLL.NtdllDefWindowProc_W`
+/// (which jumps back through the client-PFN slot), so the code has to be found by
+/// symbol. Returns `name -> RVA` for every symbol that belongs to a section.
+fn coff_symbols(bytes: &[u8]) -> BTreeMap<String, u32> {
+    let mut out = BTreeMap::new();
+    let lfanew = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
+    let coff = lfanew + 4;
+    let nsec = u16::from_le_bytes(bytes[coff + 2..coff + 4].try_into().unwrap()) as usize;
+    let ptr_sym = u32::from_le_bytes(bytes[coff + 8..coff + 12].try_into().unwrap()) as usize;
+    let n_sym = u32::from_le_bytes(bytes[coff + 12..coff + 16].try_into().unwrap()) as usize;
+    let opt_size = u16::from_le_bytes(bytes[coff + 16..coff + 18].try_into().unwrap()) as usize;
+    if ptr_sym == 0 || n_sym == 0 {
+        return out;
+    }
+    let sec_hdrs = coff + 20 + opt_size;
+    let sec_rva: Vec<u32> = (0..nsec)
+        .map(|i| {
+            let o = sec_hdrs + 40 * i + 12;
+            u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap())
+        })
+        .collect();
+    let strtab = ptr_sym + n_sym * 18;
+    let mut i = 0usize;
+    while i < n_sym {
+        let e = ptr_sym + i * 18;
+        if e + 18 > bytes.len() {
+            break;
+        }
+        let value = u32::from_le_bytes(bytes[e + 8..e + 12].try_into().unwrap());
+        let secnum = i16::from_le_bytes(bytes[e + 12..e + 14].try_into().unwrap());
+        let naux = bytes[e + 17] as usize;
+        let name = if bytes[e..e + 4] == [0, 0, 0, 0] {
+            let off = strtab + u32::from_le_bytes(bytes[e + 4..e + 8].try_into().unwrap()) as usize;
+            let end = bytes[off..].iter().position(|b| *b == 0).map(|p| off + p).unwrap_or(off);
+            String::from_utf8_lossy(&bytes[off..end]).into_owned()
+        } else {
+            let raw = &bytes[e..e + 8];
+            let end = raw.iter().position(|b| *b == 0).unwrap_or(8);
+            String::from_utf8_lossy(&raw[..end]).into_owned()
+        };
+        if secnum >= 1 && (secnum as usize) <= nsec {
+            out.entry(name).or_insert(sec_rva[secnum as usize - 1] + value);
+        }
+        i += 1 + naux;
+    }
+    out
 }
 
 /// `call/jmp qword ptr [rip+disp32]` (`FF 15` / `FF 25`) → the IAT slot RVA.
@@ -384,6 +537,238 @@ fn get_client_rect_param_is_a_rect_pointer_plus_dpi() {
     assert!(
         contains(&user32, begin, end, &[0x48, 0x8D, 0x54, 0x24, 0x20]),
         "GetClientRect passes `lea rdx, [rsp+0x20]` — the block, not the RECT"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Input routing: who hit-tests, and the message-call family
+// ---------------------------------------------------------------------------
+
+/// **Hit-testing is the kernel side's job, and the binary is what says so.**
+///
+/// `user32!WindowFromPoint` is *four instructions*: unpack the by-value `POINT`
+/// (x stays in the low half of `rcx`, y is shifted out into `edx`) and tail-jump
+/// `NtUserWindowFromPoint`. There is no window-tree walk, no Z-order, no clip
+/// arithmetic on the user side at all — so all of it has to live in exemu's
+/// win32k. The same holds for the capture and the focus: `SetCapture`,
+/// `ReleaseCapture` and `SetFocus` are bare thunks.
+#[test]
+fn window_from_point_and_capture_are_bare_kernel_calls() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let user32 = Dll::load("user32.dll");
+
+    // `WindowFromPoint` reaches the syscall and nothing else.
+    let (begin, end) = user32.func_at(user32.export("WindowFromPoint"));
+    assert!(
+        end - begin < 0x40,
+        "user32!WindowFromPoint is a handful of instructions, not a tree walk ({} bytes)",
+        end - begin
+    );
+    assert!(
+        contains(&user32, begin, end, &[0x48, 0xC1, 0xE8, 0x20]),
+        "WindowFromPoint unpacks the by-value POINT with `shr rax, 0x20`"
+    );
+    let target = first_rip_indirect(&user32, begin, end - begin)
+        .expect("WindowFromPoint tail-jumps an import");
+    assert_eq!(
+        user32.imports.get(&target).map(String::as_str),
+        Some("win32u.dll!NtUserWindowFromPoint"),
+        "…and that import is NtUserWindowFromPoint"
+    );
+    // …and it is the function's *last* instruction (`48 FF 25 disp32`, 7 bytes),
+    // so nothing else runs: no helper, no tree walk, no clip arithmetic.
+    assert!(
+        contains(&user32, end - 7, end, &[0x48, 0xFF, 0x25]),
+        "WindowFromPoint ends in the tail-jump — the whole hit test is the kernel's"
+    );
+
+    // The capture/focus setters are bare thunks: the first indirect branch in
+    // the export's bytes is the win32u entry of the same name.
+    for (export, import) in [
+        ("SetCapture", "win32u.dll!NtUserSetCapture"),
+        ("ReleaseCapture", "win32u.dll!NtUserReleaseCapture"),
+        ("SetFocus", "win32u.dll!NtUserSetFocus"),
+    ] {
+        let rva = user32.export(export);
+        let target =
+            first_rip_indirect(&user32, rva, 0x20).unwrap_or_else(|| panic!("{export} branches"));
+        assert_eq!(
+            user32.imports.get(&target).map(String::as_str),
+            Some(import),
+            "user32!{export} is a bare thunk to {import}"
+        );
+    }
+}
+
+/// `GetFocus` / `GetActiveWindow` / `GetCapture` are one-line wrappers that load
+/// index 0 / 1 / 2 and tail-jump `NtUserGetThreadState` — which is where those
+/// three index values come from. (`GetFocus` spells its zero `xor ecx, ecx`.)
+#[test]
+fn thread_state_indices_match_the_pinned_user32_wrappers() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let user32 = Dll::load("user32.dll");
+    let iat = user32.iat("NtUserGetThreadState");
+    const ECX: u8 = 1;
+    for (export, expected) in abi::THREAD_STATE {
+        let got = selector_at_call(&user32, export, iat, ECX)
+            .unwrap_or_else(|| panic!("user32!{export} reaches NtUserGetThreadState"));
+        assert_eq!(
+            got as u64, expected,
+            "user32!{export} asks for thread-state index {got}, exemu maps {expected}"
+        );
+    }
+}
+
+/// **`NtUserMessageCall` is a whole family behind one index**, and the `type`
+/// argument in its 6th slot is what selects the member. Each user32 wrapper
+/// stores that type as a `mov dword ptr [rsp+0x28], imm32` right before the
+/// syscall — including `DefWindowProcW`, which *is* nothing but this call.
+///
+/// The `dword` matters as much as the value: the upper half of the qword slot is
+/// never written, so a handler that reads the argument 64 bits wide picks up the
+/// previous frame's bytes.
+#[test]
+fn message_call_types_match_the_pinned_user32_wrappers() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let user32 = Dll::load("user32.dll");
+    let iat = user32.iat("NtUserMessageCall");
+    /// `NtUserMessageCall`'s 6th argument — the first stack slot past the
+    /// shadow space plus one.
+    const TYPE_SLOT: u8 = 0x28;
+
+    for (export, expected) in abi::MESSAGE_CALL_TYPES {
+        let (begin, end) = user32.func_at(user32.code_rva(export));
+        let got = stack_imm_at_call(&user32, begin, end, iat, TYPE_SLOT).unwrap_or_else(|| {
+            panic!("user32!{export} reaches NtUserMessageCall with a type immediate")
+        });
+        assert_eq!(
+            got as u64, expected,
+            "user32!{export} passes NtUserMessageCall type {got:#x}, exemu maps {expected:#x}"
+        );
+    }
+
+    // The dispatch type has no exported wrapper: `DispatchMessageW` tail-calls an
+    // internal `dispatch_message`, and that is where 0x3001 lives. Follow the
+    // call rather than trusting the number.
+    let (db, de) = user32.func_at(user32.export("DispatchMessageW"));
+    let dispatch_type = direct_calls(&user32, db, de)
+        .into_iter()
+        .filter_map(|t| {
+            let (b, e) = user32.func_at(t);
+            stack_imm_at_call(&user32, b, e, iat, TYPE_SLOT)
+        })
+        .next()
+        .expect("DispatchMessageW calls a helper that issues NtUserMessageCall");
+    assert_eq!(
+        dispatch_type as u64,
+        abi::MESSAGE_CALL_DISPATCH,
+        "DispatchMessageW's helper passes type {dispatch_type:#x}, exemu maps {:#x}",
+        abi::MESSAGE_CALL_DISPATCH
+    );
+
+    // Every type is distinct — the property that makes dispatching on it sound.
+    let mut all: Vec<u64> =
+        abi::MESSAGE_CALL_TYPES.iter().map(|(_, t)| *t).chain([abi::MESSAGE_CALL_DISPATCH]).collect();
+    let n = all.len();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all.len(), n, "two NtUserMessageCall members share a type");
+}
+
+/// **`DefWindowProc` is the kernel's, hit test included.**
+///
+/// The pinned `user32!DefWindowProcW` handles a handful of IME/syscommand
+/// messages and forwards everything else to `NtUserMessageCall` — it never
+/// compares the message against `WM_NCHITTEST`, and user32 exports no
+/// `NC_HandleNCHitTest`-shaped helper it could delegate to. So the default hit
+/// test has to be answered on the kernel side, which is what exemu's
+/// `def_window_proc` does.
+///
+/// It also pins the trap that made this invisible: the handle
+/// `DefWindowProcW` passes on is **whatever `NtUserCallHwnd` code 0x10 returned**
+/// (`call WIN_IsCurrentProcess; mov rbx, rax`), so that code must answer the
+/// HWND, not a boolean.
+#[test]
+fn def_window_proc_forwards_the_hit_test_and_trusts_call_hwnd_0x10() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let user32 = Dll::load("user32.dll");
+    let (begin, end) = user32.func_at(user32.code_rva("DefWindowProcW"));
+
+    // No WM_NCHITTEST arm: the message id never appears as a comparison
+    // immediate anywhere in the body.
+    let hit = u32::from(abi::WM_NCHITTEST);
+    for cmp in [
+        [0x81, 0xFE].as_slice(), // cmp esi, imm32
+        [0x81, 0xFA].as_slice(), // cmp edx, imm32
+    ] {
+        let mut needle = cmp.to_vec();
+        needle.extend_from_slice(&hit.to_le_bytes());
+        assert!(
+            !contains(&user32, begin, end, &needle),
+            "user32!DefWindowProcW has a WM_NCHITTEST ({hit:#x}) arm after all"
+        );
+    }
+    assert!(
+        !user32.exports.keys().any(|k| k.contains("HandleNCHitTest")),
+        "user32 exports a non-client hit-test helper — the default may not be the kernel's"
+    );
+
+    // It forwards through NtUserMessageCall with the DefWindowProc type.
+    let iat = user32.iat("NtUserMessageCall");
+    let ty = stack_imm_at_call(&user32, begin, end, iat, 0x28)
+        .expect("DefWindowProcW reaches NtUserMessageCall");
+    let expected = abi::MESSAGE_CALL_TYPES.iter().find(|(n, _)| *n == "DefWindowProcW").unwrap().1;
+    assert_eq!(ty as u64, expected, "DefWindowProcW forwards with type {ty:#x}");
+
+    // The handle it forwards is the result of `NtUserCallHwnd(hwnd, 0x10)`:
+    // its first direct call is a helper that issues exactly that, and the
+    // instruction that follows the call is `mov rbx, rax`.
+    let call_hwnd = user32.iat("NtUserCallHwnd");
+    const EDX: u8 = 2;
+    let helper = *direct_calls(&user32, begin, end).first().expect("DefWindowProcW calls a helper");
+    let (hb, he) = user32.func_at(helper);
+    let code = {
+        let body = user32.slice(hb, he);
+        let mut last: BTreeMap<u8, u32> = BTreeMap::new();
+        let mut i = 0usize;
+        let mut found = None;
+        while i < body.len() {
+            let at = hb + i as u32;
+            if let Some((r, imm, len)) = mov_reg_imm32(body, i) {
+                last.insert(r, imm);
+                i += len;
+                continue;
+            }
+            if rip_indirect(body, i, user32.text_rva, at) == Some(call_hwnd) {
+                found = last.get(&EDX).copied();
+                break;
+            }
+            i += 1;
+        }
+        found.expect("DefWindowProcW's first helper issues NtUserCallHwnd with an immediate")
+    };
+    let self_thread =
+        abi::CALL_HWND.iter().find(|(n, _)| *n == "SetWindowTextW").expect("selector recorded").1;
+    assert_eq!(
+        code as u64, self_thread,
+        "DefWindowProcW's helper asks NtUserCallHwnd code {code:#x}; exemu answers {self_thread:#x} \
+         with the HWND"
+    );
+    assert!(
+        contains(&user32, begin, end, &[0x48, 0x89, 0xC3]),
+        "DefWindowProcW keeps that result as the window handle (`mov rbx, rax`)"
     );
 }
 
