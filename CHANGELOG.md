@@ -295,6 +295,42 @@ end-to-end on the default path.
   the "control messaging spins on an unserviced `WineUnixCall`" symptom W6.1
   recorded; the fix belongs in the loader, and flipping it turns this default on.
 
+### Known folders through Wine's shell32 (W6.6)
+- **`SHGetFolderPathW`/`SHGetKnownFolderPath` now resolve correctly** — a console
+  sample that statically imports `shell32!SHGetFolderPathW` runs to completion on
+  the Wine boot at **exit 0** (was exit 6: every one of 6 requested `CSIDL`s
+  failing), e.g. `APPDATA=C:\Users\exemu\AppData\Roaming` (was
+  `C:\users\AppData\Roaming` — lowercase `users`, empty user component). exemu
+  hand-writes no shell32; Wine's own resolves the paths.
+- **Root cause, found by disassembling the pinned `shell32.dll` and then tracing
+  the live syscalls it issues:** the per-CSIDL resolver's registry helper calls
+  `NtQueryInformationToken` on `NtCurrentThreadEffectiveToken()` — `(HANDLE)-6`,
+  a **public, documented** NT pseudo-handle (`winternl.h`/`processthreadsapi.h`)
+  a caller may use to reach "my own token" without ever calling
+  `NtOpenProcessToken` first. exemu's token surface (added chasing this same bug)
+  recognised only the real handle it hands out itself, so this always failed with
+  `STATUS_INVALID_HANDLE`; `HKEY_CURRENT_USER` never resolved, every registry
+  read fell back to `HKLM` (visible live in the syscall trace — never `HKCU`),
+  and shell32 landed on a purely computed default with no user name in it. Three
+  earlier, plausible fixes (the `Shell Folders` registry keys, the HKCU/NT
+  namespace fold, the token surface's first cut) had each left the instruction
+  count **byte-identical**, proving Wine never executed those paths — the
+  decisive clue that pointed at the token seam instead of the registry seam.
+- The second, previously-downstream gap (5 of 6 folders reporting failure because
+  the named directory didn't exist) **closed for free**: exemu has materialised
+  the full `C:\Users\exemu\…` profile tree since the earlier W6.6 sandbox-seeding
+  commit, so once Wine resolves the *same* path exemu actually creates, every
+  directory is already there.
+- Fix: `crates/os/src/token.rs` now accepts `NtCurrentProcessToken()` (-4),
+  `NtCurrentThreadToken()` (-5) and `NtCurrentThreadEffectiveToken()` (-6)
+  everywhere the real opened pseudo-handle is accepted — correct for exemu's
+  single-user, no-impersonation model, where all four name the same token.
+  `crates/app/tests/shell_gate.rs` now pins the *fixed* paths (cross-checked
+  against `exemu_os::folders::csidl_path`, so the two can't silently drift) and a
+  zero exit code, with an explicit trap for the old bug's signature
+  (`\users\` with no name) so a regression reads immediately as "the old bug is
+  back".
+
 ## v0.0.4 — the windowing substrate
 
 The last foundation layer *under* the GUI: a real USER32/GDI object model the

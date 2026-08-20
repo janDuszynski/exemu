@@ -15,6 +15,27 @@
 //! checks, and Wine's own profile derivation all had nothing to read. That is
 //! what this module supplies.
 //!
+//! **The gap this module first shipped with, and its fix.** Implementing
+//! `NtOpenProcessToken`/`NtQueryInformationToken` did not fix the symptom above —
+//! traced live (temporary syscall logging under `shell_gate`'s Wine boot) to a
+//! handle exemu's `nt_query_information_token` rejected outright:
+//! `NtQueryInformationToken(handle=0xfffffffffffffffa, TokenUser)`, called with
+//! **no preceding `NtOpenProcessToken`/`NtOpenThreadToken` at all**.
+//! `0xfffffffffffffffa` is `-6` sign-extended to 64 bits, which is
+//! `NtCurrentThreadEffectiveToken()` — a **public, documented** NT pseudo-handle
+//! (`winternl.h`/`processthreadsapi.h`, alongside `NtCurrentProcessToken()` = -4
+//! and `NtCurrentThreadToken()` = -5): callers may pass it straight to
+//! `NtQueryInformationToken` without ever opening a real token handle. Because
+//! exemu recognised only the real [`TOKEN_PSEUDO_HANDLE`] it had itself handed
+//! out, this always failed with `STATUS_INVALID_HANDLE` — silently, since the
+//! caller (resolving `HKEY_CURRENT_USER` to `\Registry\User\<SID>`, needed to
+//! learn the SID) just falls back to `HKEY_LOCAL_MACHINE` on failure, which is
+//! why every registry lookup in the trace was `HKLM\…`, never `HKCU\…`, and why
+//! seeding `HKCU`'s `Shell Folders` values never moved the instruction count:
+//! the guest never got far enough to read them. [`is_current_token_handle`] is
+//! the fix — recognising all three well-known negative handles as "the one
+//! token this model has", the same answer `NtOpenProcessToken` already gives.
+//!
 //! # Scope
 //!
 //! exemu models a **single, fixed, non-elevated interactive user**. There is no
@@ -59,6 +80,38 @@ pub(crate) const SSDT_NT_QUERY_INFORMATION_TOKEN: u32 = 0x21;
 /// unrecognised handle trivially detectable. Chosen well clear of the file
 /// arena's 0x1000 handle base and the std-stream sentinels (0x0C/0x10/0x14).
 pub const TOKEN_PSEUDO_HANDLE: u64 = 0x0000_0000_0000_0100;
+
+// ---- The well-known NT "current token" pseudo-handles ----------------------
+//
+// Public, documented constants (`winternl.h` / `processthreadsapi.h`), not Wine
+// internals: `NtCurrentProcessToken()`, `NtCurrentThreadToken()` and
+// `NtCurrentThreadEffectiveToken()` let a caller reach "my own token" without
+// ever calling `NtOpenProcessToken`/`NtOpenThreadToken` first. Each is a small
+// negative `HANDLE` value, sign-extended to 64 bits — the same trick as
+// `NtCurrentProcess()` = -1 and `NtCurrentThread()` = -2. A guest is free to use
+// any of them interchangeably with a real opened handle; exemu's single-token,
+// no-impersonation model (see the module scope note) makes all four the same
+// object, so every one of them answers with exactly [`token_info`].
+
+/// `NtCurrentProcessToken()` = `(HANDLE)-4`.
+pub const CURRENT_PROCESS_TOKEN: u64 = 0xFFFF_FFFF_FFFF_FFFC;
+/// `NtCurrentThreadToken()` = `(HANDLE)-5`.
+pub const CURRENT_THREAD_TOKEN: u64 = 0xFFFF_FFFF_FFFF_FFFB;
+/// `NtCurrentThreadEffectiveToken()` = `(HANDLE)-6`. The one observed live: it is
+/// what resolves `HKEY_CURRENT_USER` calls to learn the profile SID (see the
+/// module doc above).
+pub const CURRENT_THREAD_EFFECTIVE_TOKEN: u64 = 0xFFFF_FFFF_FFFF_FFFA;
+
+/// Whether `handle` denotes "the one token this model has" — either the real
+/// pseudo-handle [`TOKEN_PSEUDO_HANDLE`] `NtOpenProcessToken`/`NtOpenThreadToken`
+/// hand out, or one of the three well-known negative self-token handles a guest
+/// may use without ever opening a handle at all.
+pub(crate) fn is_current_token_handle(handle: u64) -> bool {
+    matches!(
+        handle,
+        TOKEN_PSEUDO_HANDLE | CURRENT_PROCESS_TOKEN | CURRENT_THREAD_TOKEN | CURRENT_THREAD_EFFECTIVE_TOKEN
+    )
+}
 
 // ---- TOKEN_INFORMATION_CLASS (winnt.h), the ones a guest actually asks for ---
 const TOKEN_USER: u32 = 1;
@@ -262,6 +315,10 @@ impl WinOs {
     /// zero-length) buffer to learn the size, receiving `STATUS_BUFFER_TOO_SMALL`
     /// with `ReturnLength` set. Guests rely on this — they call once with 0 to
     /// size an allocation, then again for real.
+    ///
+    /// Accepts any handle [`is_current_token_handle`] recognises — the real
+    /// opened pseudo-handle *and* the three well-known negative "current token"
+    /// handles a guest may use without ever opening one (see the module doc).
     fn nt_query_information_token(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let class = self.syscall_arg(cpu, mem, 1)? as u32;
@@ -269,7 +326,7 @@ impl WinOs {
         let len = self.syscall_arg(cpu, mem, 3)? as usize;
         let ret_len = self.syscall_arg(cpu, mem, 4)?;
 
-        if handle != TOKEN_PSEUDO_HANDLE {
+        if !is_current_token_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
         let Some(info) = token_info(class, buf) else {
@@ -313,6 +370,44 @@ pub(crate) fn ssdt_nt_query_information_token(os: &mut WinOs, cpu: &mut CpuState
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three well-known negative pseudo-handles are exactly `-4`/`-5`/`-6`
+    /// sign-extended to 64 bits — the documented `NtCurrentProcessToken()` /
+    /// `NtCurrentThreadToken()` / `NtCurrentThreadEffectiveToken()` values, the
+    /// same convention as `NtCurrentProcess()` = -1 and `NtCurrentThread()` = -2.
+    /// A slip here (e.g. sign-extending from the wrong width) would silently
+    /// stop recognising the handle a real caller uses.
+    #[test]
+    fn current_token_pseudo_handles_match_the_documented_negative_values() {
+        assert_eq!(CURRENT_PROCESS_TOKEN, (-4i64) as u64);
+        assert_eq!(CURRENT_THREAD_TOKEN, (-5i64) as u64);
+        assert_eq!(CURRENT_THREAD_EFFECTIVE_TOKEN, (-6i64) as u64);
+        // Distinct from each other and from the real opened-handle value.
+        let all = [TOKEN_PSEUDO_HANDLE, CURRENT_PROCESS_TOKEN, CURRENT_THREAD_TOKEN, CURRENT_THREAD_EFFECTIVE_TOKEN];
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "the four token handles must be pairwise distinct");
+    }
+
+    /// The bug this module fixed: `NtQueryInformationToken` was called with
+    /// `0xfffffffffffffffa` (`NtCurrentThreadEffectiveToken()`, i.e. `-6`) and
+    /// **no preceding `NtOpenProcessToken`/`NtOpenThreadToken`** — observed live
+    /// via temporary syscall logging under the `shell_gate` Wine boot. Every
+    /// well-known handle, plus the real opened one, must be accepted; an
+    /// unrelated handle value must still be rejected (a guest hallucinating a
+    /// token handle should not get a plausible-looking answer).
+    #[test]
+    fn is_current_token_handle_accepts_the_well_known_and_opened_handles() {
+        assert!(is_current_token_handle(TOKEN_PSEUDO_HANDLE));
+        assert!(is_current_token_handle(CURRENT_PROCESS_TOKEN));
+        assert!(is_current_token_handle(CURRENT_THREAD_TOKEN));
+        assert!(is_current_token_handle(CURRENT_THREAD_EFFECTIVE_TOKEN));
+        assert!(is_current_token_handle(0xffff_ffff_ffff_fffa), "the exact handle observed live (-6)");
+
+        assert!(!is_current_token_handle(0));
+        assert!(!is_current_token_handle(0x1234));
+        assert!(!is_current_token_handle((-1i64) as u64), "NtCurrentProcess(), not a token handle");
+        assert!(!is_current_token_handle((-2i64) as u64), "NtCurrentThread(), not a token handle");
+    }
 
     /// The SID layout is the documented on-the-wire one. Pinned against
     /// `S-1-5-32-545` (built-in Users), whose bytes are short enough to state in
