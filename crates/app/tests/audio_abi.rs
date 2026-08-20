@@ -902,8 +902,5 @@ fn mmdevapi_clamps_the_default_period_to_ten_milliseconds() {
         "the floor is {} in 100 ns units (10 ms)",
         audio::DEFAULT_PERIOD
     );
-    assert!(
-        audio::MIN_PERIOD < audio::DEFAULT_PERIOD,
-        "the minimum period must be below the default"
-    );
+    const { assert!(audio::MIN_PERIOD < audio::DEFAULT_PERIOD) };
 }

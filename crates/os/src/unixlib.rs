@@ -267,6 +267,9 @@ impl WinOs {
     /// on top of a table of lies.
     fn register_builtin_unixlib(&mut self, mem: &dyn Memory, base: u64) -> Option<u64> {
         let name = module_name_at(mem, base)?;
+        if self.cfg.trace {
+            eprintln!("[unixlib] {name} at {base:#x} asks for its unix side");
+        }
         let lib = match name.to_ascii_lowercase().as_str() {
             // Sockets (roadmap W7.1): the PE half drives `\Device\Afd` through
             // `NtDeviceIoControlFile`, and reaches its unix half only for name
@@ -310,6 +313,10 @@ impl WinOs {
         // every dispatch so an entry that never touches it (e.g. a call made by
         // the thread switched in after a block) cannot observe a stale value.
         self.unix_call_blocked = false;
+        if self.cfg.trace {
+            let name = self.unixlibs.get(handle as usize).map(|l| l.name).unwrap_or("?");
+            eprintln!("[unixlib] {name}[{code}] args {args:#x}");
+        }
         let Some(entry) = self
             .unixlibs
             .get(handle as usize)

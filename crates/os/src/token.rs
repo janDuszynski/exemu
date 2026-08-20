@@ -60,6 +60,26 @@ pub(crate) const SSDT_NT_QUERY_INFORMATION_TOKEN: u32 = 0x21;
 /// arena's 0x1000 handle base and the std-stream sentinels (0x0C/0x10/0x14).
 pub const TOKEN_PSEUDO_HANDLE: u64 = 0x0000_0000_0000_0100;
 
+/// The **constant** token pseudo-handles a caller may use *without* opening
+/// anything: `NtCurrentProcessToken()` = `(HANDLE)-4`,
+/// `NtCurrentThreadToken()` = `(HANDLE)-5`,
+/// `NtCurrentThreadEffectiveToken()` = `(HANDLE)-6` (public `winnt.h`).
+///
+/// exemu models one user and one token, so all three denote the same object as
+/// [`TOKEN_PSEUDO_HANDLE`]. Accepting them is not cosmetic: **ntdll's own
+/// `RtlFormatCurrentUserKeyPath` asks for `TokenUser` on `(HANDLE)-6`**, and
+/// rejecting it makes `RtlOpenCurrentUser` fail — which silently costs the guest
+/// the whole of `HKEY_CURRENT_USER`, because its caller then proceeds with an
+/// uninitialised root handle. Found by the W7.2 audio work: Wine's `mmdevapi`
+/// registers each endpoint's GUID under `HKCU`, and without it every
+/// `IMMDevice::Activate` failed with `AUDCLNT_E_DEVICE_INVALIDATED`.
+fn is_token_handle(handle: u64) -> bool {
+    handle == TOKEN_PSEUDO_HANDLE
+        || handle == (-4i64) as u64
+        || handle == (-5i64) as u64
+        || handle == (-6i64) as u64
+}
+
 // ---- TOKEN_INFORMATION_CLASS (winnt.h), the ones a guest actually asks for ---
 const TOKEN_USER: u32 = 1;
 const TOKEN_GROUPS: u32 = 2;
@@ -269,7 +289,7 @@ impl WinOs {
         let len = self.syscall_arg(cpu, mem, 3)? as usize;
         let ret_len = self.syscall_arg(cpu, mem, 4)?;
 
-        if handle != TOKEN_PSEUDO_HANDLE {
+        if !is_token_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
         let Some(info) = token_info(class, buf) else {

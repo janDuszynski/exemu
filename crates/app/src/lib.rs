@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio_sample;
 pub mod cab;
 pub mod cab_sample;
 pub mod comctl_sample;
@@ -158,6 +159,12 @@ pub struct RunConfig {
     /// [`exemu_gui::RecordingDriver`] here; future CLI code injects the Cocoa
     /// driver when `--gui` is combined with `--wine-boot`.
     pub driver: Option<Box<dyn exemu_core::UserDriver>>,
+    /// Optional W7.2 host audio backend to inject before the guest starts.
+    /// `None` keeps the default [`exemu_core::NoAudio`] (accept-and-drop), which
+    /// is correct for every run that is not about audio and for a machine with
+    /// no audio device. The W7.2 gate injects a recording sink here; the CLI
+    /// injects the CoreAudio backend.
+    pub audio_sink: Option<Box<dyn exemu_core::AudioSink>>,
     /// Safety cap on executed instructions (0 = unlimited).
     pub max_steps: u64,
     /// Render dialogs in a real window and let the user drive them, instead
@@ -216,6 +223,7 @@ impl Default for RunConfig {
             load_base: None,
             wine_boot_dir: None,
             driver: None,
+            audio_sink: None,
             input: None,
             sandbox_root: None,
         }
@@ -570,6 +578,10 @@ impl Process {
         // Default is NoDriver (all-no-ops), correct for the emulated path.
         if let Some(d) = cfg.driver.take() {
             os.set_driver(d);
+        }
+        // --- Optional W7.2 host audio backend -----------------------------
+        if let Some(sink) = cfg.audio_sink.take() {
+            os.set_audio_sink(sink);
         }
         // --- Optional W4.5c input channel (native window → guest pump) ------
         if let Some(rx) = cfg.input.take() {

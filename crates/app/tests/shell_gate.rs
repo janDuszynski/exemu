@@ -70,35 +70,33 @@ fn emulated_path_cannot_resolve_known_folders() {
 /// guest code" claim holds for the *resolution* itself — exemu hand-writes no
 /// shell32.
 ///
-/// Two gaps are pinned here so they stay visible rather than being discovered
-/// again later:
+/// **Both W6.6 gaps are now closed**, by a fix that came from somewhere else
+/// entirely (roadmap W7.2). They were:
 ///
-/// 1. **The user component is missing.** Wine returns `C:\users\AppData\Roaming`
-///    where the profile is `C:\Users\exemu`, i.e. `…\users\<user>\…` with `<user>`
-///    empty. Wine's shell32 builds these from its own notion of the profile
-///    directory, which exemu has not seeded — so this is an exemu gap, not a Wine
-///    one, and it is what wiring `SHGetFolderPathW` to [`exemu_os::folders`]
-///    (whose table already spells the full `C:\Users\exemu\…`) exists to fix.
-/// 2. **Five of six calls still return a non-zero HRESULT** — because the
-///    directory Wine names does not exist. The sample does not pass
-///    `CSIDL_FLAG_CREATE`, so `SHGetFolderPath` reports failure for an absent
-///    folder while still filling the buffer. This is now *downstream of* gap 1:
-///    exemu materialises the profile tree it models (`C:\Users\exemu\…`), but
-///    Wine asks about `C:\users\…`, so only `COMMONPROGRAMS` — the one path both
-///    agree on (`C:\ProgramData\…`) — succeeds. Closing gap 1 should close this
-///    one with it.
+/// 1. **The user component was missing** — Wine returned `C:\users\AppData\Roaming`
+///    where the profile is `C:\Users\exemu`, i.e. `…\users\<user>\…` with
+///    `<user>` empty.
+/// 2. **Five of six calls returned a non-zero HRESULT**, because the directory
+///    Wine named did not exist (the sample passes no `CSIDL_FLAG_CREATE`, so
+///    `SHGetFolderPath` reports failure for an absent folder while still filling
+///    the buffer) — downstream of gap 1.
 ///
-/// **Evidence that directory existence is what matters here:** materialising the
-/// profile tree moved the run from 2,026,356 to 2,025,637 instructions and the
-/// failure count from 6 to 5. Before that, three separate changes (the
-/// `Shell Folders` keys, the HKCU namespace fix, the whole token surface) left
-/// the count *byte-identical*, proving Wine never executed those paths at all.
-/// The instruction count is a free oracle for "did the guest even go there".
+/// The cause was neither the `Shell Folders` seeds nor the folder table: it was
+/// that `NtQueryInformationToken` accepted only exemu's own token pseudo-handle
+/// and **rejected the constant `(HANDLE)-6`** (`NtCurrentThreadEffectiveToken`),
+/// which is what ntdll's `RtlFormatCurrentUserKeyPath` uses. That made
+/// `RtlOpenCurrentUser` fail, its caller proceed with an uninitialised root
+/// handle, and the whole of `HKEY_CURRENT_USER` — including the `Shell Folders`
+/// values exemu had carefully seeded — become unreachable from guest code. With
+/// the handle accepted, Wine reads the seeded paths, every folder resolves to
+/// `C:\Users\exemu\…`, the directories exemu materialises are the ones Wine
+/// names, and all six calls succeed.
 ///
-/// The assertions below therefore check the property that genuinely holds — real
-/// guest paths came back from Wine's own code — and pin both gaps by their
-/// observable signature, so closing either one fails this test and forces the
-/// documentation to be updated with it.
+/// The lesson worth keeping: the failure looked like a *shell32* gap for three
+/// separate rounds of work, and the instruction count was the tell — the
+/// `Shell Folders` keys, the HKCU namespace fix and the whole token surface each
+/// left the run **byte-identical**, proving Wine never executed those paths at
+/// all. A change that moves nothing has fixed nothing.
 #[test]
 fn shell_sample_resolves_known_folders_on_wine() {
     if !Path::new(WINE_DLLS).join("shell32.dll").exists() {
@@ -145,17 +143,21 @@ fn shell_sample_resolves_known_folders_on_wine() {
     // exports that tail-jump into kernelbase).
     assert!(stdout.contains("ROOT=C:\\"), "shlwapi!PathBuildRootW did not run; stdout:\n{stdout}");
 
-    // GAP 1 — the profile's user component is absent. When this stops being true,
-    // this assertion fails and the doc comment above must be updated with it.
+    // The paths are exemu's own profile, user component and all — Wine read them
+    // out of the `Shell Folders` values exemu seeds under HKCU, which it can only
+    // reach through a working `RtlOpenCurrentUser`.
     assert!(
-        stdout.contains("APPDATA=C:\\users\\AppData"),
-        "GAP 1 (missing user component) appears to be FIXED — update this test and \
-         the W6.6 notes. stdout:\n{stdout}"
+        stdout.contains("APPDATA=C:\\Users\\exemu\\AppData\\Roaming"),
+        "the profile's user component should be present; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("PERSONAL=C:\\Users\\exemu\\Documents"),
+        "…for every folder, not just AppData; stdout:\n{stdout}"
     );
 
-    // GAP 2 — five of six still fail because the directory Wine names does not
-    // exist; only COMMONPROGRAMS (C:\ProgramData\…), the one path exemu and Wine
-    // agree on, resolves. Closing gap 1 should close this with it.
+    // Every call succeeded: the directory Wine names is now the directory exemu
+    // materialises, so no folder is reported absent. The exit code is the
+    // sample's own failure count.
     //
     // This count is a function of **which folders exist**, so it is only
     // meaningful against a known-empty sandbox — hence `private_sandbox` above.
@@ -163,13 +165,8 @@ fn shell_sample_resolves_known_folders_on_wine() {
     // behind: a leftover 7-Zip corpus install contains
     // `C:\ProgramData\Microsoft\Windows\Start Menu\Programs`, which alone makes
     // COMMONPROGRAMS succeed and cost one engineer a false failure here.
-    //
-    // The value was established by a controlled A/B with the sandbox deleted in
-    // both arms: without the profile tree 6 failures / 2,026,356 instructions,
-    // with it 5 / 2,025,637.
     assert_eq!(
-        run.exit_code, 5,
-        "GAP 2 (absent directories) changed — gap 1 may be fixed too, in which \
-         case this test and the W6.6 notes both need updating; stdout:\n{stdout}"
+        run.exit_code, 0,
+        "every SHGetFolderPathW should now succeed; stdout:\n{stdout}"
     );
 }

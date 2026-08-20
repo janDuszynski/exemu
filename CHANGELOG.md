@@ -170,6 +170,65 @@ end-to-end on the default path.
   guest was handed a truncated, unmapped base. Now honoured.
 - *Still to come:* loading wow64 into a real process boot.
 
+### Audio — a buffer plays through Wine's own mmdevapi (W7.2)
+- **A guest plays PCM through Wine's audio stack.** A generated program that
+  imports nothing but `ole32` calls `CoCreateInstance(CLSID_MMDeviceEnumerator)`
+  and walks the ordinary WASAPI chain — `IMMDeviceEnumerator` → `IMMDevice` →
+  `IAudioClient` → `IAudioRenderClient` — writes 240 frames into the buffer
+  `GetBuffer` hands it, and the host backend receives those bytes **byte for
+  byte**. The mix format travels the other way: `GetMixFormat` reports exemu's
+  48 kHz / 2ch / 32-bit float back up through Wine's `IAudioClient`. The
+  emulated path is the control: `CoCreateInstance` leaves the out-pointer NULL
+  and the sample stops before it has an enumerator.
+- **The finding that shaped the whole item: Wine's `*.drv` audio drivers ship no
+  PE half worth the name.** The pinned `winealsa.drv` and `winepulse.drv` are
+  **byte-identical** — a 0x70-byte `.text`, *no export directory*, one import
+  (`kernel32!DisableThreadLibraryCalls`). Nothing about the interface is ALSA- or
+  PulseAudio-specific because nothing about the interface is in them at all. The
+  PE half of the whole audio stack is **`mmdevapi.dll`**, the only audio DLL that
+  imports the unixlib bootstrap trio, and every code number and argument struct
+  is compiled into *it*.
+- **So exemu ships its own driver PE.** `mmdevapi!load_driver` builds
+  `L"wine%s.drv"` from a registry list and asks the loaded module for its unixlib
+  handle; its own default list is `"pulse,alsa,oss,coreaudio"`. Since exemu
+  identifies a builtin by its **export directory** and the `.drv` stubs have
+  none, they can never be paired. exemu generates a `winecoreaudio.drv` of its
+  own — a stub PE that names itself — drops it in the sandbox's `system32` and
+  seeds `HKCU\Software\Wine\Drivers\Audio = "coreaudio"`. No Wine bytes are
+  copied, linked or transcribed; the licensing invariant is untouched.
+- **The unixlib table is a dense 0..=36, recovered exhaustively** — all 46
+  `call [__wine_unix_call_dispatcher]` sites in mmdevapi's `.text`, the
+  `mov edx, imm` in each argument slot, and the enclosing function's name from
+  mmdevapi's own **COFF symbol table** (3 114 symbols survive in the shipped
+  binary). `audio_abi.rs` re-derives all of it on every run, plus the argument
+  offsets, the `WAVEFORMATEXTENSIBLE` reply size, the endpoint-table shape, and
+  the `ERROR_INSUFFICIENT_BUFFER` retry protocol.
+- **A contract invisible until it hangs, also recovered:** `main_loop_start`
+  blocks in `WaitForSingleObject(event, INFINITE)` until the *driver* signals the
+  event it was handed, so the `main_loop` entry has to signal it before returning
+  or `stream_init` deadlocks.
+- **Bug found by that work:** `NtQueryInformationToken` accepted only exemu's own
+  token pseudo-handle, but ntdll's `RtlFormatCurrentUserKeyPath` asks for
+  `TokenUser` on `(HANDLE)-6` (`NtCurrentThreadEffectiveToken`). Rejecting it
+  made `RtlOpenCurrentUser` fail, and its caller then proceeded with an
+  **uninitialised root handle** — silently costing the guest the whole of
+  `HKEY_CURRENT_USER`. The symptom here was every `IMMDevice::Activate` failing
+  with `AUDCLNT_E_DEVICE_INVALIDATED`, because mmdevapi registers each endpoint's
+  GUID under HKCU.
+- **That one-line token fix also closed both W6.6 shell32 gaps** — every known
+  folder now resolves to `C:\Users\exemu\…`, user component and all, and all
+  six `SHGetFolderPathW` calls succeed (they were 5 of 6 failing). The gaps had
+  looked like shell32 gaps for three rounds of work; the tell was that the
+  `Shell Folders` seeds, the HKCU namespace fix and the whole token surface each
+  left the run **byte-identical** in instruction count. A change that moves
+  nothing has fixed nothing.
+- Scope is deliberate: one render endpoint, shared mode, a fixed 48 kHz stereo
+  float mix format. Capture, exclusive mode, MIDI, aux, loopback, the property
+  store and event-driven mode are refused with a real HRESULT, never a silent
+  success. Host audio leaves through a new `exemu_core::AudioSink` seam whose
+  default is accept-and-drop, so a machine with no audio device is unaffected —
+  which is also what makes the gate CI-safe.
+
 ### Sockets — Wine's ws2_32 reaches real BSD sockets (W7.1)
 - **A guest exchanges bytes with a real host socket.** A generated program calls
   Wine's `ws2_32` to connect to a loopback listener the test itself creates,
