@@ -54,6 +54,14 @@ const API_SIZE: u64 = 0x0010_0000; // 1 MiB → 128k import slots
 /// dispatcher (roadmap W2.2/W2.3) will implement. Sits ~16 MiB above the 32-bit
 /// TEB/PEB (which end ~0x7EFD_3000), so there is no collision with either
 /// bitness's layout (roadmap W2.1).
+/// Windows never maps the first 64 KiB of the address space — it is the
+/// "null-pointer guard region", reserved precisely so that a dereference
+/// through a NULL pointer (plus any plausible struct-field offset) faults
+/// instead of silently reading whatever is there. exemu keeps the same
+/// invariant, so a faulting address below this is a NULL dereference and can be
+/// reported as one. See the null-deref note in [`Process::fault_report`].
+const NULL_GUARD: u64 = 0x1_0000;
+
 const KUSER_SHARED_DATA_BASE: u64 = 0x7ffe_0000;
 /// The synthesized syscall-dispatcher landing page, reserved one page above
 /// `KUSER_SHARED_DATA`. Native x64 Wine stubs issue a raw `SYSCALL` rather than
@@ -1128,6 +1136,45 @@ impl Process {
             }
         }
 
+        // The commonest failure shape exemu has: a stubbed API returns 0, the
+        // guest keeps it as a pointer or a function pointer, and faults an
+        // arbitrary distance later. The fault itself says nothing about where
+        // the zero came from — so name the suspects.
+        //
+        // The tell is that the address involved is NULL plus at most a small
+        // struct-field offset: `rip = 0` for a call through a NULL function
+        // pointer, or a faulting address inside the never-mapped low guard
+        // region for a load/store through a NULL base. Real code never has a
+        // legitimate address there.
+        let null_deref = s.rip < NULL_GUARD
+            || matches!(
+                err,
+                Some(EmuError::Unmapped { addr, .. } | EmuError::Permission { addr, .. }) if *addr < NULL_GUARD
+            );
+        if null_deref {
+            let suspects = self.os.zero_returning_stubs();
+            let _ = writeln!(
+                o,
+                "  note: this is a NULL dereference (address below {NULL_GUARD:#x} — a null pointer\n\
+                 \x20       plus at most a struct-field offset), which in exemu almost always means\n\
+                 \x20       an unimplemented API returned 0 and the guest kept it as a pointer."
+            );
+            if suspects.is_empty() {
+                let _ = writeln!(
+                    o,
+                    "  note: no unimplemented Win32 stub has returned 0 in this run, so the NULL\n\
+                     \x20       came from somewhere else — guest logic, or a *implemented* API\n\
+                     \x20       returning the wrong thing."
+                );
+            } else {
+                let _ = writeln!(
+                    o,
+                    "  suspects (unimplemented stubs that returned 0, most recent first): {}",
+                    suspects.join(", ")
+                );
+            }
+        }
+
         let _ = writeln!(o, "  faulted after {steps} instructions");
         let _ = writeln!(
             o,
@@ -1137,7 +1184,9 @@ impl Process {
             s.reg(exemu_core::Reg::Rbp),
             s.rflags
         );
-        let _ = writeln!(o, "  rip is {}", self.addr_note(s.rip));
+        if self.os.module_at(s.rip).is_some() {
+            let _ = writeln!(o, "  rip is {}", self.addr_note(s.rip));
+        }
         for row in s.gpr.chunks(4).enumerate() {
             let (r, regs) = row;
             let _ = write!(o, "  ");
@@ -1166,10 +1215,13 @@ impl Process {
                 let _ = write!(o, " {r:#x}");
             }
             // The same trail, module-attributed: the raw addresses show *how*
-            // the guest got here, the names show *whose* code it is.
-            let _ = write!(o, "\n  recent rip trail (named):");
-            for r in recent {
-                let _ = write!(o, " {}", self.os.describe_addr(*r));
+            // the guest got here, the names show *whose* code it is. Skipped
+            // entirely when nothing resolves — a row of "?" is pure noise.
+            if recent.iter().any(|r| self.os.module_at(*r).is_some()) {
+                let _ = write!(o, "\n  recent rip trail (named):");
+                for r in recent {
+                    let _ = write!(o, " {}", self.os.describe_addr(*r));
+                }
             }
         }
         // Call stack via the x64 unwind tables (roadmap P4.2) — turns the

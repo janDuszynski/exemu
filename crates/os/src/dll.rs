@@ -688,8 +688,13 @@ impl WinOs {
         if let Some(m) = self.dll.modules.iter().find(|m| addr >= m.base && addr < m.base + m.size) {
             return Some((m.name.as_str(), addr - m.base));
         }
-        let v = self.dll.image_views.iter().find(|v| addr >= v.base && addr < v.base + v.size)?;
-        Some((v.name.as_deref().unwrap_or("<unnamed image>"), addr - v.base))
+        if let Some(v) = self.dll.image_views.iter().find(|v| addr >= v.base && addr < v.base + v.size) {
+            return Some((v.name.as_deref().unwrap_or("<unnamed image>"), addr - v.base));
+        }
+        // The main image is mapped by the app, not by either loader, so it is in
+        // neither table — and it is the one module a report most often needs.
+        let (base, size) = (self.cfg.image_base, self.cfg.image_size);
+        (size != 0 && addr >= base && addr < base + size).then(|| (self.cfg.image_name.as_str(), addr - base))
     }
 
     /// Every mapped guest image as `(name, base, size)`, sorted by base — both
@@ -706,7 +711,11 @@ impl WinOs {
                 (i.name.clone().unwrap_or_else(|| "<unnamed image>".into()), i.base, i.size)
             }))
             .collect();
+        if self.cfg.image_size != 0 {
+            v.push((self.cfg.image_name.clone(), self.cfg.image_base, self.cfg.image_size));
+        }
         v.sort_by_key(|(_, base, _)| *base);
+        v.dedup_by_key(|(_, base, _)| *base);
         v
     }
 

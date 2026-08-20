@@ -64,7 +64,9 @@ pub struct WinConfig {
     /// Bump-allocated heap arena `[heap_base, heap_base + heap_size)`.
     pub heap_base: u64,
     pub heap_size: u64,
-    /// Reported by `GetModuleHandle(NULL)`.
+    /// Base the main image is mapped at, reported by `GetModuleHandle(NULL)`.
+    /// Also what attributes an address inside the exe in a fault report — see
+    /// [`WinOs::module_at`], which pairs it with `image_size`/`image_name`.
     pub image_base: u64,
     /// Pointer to the ASCII / UTF-16 command line (mapped by the app).
     pub cmdline_ptr_a: u64,
@@ -169,6 +171,18 @@ pub struct WinOs {
     /// min(old_size, new_size) bytes and by HeapFree for last-block reclaim.
     heap_sizes: HashMap<u64, u64>,
     last_error: u32,
+
+    /// The unimplemented Win32 stubs that have returned 0 to the guest, newest
+    /// first, deduplicated by symbol and capped at [`ZERO_STUB_TRAIL`].
+    ///
+    /// This is the *suspect list* for exemu's most common failure shape: a
+    /// stubbed API returns 0, the guest stores it as a pointer or a function
+    /// pointer, and faults an arbitrary distance later when it dereferences or
+    /// calls it. The fault itself carries no trace of where the zero came from —
+    /// `rip=0`, or a write through a NULL base plus a small field offset — so
+    /// without this the only way to find the source is to guess which stub was
+    /// wrong. See [`WinOs::zero_returning_stubs`].
+    zero_stubs: Vec<String>,
 
     /// The `VirtualAlloc` family's reservations (sorted by base). Each entry
     /// tracks the nominal `PAGE_*` protection and commit state so `VirtualQuery`
@@ -420,6 +434,11 @@ pub struct WinOs {
 }
 
 // Sentinel handle values returned by GetStdHandle and understood by WriteFile.
+/// How many distinct zero-returning stubs [`WinOs::zero_returning_stubs`] keeps.
+/// Long enough that the real culprit is almost always in it, short enough that
+/// a fault report stays readable.
+const ZERO_STUB_TRAIL: usize = 12;
+
 const HANDLE_STDIN: u64 = 0x0C;
 const HANDLE_STDOUT: u64 = 0x10;
 const HANDLE_STDERR: u64 = 0x14;
@@ -436,6 +455,7 @@ impl WinOs {
             heap_next: heap_base,
             heap_sizes: HashMap::new(),
             last_error: 0,
+            zero_stubs: Vec::new(),
             vm_allocs: Vec::new(),
             valloc_next: valloc_base,
             initterm_driver: 0,
@@ -877,6 +897,26 @@ impl WinOs {
             self.wine_unix_call_thunk = self.alloc_thunk(Api::WineUnixCall);
         }
         self.wine_unix_call_thunk
+    }
+
+    /// Record that the unimplemented stub for `sym` just handed the guest a 0.
+    /// Newest first, one entry per symbol, capped at [`ZERO_STUB_TRAIL`].
+    pub(crate) fn note_zero_returning_stub(&mut self, sym: &str) {
+        if let Some(i) = self.zero_stubs.iter().position(|s| s == sym) {
+            self.zero_stubs.remove(i);
+        }
+        self.zero_stubs.insert(0, sym.to_string());
+        self.zero_stubs.truncate(ZERO_STUB_TRAIL);
+    }
+
+    /// The unimplemented Win32 stubs that returned 0 to the guest, newest first.
+    ///
+    /// When a run dies on a NULL dereference or a call through a NULL pointer,
+    /// one of these is very often the source — that is the whole shape of the
+    /// defect (`knowledge/known-issues.know`). The fault reporter prints them
+    /// so the search starts from a list of named suspects instead of nothing.
+    pub fn zero_returning_stubs(&self) -> &[String] {
+        &self.zero_stubs
     }
 
     /// Range `[start, end)` of assigned thunk addresses, so the application

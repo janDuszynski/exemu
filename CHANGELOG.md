@@ -436,6 +436,23 @@ end-to-end on the default path.
   whole report for an exception that is *delivered to the guest* rather than
   fatal — without it, an access violation Wine then swallows leaves no trace at
   all. This is what turned the hunt above from hours into minutes.
+- **A NULL-dereference fault now names the stubs that returned the NULL.** The
+  commonest failure shape in exemu is an unimplemented API returning 0 that the
+  guest keeps as a pointer and faults on an arbitrary distance later — 728
+  instructions for `tcc.exe`, 4.7M for the Firefox installer, 93M for
+  SteamSetup — and the fault itself carried no trace of where the zero came
+  from, which is why those read as three unrelated bugs. The OS layer now
+  remembers every unimplemented stub that hands the guest a 0 (newest first,
+  deduplicated, capped), and the report recognises the *shape* of the fault (an
+  address inside the never-mapped 64 KiB null-guard region — a null pointer plus
+  at most a struct-field offset) and prints the suspects. On `tcc.exe` it names
+  `kernel32.dll!VerifyVersionInfoW` and `kernel32.dll!VerSetConditionMask` —
+  exactly the pair `knowledge/known-issues.know` records as its cause, now
+  produced automatically rather than by hand. Pinned as a test against the real
+  binary. **Finding worth recording:** on the Firefox installer the same
+  diagnostic reports that *no* unimplemented stub returned 0 in the whole run —
+  so despite being filed in the same class, its NULL comes from somewhere else
+  (guest logic, or an *implemented* API returning the wrong thing).
 - **PINNED GAP:** the saved `.lnk` carries no `LinkTargetIDList`. Real Windows
   also stores the target as a PIDL, which `SetPath` builds by walking the shell
   namespace (`SHGetDesktopFolder` → `IShellFolder::ParseDisplayName`); that walk
