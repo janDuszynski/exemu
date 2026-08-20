@@ -81,6 +81,16 @@ end-to-end on the default path.
   sections RWX, so an ordinary store into `.data` moves the global counter — and
   treating that as "code changed" measured **40× slower than the interpreter**
   on SteamSetup before the fix. Pinned by three tests.
+- **Two traps found by reading rather than by a failing test**, both fixed with
+  a pin. (1) The block cache is keyed by `(address, CPU mode)`, not by address:
+  a 32-bit guest on Wine's 64-bit PE set starts on a *64-bit* trampoline and
+  switches modes at every transition, so a mode fixed at load time would have
+  decoded 64-bit code as 32-bit, silently. (2) `Hooks::intercept` is not only
+  the API-thunk seam — the OS layer uses "called once per instruction" as its
+  **timeslice clock**, so a JIT-compiled spin loop would never yield and a
+  compute-bound guest thread would starve the others. New `Hooks::retire(n)`
+  (default no-op) reports what a block ran; the JIT variant of the preemption
+  test fails without it.
 - **`crates/jit` is the only crate in the workspace that is not
   `#![forbid(unsafe_code)]`**, and the relaxation is bounded on purpose: the
   whole foreign surface is four declarations (`mmap`, `munmap`,
