@@ -366,6 +366,16 @@ pub enum Api {
     /// `RtlPcToFileHeader(pc, *base)` — return the image base if `pc` is inside
     /// the image (write it out too), else 0.
     RtlPcToFileHeader,
+    /// `LdrGetDllHandle(DllPath, DllCharacteristics, DllName, *DllHandle)` —
+    /// the NT loader's "is this module already loaded?" query (roadmap W5.1).
+    ///
+    /// Serviced natively because on the WoW64 boot path **exemu is the loader**:
+    /// it maps the module set and builds the process, so it — not Wine's
+    /// `LdrGetDllHandleEx` (which walks a hash table only `loader_init` fills) —
+    /// is what knows the answer. `wow64cpu!BTCpuProcessInit` calls this first
+    /// thing to find the 64-bit `ntdll` it then resolves
+    /// `__wine_unix_call_dispatcher` out of.
+    LdrGetDllHandle,
     /// `RaiseException(code, flags, nargs, args)` / `RtlRaiseException` — start
     /// dispatch: build the record, capture context, walk frames offering the
     /// exception to each guest language handler (roadmap P4.3c).
@@ -449,6 +459,7 @@ impl Api {
             "RtlLookupFunctionEntry" => Api::RtlLookupFunctionEntry,
             "RtlVirtualUnwind" => Api::RtlVirtualUnwind,
             "RtlPcToFileHeader" => Api::RtlPcToFileHeader,
+            "LdrGetDllHandle" => Api::LdrGetDllHandle,
             "RaiseException" | "RtlRaiseException" => Api::RaiseException,
             "RtlUnwindEx" | "RtlUnwind" => Api::RtlUnwindEx,
             "SetUnhandledExceptionFilter" => Api::SetUnhandledExceptionFilter,
@@ -979,7 +990,7 @@ impl Api {
             // x64-only ntdll exception APIs: no 32-bit stdcall footprint.
             Api::RtlCaptureContext | Api::RtlLookupFunctionEntry | Api::RtlVirtualUnwind
             | Api::RtlPcToFileHeader | Api::RaiseException | Api::RtlUnwindEx
-            | Api::ExceptionDriver => 0,
+            | Api::ExceptionDriver | Api::LdrGetDllHandle => 0,
             // SetUnhandledExceptionFilter is stdcall(1) on 32-bit; the filter
             // itself (UnhandledExceptionFilter) takes one pointer arg too.
             Api::SetUnhandledExceptionFilter | Api::UnhandledExceptionFilter => 1,
@@ -1569,6 +1580,35 @@ impl WinOs {
                     mem.write_u64(base_out, base)?;
                 }
                 ret(base)
+            }
+
+            // `LdrGetDllHandle(DllPath, DllCharacteristics, &DllName, &Handle)`
+            // — `DllName` is a UNICODE_STRING {Length u16, MaximumLength u16,
+            // pad, Buffer}. Returns STATUS_DLL_NOT_FOUND when the module is not
+            // a real mapped guest image (rather than handing back a synthetic
+            // handle, which the caller would dereference as a PE header).
+            Api::LdrGetDllHandle => {
+                let name_us = self.arg(cpu, mem, 2)?;
+                let handle_out = self.arg(cpu, mem, 3)?;
+                const STATUS_DLL_NOT_FOUND: u64 = 0xC000_0135;
+                let mut status = STATUS_DLL_NOT_FOUND;
+                if name_us != 0 {
+                    let len = mem.read_u16(name_us)? as u64;
+                    let buf = mem.read_u64(name_us + 8)?;
+                    let mut units = Vec::with_capacity((len / 2) as usize);
+                    for i in 0..len / 2 {
+                        units.push(mem.read_u16(buf + i * 2)?);
+                    }
+                    let name = String::from_utf16_lossy(&units).to_ascii_lowercase();
+                    let name = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_string();
+                    if let Some(base) = self.module_base(&name) {
+                        if handle_out != 0 {
+                            mem.write_u64(handle_out, base)?;
+                        }
+                        status = 0;
+                    }
+                }
+                ret(status)
             }
 
             Api::RaiseException => self.raise_exception(cpu, mem),

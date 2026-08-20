@@ -26,6 +26,11 @@ pub(crate) const CONTEXT_SIZE: u64 = 0x4d0;
 /// the wire site when the symbol is exported (roadmap W3.3).
 pub const RVA_KI_USER_EXCEPTION_DISPATCHER: u64 = 0x10a30;
 
+/// Bytes of guest stack the `KiUserExceptionDispatcher` frame occupies:
+/// `CONTEXT` (0x4D0) + `CONTEXT_EX` (0x18) + `EXCEPTION_RECORD` (0x98) + the
+/// machine frame (0x28), rounded to the 16-byte alignment the frame is built at.
+const EXC_FRAME_BYTES: u64 = 0x5C0;
+
 // ---- EXCEPTION_RECORD (x64) -------------------------------------------------
 
 /// `sizeof(EXCEPTION_RECORD)` — header (0x20) + 15 information slots.
@@ -524,7 +529,18 @@ impl WinOs {
         info: &[u64],
     ) -> Result<()> {
         let old_rsp = cpu.rsp();
-        let new_rsp = (old_rsp - 0x5C0) & !0xF;
+        // A guest whose stack pointer is below the frame size (a corrupt or
+        // mode-confused state — e.g. a 32-bit `esp` after a mis-taken WoW64
+        // transition) has nowhere to put the dispatcher frame. Report it as an
+        // OS error rather than wrapping the subtraction (which panicked in debug
+        // builds and silently built the frame at a wild address in release).
+        let Some(new_rsp) = old_rsp.checked_sub(EXC_FRAME_BYTES) else {
+            return Err(exemu_core::EmuError::Os(format!(
+                "cannot deliver exception {code:#x}: rsp {old_rsp:#x} is below the \
+                 {EXC_FRAME_BYTES:#x}-byte KiUserExceptionDispatcher frame"
+            )));
+        };
+        let new_rsp = new_rsp & !0xF;
         let fault_rip = cpu.rip;
         let rflags = cpu.rflags;
 

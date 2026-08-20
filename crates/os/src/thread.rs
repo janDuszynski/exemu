@@ -902,6 +902,9 @@ impl WinOs {
         let buffer = self.syscall_arg(cpu, mem, 2)?;
         let length = self.syscall_arg(cpu, mem, 3)?;
         let return_length = self.syscall_arg(cpu, mem, 4)?;
+        if class == THREAD_WOW64_CONTEXT {
+            return self.query_wow64_context(cpu, mem, handle, buffer, length, return_length);
+        }
         if class != THREAD_BASIC_INFORMATION {
             return Ok(STATUS_NOT_IMPLEMENTED);
         }
@@ -940,6 +943,52 @@ impl WinOs {
         }
         Ok(STATUS_SUCCESS)
     }
+
+    /// `NtQueryInformationThread(handle, ThreadWow64Context, …)` — the
+    /// `WOW64_CONTEXT` of a WoW64 thread's 32-bit half (roadmap W5.1).
+    ///
+    /// This is the service behind `ntdll!RtlWow64GetThreadContext`, which the
+    /// pinned 64-bit ntdll implements as exactly this call
+    /// (`mov edx,0x1d; mov r9d,0x2cc; call NtQueryInformationThread` @ rva
+    /// 0x3a960 — both the class and the 0x2cc buffer size are read out of those
+    /// bytes, not chosen here). `wow64cpu!BTCpuProcessInit` calls it to learn
+    /// the 32-bit `SegCs`/`SegSs` it then caches in its own `.bss`.
+    ///
+    /// The answer is the live `WOW64_CONTEXT` in this thread's WoW64
+    /// **CPU-reserved area** — the same record `BTCpuSimulate` loads the 32-bit
+    /// registers from — reached through `TEB64 + 0x1488` (a pointer) `+ 4` (past
+    /// the machine-type header). A thread with no CPU-reserved area is not a
+    /// WoW64 thread: `STATUS_INVALID_PARAMETER`, never a zeroed context (which
+    /// would silently hand out `SegCs = 0`).
+    fn query_wow64_context(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+        handle: u64,
+        buffer: u64,
+        length: u64,
+        return_length: u64,
+    ) -> Result<u32> {
+        if self.nt_thread_index(handle).is_none() {
+            return Ok(STATUS_INVALID_HANDLE);
+        }
+        if buffer == 0 || length < WOW64_CONTEXT_SIZE {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let teb = if cpu.gs_base != 0 { cpu.gs_base } else { self.cfg.teb_base };
+        let area = mem.read_u64(teb + crate::wow64::TEB_CPU_AREA_PTR_OFF)?;
+        if area == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let ctx = area + crate::wow64::CPU_AREA_HEADER_LEN;
+        let mut buf = vec![0u8; WOW64_CONTEXT_SIZE as usize];
+        mem.read(ctx, &mut buf)?;
+        mem.write(buffer, &buf)?;
+        if return_length != 0 {
+            mem.write_u32(return_length, WOW64_CONTEXT_SIZE as u32)?;
+        }
+        Ok(STATUS_SUCCESS)
+    }
 }
 
 // ---- NT thread syscall status codes + SSDT wiring (roadmap W2.9) ----------
@@ -950,6 +999,9 @@ const NT_CURRENT_THREAD: u64 = u64::MAX - 1;
 const CREATE_SUSPENDED_NT: u32 = 0x0000_0001;
 /// `ThreadBasicInformation` `THREADINFOCLASS` value.
 const THREAD_BASIC_INFORMATION: u32 = 0;
+/// `ThreadWow64Context` + `sizeof(WOW64_CONTEXT)` — both read out of the pinned
+/// 64-bit `ntdll.dll`'s own `RtlWow64GetThreadContext`; see [`crate::wow64`].
+use crate::wow64::{THREAD_WOW64_CONTEXT, WOW64_CONTEXT_SIZE};
 
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
