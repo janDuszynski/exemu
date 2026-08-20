@@ -13,7 +13,8 @@
 //! `GetPath` call below is a **guest indirect call through a vtable Wine
 //! populated**, on guest memory, with no native COM in exemu.
 //!
-//! What the generated program does:
+//! What the generated program does — the whole **start-menu-shortcut**
+//! sequence an installer performs:
 //!
 //! 1. `CoInitializeEx(NULL, COINIT_APARTMENTTHREADED)`;
 //! 2. `CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
@@ -27,39 +28,47 @@
 //!    A wrong vtable slot would not coincidentally reproduce a specific
 //!    documented HRESULT; getting *this exact* answer is what makes the call
 //!    a real proof rather than "some function got called";
-//! 4. `Release`s the interface and `CoUninitialize`s.
+//! 4. `pShellLink->SetPath([`TARGET_PATH`])` — slot 20 (`IShellLinkW`'s last),
+//!    which inside Wine resolves the target through `GetFullPathNameW` /
+//!    `PathFileExistsW`, builds a PIDL for it through the shell namespace, and
+//!    records the volume information;
+//! 5. `GetPath` again — the link must now hand [`TARGET_PATH`] back, which is
+//!    what proves step 4 stored something rather than merely returning `S_OK`;
+//! 6. `QueryInterface(&IID_IPersistFile, &pPersistFile)` on the same object;
+//! 7. `pPersistFile->Save([`LNK_PATH`], TRUE)` — slot 6 — writing a **real
+//!    `.lnk` file** into the sandboxed `CSIDL_PROGRAMS` folder;
+//! 8. `Release`s both interfaces and `CoUninitialize`s.
 //!
 //! Every HRESULT is printed as an 8-hex-digit line (`<LABEL>=<hex>\n`) so a
 //! run that stops short is diagnosable from stdout alone. The exit code is the
-//! count of the 3 steps above that did not hold (`CoInitializeEx`/
-//! `CoCreateInstance` must return `S_OK`; `GetPath` must return `S_OK` *or*
-//! `S_FALSE`, both documented non-error outcomes) — 0 means every step held. A
-//! guarded pointer is never dereferenced when NULL: a failed `CoCreateInstance`
-//! skips `GetPath` (counted as a failure) rather than faulting the interpreter
-//! on a NULL vtable call.
+//! count of the [`LABELS`] steps that did not hold (all must return `S_OK`,
+//! except the pristine `GetPath`, where `S_FALSE` is the documented answer) —
+//! 0 means every step held. A guarded pointer is never dereferenced when NULL:
+//! a failed `CoCreateInstance` or `QueryInterface` skips the steps that would
+//! use it (each counted as a failure) rather than faulting the interpreter on
+//! a NULL vtable call.
 //!
-//! # What this sample deliberately does *not* attempt
+//! # The bug this sample used to trip over
 //!
-//! An earlier version of this sample went further — `SetPath`, then
-//! `QueryInterface(IID_IPersistFile)`, then `IPersistFile::Save` to write a
-//! real `.lnk` into the sandboxed `CSIDL_PROGRAMS` folder (the "7-Zip
-//! start-menu-shortcut pin"). **`SetPath` crashes the guest process**: Wine's
-//! own crash reporter (visible on stderr under `--trace`) names it exactly —
-//! `Unhandled page fault on read access to 00000000000000BC` — a **NULL
-//! pointer plus a small struct-field offset**, the same failure class
-//! `knowledge/known-issues.know` already documents ("a stubbed Win32 API
-//! returns 0/NULL, the guest stores it as a pointer, and faults later when it
-//! dereferences it"). This was isolated methodically, not guessed: the
-//! `GetPath` slot (0x18) was proven correct and callable (§3 above); a sweep
-//! of the vtable's neighbouring slots (0x90/0x98/0xA0/0xA8/0xB0) showed 0xA0
-//! ("SetPath", the last of `IShellLinkW`'s 21 slots) holds a plausible,
-//! same-image function pointer immediately followed by the vtable's true end
-//! (0xA8/0xB0 both `NULL`) — confirming the *offset* is right; and the
-//! `pszFile` argument was echoed back byte-for-byte correct before the call.
-//! The crash is therefore **inside Wine's real `SetPath`**, hitting some
-//! *other*, not-yet-identified exemu stub that returns `NULL` where Wine
-//! expects a valid pointer — a genuine, separate gap, out of scope for W6.6
-//! (known folders). Worth its own investigation; not this one.
+//! `SetPath` crashed the guest for a long time — `Unhandled page fault on read
+//! access to 00000000000000BC`, a NULL pointer plus a small struct-field
+//! offset. The chain, recovered end to end, is worth keeping because it is the
+//! archetype of the "a stub returned a plausible zero" class in
+//! `knowledge/known-issues.know`:
+//!
+//! exemu answered `NtGetNlsSectionPtr(type 0xA)` — ntdll's **case-mapping**
+//! section — with a zero-filled codepage stub. ntdll installed it as its
+//! upcase/downcase tables; because the pointer was non-NULL, every
+//! case-insensitive comparison in the process took the table path instead of
+//! its ASCII fallback, and a table of zeros maps every character to itself. So
+//! case-insensitive comparison silently became case-**sensitive**. The loader
+//! then failed to recognise the `NTDLL.dll` a forwarder named as the already
+//! loaded `ntdll.dll`, and mapped a **second, uninitialised copy** of ntdll.
+//! shell32's delay-load stub bound to that copy, and the first delay-load
+//! resolution walked its never-initialised `LdrpHashTable` — a bucket whose
+//! `LIST_ENTRY.Flink` was `NULL` — and read a field at `+0xBC` off it. Four
+//! subsystems and two million instructions between the stub and the fault.
+//! The fix is [`exemu_os`]'s real case tables; see `crates/os/src/nls.rs`.
 //!
 //! The layout code mirrors [`crate::shell_sample`] and the COM section of
 //! [`crate::sample`] (hand-assembled, RIP-relative displacements patched from
@@ -89,11 +98,36 @@ pub const IID_ISHELL_LINK_W: [u8; 16] = [
     0xF9, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
 ];
 
-/// The 3 counted steps, in order — the sample's exit code is how many of
-/// these did not hold.
-pub const LABELS: [&str; 3] = ["COINIT=", "CREATE=", "GETPATH="];
-/// The tag the (expected-empty) `GetPath` result is printed under.
+/// `IID_IPersistFile` = `{0000010B-0000-0000-C000-000000000046}`.
+pub const IID_IPERSIST_FILE: [u8; 16] = [
+    0x0B, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+
+/// The counted steps, in order — the sample's exit code is how many of these
+/// did not hold.
+pub const LABELS: [&str; 7] =
+    ["COINIT=", "CREATE=", "GETPATH=", "SETPATH=", "GETPATH2=", "QIPERSIST=", "SAVE="];
+/// The tag the (expected-empty) pristine `GetPath` result is printed under.
 pub const PATH_TAG: &str = "PATH=";
+/// The tag the post-`SetPath` `GetPath` result is printed under.
+pub const PATH2_TAG: &str = "PATH2=";
+
+/// The target `SetPath` records in the link.
+///
+/// It deliberately **exists in the sandbox** (exemu materialises the Windows
+/// tree), because Wine's `SetPath` resolves the target — `GetFullPathNameW`,
+/// then `PathFileExistsW`, and only `SearchPathW` if that fails — and stores a
+/// PIDL plus the volume information for it. Pointing at a file that is really
+/// there exercises the path that a real installer takes.
+pub const TARGET_PATH: &str = "C:\\Windows\\system32\\notepad.exe";
+
+/// Where `IPersistFile::Save` writes the shortcut: a `.lnk` in `CSIDL_PROGRAMS`
+/// (the per-user Start-menu Programs folder), the 7-Zip start-menu-shortcut
+/// shape. Spelled out rather than resolved through `SHGetFolderPathW` so the
+/// sample needs no shell32 import of its own — the gate cross-checks it against
+/// [`exemu_os::folders::csidl_path`] so the two cannot drift.
+pub const LNK_PATH: &str =
+    "C:\\Users\\exemu\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\exemu Test.lnk";
 
 /// Build the IShellLink-through-COM sample executable.
 pub fn build() -> Vec<u8> {
@@ -175,13 +209,22 @@ struct Rdata {
     iat: HashMap<String, u32>,
     clsid_shelllink_rva: u32,
     iid_shelllinkw_rva: u32,
+    iid_persistfile_rva: u32,
     /// RVA + byte length (including `=`) of each of [`LABELS`], in order.
-    label_rva: [u32; 3],
-    label_len: [u32; 3],
+    label_rva: [u32; 7],
+    label_len: [u32; 7],
     path_tag_rva: u32,
     path_tag_len: u32,
+    path2_tag_rva: u32,
+    path2_tag_len: u32,
+    /// UTF-16 [`TARGET_PATH`], NUL-terminated.
+    target_w_rva: u32,
+    /// UTF-16 [`LNK_PATH`], NUL-terminated.
+    lnk_w_rva: u32,
     // --- `.data` (BSS) scratch, laid out by `Rdata::build` -----------------
     punk_shelllink_rva: u32,
+    /// `QueryInterface(IID_IPersistFile)`'s out-pointer.
+    punk_persistfile_rva: u32,
     /// `IShellLinkW::GetPath`'s output buffer (UTF-16, `MAX_PATH` code units).
     wbuf_getpath_rva: u32,
     /// ASCII line buffer the squeezed `GetPath` result is built in.
@@ -224,16 +267,18 @@ impl Rdata {
             pos += dll.len() as u32 + 1;
         }
 
-        // The two GUIDs, 16-byte aligned.
+        // The GUIDs, 16-byte aligned.
         pos = align_up_u32(pos, 16);
         let clsid_shelllink_rva = RDATA_RVA + pos;
         pos += 16;
         let iid_shelllinkw_rva = RDATA_RVA + pos;
         pos += 16;
+        let iid_persistfile_rva = RDATA_RVA + pos;
+        pos += 16;
 
-        // The 3 step labels.
-        let mut label_rva = [0u32; 3];
-        let mut label_len = [0u32; 3];
+        // The step labels.
+        let mut label_rva = [0u32; 7];
+        let mut label_len = [0u32; 7];
         for (i, s) in LABELS.iter().enumerate() {
             label_rva[i] = RDATA_RVA + pos;
             label_len[i] = s.len() as u32;
@@ -242,6 +287,16 @@ impl Rdata {
         let path_tag_rva = RDATA_RVA + pos;
         let path_tag_len = PATH_TAG.len() as u32;
         pos += path_tag_len;
+        let path2_tag_rva = RDATA_RVA + pos;
+        let path2_tag_len = PATH2_TAG.len() as u32;
+        pos += path2_tag_len;
+
+        // The UTF-16 strings, 2-byte aligned and NUL-terminated.
+        pos = align_up_u32(pos, 2);
+        let target_w_rva = RDATA_RVA + pos;
+        pos += (TARGET_PATH.chars().count() as u32 + 1) * 2;
+        let lnk_w_rva = RDATA_RVA + pos;
+        pos += (LNK_PATH.chars().count() as u32 + 1) * 2;
 
         let mut b = vec![0u8; pos as usize];
 
@@ -283,7 +338,11 @@ impl Rdata {
             b[off..off + dll.len()].copy_from_slice(dll.as_bytes());
         }
         // GUIDs.
-        for (rva, guid) in [(clsid_shelllink_rva, &CLSID_SHELL_LINK), (iid_shelllinkw_rva, &IID_ISHELL_LINK_W)] {
+        for (rva, guid) in [
+            (clsid_shelllink_rva, &CLSID_SHELL_LINK),
+            (iid_shelllinkw_rva, &IID_ISHELL_LINK_W),
+            (iid_persistfile_rva, &IID_IPERSIST_FILE),
+        ] {
             let off = (rva - RDATA_RVA) as usize;
             b[off..off + 16].copy_from_slice(guid);
         }
@@ -292,12 +351,18 @@ impl Rdata {
             let off = (label_rva[i] - RDATA_RVA) as usize;
             b[off..off + s.len()].copy_from_slice(s.as_bytes());
         }
-        let off = (path_tag_rva - RDATA_RVA) as usize;
-        b[off..off + PATH_TAG.len()].copy_from_slice(PATH_TAG.as_bytes());
+        for (rva, tag) in [(path_tag_rva, PATH_TAG), (path2_tag_rva, PATH2_TAG)] {
+            let off = (rva - RDATA_RVA) as usize;
+            b[off..off + tag.len()].copy_from_slice(tag.as_bytes());
+        }
+        // UTF-16 strings.
+        put_utf16(&mut b, (target_w_rva - RDATA_RVA) as usize, TARGET_PATH);
+        put_utf16(&mut b, (lnk_w_rva - RDATA_RVA) as usize, LNK_PATH);
 
         // `.data` (BSS) scratch layout.
         let punk_shelllink_rva = DATA_RVA;
-        let wbuf_getpath_rva = punk_shelllink_rva + 8;
+        let punk_persistfile_rva = punk_shelllink_rva + 8;
+        let wbuf_getpath_rva = punk_persistfile_rva + 8;
         let abuf_rva = wbuf_getpath_rva + MAX_PATH * 2 + 8;
         let written_rva = align_up_u32(abuf_rva + MAX_PATH + 16, 8);
         let hexbuf_rva = written_rva + 8;
@@ -312,11 +377,17 @@ impl Rdata {
             iat,
             clsid_shelllink_rva,
             iid_shelllinkw_rva,
+            iid_persistfile_rva,
             label_rva,
             label_len,
             path_tag_rva,
             path_tag_len,
+            path2_tag_rva,
+            path2_tag_len,
+            target_w_rva,
+            lnk_w_rva,
             punk_shelllink_rva,
+            punk_persistfile_rva,
             wbuf_getpath_rva,
             abuf_rva,
             written_rva,
@@ -337,8 +408,13 @@ const FRAME: u32 = 0x38;
 
 // ---- COM vtable slot byte offsets (public, documented — shobjidl_core.h /
 // unknwn.h; NOT recovered from the binary) -----------------------------------
+const VT_QUERY_INTERFACE: u32 = 0x00; // IUnknown, slot 0
 const VT_RELEASE: u32 = 0x10; // IUnknown, slot 2
 const VT_SLW_GET_PATH: u32 = 0x18; // IShellLinkW, slot 3
+const VT_SLW_SET_PATH: u32 = 0xA0; // IShellLinkW, slot 20 (its last)
+/// `IPersistFile::Save`, slot 6: `IUnknown`'s 3, `IPersist::GetClassID`, then
+/// `IsDirty`, `Load`, **`Save`** (`objidl.h` declaration order).
+const VT_PF_SAVE: u32 = 0x30;
 
 /// Emit the sample's `.text`.
 ///
@@ -386,8 +462,9 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     c.extend_from_slice(&[0x48, 0x85, 0xC9]); // test rcx, rcx
     c.extend_from_slice(&[0x0F, 0x85, 0, 0, 0, 0]); // jne HAVE_SL
     let jne_have_sl = c.len() - 4;
-    // No object: GETPATH (1 step) skipped.
-    c.extend_from_slice(&[0x41, 0xFF, 0xC5]); // inc r13d
+    // No object: the 5 remaining steps are all skipped, and each counts as a
+    // failure — `add r13d, 5`.
+    c.extend_from_slice(&[0x41, 0x83, 0xC5, 5]);
     c.extend_from_slice(&[0xE9, 0, 0, 0, 0]); // jmp AFTER_SL
     let jmp_after_sl = c.len() - 4;
 
@@ -416,6 +493,65 @@ fn build_text(r: &Rdata) -> Vec<u8> {
 
     // Report "PATH=<squeezed wbuf_getpath>\n" (expected empty).
     emit_report(&mut c, r.path_tag_rva, r.path_tag_len, r.wbuf_getpath_rva, r.abuf_rva, r.written_rva, r.slot("WriteFile"));
+
+    // --- SetPath(this, TARGET_PATH) --------------------------------------
+    rip(&mut c, &[0x48, 0x8D, 0x15], r.target_w_rva); // lea rdx, [rip+target]
+    rip(&mut c, &[0x48, 0x8B, 0x0D], r.punk_shelllink_rva); // mov rcx, [rip+punk_sl]
+    c.extend_from_slice(&[0x48, 0x8B, 0x01]); // mov rax, [rcx]  (vtbl)
+    call_vtbl(&mut c, VT_SLW_SET_PATH);
+    print_hex(&mut c, r, 3);
+    fail_unless_zero(&mut c);
+
+    // --- GetPath again: the link must now report the target back ----------
+    rip_imm16(&mut c, &[0x66, 0xC7, 0x05], r.wbuf_getpath_rva, 0);
+    rip(&mut c, &[0x48, 0x8D, 0x15], r.wbuf_getpath_rva); // lea rdx, [rip+wbuf_getpath]
+    c.extend_from_slice(&[0x41, 0xB8]); // mov r8d, MAX_PATH
+    c.extend_from_slice(&MAX_PATH.to_le_bytes());
+    c.extend_from_slice(&[0x4D, 0x31, 0xC9]); // xor r9, r9
+    c.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00]); // mov qword [rsp+0x20], 0
+    rip(&mut c, &[0x48, 0x8B, 0x0D], r.punk_shelllink_rva);
+    c.extend_from_slice(&[0x48, 0x8B, 0x01]);
+    call_vtbl(&mut c, VT_SLW_GET_PATH);
+    print_hex(&mut c, r, 4);
+    fail_unless_zero(&mut c); // now that the link has a target, only S_OK will do
+    emit_report(&mut c, r.path2_tag_rva, r.path2_tag_len, r.wbuf_getpath_rva, r.abuf_rva, r.written_rva, r.slot("WriteFile"));
+
+    // --- QueryInterface(IID_IPersistFile, &punk_persistfile) --------------
+    rip(&mut c, &[0x48, 0x8D, 0x15], r.iid_persistfile_rva); // lea rdx, [rip+iid_pf]
+    rip(&mut c, &[0x4C, 0x8D, 0x05], r.punk_persistfile_rva); // lea r8, [rip+punk_pf]
+    rip(&mut c, &[0x48, 0x8B, 0x0D], r.punk_shelllink_rva);
+    c.extend_from_slice(&[0x48, 0x8B, 0x01]);
+    call_vtbl(&mut c, VT_QUERY_INTERFACE);
+    print_hex(&mut c, r, 5);
+    fail_unless_zero(&mut c);
+
+    // Guard the second interface pointer exactly like the first.
+    rip(&mut c, &[0x48, 0x8B, 0x0D], r.punk_persistfile_rva);
+    c.extend_from_slice(&[0x48, 0x85, 0xC9]); // test rcx, rcx
+    c.extend_from_slice(&[0x0F, 0x85, 0, 0, 0, 0]); // jne HAVE_PF
+    let jne_have_pf = c.len() - 4;
+    c.extend_from_slice(&[0x41, 0xFF, 0xC5]); // inc r13d  (SAVE skipped)
+    c.extend_from_slice(&[0xE9, 0, 0, 0, 0]); // jmp AFTER_PF
+    let jmp_after_pf = c.len() - 4;
+    let have_pf = c.len();
+    patch_rel32(&mut c, jne_have_pf, have_pf);
+
+    // --- IPersistFile::Save(LNK_PATH, fRemember = TRUE) -------------------
+    rip(&mut c, &[0x48, 0x8D, 0x15], r.lnk_w_rva); // lea rdx, [rip+lnk]
+    c.extend_from_slice(&[0x41, 0xB8, 0x01, 0x00, 0x00, 0x00]); // mov r8d, 1
+    rip(&mut c, &[0x48, 0x8B, 0x0D], r.punk_persistfile_rva);
+    c.extend_from_slice(&[0x48, 0x8B, 0x01]);
+    call_vtbl(&mut c, VT_PF_SAVE);
+    print_hex(&mut c, r, 6);
+    fail_unless_zero(&mut c);
+
+    // Release(punk_persistfile)
+    rip(&mut c, &[0x48, 0x8B, 0x0D], r.punk_persistfile_rva);
+    c.extend_from_slice(&[0x48, 0x8B, 0x01]);
+    call_vtbl(&mut c, VT_RELEASE);
+
+    let after_pf = c.len();
+    patch_rel32(&mut c, jmp_after_pf, after_pf);
 
     // Release(punk_shelllink)
     rip(&mut c, &[0x48, 0x8B, 0x0D], r.punk_shelllink_rva);
@@ -594,6 +730,15 @@ fn put_u32(f: &mut [u8], at: usize, v: u32) {
 }
 fn put_u64(f: &mut [u8], at: usize, v: u64) {
     f[at..at + 8].copy_from_slice(&v.to_le_bytes());
+}
+/// Write `s` as NUL-terminated UTF-16LE at byte offset `at`.
+fn put_utf16(f: &mut [u8], at: usize, s: &str) {
+    let mut o = at;
+    for u in s.encode_utf16() {
+        put_u16(f, o, u);
+        o += 2;
+    }
+    put_u16(f, o, 0);
 }
 fn align_up(v: usize, a: usize) -> usize {
     v.div_ceil(a) * a
