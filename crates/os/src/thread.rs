@@ -139,8 +139,9 @@ const _: () = assert!(
 );
 
 /// Fixed process id reported through `ClientId.UniqueProcess` (matches
-/// `GetCurrentProcessId`).
-const PROCESS_ID: u64 = 0x1000;
+/// `GetCurrentProcessId`). One source of truth with the process-object code
+/// (roadmap W3.5), which hands children ids from a disjoint range.
+const PROCESS_ID: u64 = crate::CURRENT_PROCESS_ID;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ThreadState {
@@ -833,20 +834,27 @@ impl WinOs {
     /// Terminating the current process ends the whole run with `ExitStatus`: the
     /// handler records the code in `pending_syscall_exit`, which the syscall
     /// dispatcher observes to yield `Exit::ProcessExit` to the run loop (the same
-    /// termination `ExitProcess` reaches). A handle naming some *other* process is
-    /// meaningless in exemu's single-process model and is accepted as a no-op
-    /// success. This also services Wine's `loader_init` crash-cascade path, which
-    /// calls `ZwTerminateProcess` after a failed `load_dll` (roadmap W3.2).
+    /// termination `ExitProcess` reaches). This also services Wine's
+    /// `loader_init` crash-cascade path, which calls `ZwTerminateProcess` after a
+    /// failed `load_dll` (roadmap W3.2).
+    ///
+    /// A handle naming a **child process** (roadmap W3.5) terminates that child:
+    /// one that has not been resumed never runs, and `ExitStatus` becomes the
+    /// exit code its parent will read back. Any other handle names no process
+    /// exemu knows about, and is refused rather than inertly succeeding — a
+    /// success there would tell a guest that something it cannot see was killed.
     pub(crate) fn nt_terminate_process(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let code = self.syscall_arg(cpu, mem, 1)? as i32;
-        // 0 or NtCurrentProcess (-1) name the current (only) process.
+        // 0 or NtCurrentProcess (-1) name the current process.
         if handle == 0 || handle == u64::MAX {
             self.pending_syscall_exit = Some(code);
             return Ok(STATUS_SUCCESS);
         }
-        // Any other handle: no other process exists to terminate — succeed inertly.
-        Ok(STATUS_SUCCESS)
+        if self.terminate_child(handle, code as u32) {
+            return Ok(STATUS_SUCCESS);
+        }
+        Ok(STATUS_INVALID_HANDLE)
     }
 
     /// `NtSuspendThread(ThreadHandle, *PreviousSuspendCount)`.
@@ -870,9 +878,20 @@ impl WinOs {
 
     /// `NtResumeThread(ThreadHandle, *PreviousSuspendCount)`.
     /// arg0=ThreadHandle, arg1=&PreviousSuspendCount (OUT, optional).
+    ///
+    /// **A child process's initial thread lands here too** (roadmap W3.5).
+    /// kernelbase creates every child suspended and resumes it as the last step
+    /// of `CreateProcessW`, so this is where a child actually starts running —
+    /// which is why the child arm is checked before the in-process thread table.
     pub(crate) fn nt_resume_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let prev_out = self.syscall_arg(cpu, mem, 1)?;
+        if let Some(prev) = self.resume_child_thread(handle) {
+            if prev_out != 0 {
+                mem.write_u32(prev_out, prev)?;
+            }
+            return Ok(STATUS_SUCCESS);
+        }
         let Some(i) = self.nt_thread_index(handle) else {
             return Ok(STATUS_INVALID_HANDLE);
         };

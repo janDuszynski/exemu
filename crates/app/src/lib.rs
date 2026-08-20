@@ -21,6 +21,8 @@ pub mod gui_sample;
 pub mod sample;
 pub mod shell_sample;
 pub mod socket_sample;
+pub mod spawn;
+pub mod spawn_sample;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -201,6 +203,19 @@ pub struct RunConfig {
     /// `None` keeps the shared sandbox, which is right for real CLI runs — a
     /// user expects `exemu run` to write where the last one did.
     pub sandbox_root: Option<std::path::PathBuf>,
+    /// Use this **verbatim** as the guest command line instead of joining
+    /// [`RunConfig::args`] (roadmap W3.5). A child process's command line was
+    /// already built by its parent — re-joining an argv would re-quote it — so
+    /// the spawner passes the parent's string straight through.
+    pub command_line: Option<String>,
+    /// Seed the guest environment with these `name=value` pairs instead of the
+    /// OS layer's default set (roadmap W3.5). A child inherits the environment
+    /// block its parent handed to `NtCreateUserProcess`; empty keeps the default.
+    pub environment: Vec<(String, String)>,
+    /// How deep this process sits in the spawn chain: 0 for a run started from
+    /// the CLI or a test, `parent + 1` for a child. Bounds runaway recursion
+    /// (see [`crate::spawn::MAX_SPAWN_DEPTH`]).
+    pub spawn_depth: u32,
 }
 
 impl Default for RunConfig {
@@ -218,6 +233,9 @@ impl Default for RunConfig {
             driver: None,
             input: None,
             sandbox_root: None,
+            command_line: None,
+            environment: Vec::new(),
+            spawn_depth: 0,
         }
     }
 }
@@ -347,8 +365,15 @@ impl Process {
         map_kuser_shared_data(&mut mem)?;
 
         // --- Command line (ASCII + UTF-16) in the env region --------------
+        // A child process (roadmap W3.5) arrives with the command line its
+        // parent already built, so it is used verbatim; everything else joins
+        // argv. Either way it is bounded to the region: the ASCII copy has
+        // 0x400 bytes and the UTF-16 copy the rest of the page, and a command
+        // line that overran them would corrupt whatever follows.
         mem.map(Region::new("env", lay.env_base, ENV_SIZE, Perm::RW))?;
-        let cmdline = build_cmdline(&cfg.args);
+        let cmdline = truncate_cmdline(
+            cfg.command_line.clone().unwrap_or_else(|| build_cmdline(&cfg.args)),
+        );
         let cmd_a = lay.env_base;
         let mut ascii = cmdline.clone().into_bytes();
         ascii.push(0);
@@ -472,6 +497,16 @@ impl Process {
         // Hand the OS layer the unwind table so its native Rtl* exception
         // APIs and dispatch can walk guest frames (roadmap P4.3).
         os.set_unwind_table(image.function_table.clone());
+
+        // --- Child processes (roadmap W3.5) --------------------------------
+        // The OS layer owns `NtCreateUserProcess`, the process objects and the
+        // handle semantics; *running* a second guest image needs this crate, so
+        // it is injected the same way the display driver is. A child inherits
+        // this run's sandbox, Wine prefix and budget, and its environment is the
+        // block its parent handed over.
+        os.set_environment(cfg.environment.clone());
+        os.set_spawn_depth(cfg.spawn_depth);
+        os.set_process_spawner(Box::new(spawn::AppSpawner::new(cfg, sandbox.clone())));
 
         // Complete the main thread's Wine-walkable TEB (roadmap W2.9/W2.10). The
         // app seeded Self/PEB/StackBase/StackLimit above; this fills every field
@@ -1050,6 +1085,27 @@ fn data_import_seed(name: &str, cmd_a: u64, cmd_w: u64) -> Option<u64> {
         // etc. all correctly default to 0, which the zeroed mapping provides.
         _ => None,
     }
+}
+
+/// Longest command line the `env` region can hold. The ASCII copy sits at
+/// `env_base` with 0x400 bytes to itself and the UTF-16 copy at `env_base+0x400`
+/// with the rest of the 0x1000-byte region, so 0x3F0 characters (plus a NUL)
+/// fits both with room to spare.
+const CMDLINE_MAX_CHARS: usize = 0x3F0;
+
+/// Clamp a command line to what the `env` region can hold, on a character
+/// boundary. A parent-supplied command line (roadmap W3.5) is arbitrary guest
+/// data; truncating it loses arguments, which is visible and debuggable, where
+/// overrunning the region would silently corrupt the pages after it.
+fn truncate_cmdline(mut cmdline: String) -> String {
+    if cmdline.chars().count() > CMDLINE_MAX_CHARS {
+        let end = cmdline
+            .char_indices()
+            .nth(CMDLINE_MAX_CHARS)
+            .map_or(cmdline.len(), |(i, _)| i);
+        cmdline.truncate(end);
+    }
+    cmdline
 }
 
 /// Build a Windows-style command line from argv, quoting args with spaces.

@@ -29,6 +29,7 @@ mod gdi;
 mod msg;
 pub mod net;
 mod nls;
+pub mod process;
 mod reg;
 mod section;
 mod server;
@@ -410,6 +411,24 @@ pub struct WinOs {
     /// NTSTATUS to the (now-terminating) guest. Cleared at the start of every
     /// dispatch.
     pending_syscall_exit: Option<i32>,
+
+    /// Child processes this process created (roadmap W3.5). Each owns the
+    /// process/thread handle pair the guest holds and the create-time snapshot
+    /// needed to run it. See [`crate::process`].
+    children: Vec<process::ChildProcess>,
+    /// Monotonic child process/thread id source.
+    next_pid: u32,
+    /// The application layer's child-process runner. The default
+    /// [`exemu_core::NoSpawner`] refuses every request, so a build that has not
+    /// wired one in fails `NtCreateUserProcess` with a real NTSTATUS rather than
+    /// handing back a handle to a process that will never run.
+    spawner: Box<dyn exemu_core::ProcessSpawner>,
+    /// How deep this process sits in the spawn chain (0 = the top-level
+    /// process). Passed to the spawner so it can bound recursion.
+    spawn_depth: u32,
+    /// Why the last child run failed, when it did — surfaced to tests and to the
+    /// parent's stderr so an emulator failure is never mistaken for a guest exit.
+    child_failure: Option<String>,
 }
 
 // Sentinel handle values returned by GetStdHandle and understood by WriteFile.
@@ -417,6 +436,14 @@ const HANDLE_STDIN: u64 = 0x0C;
 const HANDLE_STDOUT: u64 = 0x10;
 const HANDLE_STDERR: u64 = 0x14;
 const HANDLE_PROCESS_HEAP: u64 = 0x00AB_0000;
+
+/// The id `GetCurrentProcessId` / `ClientId.UniqueProcess` report for the
+/// process exemu is running. Child processes (roadmap W3.5) get ids from a
+/// separate range so a guest can tell them apart.
+pub(crate) const CURRENT_PROCESS_ID: u64 = 0x1000;
+/// First id handed out to a child process; multiples of four, as Windows does,
+/// and clear of [`CURRENT_PROCESS_ID`].
+const FIRST_CHILD_PROCESS_ID: u32 = 0x2000;
 
 impl WinOs {
     pub fn new(cfg: WinConfig) -> Self {
@@ -495,6 +522,11 @@ impl WinOs {
             unix_call_blocked: false,
             pending_process_exit: None,
             pending_syscall_exit: None,
+            children: Vec::new(),
+            next_pid: FIRST_CHILD_PROCESS_ID,
+            spawner: Box::new(exemu_core::NoSpawner),
+            spawn_depth: 0,
+            child_failure: None,
         };
         // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
@@ -577,6 +609,18 @@ impl WinOs {
         os.set_syscall_handler(
             thread::SSDT_NT_QUERY_INFORMATION_THREAD,
             thread::ssdt_nt_query_information_thread,
+        );
+        // Child process creation (roadmap W3.5): the path Wine's
+        // `CreateProcessW` → `create_nt_process` actually takes, plus the single
+        // query kernelbase's `GetExitCodeProcess` is made of. See
+        // [`crate::process`].
+        os.set_syscall_handler(
+            process::SSDT_NT_CREATE_USER_PROCESS,
+            process::ssdt_nt_create_user_process,
+        );
+        os.set_syscall_handler(
+            process::SSDT_NT_QUERY_INFORMATION_PROCESS,
+            process::ssdt_nt_query_information_process,
         );
         // NT sync syscalls (roadmap W2.12): the NTSTATUS face of the P3.6 sync
         // objects + P3.4 scheduler (REAL blocking, not speculative WAIT_OBJECT_0).
@@ -930,6 +974,22 @@ impl WinOs {
             cpu.set_rsp((sp + 4 + stack_args as u64 * 4) & 0xFFFF_FFFF);
         }
         Ok(())
+    }
+
+    /// Replace the process environment (roadmap W3.5): a child process inherits
+    /// the block its parent built, so the application layer seeds it here rather
+    /// than letting the child start from [`default_environment`]. An empty list
+    /// leaves the default in place.
+    pub fn set_environment(&mut self, env: Vec<(String, String)>) {
+        if !env.is_empty() {
+            self.env = env;
+        }
+    }
+
+    /// [`WinOs::emit`] under a name the sibling modules can reach (the child
+    /// process runner folds a child's console output into this stream).
+    pub(crate) fn emit_bytes(&mut self, is_err: bool, bytes: &[u8]) {
+        self.emit(is_err, bytes);
     }
 
     /// Append console output, echoing to the host if configured.

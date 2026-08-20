@@ -110,6 +110,13 @@ pub enum Api {
     SuspendThread,
     TerminateThread,
     GetExitCodeThread,
+    /// `CreateProcessA`/`CreateProcessW` on the **emulated** path (roadmap
+    /// W3.5). The Wine boot reaches child creation through kernelbase and
+    /// `NtCreateUserProcess` instead; both meet in the same process objects.
+    CreateProcessApi { wide: bool },
+    /// `GetExitCodeProcess(hProcess, *code)` — the emulated-path counterpart of
+    /// `NtQueryInformationProcess(ProcessBasicInformation)`.
+    GetExitCodeProcessApi,
     SwitchToThread,
     /// Sleep (argc 1) / SleepEx (argc 2), both cooperative-scheduler yields.
     SleepApi { ex: bool },
@@ -468,6 +475,10 @@ impl Api {
             "SuspendThread" => Api::SuspendThread,
             "TerminateThread" => Api::TerminateThread,
             "GetExitCodeThread" => Api::GetExitCodeThread,
+            // Child processes (roadmap W3.5), see [`crate::process`].
+            "CreateProcessW" => Api::CreateProcessApi { wide: true },
+            "CreateProcessA" => Api::CreateProcessApi { wide: false },
+            "GetExitCodeProcess" => Api::GetExitCodeProcessApi,
             "SwitchToThread" => Api::SwitchToThread,
             "QueryPerformanceCounter" => Api::QueryPerformanceCounter,
             "QueryPerformanceFrequency" => Api::QueryPerformanceFrequency,
@@ -880,7 +891,10 @@ impl Api {
             Api::ExitThread => 1,
             Api::ThreadExit => 0,
             Api::ResumeThread | Api::SuspendThread => 1,
-            Api::TerminateThread | Api::GetExitCodeThread => 2,
+            Api::TerminateThread | Api::GetExitCodeThread | Api::GetExitCodeProcessApi => 2,
+            // CreateProcess[AW](appName, cmdLine, procAttr, threadAttr, inherit,
+            // flags, env, curDir, startupInfo, processInformation).
+            Api::CreateProcessApi { .. } => 10,
             Api::SwitchToThread => 0,
             Api::SleepApi { ex } => if *ex { 2 } else { 1 },
             // Message queue (roadmap P5a.1).
@@ -1052,7 +1066,7 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         "SetConsoleCtrlHandler" | "SetThreadPriority"
         | "CompareFileTime" | "CreateDirectoryW" | "GetFileSize" | "GlobalAlloc" | "MoveFileW"
         | "SetEnvironmentVariableW" | "SetFileAttributesW" | "WaitForSingleObject"
-        | "GetExitCodeProcess" | "GetTempPathW" | "GetSystemDirectoryW" | "GetWindowsDirectoryW"
+        | "GetTempPathW" | "GetSystemDirectoryW" | "GetWindowsDirectoryW"
         | "HeapCompact" | "InitializeCriticalSectionAndSpinCount" | "SetCriticalSectionSpinCount"
         | "EnableWindow" | "EndDialog" | "EndPaint" | "ExitWindowsEx" | "GetClientRect"
         | "GetDlgItem" | "GetSystemMenu" | "GetWindowLongW" | "GetWindowRect" | "LoadBitmapW"
@@ -1123,7 +1137,6 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         // --- 8, 9, 10, 12 args ---
         "WideCharToMultiByte" | "RegEnumValueW" | "RegEnumKeyExW" => 8,
         "RegCreateKeyExW" => 9,
-        "CreateProcessW" => 10,
         "CreateWindowExW" | "RegQueryInfoKeyW" => 12,
 
         _ => return None,
@@ -1620,6 +1633,9 @@ impl WinOs {
             Api::SuspendThread => self.suspend_thread(cpu, mem),
             Api::TerminateThread => self.terminate_thread(cpu, mem),
             Api::GetExitCodeThread => self.get_exit_code_thread(cpu, mem),
+            // Child processes (roadmap W3.5), see [`crate::process`].
+            Api::CreateProcessApi { wide } => self.win32_create_process(cpu, mem, *wide),
+            Api::GetExitCodeProcessApi => self.win32_get_exit_code_process(cpu, mem),
             Api::SwitchToThread => self.switch_to_thread(cpu, mem),
             Api::SleepApi { ex } => self.sleep(cpu, mem, if *ex { 2 } else { 1 }),
 

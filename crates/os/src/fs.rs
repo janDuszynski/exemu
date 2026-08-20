@@ -202,6 +202,10 @@ impl WinOs {
         }
         if self.kobjects.remove(&handle).is_some() {
             self.named_kobjects.retain(|_, &mut h| h != handle);
+            // A child process's handle pair is tracked alongside the object
+            // (roadmap W3.5); drop the bookkeeping once the guest lets go of
+            // both, so a long-running parent does not accumulate dead children.
+            self.forget_child_handle(handle);
             return true;
         }
         self.file_dirs.remove(&handle);
