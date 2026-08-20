@@ -84,6 +84,17 @@ impl Interpreter {
         self.bits
     }
 
+    /// Put the CPU in `bits` mode without touching the register file.
+    ///
+    /// Normally the mode changes only through a far transfer whose CS selector
+    /// picks it (the WoW64 mechanism, roadmap W5.2). This is for the *process
+    /// bootstrap*, which must seat a freshly built thread in the mode its first
+    /// instruction is encoded for — e.g. the WoW64 bring-up trampoline, which is
+    /// 64-bit code even though the image being run is a PE32 (roadmap W5.4).
+    pub fn set_bits(&mut self, bits: Bits) {
+        self.bits = bits;
+    }
+
     /// The SSE control/status register (`MXCSR`).
     pub fn mxcsr(&self) -> u32 {
         self.mxcsr
@@ -629,7 +640,7 @@ mod sse;
 mod vex;
 mod x87;
 
-pub use exec::{CpuidFeature, CpuidReg};
+pub use exec::{CpuidFeature, CpuidReg, SEL_CS32, SEL_CS64, SEL_DATA};
 
 /// True if `op2` (the byte after a `0F` escape) is a two-byte opcode the SSE
 /// unit decodes. Exposed for out-of-crate decode-coverage tooling (e.g. the W1
