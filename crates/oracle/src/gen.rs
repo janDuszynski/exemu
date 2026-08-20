@@ -280,6 +280,19 @@ pub fn build(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     }
 }
 
+/// Integer-only trials: the register/immediate and memory-operand families,
+/// which is the surface the W8 JIT compiles. The JIT differential draws from
+/// here so its trials land on compiled paths instead of the vector categories
+/// the JIT declines by design (those are still covered — see the mixed-category
+/// run in `jitdiff`, where a declined block must be a no-op).
+pub fn build_integer(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    if rng.boolean() {
+        build_reg(rng, bits, seed)
+    } else {
+        build_mem(rng, bits, seed)
+    }
+}
+
 /// Register/immediate-form instructions (no memory operand).
 fn build_reg(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
     match rng.below(26) {
@@ -3003,7 +3016,12 @@ fn f64_to_ext_seed(x: f64) -> u128 {
     } else if exp == 0 {
         (0, 0) // treat subnormal seeds as ±0 (kept out of the edge set anyway)
     } else {
-        (exp - 1023 + 16383, 0x8000_0000_0000_0000 | (frac << 11))
+        // `exp + 16383 - 1023`, not `exp - 1023 + 16383`: every f64 with an
+        // exponent below 1023 (0.5, 0.125, …) underflows the u32 in the second
+        // form. Harmless in the release-only Unicorn runs, a panic the moment
+        // the generator is used from a debug build — which the JIT differential
+        // (roadmap W8.7) is, since it runs in the ordinary test gate.
+        (exp + 16383 - 1023, 0x8000_0000_0000_0000 | (frac << 11))
     };
     ((sign as u128) << 79) | ((ext_exp as u128) << 64) | (signif as u128)
 }

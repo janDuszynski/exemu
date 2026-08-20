@@ -14,5 +14,12 @@ exemu-core = { workspace = true }
 [dev-dependencies]
 exemu-memory = { workspace = true }
 
+[features]
+default = []
+# Dynamic opcode-frequency profiling (roadmap W8.3). OFF by default: every hook
+# site is `#[cfg]`-gated, so the shipping interpreter carries no cost at all and
+# an instrumented build cannot perturb the exact corpus instruction counts.
+profile = []
+
 [lints.rust]
 unsafe_code = "forbid"

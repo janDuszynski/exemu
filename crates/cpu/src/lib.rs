@@ -339,6 +339,21 @@ impl Ctx {
         }
     }
 
+    /// Look at the next instruction byte **without consuming it**, or `None`
+    /// when it is not in the prefetch window. Used only by the opcode profiler
+    /// (roadmap W8.3) to read a group opcode's ModRM `reg` field before the
+    /// handler decodes it; a window miss simply loses that one sample.
+    #[cfg(feature = "profile")]
+    #[inline]
+    fn peek(&self) -> Option<u8> {
+        let off = self.cur.wrapping_sub(self.ibuf_base);
+        if off < self.ibuf_n as u64 {
+            Some(self.ibuf[off as usize])
+        } else {
+            None
+        }
+    }
+
     #[inline]
     fn u8(&mut self, mem: &dyn Memory) -> Result<u8> {
         match self.take::<1>() {
@@ -689,6 +704,8 @@ impl RegAt for CpuState {
 
 mod exec;
 mod mmx;
+#[cfg(feature = "profile")]
+pub mod profile;
 mod sse;
 mod vex;
 mod x87;

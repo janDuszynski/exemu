@@ -13,6 +13,7 @@ exemu-core = { workspace = true }
 exemu-loader = { workspace = true }
 exemu-memory = { workspace = true }
 exemu-cpu = { workspace = true }
+exemu-jit = { workspace = true }
 exemu-os = { workspace = true }
 exemu-gui = { workspace = true }
 

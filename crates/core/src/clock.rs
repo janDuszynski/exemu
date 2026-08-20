@@ -182,6 +182,19 @@ impl GuestClock {
         self.inner.instret.store(n, Ordering::Relaxed);
     }
 
+    /// Retire `n` instructions at once — what a JIT block does when it returns
+    /// (roadmap W8.3). Exactly equivalent to `n` calls to [`Self::retire_one`],
+    /// so a JIT run and an interpreter run of the same program see the same
+    /// clock at the same points in the instruction stream.
+    #[inline]
+    pub fn retire(&self, n: u64) {
+        if !self.inner.virtualized || n == 0 {
+            return;
+        }
+        let v = self.inner.instret.load(Ordering::Relaxed).wrapping_add(n);
+        self.inner.instret.store(v, Ordering::Relaxed);
+    }
+
     /// Instructions retired so far (always 0 in host mode — nothing counts them).
     #[inline]
     pub fn instret(&self) -> u64 {

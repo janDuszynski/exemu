@@ -104,6 +104,11 @@ const KUSER_TICK_COUNT_MULTIPLIER_VALUE: u32 = 0x0FA0_0000;
 /// pokes per 65,536 instructions) to be invisible in the run loop.
 const KUSER_REFRESH_INSTRUCTIONS: u64 = 65_536;
 
+/// Size of the block JIT's W^X code buffer (roadmap W8). 32 MiB holds tens of
+/// thousands of blocks; when it fills, the engine drops everything and starts
+/// again rather than degrading to the interpreter forever.
+const JIT_CODE_BYTES: usize = 32 << 20;
+
 /// Where the various regions live, chosen per bitness so 32-bit processes
 /// stay entirely within the low 4 GiB.
 struct Layout {
@@ -299,6 +304,19 @@ pub struct RunConfig {
     /// the CLI or a test, `parent + 1` for a child. Bounds runaway recursion
     /// (see [`crate::spawn::MAX_SPAWN_DEPTH`]).
     pub spawn_depth: u32,
+    /// Run guest code through the **block JIT** (roadmap W8) instead of the
+    /// interpreter wherever it can, falling back to the interpreter for every
+    /// instruction the JIT declines.
+    ///
+    /// `false` (the default) is the interpreter-only path that every pin in
+    /// `corpus.toml` was measured against, and stays so until the JIT has been
+    /// through more than the W8.3 opcode slice. The JIT is required to be
+    /// bit-for-bit identical to the interpreter (`crates/oracle`'s W8.7
+    /// differential), so turning it on must change *nothing* observable — which
+    /// is exactly what makes an A/B of the same corpus run a meaningful test:
+    /// same exit code, same artifacts, same instruction count, less wall time.
+    /// Also settable with `EXEMU_JIT=1`.
+    pub jit: bool,
 }
 
 impl Default for RunConfig {
@@ -322,8 +340,31 @@ impl Default for RunConfig {
             command_line: None,
             environment: Vec::new(),
             spawn_depth: 0,
+            jit: false,
         }
     }
+}
+
+/// What the block JIT did during a run (roadmap W8) — reported rather than
+/// claimed, so "how much of this workload actually ran as native code?" has a
+/// measured answer.
+#[derive(Clone, Debug, Default)]
+pub struct JitReport {
+    pub blocks_compiled: u64,
+    pub blocks_executed: u64,
+    /// Guest instructions executed as native ARM64.
+    pub insns_executed: u64,
+    /// Blocks that ended by rewinding onto a faulting access.
+    pub faults: u64,
+    /// Addresses where nothing could be compiled (the interpreter took them).
+    pub not_compiled: u64,
+    /// Whole-cache invalidations caused by guest code changing (W1.7 seam).
+    pub flushes: u64,
+    /// High-water mark of emitted native code, in bytes.
+    pub code_bytes: usize,
+    /// The opcodes that most often stopped a block, `(opcode | 0x100 for the
+    /// 0F map, count)`, most frequent first — the to-do list for W8.4+.
+    pub declined: Vec<(u16, u64)>,
 }
 
 /// The result of running a program to completion.
@@ -339,6 +380,8 @@ pub struct RunResult {
     /// Monotonic, so a per-exe probe can state "this binary never reached child
     /// creation" as a measurement rather than an inference.
     pub children_created: u32,
+    /// Block-JIT statistics, when the run used it (roadmap W8).
+    pub jit: Option<JitReport>,
 }
 
 /// A loaded, ready-to-run process.
@@ -374,6 +417,10 @@ pub struct Process {
     /// The WoW64 process model, when this is a 32-bit guest on Wine's 64-bit PE
     /// set (roadmap W5.4). `None` on every other path.
     wow64: Option<wow64_boot::Wow64Boot>,
+    /// The block JIT (roadmap W8), when `RunConfig::jit` asked for it and the
+    /// platform has a W^X backend. `None` everywhere else — and `None` is the
+    /// default, so the interpreter path is untouched.
+    jit: Option<exemu_jit::Jit>,
 }
 
 impl Process {
@@ -760,6 +807,23 @@ impl Process {
 
         // --- Initial CPU state --------------------------------------------
         let mut cpu = Interpreter::with_bits(if image.is_64bit { Bits::B64 } else { Bits::B32 });
+        // --- The block JIT (roadmap W8), opt-in ---------------------------
+        // A JIT that cannot be created is never a correctness problem: the run
+        // loop simply stays on the interpreter, so a platform without a W^X
+        // backend (or a hardened-runtime build missing the JIT entitlement)
+        // degrades in speed and nothing else.
+        let want_jit = cfg.jit || std::env::var("EXEMU_JIT").is_ok_and(|v| v != "0");
+        let jit = if want_jit {
+            match exemu_jit::Jit::new(JIT_CODE_BYTES) {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    eprintln!("[exemu] JIT unavailable, running on the interpreter: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Both halves of the emulator share the one clock handle (W9.6).
         cpu.set_clock(clock.clone());
         os.set_clock(clock.clone());
@@ -975,6 +1039,7 @@ impl Process {
             image_base: base,
             exc_depth: 0,
             wow64,
+            jit,
         })
     }
 
@@ -1054,8 +1119,10 @@ impl Process {
         // schedule keyed to the instruction count (roadmap W9.6). Off entirely
         // on the host-clock path, where the page keeps its load-time snapshot.
         let refresh_kuser = self.clock.is_virtual();
+        let mut next_kuser_refresh = KUSER_REFRESH_INSTRUCTIONS;
         // Rolling window of the most recent instruction pointers, for the
-        // fault report (helps trace how a bad jump was reached).
+        // fault report (helps trace how a bad jump was reached). With the JIT
+        // on, this records block entries rather than every instruction.
         const TAIL: usize = 24;
         let mut recent: std::collections::VecDeque<u64> = std::collections::VecDeque::with_capacity(TAIL + 1);
         let exit_code = loop {
@@ -1073,13 +1140,75 @@ impl Process {
             }
 
             let step_rip = self.cpu.state().rip;
+            // --- The block JIT (roadmap W8), when it is switched on --------
+            //
+            // A compiled block runs many guest instructions per call, so
+            // everything the loop does per instruction has to be reconciled:
+            // the step count and the clock advance by the number the block
+            // retired, and the KUSER refresh compares against a threshold
+            // instead of testing a modulus that a multi-instruction jump can
+            // step over. On the interpreter path the threshold test fires at
+            // exactly the same instructions the modulus did.
+            //
+            // The JIT can never swallow an API thunk: thunks live in the
+            // `imports` region, which is mapped RW (never executable), so
+            // `Memory::fetch` refuses and the block is not compiled — the
+            // interpreter takes that address and `Hooks::intercept` fires as
+            // usual.
+            if let Some(jit) = self.jit.as_mut() {
+                // The mode is the CPU's *current* one, not the image's: a WoW64
+                // process runs 32- and 64-bit code in one address space and the
+                // same bytes decode differently in each (roadmap W5.2).
+                let mode = match self.cpu.bits() {
+                    Bits::B64 => exemu_jit::Mode::Long,
+                    Bits::B32 => exemu_jit::Mode::Protected,
+                };
+                let ran = jit.run(self.cpu.state_mut(), &mut self.mem, mode);
+                let insns = match ran {
+                    exemu_jit::Run::NotCompiled => 0,
+                    exemu_jit::Run::Executed { insns } | exemu_jit::Run::Faulted { insns } => insns,
+                };
+                if insns != 0 {
+                    self.clock.retire(insns as u64);
+                    steps += insns as u64;
+                    // The OS layer counts instructions to drive timeslice
+                    // preemption, and a compiled block bypasses the per-
+                    // instruction `intercept` that does the counting — so tell
+                    // it how many ran. Without this the JIT would change guest
+                    // *scheduling*, not just speed.
+                    exemu_core::Hooks::retire(
+                        &mut self.os,
+                        insns as u64,
+                        self.cpu.state_mut(),
+                        &mut self.mem,
+                    )?;
+                    if refresh_kuser && steps >= next_kuser_refresh {
+                        refresh_kuser_time(&mut self.mem, &self.clock)?;
+                        next_kuser_refresh =
+                            (steps / KUSER_REFRESH_INSTRUCTIONS + 1) * KUSER_REFRESH_INSTRUCTIONS;
+                    }
+                    if self.exc_depth != 0 && !self.at_exc_dispatcher(step_rip) {
+                        self.exc_depth = 0;
+                    }
+                }
+                // `Executed` leaves `rip` on the next block, so go round again.
+                // `Faulted` rewound onto the instruction whose access failed and
+                // changed nothing for it: fall through and let the interpreter
+                // execute exactly that instruction, which raises the real error
+                // (and leaves whatever partial state the interpreter would).
+                if matches!(ran, exemu_jit::Run::Executed { .. }) {
+                    continue;
+                }
+            }
             let outcome = self.cpu.step(&mut self.mem, &mut self.os);
             let tail = || recent.iter().copied().collect::<Vec<_>>();
             match outcome {
                 Ok(Exit::Continue) => {
                     steps += 1;
-                    if refresh_kuser && steps % KUSER_REFRESH_INSTRUCTIONS == 0 {
+                    if refresh_kuser && steps >= next_kuser_refresh {
                         refresh_kuser_time(&mut self.mem, &self.clock)?;
+                        next_kuser_refresh =
+                            (steps / KUSER_REFRESH_INSTRUCTIONS + 1) * KUSER_REFRESH_INSTRUCTIONS;
                     }
                     // Guest made forward progress off the exception-dispatcher
                     // entry — a subsequent, unrelated fault is a fresh delivery.
@@ -1127,6 +1256,23 @@ impl Process {
             stderr: self.os.captured_stderr().to_vec(),
             sandbox: self.sandbox.clone(),
             children_created: self.os.children_created(),
+            jit: self.jit_report(),
+        })
+    }
+
+    /// What the JIT did, if this process had one (roadmap W8).
+    pub fn jit_report(&self) -> Option<JitReport> {
+        let jit = self.jit.as_ref()?;
+        let s = jit.stats();
+        Some(JitReport {
+            blocks_compiled: s.blocks_compiled,
+            blocks_executed: s.blocks_executed,
+            insns_executed: s.insns_executed,
+            faults: s.faults,
+            not_compiled: s.not_compiled,
+            flushes: s.flushes,
+            code_bytes: s.peak_code_bytes.max(jit.code_bytes()),
+            declined: s.top_declined(16),
         })
     }
 

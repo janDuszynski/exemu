@@ -97,6 +97,19 @@ impl Interpreter {
         self.read_prefixes(&mut ctx, mem)?;
         let opcode = ctx.u8(mem)?;
 
+        // Opcode-frequency profiling (roadmap W8.3). Compiled out entirely
+        // unless the `profile` feature is on. `0F`-escaped opcodes are recorded
+        // by `exec_0f` instead, so the escape byte itself is never counted.
+        #[cfg(feature = "profile")]
+        if opcode != 0x0F {
+            let greg = if crate::profile::is_group(opcode, false) {
+                ctx.peek().map_or(0, |m| (m >> 3) & 7)
+            } else {
+                0
+            };
+            crate::profile::record(opcode, false, ctx.pfx.w(), ctx.pfx.p66, greg);
+        }
+
         // The regular ALU opcodes 0x00..=0x3D share one handler.
         if opcode < 0x40 && (opcode & 7) < 6 {
             self.alu_regular(&mut ctx, mem, opcode)?;
@@ -1406,6 +1419,17 @@ impl Interpreter {
         op2: u8,
         start: u64,
     ) -> Result<Option<Exit>> {
+        // Opcode-frequency profiling of the `0F` map (roadmap W8.3); compiled
+        // out unless the `profile` feature is on.
+        #[cfg(feature = "profile")]
+        {
+            let greg = if crate::profile::is_group(op2, true) {
+                ctx.peek().map_or(0, |m| (m >> 3) & 7)
+            } else {
+                0
+            };
+            crate::profile::record(op2, true, ctx.pfx.w(), ctx.pfx.p66, greg);
+        }
         // Bare-form (no 66/F3/F2 mandatory prefix) MMX ops alias onto the x87
         // register file — they must NOT be treated as 128-bit XMM. Route them to
         // the MMX unit before the SSE dispatch below. (The `66`/`F3`/`F2` forms
