@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:5ac01f48-bec3-5b8e-8491-f4d48fa3c445",
+  "serialNumber": "urn:uuid:de7e0ea7-79ee-57f0-853e-a350b5c839b2",
   "version": 1,
   "metadata": {
     "component": {
@@ -269,6 +269,25 @@
         }
       ],
       "description": "A minifb-backed renderer for Windows dialogs, implementing exemu_core::Gui.",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/janDuszynski/exe-emulator"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/exemu-jit@0.0.4",
+      "name": "exemu-jit",
+      "version": "0.0.4",
+      "purl": "pkg:cargo/exemu-jit@0.0.4",
+      "licenses": [
+        {
+          "expression": "PolyForm-Noncommercial-1.0.0"
+        }
+      ],
+      "description": "Block JIT: compiles guest x86/x86-64 basic blocks to native ARM64 (roadmap W8).",
       "externalReferences": [
         {
           "type": "vcs",
@@ -858,6 +877,7 @@
         "pkg:cargo/exemu-core@0.0.4",
         "pkg:cargo/exemu-cpu@0.0.4",
         "pkg:cargo/exemu-gui@0.0.4",
+        "pkg:cargo/exemu-jit@0.0.4",
         "pkg:cargo/exemu-loader@0.0.4",
         "pkg:cargo/exemu-memory@0.0.4",
         "pkg:cargo/exemu-os@0.0.4"
@@ -868,6 +888,7 @@
       "dependsOn": [
         "pkg:cargo/exemu-app@0.0.4",
         "pkg:cargo/exemu-core@0.0.4",
+        "pkg:cargo/exemu-cpu@0.0.4",
         "pkg:cargo/exemu-gui@0.0.4",
         "pkg:cargo/exemu-loader@0.0.4"
       ]
@@ -897,6 +918,12 @@
         "pkg:cargo/objc2-quartz-core@0.3.2",
         "pkg:cargo/objc2@0.6.4",
         "pkg:cargo/png@0.17.16"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/exemu-jit@0.0.4",
+      "dependsOn": [
+        "pkg:cargo/exemu-core@0.0.4"
       ]
     },
     {

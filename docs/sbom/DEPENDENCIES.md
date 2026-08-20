@@ -17,7 +17,7 @@ The `Verdict` column is a reading aid, not the gate. The gate is `cargo deny che
 
 **Wine is not in this table and cannot be.** Wine's PE builtin DLLs are LGPL-2.1-or-later and are loaded at runtime as separate guest image files, not as cargo dependencies. Their obligations are tracked in [`docs/COMPLIANCE.md`](../COMPLIANCE.md).
 
-## Shipping closure (37 dependencies)
+## Shipping closure (38 dependencies)
 
 | Crate | Version | Licence (SPDX) | Scope | Verdict |
 | ----- | ------- | -------------- | ----- | ------- |
@@ -33,6 +33,7 @@ The `Verdict` column is a reading aid, not the gate. The gate is `cargo deny che
 | `exemu-core` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
 | `exemu-cpu` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
 | `exemu-gui` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
+| `exemu-jit` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
 | `exemu-loader` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
 | `exemu-memory` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
 | `exemu-os` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
