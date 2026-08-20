@@ -360,6 +360,7 @@ fn wow64_wine_loader_registers_the_win32k_table() {
         .and_then(|b| b.wow64cpu.export("BTCpuSimulate"))
         .expect("wow64cpu!BTCpuSimulate");
     let steps = proc.run_until_rip(simulate, 4_000_000).expect("Wow64LdrpInitialize ran");
+    eprintln!("W5.7 — Wine's WoW64 process + thread init ran {steps} instructions");
     assert!(steps > 1_000, "Wine's process + thread init ran {steps} instructions");
 
     let (w, sdwhwin32) = {
