@@ -425,7 +425,7 @@ What is verified today:
 | A Win32 GUI app on Wine's `user32`/`gdi32`/`win32u` opens a **native macOS window** | **works** — real mouse/keyboard reach the guest `WndProc`; first frame pinned by a golden-PNG CI gate |
 | Guest faults delivered as Windows exceptions | **works** — via `KiUserExceptionDispatcher`, resumed through `NtContinue` |
 | **WoW64** (32-bit guests on the 64-bit Wine set) | **a 32-bit PE boots and reaches the NT layer through Wine's own thunks** — `exemu run --wine-boot <dir>` on a **PE32** builds a real WoW64 process (Wine's 32-bit `ntdll` + the 64-bit `ntdll`/`wow64`/`wow64cpu`/`wow64win`, dual PEB32/PEB64 and a TEB pair linked by `TEB64.WowTebOffset`), runs Wine's own `BTCpuProcessInit`, and enters the guest through `BTCpuSimulate`. A 32-bit `NtAllocateVirtualMemory` then travels Wine's own chain — the i386 ntdll's syscall stub → `__wine_syscall_dispatcher` → the `wow64cpu` BOP → `Wow64SystemServiceEx` → `wow64.dll`'s marshalling thunk → the 64-bit ntdll's `syscall` → exemu's SSDT — and the guest writes through the pointer it gets back. **exemu marshals nothing.** Gate: 1,292 instructions, exit code from the guest itself. **Not yet:** the win32k service table (`wow64win!sdwhwin32`) is unregistered, so a 32-bit **GUI** guest does not work; only `ntdll` imports are bound for the guest; Wine's own `Wow64LdrpInitialize`/32-bit `LdrInitializeThunk` are not run. Both gaps are pinned as tests |
-| **comctl32 / uxtheme / comdlg32** | **arrive as guest code** — a sample that statically imports `comctl32!InitCommonControlsEx` runs to completion on the Wine boot, and Wine's own comctl32 registers `msctls_progress32` as a real window class. exemu implements no progress bar. user32's **built-in control classes** (`BUTTON`/`EDIT`/`STATIC`/…) are registered too: win32k recovers their WndProcs by following the `jmp qword [rip+disp32]` thunks in the client-PFN arrays user32 publishes at boot, so `CreateWindowExW(L"BUTTON", …)` reaches `NtUserCreateWindowEx`. One measured gap is pinned as a test: child windows do not paint yet |
+| **comctl32 / uxtheme / comdlg32** | **arrive as guest code** — a sample that statically imports `comctl32!InitCommonControlsEx` runs to completion on the Wine boot, and Wine's own comctl32 registers `msctls_progress32` as a real window class. exemu implements no progress bar. user32's **built-in control classes** (`BUTTON`/`EDIT`/`STATIC`/…) are registered too: win32k recovers their WndProcs by following the `jmp qword [rip+disp32]` thunks in the client-PFN arrays user32 publishes at boot, so `CreateWindowExW(L"BUTTON", …)` reaches `NtUserCreateWindowEx`. Those controls **paint themselves** into the top-level window's surface (child windows get no surface of their own — origin and clip are the kernel side's job, exactly as Wine's gdi32 expects) and they are **clickable**: a synthesized click at the button's coordinates is hit-tested onto the child, and Wine's own `ButtonWndProc` takes the capture, repaints itself pressed and sends the parent a real `WM_COMMAND`/`BN_CLICKED` |
 | **COM** (`ole32` / `combase` / `oleaut32`) | **works** — `CoCreateInstance` genuinely succeeds: the CLSID resolves through exemu's registry to an `InprocServer32`, the in-proc server loads, and the guest calls a method through the returned vtable. No native COM in exemu; the emulated path is the control that proves it |
 | **CAB extraction** (`cabinet`) | **works** — a guest extracts a real `.cab` through Wine's `FDICreate`/`FDICopy`, driven entirely by the guest's own FDI callbacks, and the bytes come back identical. exemu contributes a cabinet *writer* and no decoder, retiring the planned clean-room FDI |
 | **shell32 / shlwapi** | **works** — known folders (`SHGetFolderPathW`/`SHGetKnownFolderPath`) resolve through Wine's own shell32 to the correct, fully-qualified profile paths (`C:\Users\exemu\AppData\Roaming`, …), user component and all, and every requested folder succeeds. exemu implements no shell32. The long-standing gap turned out not to be a shell32 one at all: `NtQueryInformationToken` rejected the constant `(HANDLE)-6` pseudo-handle that both shell32 and ntdll's own `RtlOpenCurrentUser` use, which made the whole of `HKEY_CURRENT_USER` silently unreachable from guest code |
@@ -604,6 +604,26 @@ knows where it was clicked), `SetCursor`/`SetCursorPos`/`ClipCursor` are honoure
 and `EnumDisplaySettings`/`ChangeDisplaySettings` present a single 1920×1080
 monitor. `exemu cocoa-demo` still opens the same presenter directly with a test
 frame.
+
+Input is **routed**, not broadcast. Which window a click belongs to is the
+kernel side's decision, and the pinned binaries say so plainly:
+`user32!WindowFromPoint` is four instructions that unpack the by-value `POINT`
+and tail-jump `NtUserWindowFromPoint`, and `SetCapture`/`ReleaseCapture`/
+`SetFocus` are bare thunks. So native events are queued **raw** and given a
+target when the app asks for a message: the capture holder first (in its own
+client coordinates, hit test skipped — which is what lets a pushed button see
+the button-up after the pointer has left its rect), otherwise the deepest
+visible window under the point, which is then asked `WM_NCHITTEST` and gets to
+answer. `HTCLIENT` delivers the ordinary message with the point rebased into
+that window's client space; `HTTRANSPARENT` retries with it excluded (Wine's own
+`ButtonWndProc` answers exactly that for a `BS_GROUPBOX`); anything else
+delivers the `WM_NC*` twin. Keyboard input follows `SetFocus`, and
+`TranslateMessage` produces the `WM_CHAR` that follows a key-down. The result is
+that Wine's real controls work: a click at a `BUTTON`'s coordinates makes
+user32's own `ButtonWndProc` take the capture, repaint itself pressed (the
+Win95 highlight/shadow edge swap, pinned pixel-for-pixel against a golden) and
+send its parent a genuine `WM_COMMAND`/`BN_CLICKED`; pressing space afterwards
+does it again, because the button took the focus.
 
 ### Differential CPU oracle
 

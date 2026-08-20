@@ -501,6 +501,74 @@ end-to-end on the default path.
   dispatcher with the faulting instruction's bytes — without it, a Wine guest
   that catches its own access violation shows up only as an exit code.
 
+### The GUI is interactive — input routing, capture and focus (W4.8)
+- **A click reaches Wine's own `ButtonWndProc`, and the button behaves like a
+  button.** W4.8 had painted the controls but routed input only to the first
+  shown top-level window, so a click never got near a child. Now a press at the
+  `BUTTON`'s coordinates is hit-tested onto that child, and user32's own
+  procedure runs the whole documented sequence: `NtUserSetCapture`, push itself,
+  `NtUserSetFocus`, `BM_SETSTATE` (which repaints on the spot through
+  `NtUserGetDC`); then on the release it un-pushes, checks the point against
+  `GetClientRect`, `NtUserReleaseCapture`, reads its id from `GWLP_ID`, asks
+  `GetParent` and sends the parent a genuine `WM_COMMAND`/`BN_CLICKED`. The gate
+  observes the notification by having the sample's WndProc set the window text
+  of the HWND it was handed in **lParam** — so the recorded driver call naming
+  the *button* is proof the message carried its real handle.
+- **The pressed repaint is proven in pixels.** 1926 of the button rect's 17,920
+  bytes change while it is down, and specifically the Win95 edge swap: the
+  top-left inner edge goes `COLOR_BTNHIGHLIGHT` white → `COLOR_BTNSHADOW` grey
+  and the black `COLOR_3DDKSHADOW` bottom-right lifts to grey. exemu supplies
+  the palette; which colour goes on which edge in which state is Wine's
+  `UITOOLS95_DFC_ButtonPush`. Pinned as
+  `crates/app/tests/goldens/comctl_button_pressed.png`.
+- **Which side hit-tests is recovered, not chosen.** `user32!WindowFromPoint` is
+  sixteen bytes — unpack the by-value `POINT` (`shr rax, 0x20`) and tail-jump
+  `NtUserWindowFromPoint`, which is the function's last instruction — and
+  `SetCapture`/`ReleaseCapture`/`SetFocus` are bare thunks, while
+  `GetFocus`/`GetActiveWindow`/`GetCapture` are indices 0/1/2 of
+  `NtUserGetThreadState`. So native events are queued **raw** and given a target
+  at retrieval: the capture holder first (in its own client coordinates, no hit
+  test — which is what lets a pushed button see the button-up after the pointer
+  leaves its rect), else the deepest visible window under the point, which is
+  then asked `WM_NCHITTEST` and gets to answer. `HTCLIENT` delivers the client
+  message with the point rebased; `HTTRANSPARENT` retries with that window
+  excluded (Wine's `ButtonWndProc` answers exactly that for a `BS_GROUPBOX`);
+  anything else delivers the `WM_NC*` twin. Honouring a callback's *return
+  value* needed a continuation on the win32k callback frame.
+- **`NtUserMessageCall` turned out to be a whole family behind one index**,
+  selected by the `type` immediate each user32 wrapper stores at `[rsp+0x28]`:
+  `SendMessage` 0x2b1, `SendMessageTimeout` 0x2b3, `SendNotifyMessage` 0x2b7,
+  `SendMessageCallback` 0x2b8, `CallWindowProc` 0x2ab, `DefWindowProc` 0x29e and
+  0x3001 for the internal `dispatch_message` behind `DispatchMessage`. Two of
+  those matter a great deal. 0x3001 must answer **zero**, or user32 walks a
+  `win_proc_params` block its caller never initialized. And 0x29e must run a
+  **kernel-side `DefWindowProc`**, because `user32!DefWindowProcW` is nothing but
+  this syscall — it handles five IME/syscommand messages and forwards the rest,
+  `WM_NCHITTEST` included; there is no `NC_HandleNCHitTest` anywhere in user32.
+- **Two long-standing marshalling bugs fell out.** `NtUserCallHwnd` code 0x10
+  returns the **HWND**, not a boolean: `user32!WIN_IsCurrentProcess` is
+  `mov edx,0x10; call NtUserCallHwnd; mov eax,eax` and `DefWindowProcW` uses what
+  comes back *as the window handle* (`mov rbx, rax`) — answering 1 sent every
+  `DefWindowProc` in the process to window number 1, which is why the recursion
+  above had never been observed. And `NtUserMessageCall`'s `type`/`ansi` are
+  **DWORD** stack slots, written with `mov dword ptr [rsp+…], imm`; reading the
+  full qword picked up the previous frame's bytes, so the same `SetWindowTextW`
+  came out Unicode on one call and ANSI on the next.
+- **Keyboard follows the focus.** `NtUserSetFocus` sends `WM_KILLFOCUS`/
+  `WM_SETFOCUS` and key messages go to the focus window (falling back to the
+  active top-level), `NtUserTranslateMessage` produces the `WM_CHAR` after a
+  key-down instead of returning 0, and `NtUserPeekMessage` is a real
+  non-blocking pump rather than a permanent "nothing available". Gate:
+  after a click the `BUTTON` holds the focus, and `VK_SPACE` makes Wine's button
+  notify its parent a second time.
+- Gates: `comctl_gate` 8 → 12 (`clicking_the_button_reaches_wine_button_wndproc_on_wine`,
+  `a_click_that_misses_the_button_notifies_nobody_on_wine`,
+  `space_activates_the_focused_button_on_wine`,
+  `the_pressed_button_matches_golden_on_wine`), `win32k_abi` 9 → 13 with the
+  re-derived index table 26 → 36, and +7 win32k unit tests. Both existing
+  goldens stay byte-identical. `comctl_sample`: 1,758,795 instructions plain,
+  1,789,659 pumped, 1,819,519 with the click.
+
 ### Known folders through Wine's shell32 (W6.6)
 - **`SHGetFolderPathW`/`SHGetKnownFolderPath` now resolve correctly** — a console
   sample that statically imports `shell32!SHGetFolderPathW` runs to completion on
