@@ -225,6 +225,7 @@ impl WinOs {
         }
         self.reg_seed_classes();
         self.reg_seed_shell_folders();
+        self.reg_seed_shell_classes();
     }
 
     /// Seed `…\Explorer\Shell Folders` and `User Shell Folders` from the
@@ -371,6 +372,39 @@ impl WinOs {
             self.reg_value_set(&inproc, "", sz(COM_INPROC_SERVER));
             self.reg_value_set(&inproc, "ThreadingModel", sz("Both"));
         }
+    }
+
+    /// Seed `HKCR\CLSID\{CLSID_ShellLink}\InprocServer32` so `CoCreateInstance`
+    /// finds **shell32's own** `IShellLinkW` implementation (roadmap W6.6
+    /// stretch — IShellLink through COM). Same shape as [`reg_seed_classes`],
+    /// one class: `shell32.dll` is the in-proc server, not `ole32.dll`. Proved
+    /// so far: creation and a real `GetPath` vtable call, both from Wine's own
+    /// guest code (`crates/app/tests/shell_link_gate.rs`). `SetPath` (and so
+    /// `IPersistFile::Save`, needed for an actual `.lnk` file) hits a separate,
+    /// not-yet-fixed crash elsewhere in the Win32 surface — see
+    /// `shell_link_sample`'s module doc for the isolation trail.
+    ///
+    /// `CLSID_ShellLink` = `{00021401-0000-0000-C000-000000000046}` is a
+    /// public, decades-stable Microsoft constant (`shobjidl_core.h`) —
+    /// independently cross-checked against Microsoft's own docs and multiple
+    /// public reference implementations, not recovered from the pinned
+    /// binary. `ThreadingModel = "Apartment"` matches the documented real-world
+    /// registration for shell extensions; it is a registration *choice* exemu
+    /// makes for its synthetic prefix (like `reg_seed_classes`'s own choice of
+    /// `"Both"` for the ole32 moniker classes), not a fact read out of a
+    /// binary — same-thread create-use-release (all this sample does) needs no
+    /// cross-apartment marshalling regardless of the declared model.
+    ///
+    /// [`reg_seed_classes`]: Self::reg_seed_classes
+    fn reg_seed_shell_classes(&mut self) {
+        const SHELL_INPROC_SERVER: &str = "shell32.dll";
+        const CLSID_SHELL_LINK: &str = "{00021401-0000-0000-C000-000000000046}";
+        let root = Self::CLASSES_ROOT;
+        let key = self.reg_key_create(&format!("{root}\\CLSID\\{CLSID_SHELL_LINK}"));
+        self.reg_value_set(&key, "", sz("ShellLink"));
+        let inproc = self.reg_key_create(&format!("{key}\\InprocServer32"));
+        self.reg_value_set(&inproc, "", sz(SHELL_INPROC_SERVER));
+        self.reg_value_set(&inproc, "ThreadingModel", sz("Apartment"));
     }
 
     /// RegCreateKeyEx[AW]: create or open a key; allocate a handle.

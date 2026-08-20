@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use exemu_app::{load_and_run, shell_sample, RunConfig};
+use exemu_os::folders;
 
 const WINE_DLLS: &str = "../../example_exe/wine-dlls/x86_64-windows";
 
@@ -62,43 +63,52 @@ fn emulated_path_cannot_resolve_known_folders() {
     );
 }
 
-/// The W6.6 gate, asserting what is **actually true today** rather than a hoped-for
-/// result.
+/// The W6.6 gate, asserting what is **actually true today**: Wine's shell32
+/// resolves every requested `CSIDL` to the *correct*, fully-qualified guest
+/// path, and the sample exits **0**.
 ///
-/// Measured: Wine's shell32 boots and resolves every requested `CSIDL` to a
-/// well-formed guest path (2.03M guest instructions). So the W6 "arrives free as
-/// guest code" claim holds for the *resolution* itself — exemu hand-writes no
-/// shell32.
+/// Measured: **exit 0 after ~2.0M guest instructions**, e.g.
+/// `APPDATA=C:\Users\exemu\AppData\Roaming` — matching
+/// [`exemu_os::folders::csidl_path`] exactly, capitalisation and all.
 ///
-/// Two gaps are pinned here so they stay visible rather than being discovered
-/// again later:
+/// # The two gaps this used to pin, and what actually closed them
 ///
-/// 1. **The user component is missing.** Wine returns `C:\users\AppData\Roaming`
-///    where the profile is `C:\Users\exemu`, i.e. `…\users\<user>\…` with `<user>`
-///    empty. Wine's shell32 builds these from its own notion of the profile
-///    directory, which exemu has not seeded — so this is an exemu gap, not a Wine
-///    one, and it is what wiring `SHGetFolderPathW` to [`exemu_os::folders`]
-///    (whose table already spells the full `C:\Users\exemu\…`) exists to fix.
-/// 2. **Five of six calls still return a non-zero HRESULT** — because the
-///    directory Wine names does not exist. The sample does not pass
-///    `CSIDL_FLAG_CREATE`, so `SHGetFolderPath` reports failure for an absent
-///    folder while still filling the buffer. This is now *downstream of* gap 1:
-///    exemu materialises the profile tree it models (`C:\Users\exemu\…`), but
-///    Wine asks about `C:\users\…`, so only `COMMONPROGRAMS` — the one path both
-///    agree on (`C:\ProgramData\…`) — succeeds. Closing gap 1 should close this
-///    one with it.
+/// 1. **The profile's user component was missing** —
+///    `APPDATA=C:\users\AppData\Roaming` (lowercase `users`, empty `<user>`)
+///    instead of `C:\Users\exemu\AppData\Roaming`. Three plausible fixes (the
+///    `Shell Folders` registry keys, the HKCU/NT-namespace fold, a first cut of
+///    the token surface) each left the instruction count **byte-identical**,
+///    proving Wine never executed those paths at all — see
+///    `crates/os/src/token.rs`'s module doc and `knowledge/known-issues.know`
+///    for the full elimination trail.
 ///
-/// **Evidence that directory existence is what matters here:** materialising the
-/// profile tree moved the run from 2,026,356 to 2,025,637 instructions and the
-/// failure count from 6 to 5. Before that, three separate changes (the
-/// `Shell Folders` keys, the HKCU namespace fix, the whole token surface) left
-/// the count *byte-identical*, proving Wine never executed those paths at all.
-/// The instruction count is a free oracle for "did the guest even go there".
+///    The actual cause, found by disassembling the pinned `shell32.dll`
+///    (`SHGetFolderPathAndSubDirW`'s per-CSIDL dispatch → the group-0 handler at
+///    a fixed RVA off the DLL's own image base → its registry helper) and then
+///    tracing the live syscalls it issues: that helper calls
+///    `NtQueryInformationToken` on `NtCurrentThreadEffectiveToken()`
+///    (`(HANDLE)-6`, sign-extended to `0xfffffffffffffffa`) to learn the
+///    profile's SID **before ever opening a token handle** — a public,
+///    documented NT pseudo-handle (`winternl.h`/`processthreadsapi.h`), not a
+///    Wine internal. exemu's token surface recognised only the real handle
+///    `NtOpenProcessToken` hands out, so this always failed with
+///    `STATUS_INVALID_HANDLE`, `HKEY_CURRENT_USER` never resolved, and shell32
+///    fell all the way back to `HKEY_LOCAL_MACHINE` (visible live: every
+///    registry read in the trace was `HKLM\…`, never `HKCU\…`) and finally to a
+///    purely computed default with no user name in it. Fixed in
+///    `crates/os/src/token.rs` (`is_current_token_handle`).
+/// 2. **The directory Wine named did not exist**, so `SHGetFolderPath` (called
+///    without `CSIDL_FLAG_CREATE`) reported failure for 5 of 6 folders even while
+///    filling the buffer. This was already known to be *downstream* of gap 1
+///    (`crates/app/src/lib.rs` has materialised the full `C:\Users\exemu\…` tree
+///    since the W6.6 profile-tree commit) — once Wine asks about the same
+///    `C:\Users\exemu\…` tree exemu actually creates, the directories are there
+///    and every call succeeds. No separate fix was needed; closing gap 1 closed
+///    this one with it, exactly as predicted.
 ///
-/// The assertions below therefore check the property that genuinely holds — real
-/// guest paths came back from Wine's own code — and pin both gaps by their
-/// observable signature, so closing either one fails this test and forces the
-/// documentation to be updated with it.
+/// The assertions below now pin the *fixed* behaviour — exact paths, zero exit —
+/// so either gap reopening (a registry/token regression, or the profile tree
+/// silently no longer being materialised) fails this test loudly.
 #[test]
 fn shell_sample_resolves_known_folders_on_wine() {
     if !Path::new(WINE_DLLS).join("shell32.dll").exists() {
@@ -130,46 +140,32 @@ fn shell_sample_resolves_known_folders_on_wine() {
         run.steps
     );
 
-    // THE CLAIM: every folder came back as a well-formed guest path, from Wine's
-    // own code. exemu implements no shell32.
-    for tag in ["APPDATA", "LOCALAPPDATA", "PERSONAL", "DESKTOP", "PROGRAMS", "COMMONPROGRAMS"] {
+    // THE CLAIM: every folder came back as the exact guest path `folders.rs`
+    // models, from Wine's own code — not merely "a well-formed path" (the old,
+    // partial pin), but the *same* path exemu's table and the seeded sandbox
+    // tree agree on. Cross-checking against `folders::csidl_path` (rather than
+    // hand-duplicating the strings here) means the two can never silently drift
+    // apart — a table edit that stops matching what the guest resolves fails
+    // both this test and `folders.rs`'s own tests.
+    for (tag, csidl) in shell_sample::CSIDLS {
         let line = stdout
             .lines()
             .find(|l| l.starts_with(&format!("{tag}=")))
             .unwrap_or_else(|| panic!("no {tag} line in:\n{stdout}"));
         let path = &line[tag.len() + 1..];
-        assert!(path.starts_with("C:\\"), "{tag} resolved to {path:?}, not a C:\\ guest path");
-        assert!(path.len() > 4, "{tag} resolved to the bare drive {path:?}");
+        let want =
+            folders::csidl_path(csidl).unwrap_or_else(|| panic!("{tag} (CSIDL {csidl:#x}) has no folders.rs entry"));
+        assert_eq!(path, want, "{tag} resolved to {path:?}, expected folders.rs's {want:?}");
+        // The historical bug's exact signature: a lowercase, user-less `users`
+        // component. Kept as an explicit trap so a regression reads immediately
+        // as "the old bug is back", not just "a string mismatch".
+        assert!(!path.contains("\\users\\"), "{tag}={path:?} looks like the old empty-user-component bug");
     }
     // shlwapi's own local code ran too (PathBuildRootW is not one of the Wine-11
     // exports that tail-jump into kernelbase).
     assert!(stdout.contains("ROOT=C:\\"), "shlwapi!PathBuildRootW did not run; stdout:\n{stdout}");
 
-    // GAP 1 — the profile's user component is absent. When this stops being true,
-    // this assertion fails and the doc comment above must be updated with it.
-    assert!(
-        stdout.contains("APPDATA=C:\\users\\AppData"),
-        "GAP 1 (missing user component) appears to be FIXED — update this test and \
-         the W6.6 notes. stdout:\n{stdout}"
-    );
-
-    // GAP 2 — five of six still fail because the directory Wine names does not
-    // exist; only COMMONPROGRAMS (C:\ProgramData\…), the one path exemu and Wine
-    // agree on, resolves. Closing gap 1 should close this with it.
-    //
-    // This count is a function of **which folders exist**, so it is only
-    // meaningful against a known-empty sandbox — hence `private_sandbox` above.
-    // Sharing `$TMPDIR/exemu-sandbox` made it read whatever a previous run left
-    // behind: a leftover 7-Zip corpus install contains
-    // `C:\ProgramData\Microsoft\Windows\Start Menu\Programs`, which alone makes
-    // COMMONPROGRAMS succeed and cost one engineer a false failure here.
-    //
-    // The value was established by a controlled A/B with the sandbox deleted in
-    // both arms: without the profile tree 6 failures / 2,026,356 instructions,
-    // with it 5 / 2,025,637.
-    assert_eq!(
-        run.exit_code, 5,
-        "GAP 2 (absent directories) changed — gap 1 may be fixed too, in which \
-         case this test and the W6.6 notes both need updating; stdout:\n{stdout}"
-    );
+    // Both gaps closed: every folder resolved (HRESULT S_OK), so the sample's
+    // failure-counting exit code is zero.
+    assert_eq!(run.exit_code, 0, "expected every folder to resolve; stdout:\n{stdout}");
 }
