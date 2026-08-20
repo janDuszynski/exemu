@@ -279,6 +279,23 @@ impl WinOs {
         mem.map_fixed(base, size, perm, name).ok().map(|()| base)
     }
 
+    /// [`WinOs::map_anywhere`] with a 4 GiB ceiling — the placement a **32-bit**
+    /// image needs in a WoW64 process (roadmap W5.7). `wow64.dll`'s
+    /// `NtMapViewOfSection` thunk narrows the base it gets back into the guest's
+    /// 32-bit `*BaseAddress` cell without checking, so a view placed above 4 GiB
+    /// is silently truncated into an unmapped pointer — which is exactly what a
+    /// 32-bit `RtlImageNtHeader` then faults on.
+    pub(crate) fn map_anywhere_low(
+        &mut self,
+        mem: &mut dyn Memory,
+        size: u64,
+        perm: exemu_core::Perm,
+        name: &str,
+    ) -> Option<u64> {
+        let base = self.vm_find_free_below(mem, size, u32::MAX as u64)?;
+        mem.map_fixed(base, size, perm, name).ok().map(|()| base)
+    }
+
     /// Find a free, 64 KiB-aligned base for at least `size` bytes ending at or
     /// below `max_addr`, or `None` if the constrained space is exhausted.
     /// Unconstrained requests take the ordinary bump arena; a ceiling makes the

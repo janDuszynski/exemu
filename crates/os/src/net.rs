@@ -1389,7 +1389,7 @@ static WS2_32_UNIXLIB: &[UnixEntry] = &[
 /// The unix side [`crate::unixlib`] registers when Wine's `ws2_32.dll` asks for
 /// its half.
 pub(crate) fn ws2_32_unixlib() -> Unixlib {
-    Unixlib { name: "ws2_32", table: WS2_32_UNIXLIB }
+    Unixlib { name: "ws2_32", table: WS2_32_UNIXLIB, wow64: false }
 }
 
 /// The SSDT thunk.

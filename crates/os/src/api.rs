@@ -378,6 +378,19 @@ pub enum Api {
     /// thing to find the 64-bit `ntdll` it then resolves
     /// `__wine_unix_call_dispatcher` out of.
     LdrGetDllHandle,
+    /// `LdrLoadDll(DllPath, DllCharacteristics, DllName, *DllHandle)` — the NT
+    /// loader's "map this module" entry (roadmap W5.7).
+    ///
+    /// Serviced natively for the **WoW64 module set only**. `wow64.dll`'s
+    /// process init loads `wow64cpu.dll` and `wow64win.dll` through this call
+    /// (its own `load_dll` helper, rva 0x4180, builds a system-directory path
+    /// and hands it to `LdrLoadDll`), but the WoW64 boot deliberately does not
+    /// run Wine's 64-bit `loader_init`, so Wine's own `LdrLoadDll` has no
+    /// module list to add to. exemu has already mapped both images, so this
+    /// hands back their bases. A name that is **not** part of the WoW64 set is
+    /// refused with `STATUS_DLL_NOT_FOUND` rather than quietly loaded from
+    /// somewhere else.
+    LdrLoadDll,
     /// `RaiseException(code, flags, nargs, args)` / `RtlRaiseException` — start
     /// dispatch: build the record, capture context, walk frames offering the
     /// exception to each guest language handler (roadmap P4.3c).
@@ -462,6 +475,7 @@ impl Api {
             "RtlVirtualUnwind" => Api::RtlVirtualUnwind,
             "RtlPcToFileHeader" => Api::RtlPcToFileHeader,
             "LdrGetDllHandle" => Api::LdrGetDllHandle,
+            "LdrLoadDll" => Api::LdrLoadDll,
             "RaiseException" | "RtlRaiseException" => Api::RaiseException,
             "RtlUnwindEx" | "RtlUnwind" => Api::RtlUnwindEx,
             "SetUnhandledExceptionFilter" => Api::SetUnhandledExceptionFilter,
@@ -992,7 +1006,7 @@ impl Api {
             // x64-only ntdll exception APIs: no 32-bit stdcall footprint.
             Api::RtlCaptureContext | Api::RtlLookupFunctionEntry | Api::RtlVirtualUnwind
             | Api::RtlPcToFileHeader | Api::RaiseException | Api::RtlUnwindEx
-            | Api::ExceptionDriver | Api::LdrGetDllHandle => 0,
+            | Api::ExceptionDriver | Api::LdrGetDllHandle | Api::LdrLoadDll => 0,
             // SetUnhandledExceptionFilter is stdcall(1) on 32-bit; the filter
             // itself (UnhandledExceptionFilter) takes one pointer arg too.
             Api::SetUnhandledExceptionFilter | Api::UnhandledExceptionFilter => 1,
@@ -1178,6 +1192,27 @@ fn control_id(hwnd: u64) -> Option<u32> {
 }
 
 /// Read a NUL-terminated UTF-16 string as code units (no terminator).
+/// The lower-cased **base name** carried by a 64-bit `UNICODE_STRING`
+/// (`{Length u16, MaximumLength u16, pad, Buffer u64}`), or `None` for a null
+/// pointer. `Length` is a byte count, and the buffer is not NUL-terminated —
+/// which is why this reads exactly `Length/2` code units rather than scanning.
+fn read_unicode_string_base_name(mem: &dyn Memory, us: u64) -> Result<Option<String>> {
+    if us == 0 {
+        return Ok(None);
+    }
+    let len = mem.read_u16(us)? as u64;
+    let buf = mem.read_u64(us + 8)?;
+    if buf == 0 {
+        return Ok(None);
+    }
+    let mut units = Vec::with_capacity((len / 2) as usize);
+    for i in 0..len / 2 {
+        units.push(mem.read_u16(buf + i * 2)?);
+    }
+    let name = String::from_utf16_lossy(&units).to_ascii_lowercase();
+    Ok(Some(name.rsplit(['\\', '/']).next().unwrap_or(&name).to_string()))
+}
+
 pub(crate) fn read_wstr_units(mem: &dyn Memory, addr: u64) -> Result<Vec<u16>> {
     let mut v = Vec::new();
     if addr == 0 {
@@ -1589,21 +1624,18 @@ impl WinOs {
             // pad, Buffer}. Returns STATUS_DLL_NOT_FOUND when the module is not
             // a real mapped guest image (rather than handing back a synthetic
             // handle, which the caller would dereference as a PE header).
-            Api::LdrGetDllHandle => {
+            Api::LdrGetDllHandle | Api::LdrLoadDll => {
                 let name_us = self.arg(cpu, mem, 2)?;
                 let handle_out = self.arg(cpu, mem, 3)?;
                 const STATUS_DLL_NOT_FOUND: u64 = 0xC000_0135;
                 let mut status = STATUS_DLL_NOT_FOUND;
-                if name_us != 0 {
-                    let len = mem.read_u16(name_us)? as u64;
-                    let buf = mem.read_u64(name_us + 8)?;
-                    let mut units = Vec::with_capacity((len / 2) as usize);
-                    for i in 0..len / 2 {
-                        units.push(mem.read_u16(buf + i * 2)?);
-                    }
-                    let name = String::from_utf16_lossy(&units).to_ascii_lowercase();
-                    let name = name.rsplit(['\\', '/']).next().unwrap_or(&name).to_string();
-                    if let Some(base) = self.module_base(&name) {
+                if let Some(name) = read_unicode_string_base_name(mem, name_us)? {
+                    // The WoW64 module set first: on that boot path exemu — not
+                    // Wine's loader — mapped `wow64cpu`/`wow64win`, so they are
+                    // invisible to `module_base`'s loader table by design (the
+                    // process holds two `ntdll.dll`s; keeping the WoW64 set out
+                    // of the name table is what stops them being confused).
+                    if let Some(base) = self.wow64_module(&name).or_else(|| self.module_base(&name)) {
                         if handle_out != 0 {
                             mem.write_u64(handle_out, base)?;
                         }

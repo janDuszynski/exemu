@@ -32,11 +32,16 @@
 //! * **`ntdll.dll` (64-bit), `wow64.dll` and `wow64win.dll`** have no such
 //!   constraint and stay in the ordinary 64-bit DLL arena.
 //!
-//! What this module does *not* do: it does not run Wine's own
-//! `Wow64LdrpInitialize`. exemu constructs the process, exactly as the Windows
-//! kernel + `wow64.dll` would, and then hands control to Wine's binary
-//! translator. Everything downstream of that hand-off — the mode switch, the
-//! service dispatch and all 32↔64 argument marshalling — is Wine's own code.
+//! exemu's job here is the **kernel's** (and, in Wine's split, the Unix side's):
+//! map the module set, build the dual TEB/PEB pair, fill
+//! `ntdll!LdrSystemDllInitBlock` and `PEB32.ProcessParameters`, and seed the
+//! CPU-reserved area with the thread's 32-bit start state. Everything after the
+//! hand-off is Wine's own code — including, on the default
+//! [`Bringup::WineLoader`] path, `Wow64LdrpInitialize` itself: it registers the
+//! win32k service table, publishes the BOP, and starts the 32-bit thread inside
+//! `ntdll32!LdrInitializeThunk`, so Wine's i386 loader binds the guest's whole
+//! import graph. The mode switch, the service dispatch and all 32↔64 argument
+//! marshalling are Wine's throughout.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -67,8 +72,11 @@ pub const WOW64_PEB64: u64 = WOW64_TEB64 + 0x2000;
 /// the `WOW64INFO`. Placed clear of the debug-scratch pages at `TEB64+0x3000`
 /// and `PEB64+0x2000`.
 pub const WOW64_EXTRA: u64 = WOW64_TEB64 + 0x8000;
-/// Bytes covered by that block.
-pub const WOW64_EXTRA_SIZE: u64 = 0x8000;
+/// Bytes covered by that block. Large enough to carry the 32-bit
+/// `RTL_USER_PROCESS_PARAMETERS` and its strings/environment too — those are
+/// reached through a 32-bit PEB field, so they cannot live in the ordinary
+/// loader arena, which is above 4 GiB on this layout.
+pub const WOW64_EXTRA_SIZE: u64 = 0x2_0000;
 /// The 32-bit TEB (`fs:`). `TEB64.WowTebOffset` is the delta to here.
 pub const WOW64_TEB32: u64 = WOW64_EXTRA;
 /// `PEB32` (`fs:[0x30]`).
@@ -78,6 +86,10 @@ pub const WOW64_PEB32: u64 = WOW64_EXTRA + 0x2000;
 pub const WOW64_CPU_AREA: u64 = WOW64_EXTRA + 0x3000;
 /// The `WOW64INFO` block `BTCpuProcessInit` flags through `TEB64+0x14d0`.
 pub const WOW64_INFO: u64 = WOW64_EXTRA + 0x4000;
+/// A sub-4 GiB arena for `PEB32.ProcessParameters` and the strings it points at.
+pub const WOW64_PARAMS: u64 = WOW64_EXTRA + 0x5000;
+/// Bytes available to it (the rest of the WoW64 block).
+pub const WOW64_PARAMS_SIZE: u64 = WOW64_EXTRA_SIZE - 0x5000;
 
 /// The 32-bit guest's own stack (separate from the 64-bit stack the WoW64 thunk
 /// layer runs on — `BTCpuSimulate` `xchg`es between them).
@@ -208,10 +220,7 @@ pub fn build(
     let stack32_top = WOW64_STACK32_BASE + WOW64_STACK32_SIZE;
 
     // TEB32: the NT_TIB fields 32-bit code and Wine's 32-bit ntdll read.
-    mem.write_u32(teb32 + wow64::TEB32_EXCEPTION_LIST, u32::MAX)?;
-    mem.write_u32(teb32 + wow64::TEB32_STACK_BASE, stack32_top as u32)?;
-    mem.write_u32(teb32 + wow64::TEB32_STACK_LIMIT, WOW64_STACK32_BASE as u32)?;
-    mem.write_u32(teb32 + wow64::TEB32_PEB, WOW64_PEB32 as u32)?;
+    wow64::seed_teb32(mem, teb32, WOW64_PEB32, WOW64_STACK32_BASE, stack32_top)?;
     mem.write_u32(teb32 + wow64::TEB32_CLIENT_ID, 0x1000)?; // UniqueProcess
     mem.write_u32(teb32 + wow64::TEB32_CLIENT_ID + 4, 0x1001)?; // UniqueThread
 
@@ -229,6 +238,25 @@ pub fn build(
     // init flags (`or dword [P+4],1` through `TEB64+0x14d0`).
     mem.write_u64(teb64 + WOW64_INFO_TEB_SLOT, WOW64_INFO)?;
 
+    // `ntdll!LdrSystemDllInitBlock` — the block through which the loader tells
+    // `wow64.dll` where the 32-bit ntdll and its entry points are. On Windows
+    // the kernel fills it; in Wine the *Unix* side of ntdll does, and that is
+    // the role exemu plays here. `wow64.dll` reads it in two places that decide
+    // the whole boot: its process init takes the ntdll32 base out of it to
+    // publish the BOP, and its per-thread init takes `LdrInitializeThunk` out
+    // of it to seat the 32-bit thread inside Wine's own loader.
+    let block = ntdll64.export("LdrSystemDllInitBlock").ok_or_else(|| {
+        EmuError::Os("WoW64 boot: the 64-bit ntdll exports no LdrSystemDllInitBlock".into())
+    })?;
+    let sysdll = wow64::SystemDllInitBlock {
+        ntdll32_base: ntdll32.base,
+        ldr_initialize_thunk: ntdll32_export(&ntdll32, "LdrInitializeThunk")?,
+        exception_dispatcher: ntdll32_export(&ntdll32, "KiUserExceptionDispatcher")?,
+        apc_dispatcher: ntdll32_export(&ntdll32, "KiUserApcDispatcher")?,
+        callback_dispatcher: ntdll32_export(&ntdll32, "KiUserCallbackDispatcher")?,
+    };
+    wow64::publish_system_dll_init_block(mem, block, &sysdll)?;
+
     Ok(Wow64Boot {
         ntdll32,
         wow64cpu,
@@ -243,6 +271,18 @@ pub fn build(
     })
 }
 
+/// `PEB.ProcessHeap` (x64 PEB). Witnessed from both sides of the boundary:
+/// Wine's 64-bit `loader_init` stores `RtlCreateHeap`'s result there (ntdll rva
+/// 0x547d3, `mov [rdi+0x30], rax` with `rdi = gs:[0x30]->Peb`), and
+/// `wow64.dll!Wow64AllocateTemp` reads it back (`mov rcx,[rdx+0x30]`).
+pub const PEB64_PROCESS_HEAP: u64 = 0x30;
+
+/// An export of the mapped 32-bit `ntdll`, by name, or a loud error.
+fn ntdll32_export(img: &Wow64Image, name: &str) -> Result<u64> {
+    img.export(name)
+        .ok_or_else(|| EmuError::Os(format!("WoW64 boot: the 32-bit ntdll exports no {name}")))
+}
+
 /// `TEB64` slot holding the `WOW64INFO` pointer. `wow64cpu!BTCpuProcessInit`
 /// reads `gs:[0x30]` then `[teb+0x14d0]` and sets bit 0 of `[+4]`; `wow64.dll`'s
 /// per-thread init writes the same slot, and its `Wow64LdrpInitialize` tests
@@ -253,11 +293,31 @@ pub const WOW64_INFO_TEB_SLOT: u64 = 0x14d0;
 /// the WoW64 block — it must be executable, so it is its own region).
 pub const WOW64_BOOTSTRAP: u64 = WOW64_EXTRA + WOW64_EXTRA_SIZE;
 
-/// Seat the initial thread on the WoW64 bring-up trampoline (roadmap W5.1).
-///
-/// exemu does **not** re-implement `Wow64LdrpInitialize`; it assembles the same
-/// four steps Wine's `wow64.dll` performs, as ordinary 64-bit guest code, and
-/// lets Wine's own DLLs do all of them:
+/// Which bring-up the WoW64 boot runs (roadmap W5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Bringup {
+    /// **Direct**: exemu performs the WoW64 process's own setup — run
+    /// `BTCpuProcessInit`, publish the BOP into the three cells Wine's own
+    /// `wow64.dll` fills, then `BTCpuSimulate` straight into the guest's entry
+    /// point with no 32-bit loader at all.
+    ///
+    /// Only the guest's `ntdll` imports are bound (by [`bind_guest_imports`]),
+    /// so this is limited to a program that imports nothing else — but every
+    /// hop it does take is Wine's, and it is the shortest path that proves the
+    /// 32→64 service chain end to end.
+    Direct,
+    /// **Wine's own loader**: hand control to `wow64!Wow64LdrpInitialize`,
+    /// which registers the win32k service table, publishes the BOP itself and
+    /// starts the 32-bit thread inside `ntdll32!LdrInitializeThunk` — so Wine's
+    /// i386 loader binds the guest's whole import graph. What a real 32-bit
+    /// application needs, and the default; see [`seat_wine_loader`].
+    #[default]
+    WineLoader,
+}
+
+/// Seat the initial thread on the **direct** bring-up trampoline (roadmap
+/// W5.1): exemu assembles the four steps `wow64.dll` would perform, as ordinary
+/// 64-bit guest code, and lets Wine's own DLLs do all of them.
 ///
 /// ```text
 ///   call wow64cpu!BTCpuProcessInit     ; builds the 32→64 return BOP + selectors
@@ -265,7 +325,7 @@ pub const WOW64_BOOTSTRAP: u64 = WOW64_EXTRA + WOW64_EXTRA_SIZE;
 ///   mov  [ntdll32!Wow64Transition], eax
 ///   mov  [ntdll32!__wine_syscall_dispatcher], eax
 ///   mov  [TEB32+0xC0], eax             ; WOW32Reserved
-///   call wow64cpu!BTCpuSimulate        ; enters the 32-bit guest
+///   call wow64cpu!BTCpuSimulate        ; enters the 32-bit guest at its entry point
 ///   hlt
 /// ```
 ///
@@ -275,10 +335,7 @@ pub const WOW64_BOOTSTRAP: u64 = WOW64_EXTRA + WOW64_EXTRA_SIZE;
 /// (rva 0x5550) does the same into `TEB32+0xC0`. The **32-bit store width** is
 /// why every one of those cells — and therefore `wow64cpu` itself — must live
 /// below 4 GiB.
-///
-/// The addresses are resolved by name from the real export tables; nothing about
-/// the BOP's shape, the selectors or the service dispatch is supplied by exemu.
-pub fn seat(
+pub fn seat_direct(
     cpu: &mut exemu_cpu::Interpreter,
     mem: &mut VirtualMemory,
     boot: &Wow64Boot,
@@ -292,7 +349,6 @@ pub fn seat(
     let process_init = sym(&boot.wow64cpu, "BTCpuProcessInit")?;
     let get_bop = sym(&boot.wow64cpu, "BTCpuGetBopCode")?;
     let simulate = sym(&boot.wow64cpu, "BTCpuSimulate")?;
-
     let slots = wow64::BopSlots {
         transition: boot
             .ntdll32
@@ -304,9 +360,8 @@ pub fn seat(
         wow32_reserved: boot.teb32 + wow64::TEB32_WOW32_RESERVED,
     };
 
-    // Assemble the trampoline.
     let mut code: Vec<u8> = Vec::new();
-    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20   (Win64 shadow space)
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 0x20 (Win64 shadow space)
     let call_abs = |code: &mut Vec<u8>, target: u64| {
         code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, target
         code.extend_from_slice(&target.to_le_bytes());
@@ -325,20 +380,128 @@ pub fn seat(
     mem.map(exemu_core::Region::new("wow64_bootstrap", WOW64_BOOTSTRAP, 0x1000, Perm::RWX))?;
     mem.write(WOW64_BOOTSTRAP, &code)?;
 
-    // The WoW64 CPU-reserved area: `TEB64+0x1488` → a `WOW64_CONTEXT` seeded
-    // with the 32-bit guest's entry point, stack and flat selectors. This is the
-    // record `BTCpuSimulate` loads the 32-bit register file from, and the one
-    // `NtQueryInformationThread(ThreadWow64Context)` answers with — which is how
-    // `BTCpuProcessInit` learns the 32-bit `SegCs`/`SegSs` it caches.
+    // The 32-bit thread starts *at the guest's entry point*: no loader runs, so
+    // there is no `RtlUserThreadStart` frame to build.
     let esp32 = (boot.stack32_top - 0x100) & !0xf;
-    wow64::init_cpu_area(mem, boot.teb64, boot.cpu_area, guest_entry as u32, esp32 as u32)?;
+    let start = wow64::Start32 { eip: guest_entry as u32, esp: esp32 as u32, eax: 0, ebx: 0 };
+    wow64::init_cpu_area(mem, boot.teb64, boot.cpu_area, start)?;
+    seat_cpu(cpu, boot, stack64_top);
+    Ok(())
+}
 
+/// Common CPU seating for both bring-ups.
+fn seat_cpu(cpu: &mut exemu_cpu::Interpreter, boot: &Wow64Boot, stack64_top: u64) {
     let s = cpu.state_mut();
     s.rip = WOW64_BOOTSTRAP;
     s.set_rsp((stack64_top - 0x100) & !0xf);
     s.gs_base = boot.teb64; // 64-bit code reads its TEB through gs:
     s.fs_base = boot.teb32; // 32-bit guest code reads its TEB through fs:
     cpu.set_bits(exemu_cpu::Bits::B64); // the bring-up runs in long mode
+}
+
+/// Seat the initial thread on the **Wine-loader** bring-up (roadmap W5.7).
+///
+/// The trampoline hands straight to Wine, and everything it does is Wine's:
+///
+/// ```text
+///   sub  rsp, 0x38
+///   call ntdll!RtlCreateHeap           ; → PEB64.ProcessHeap
+///   call wow64!Wow64LdrpInitialize     ; Wine's own WoW64 process/thread start
+///   hlt                                ; it never returns
+/// ```
+///
+/// `Wow64LdrpInitialize` (rva 0x2ce0) is exactly three calls:
+///
+/// ```text
+///   RtlRunOnceExecuteOnce(&once, process_init)   ; rva 0x4440
+///   thread_init()                                ; rva 0x5550
+///   for (;;) pBTCpuSimulate();                   ; rva 0x1558
+/// ```
+///
+/// and running it is what closes the two gaps exemu used to paper over:
+///
+/// * **process init** loads `wow64cpu.dll` and `wow64win.dll`, resolves their
+///   `BTCpu*` exports, `movdqu`-copies the win32k service descriptor out of
+///   `wow64win!sdwhwin32` into its own **table 1** (rva 0x160a0), and publishes
+///   `BTCpuGetBopCode()` into `ntdll32!Wow64Transition`,
+///   `ntdll32!__wine_syscall_dispatcher` and `ntdll32!__wine_unix_call_dispatcher`.
+///   exemu used to hand-assemble a subset of those stores and could not do the
+///   descriptor copy at all.
+/// * **thread init** writes the BOP to `TEB32+0xC0`, publishes the `WOW64INFO`
+///   at `TEB64+0x14d0`, then reads this thread's 32-bit context, copies it onto
+///   the 32-bit stack and re-seats `Eip` on `LdrSystemDllInitBlock[0x18]` —
+///   **`ntdll32!LdrInitializeThunk`** — with the copied `CONTEXT` as its stack
+///   argument. So the first 32-bit code that runs is Wine's own loader.
+///
+/// exemu's remaining job is the one a kernel does: seed the CPU-reserved area
+/// with the thread's start state ([`wow64::Start32`], recovered from
+/// `ntdll32!RtlUserThreadStart`) and enter.
+pub fn seat_wine_loader(
+    cpu: &mut exemu_cpu::Interpreter,
+    mem: &mut VirtualMemory,
+    boot: &Wow64Boot,
+    ntdll64: &Wow64Image,
+    peb64: u64,
+    guest_entry: u64,
+    stack64_top: u64,
+) -> Result<()> {
+    let ldrp_init = boot
+        .wow64
+        .export("Wow64LdrpInitialize")
+        .ok_or_else(|| EmuError::Os("WoW64 boot: wow64.dll does not export Wow64LdrpInitialize".into()))?;
+    let create_heap = ntdll64
+        .export("RtlCreateHeap")
+        .ok_or_else(|| EmuError::Os("WoW64 boot: the 64-bit ntdll exports no RtlCreateHeap".into()))?;
+
+    // Assemble the trampoline.
+    let mut code: Vec<u8> = Vec::new();
+    code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x38]); // sub rsp, 0x38 (shadow space + 2 stack args)
+    // --- PEB64.ProcessHeap ------------------------------------------------
+    // `RtlCreateHeap(HEAP_GROWABLE, NULL, 0, 0, NULL, NULL)` — Wine's own heap
+    // implementation — published at `PEB64 + 0x30`. This is the one piece of
+    // 64-bit `loader_init` the WoW64 boot has to stand in for: `wow64.dll`
+    // allocates every marshalling buffer through `Wow64AllocateTemp` (rva
+    // 0x2730), which is `mov rbx,gs:[0x30]; mov rdx,[rbx+0x60]; mov
+    // rcx,[rdx+0x30]; call RtlAllocateHeap` — i.e. straight out of
+    // `PEB.ProcessHeap`. A null heap there faults inside `RtlAllocateHeap`.
+    code.extend_from_slice(&[0xB9, 0x02, 0x00, 0x00, 0x00]); // mov ecx, 2 (HEAP_GROWABLE)
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx      (Addr)
+    code.extend_from_slice(&[0x45, 0x31, 0xC0]); // xor r8d, r8d (TotalSize)
+    code.extend_from_slice(&[0x45, 0x31, 0xC9]); // xor r9d, r9d (CommitSize)
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x20, 0, 0, 0, 0]); // mov [rsp+0x20], 0 (Lock)
+    code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x28, 0, 0, 0, 0]); // mov [rsp+0x28], 0 (Params)
+    code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, RtlCreateHeap
+    code.extend_from_slice(&create_heap.to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    code.extend_from_slice(&[0x48, 0xB9]); // movabs rcx, &PEB64.ProcessHeap
+    code.extend_from_slice(&(peb64 + PEB64_PROCESS_HEAP).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+    // --- Wine's WoW64 process/thread start --------------------------------
+    code.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx  (its CONTEXT arg is unused: it `lea`s over rcx)
+    code.extend_from_slice(&[0x48, 0xB8]); // movabs rax, Wow64LdrpInitialize
+    code.extend_from_slice(&ldrp_init.to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    code.push(0xF4); // hlt — Wow64LdrpInitialize is not expected to return
+
+    mem.map(exemu_core::Region::new("wow64_bootstrap", WOW64_BOOTSTRAP, 0x1000, Perm::RWX))?;
+    mem.write(WOW64_BOOTSTRAP, &code)?;
+
+    // The WoW64 CPU-reserved area: `TEB64+0x1488` → a `WOW64_CONTEXT` seeded
+    // with the fresh thread's 32-bit start state. This is the record
+    // `BTCpuSimulate` loads the 32-bit register file from, the one
+    // `NtQueryInformationThread(ThreadWow64Context)` answers with (which is how
+    // `BTCpuProcessInit` learns the 32-bit `SegCs`/`SegSs` it caches), and the
+    // one `wow64.dll`'s per-thread init reads back through `BTCpuGetContext`,
+    // copies to the 32-bit stack and hands to `LdrInitializeThunk`.
+    let esp32 = (boot.stack32_top - 0x100) & !0xf;
+    let start = wow64::Start32 {
+        eip: ntdll32_export(&boot.ntdll32, "RtlUserThreadStart")? as u32,
+        esp: esp32 as u32,
+        eax: guest_entry as u32, // RtlUserThreadStart: arg0 = EntryPoint, from EAX
+        ebx: 0,                  //                     arg1 = Arg,        from EBX
+    };
+    wow64::init_cpu_area(mem, boot.teb64, boot.cpu_area, start)?;
+    seat_cpu(cpu, boot, stack64_top);
     Ok(())
 }
 

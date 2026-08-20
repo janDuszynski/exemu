@@ -76,6 +76,10 @@ const SECTION_IMAGE_INFORMATION_LEN: u64 = 0x40;
 
 /// `IMAGE_FILE_MACHINE_AMD64`. `open_dll_file` gates on `[info+0x30] == 0x8664`.
 const MACHINE_AMD64: u16 = 0x8664;
+/// `IMAGE_FILE_MACHINE_I386` — what a **32-bit** image must report, or Wine's
+/// i386 loader rejects it with `STATUS_INVALID_IMAGE_FORMAT` before it ever maps
+/// a view (roadmap W5.7).
+const MACHINE_I386: u16 = 0x014c;
 
 const PAGE: u64 = 0x1000;
 
@@ -112,6 +116,9 @@ pub(crate) struct SectionImage {
     pub subsystem: u16,
     /// Amount of stack the image asks the loader to reserve → `MaximumStackSize`.
     pub stack_reserve: u64,
+    /// PE32+ (x86-64) vs PE32 (i386) — reported as `SectionImageInformation.
+    /// Machine`, which each loader half gates on (roadmap W5.7).
+    pub is_64bit: bool,
     /// The raw PE header bytes (mapped at the image base so `RtlImageNtHeader`
     /// finds MZ/PE at `base` / `base+e_lfanew`).
     pub headers: Vec<u8>,
@@ -214,6 +221,7 @@ impl WinOs {
                 entry_rva: pe.entry_rva,
                 subsystem: pe.subsystem,
                 stack_reserve: pe.stack_reserve,
+                is_64bit: pe.is_64bit,
                 headers: pe.headers,
                 sections: pe
                     .sections
@@ -304,6 +312,9 @@ impl WinOs {
         let max_stack = img.stack_reserve.max(PAGE);
         let committed_stack = PAGE.min(max_stack);
         let subsystem = img.subsystem as u32;
+        // The image's OWN machine, not the host's: a WoW64 process maps both
+        // widths, and each loader half gates on this field.
+        let machine = if img.is_64bit { MACHINE_AMD64 } else { MACHINE_I386 };
 
         // Zero the whole 0x40-byte struct, then fill the fields Wine reads.
         let mut buf = [0u8; SECTION_IMAGE_INFORMATION_LEN as usize];
@@ -311,7 +322,7 @@ impl WinOs {
         buf[0x10..0x18].copy_from_slice(&max_stack.to_le_bytes()); // MaximumStackSize
         buf[0x18..0x20].copy_from_slice(&committed_stack.to_le_bytes()); // CommittedStackSize
         buf[0x20..0x24].copy_from_slice(&subsystem.to_le_bytes()); // SubSystemType
-        buf[0x30..0x32].copy_from_slice(&MACHINE_AMD64.to_le_bytes()); // Machine
+        buf[0x30..0x32].copy_from_slice(&machine.to_le_bytes()); // Machine
         buf[0x32] = 1; // ImageContainsCode
         buf[0x33] = 0; // ImageFlags (bit0 clear)
         mem.write(info_ptr, &buf)?;
@@ -440,6 +451,7 @@ impl WinOs {
             .iter()
             .map(|s| (s.rva, s.virtual_size, s.data.clone()))
             .collect();
+        let is_64bit = img.is_64bit;
 
         // Reserve SizeOfImage: honour a caller base (64 KiB rounded down), else
         // pick a free window. Back it RWX so the guest's NtProtectVirtualMemory
@@ -452,7 +464,15 @@ impl WinOs {
             }
             base
         } else {
-            match self.map_anywhere(mem, view_size, Perm::RWX, "image-view") {
+            // A PE32 view must be 32-bit addressable: it is mapped for a 32-bit
+            // consumer, and the WoW64 thunk that hands the base back narrows it
+            // to 32 bits.
+            let placed = if is_64bit {
+                self.map_anywhere(mem, view_size, Perm::RWX, "image-view")
+            } else {
+                self.map_anywhere_low(mem, view_size, Perm::RWX, "image-view")
+            };
+            match placed {
                 Some(b) => b,
                 None => return Ok(STATUS_NO_MEMORY),
             }

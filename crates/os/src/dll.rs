@@ -1033,6 +1033,90 @@ impl WinOs {
         Ok(pp)
     }
 
+    /// Build the **WoW64 PEB32's** `RTL_USER_PROCESS_PARAMETERS` inside a
+    /// caller-supplied sub-4 GiB arena and return its guest address (roadmap
+    /// W5.7).
+    ///
+    /// A WoW64 process needs *two* parameter blocks: the 64-bit one PEB64 points
+    /// at (built by [`Self::build_process_parameters_64`], reachable only from
+    /// 64-bit code) and this 32-bit one, which Wine's **i386** `ntdll` walks the
+    /// moment its `loader_init` starts. The pointer lives in a 32-bit PEB field,
+    /// so it cannot come from the loader arena — that sits above 4 GiB on this
+    /// layout — hence the explicit arena.
+    ///
+    /// **Header size recovered from the pinned i386 `ntdll`,** not assumed: its
+    /// `init_user_process_params` (rva 0x4fc00) reads `EnvironmentSize` at
+    /// **`+0x290`** — `mov eax,[edx+0x30]` (PEB32.ProcessParameters via
+    /// `fs:[0x18]`), `mov eax,[eax+0x10]`, `mov ebx,[eax+0x290]` — exactly
+    /// mirroring the 64-bit `+0x3f0` this crate already pins. So the 32-bit
+    /// header runs past the 0x290 bytes the public winternl stub covers
+    /// (`CurrentDirectores[32]` is 32 × 0x10 at 0x90, ending at 0x290, with
+    /// `EnvironmentSize`/`EnvironmentVersion`/`PackageDependencyData`/
+    /// `ProcessGroupId`/`LoaderThreads` after it).
+    ///
+    /// Returns `None` when the arena is too small for the block plus its
+    /// strings, rather than writing outside it.
+    pub fn build_wow64_process_parameters(
+        &mut self,
+        mem: &mut dyn Memory,
+        arena: u64,
+        arena_size: u64,
+    ) -> Result<Option<u64>> {
+        /// Bytes of 32-bit header exemu lays down: through `LoaderThreads`
+        /// (`+0x2a0`), rounded up to 16.
+        const PP32_SIZE: u64 = 0x2b0;
+        /// `EnvironmentSize`, recovered from `ntdll32!init_user_process_params`.
+        const PP32_ENVIRONMENT_SIZE: u64 = 0x290;
+        let mut next = arena;
+        let mut alloc = |n: u64| {
+            let at = next;
+            next += n.div_ceil(8) * 8;
+            at
+        };
+        let pp = alloc(PP32_SIZE);
+        let img = self.cfg.module_path_w.clone();
+        let img_units: Vec<u16> = img.encode_utf16().collect();
+        let img_buf = alloc((img_units.len() * 2 + 2) as u64);
+        let cmd_units: Vec<u16> = if self.cfg.cmdline_ptr_w != 0 {
+            crate::api::read_wstr_units(mem, self.cfg.cmdline_ptr_w)?
+        } else {
+            img_units.clone()
+        };
+        let cmd_buf = alloc((cmd_units.len() * 2 + 2) as u64);
+        let cur_units: Vec<u16> = "C:\\\0".encode_utf16().collect();
+        let cur_buf = alloc((cur_units.len() * 2 + 2) as u64);
+        let env_units = self.env_block_utf16();
+        let env_buf = alloc((env_units.len() * 2) as u64);
+        if next > arena + arena_size || next > u32::MAX as u64 {
+            return Ok(None);
+        }
+
+        mem.write(pp, &vec![0u8; PP32_SIZE as usize])?;
+        mem.write_u32(pp, PP32_SIZE as u32)?; // MaximumLength
+        mem.write_u32(pp + 0x04, PP32_SIZE as u32)?; // Length
+        mem.write_u32(pp + 0x08, 0x1)?; // Flags = NORMALIZED (Buffers are absolute)
+        let put = |mem: &mut dyn Memory, at: u64, buf: u64, units: &[u16]| -> Result<()> {
+            for (i, u) in units.iter().enumerate() {
+                mem.write_u16(buf + (i * 2) as u64, *u)?;
+            }
+            mem.write_u16(buf + units.len() as u64 * 2, 0)?;
+            let bytes = (units.len() * 2) as u16;
+            mem.write_u16(at, bytes)?; // Length
+            mem.write_u16(at + 2, bytes + 2)?; // MaximumLength
+            mem.write_u32(at + 4, buf as u32)?; // Buffer (32-bit)
+            Ok(())
+        };
+        put(mem, pp + 0x24, cur_buf, &cur_units)?; // CurrentDirectory.DosPath
+        put(mem, pp + 0x38, img_buf, &img_units)?; // ImagePathName
+        put(mem, pp + 0x40, cmd_buf, &cmd_units)?; // CommandLine
+        for (i, u) in env_units.iter().enumerate() {
+            mem.write_u16(env_buf + (i * 2) as u64, *u)?;
+        }
+        mem.write_u32(pp + 0x48, env_buf as u32)?; // Environment
+        mem.write_u32(pp + PP32_ENVIRONMENT_SIZE, (env_units.len() * 2) as u32)?;
+        Ok(Some(pp))
+    }
+
     /// Write the process environment (`name=value\0…\0\0`, UTF-16) into the loader
     /// arena from `self.env`. Returns (buffer address, byte length including the
     /// double-NUL terminator) — the exact size `init_user_process_params` copies.
