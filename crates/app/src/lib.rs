@@ -436,6 +436,23 @@ impl Process {
             None
         };
 
+        // exemu's own audio driver PE (roadmap W7.2). Wine's `*.drv` audio
+        // drivers ship no usable PE half — the pinned `winealsa.drv` and
+        // `winepulse.drv` are byte-identical, export-less stubs — so exemu
+        // supplies its own `winecoreaudio.drv` and pairs the CoreAudio unixlib
+        // with it. It goes into the sandbox's `system32`, which the DLL-search
+        // redirect consults *before* the pinned prefix, so
+        // `mmdevapi!load_driver`'s `LoadLibraryW` finds it. Written only on a
+        // Wine boot: nothing on the emulated path loads it.
+        if wine_dll_dir.is_some() {
+            let drv = sandbox
+                .join("C")
+                .join("windows")
+                .join("system32")
+                .join(exemu_os::audio::DRIVER_MODULE);
+            let _ = std::fs::write(drv, exemu_os::audio::driver_stub_pe());
+        }
+
         // --- The OS layer and import resolution ---------------------------
         let mut os = WinOs::new(WinConfig {
             api_base: lay.api_base,

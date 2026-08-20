@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod cpu;
 pub mod driver;
 pub mod error;
@@ -21,6 +22,7 @@ pub mod pe;
 pub mod telemetry;
 pub mod unwind;
 
+pub use audio::{AudioFormat, AudioSink, NoAudio};
 pub use cpu::{Cpu, CpuState, Exit, Reg, X87, flags};
 pub use driver::{
     DisplayMode, InputEvent, MouseButton, NoDriver, TextBitmap, UserDriver, WindowParams,

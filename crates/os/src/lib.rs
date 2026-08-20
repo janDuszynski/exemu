@@ -20,6 +20,7 @@
 
 mod api;
 mod apiset;
+pub mod audio;
 mod boot;
 mod dll;
 mod exc;
@@ -200,6 +201,14 @@ pub struct WinOs {
     /// Remaining `WM_NULL` iterations `GetMessageW`/`PeekMessageW` will hand a
     /// message-loop before reporting `WM_QUIT`, so deferred-work loops run.
     msg_pumps: u32,
+
+    /// The audio boundary's own state — live render streams (roadmap W7.2).
+    audio: audio::AudioState,
+    /// The host audio backend the mmdevapi driver unixlib pushes PCM at.
+    /// `NoAudio` (accept-and-drop) is the default, which is what a headless run
+    /// and a machine with no audio device get; the application layer injects a
+    /// real one, mirroring `set_driver`.
+    audio_sink: Box<dyn exemu_core::AudioSink>,
 
     /// The windowing backend (NoGui = headless auto-drive).
     gui: Box<dyn exemu_core::Gui>,
@@ -439,6 +448,8 @@ impl WinOs {
             win32k_cb: Vec::new(),
             controls: std::collections::HashMap::new(),
             msg_pumps: 8,
+            audio: audio::AudioState::default(),
+            audio_sink: Box::new(exemu_core::NoAudio),
             gui: Box::new(exemu_core::NoGui),
             driver: Box::new(exemu_core::NoDriver),
             input: None,
@@ -726,6 +737,15 @@ impl WinOs {
     /// future `CocoaDriver` for live windows) before running the guest.
     pub fn set_driver(&mut self, d: Box<dyn exemu_core::UserDriver>) {
         self.driver = d;
+    }
+
+    /// Install a host audio backend (roadmap W7.2). The mmdevapi driver unixlib
+    /// pushes the frames a guest writes through `IAudioRenderClient` at this
+    /// sink. The default is [`exemu_core::NoAudio`] — accept and drop — which
+    /// keeps a run on a machine with no audio device working; the application
+    /// layer injects the CoreAudio backend, or a recording sink for tests.
+    pub fn set_audio_sink(&mut self, sink: Box<dyn exemu_core::AudioSink>) {
+        self.audio_sink = sink;
     }
 
     /// Attach the main→interpreter input channel (roadmap W4.5c). With a channel

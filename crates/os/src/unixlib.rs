@@ -272,6 +272,12 @@ impl WinOs {
             // `NtDeviceIoControlFile`, and reaches its unix half only for name
             // resolution. See [`crate::net`].
             "ws2_32.dll" => crate::net::ws2_32_unixlib(),
+            // Audio (roadmap W7.2): Wine's own `*.drv` audio drivers ship no PE
+            // half worth the name — the pinned `winealsa.drv` and
+            // `winepulse.drv` are byte-identical export-less stubs — so exemu
+            // generates its own driver module instead and pairs it here. Its
+            // unix side is CoreAudio. See [`crate::audio`].
+            crate::audio::DRIVER_MODULE => crate::audio::coreaudio_unixlib(),
             _ => return None,
         };
         Some(self.register_unixlib(base, lib))
