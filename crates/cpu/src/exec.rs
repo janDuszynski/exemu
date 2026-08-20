@@ -341,10 +341,16 @@ impl Interpreter {
             0xA0..=0xA3 => {
                 // The offset is an address-size immediate (4 or 8 bytes).
                 let mut addr = if ctx.bits == Bits::B64 { ctx.u64(mem)? } else { ctx.u32(mem)? as u64 };
+                // The **live** segment bases, exactly as the ModRM path uses
+                // them — they are per-thread (roadmap W2.9), and under WoW64 the
+                // 32-bit `fs` base is the guest's TEB32, nowhere near the
+                // process default. Wine's 32-bit ntdll installs its SEH frame
+                // with `mov fs:[0], eax` (the moffs form, rva 0x43b74), so a
+                // fixed base here sent that store to an unmapped address.
                 if ctx.pfx.seg == 0x64 {
-                    addr = addr.wrapping_add(if ctx.bits == Bits::B64 { FS_BASE } else { FS_BASE_32 });
+                    addr = addr.wrapping_add(self.fs_base(ctx.bits));
                 } else if ctx.pfx.seg == 0x65 {
-                    addr = addr.wrapping_add(GS_BASE);
+                    addr = addr.wrapping_add(self.state.gs_base);
                 }
                 addr &= self.addr_mask();
                 let size = if opcode & 1 == 0 { 1 } else { Self::opsize(&ctx) };

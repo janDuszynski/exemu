@@ -139,3 +139,44 @@ fn mov_store_data_segments_report_the_flat_selector() {
         );
     }
 }
+
+/// **`mov fs:[0], eax` must use the thread's *live* FS base** (roadmap W5.7).
+///
+/// The `moffs` forms of `MOV` (`A0`–`A3`) take an absolute address immediate
+/// rather than a ModRM operand, and used to add a fixed, process-default
+/// segment base instead of the per-thread one on [`exemu_core::CpuState`]. That
+/// is invisible on the ordinary 32-bit path — where the two are the same value
+/// — and fatal under WoW64, where the guest's TEB32 is nowhere near the
+/// default: Wine's i386 `ntdll` installs its first SEH frame with exactly this
+/// instruction (`64 a3 00 00 00 00` at rva 0x43b74), and the store landed in
+/// unmapped memory.
+#[test]
+fn moffs_mov_uses_the_live_segment_bases() {
+    const TEB32: u64 = 0x7F00_8000;
+    const TEB64: u64 = 0x7F00_0000;
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
+    mem.map(Region::new("tebs", TEB64, 0x1_0000, Perm::RW)).unwrap();
+
+    // 32-bit: `mov fs:[0], eax` — the SEH-frame install.
+    mem.write(CODE, &[0x64, 0xA3, 0x00, 0x00, 0x00, 0x00]).unwrap();
+    let mut cpu = Interpreter::with_bits(Bits::B32);
+    cpu.state_mut().rip = CODE;
+    cpu.state_mut().fs_base = TEB32;
+    cpu.state_mut().set_reg(Reg::Rax, 0x0012_3456);
+    cpu.step(&mut mem, &mut NoHooks).expect("moffs store executes");
+    assert_eq!(
+        mem.read_u32(TEB32).unwrap(),
+        0x0012_3456,
+        "the store landed at the thread's own TEB32, not the process default",
+    );
+
+    // 64-bit: `mov eax, gs:[0x30]` — the same rule for the live GS base.
+    mem.write(CODE, &[0x65, 0xA1, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap();
+    mem.write_u32(TEB64 + 0x30, 0xB16B_00B5).unwrap();
+    let mut cpu = Interpreter::with_bits(Bits::B64);
+    cpu.state_mut().rip = CODE;
+    cpu.state_mut().gs_base = TEB64;
+    cpu.step(&mut mem, &mut NoHooks).expect("moffs load executes");
+    assert_eq!(cpu.state().reg(Reg::Rax), 0xB16B_00B5, "gs:[0x30] read through the live GS base");
+}
