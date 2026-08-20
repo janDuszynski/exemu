@@ -161,6 +161,18 @@ mod frame {
     pub const XMM_LAST: u8 = 15;
 }
 
+/// `EXEMU_W32K_TRACE` — log every win32u (`NtUser*`/`NtGdi*`) index as it is
+/// dispatched, on stderr as `[w32k] 0xIDX`.
+///
+/// This exists because the win32u boundary is the one place exemu can *observe*
+/// what Wine's user32/gdi32 actually ask the kernel side for: which primitive a
+/// real control paints with is recovered by reading this trace, not guessed. Off
+/// unless the variable is set, and read once.
+fn win32k_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EXEMU_W32K_TRACE").is_some())
+}
+
 /// The saved Windows context. When a TEB exists the frame lives in guest memory
 /// (`Teb`), which is the design's "build it in the TEB" path; host-only unit
 /// tests with no TEB fall back to a `Host` snapshot so the save/restore
@@ -351,6 +363,19 @@ impl WinOs {
         self.win32k.set(index & !WIN32K_TABLE_BIT, handler);
     }
 
+    /// Return a full 64-bit value from the running syscall (roadmap W4.8).
+    ///
+    /// The SSDT handler signature returns a `u32` NTSTATUS, which is right for
+    /// almost everything — but a handful of win32k services hand back real
+    /// pointers (`GetWindowLongPtr` returning a control's instance data, its
+    /// `Set` counterpart returning the previous one). Truncating those to 32 bits
+    /// would hand the guest a pointer that faults on first use. A handler calls
+    /// this and then returns any status; the dispatcher's ordinary context
+    /// restore still runs, and RAX ends up holding `value`.
+    pub(crate) fn return_u64_from_syscall(&mut self, value: u64) {
+        self.syscall_result64 = Some(value);
+    }
+
     /// Test-only: publish the guest RSP a native `Nt*` handler reads stack args
     /// relative to, without driving a full `SYSCALL` through the interpreter.
     #[cfg(test)]
@@ -374,6 +399,10 @@ impl WinOs {
         // Cleared per dispatch; NtTerminateProcess on the current process sets it
         // so the dispatcher yields Exit::ProcessExit below.
         self.pending_syscall_exit = None;
+        // Cleared per dispatch; a handler returning a value too wide for the u32
+        // NTSTATUS (a pointer from GetWindowLongPtr, say) sets it via
+        // `return_u64_from_syscall` and the restore below honours it.
+        self.syscall_result64 = None;
 
         // Ensure the seam itself doesn't run the host handler with DF set: the
         // guest may have left DF=1, but the native handlers assume forward
@@ -388,6 +417,16 @@ impl WinOs {
         // handler lookup differs. Resolved *before* the frame save so the switch
         // is untouched.
         let handler = if index & WIN32K_TABLE_BIT != 0 {
+            if win32k_trace() {
+                // Registers are still the guest's here (the frame save and the
+                // unix-stack switch happen below), so arg0..2 read straight out.
+                eprintln!(
+                    "[w32k] {index:#06x} {:#x} {:#x} {:#x}",
+                    cpu.reg(Reg::R10),
+                    cpu.reg(Reg::Rdx),
+                    cpu.reg(Reg::R8)
+                );
+            }
             self.win32k.handler(index & !WIN32K_TABLE_BIT)
         } else {
             self.ssdt.handler(index)
@@ -421,9 +460,11 @@ impl WinOs {
             return Ok(Exit::Continue);
         }
 
-        // Phase 4: restore the non-volatile set, then return the NTSTATUS.
+        // Phase 4: restore the non-volatile set, then return the NTSTATUS — or
+        // the full 64-bit result a handler seated instead (roadmap W4.8).
         self.restore_context(cpu, mem, &saved)?;
-        cpu.set_reg(Reg::Rax, status as u64);
+        let result = self.syscall_result64.take().unwrap_or(status as u64);
+        cpu.set_reg(Reg::Rax, result);
 
         // Resume the guest at the restored `rip` (the saved return address).
         Ok(Exit::Continue)

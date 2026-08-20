@@ -644,6 +644,19 @@ impl WinOs {
         self.dll.exports.contains_key(&base).then_some(base)
     }
 
+    /// `"name+0xRVA"` for the loaded guest module containing `addr`, or `None`
+    /// when the address belongs to no mapped image. Diagnostics only — the fault
+    /// trace uses it to turn a bare rip into a place in a named DLL.
+    pub fn module_for_addr(&self, addr: u64) -> Option<String> {
+        if let Some(m) = self.dll.modules.iter().find(|m| addr >= m.base && addr < m.base + m.size) {
+            return Some(format!("{}+{:#x}", m.name, addr - m.base));
+        }
+        // Outside every image: name the nearest one below, so an address in a
+        // heap or a thunk block still says which module it sits after.
+        let m = self.dll.modules.iter().filter(|m| m.base <= addr).max_by_key(|m| m.base)?;
+        Some(format!("(after {}+{:#x})", m.name, addr - m.base))
+    }
+
     /// The absolute virtual address of `symbol` in the loaded `ntdll` image,
     /// resolved **by name** from its recorded export table (never a hardcoded
     /// RVA), or `None` if ntdll is not a loaded guest image or the symbol is

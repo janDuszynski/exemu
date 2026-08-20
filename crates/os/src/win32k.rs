@@ -76,6 +76,109 @@ const NT_USER_MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX: u32 = 0x14bb;
 const NT_GDI_EXT_TEXT_OUT_W: u32 = 0x11c9;
 const NT_GDI_RECTANGLE: u32 = 0x1259;
 
+// --- W4.8: the physdev primitive set Wine's own controls paint with ---------
+// Recovered by tracing `comctl_sample`'s pump (`EXEMU_W32K_TRACE`) and reading
+// the pinned gdi32/user32 wrappers those indices come from:
+//   user32!FillRect  @ RVA 0x2dd40 -> SelectObject(hdc, hbr)
+//                                     PatBlt(hdc, l, t, r-l, b-t, PATCOPY)
+//                                     SelectObject(hdc, previous)
+//   gdi32!PatBlt     @ RVA 0x2c490 -> tail-jmp NtGdiPatBlt, args untouched:
+//                                     (hdc, x, y, cx, cy, rop) with cy/rop the
+//                                     5th/6th (first two stack) arguments
+//   gdi32!SelectObject @ RVA 0x39e20 -> NtGdiSelectBrush for a 0x10-typed handle
+//   gdi32!CreateSolidBrush @ RVA 0x13e00 -> `xor edx,edx; jmp NtGdiCreateSolidBrush`
+//   gdi32!SetTextColor @ RVA 0x3b670 / SetBkColor @ 0x3a260 ->
+//                                     NtGdiGetAndSetDCDword(hdc, 0x66/0x64,
+//                                                           color, &previous)
+const NT_GDI_PAT_BLT: u32 = 0x124c;
+const NT_GDI_SELECT_BRUSH: u32 = 0x126c;
+const NT_GDI_SELECT_PEN: u32 = 0x126f;
+const NT_GDI_CREATE_SOLID_BRUSH: u32 = 0x10bf;
+const NT_GDI_CREATE_PEN: u32 = 0x10ba;
+const NT_GDI_GET_AND_SET_DC_DWORD: u32 = 0x11da;
+const NT_GDI_SELECT_FONT: u32 = 0x126e;
+const NT_GDI_CREATE_RECT_RGN: u32 = 0x10bb;
+const NT_GDI_DELETE_OBJECT_APP: u32 = 0x118f;
+const NT_GDI_INTERSECT_CLIP_RECT: u32 = 0x1238;
+const NT_GDI_GET_TEXT_METRICS_W: u32 = 0x1229;
+const NT_GDI_GET_TEXT_EXTENT_EX_W: u32 = 0x1227;
+
+// --- TEXTMETRICW field offsets (documented Win32 layout; all LONG/WCHAR/BYTE,
+//     so identical on 32- and 64-bit). `gdi32!GetTextMetricsW` (RVA 0x26290) is
+//     `xor r8d,r8d; jmp NtGdiGetTextMetricsW`, so the caller's buffer arrives
+//     untouched as arg1 and win32k fills it.
+const TM_HEIGHT: u64 = 0x00;
+const TM_ASCENT: u64 = 0x04;
+const TM_DESCENT: u64 = 0x08;
+const TM_INTERNAL_LEADING: u64 = 0x0C;
+const TM_EXTERNAL_LEADING: u64 = 0x10;
+const TM_AVE_CHAR_WIDTH: u64 = 0x14;
+const TM_MAX_CHAR_WIDTH: u64 = 0x18;
+const TM_WEIGHT: u64 = 0x1C;
+const TM_OVERHANG: u64 = 0x20;
+const TM_DIGITIZED_ASPECT_X: u64 = 0x24;
+const TM_DIGITIZED_ASPECT_Y: u64 = 0x28;
+const TM_FIRST_CHAR: u64 = 0x2C;
+const TM_LAST_CHAR: u64 = 0x2E;
+const TM_DEFAULT_CHAR: u64 = 0x30;
+const TM_BREAK_CHAR: u64 = 0x32;
+const TM_ITALIC: u64 = 0x34;
+const TM_UNDERLINED: u64 = 0x35;
+const TM_STRUCK_OUT: u64 = 0x36;
+const TM_PITCH_AND_FAMILY: u64 = 0x37;
+const TM_CHARSET: u64 = 0x38;
+
+/// The stand-in font's cell metrics. exemu does not track HFONT selection yet
+/// (design §5 defers it), so one cell stands in: 8 px wide, 16 px tall, the same
+/// advance the deterministic `font8x8` fallback uses. A control that lays its
+/// label out from these gets a sane box; a real per-HFONT metric set arrives with
+/// font selection.
+const STUB_FONT_CELL_W: u32 = 8;
+const STUB_FONT_CELL_H: u32 = 16;
+const STUB_FONT_DESCENT: u32 = 3;
+
+/// `SIMPLEREGION` — the region-complexity result a successful clip operation
+/// reports (`NULLREGION` = 1 means "the clip is now empty", `ERROR` = 0).
+const SIMPLEREGION: u32 = 2;
+
+/// `NtUserCallHwnd` / `NtUserCallHwndParam` / `NtUserCallOneParam` — the fan-in
+/// multiplexers (roadmap W4.8; the call-number enums are recovered from user32,
+/// see [`call_hwnd`]).
+const NT_USER_CALL_HWND: u32 = 0x1332;
+const NT_USER_CALL_HWND_PARAM: u32 = 0x1336;
+const NT_USER_CALL_ONE_PARAM: u32 = 0x133d;
+/// `NtUserSetWindowLong` / `NtUserSetWindowLongPtr` — the write half of the
+/// `GetWindowLong*` family the multiplexers read.
+const NT_USER_SET_WINDOW_LONG: u32 = 0x15a3;
+const NT_USER_SET_WINDOW_LONG_PTR: u32 = 0x15a4;
+
+// --- DC_ATTR (the guest-visible DC object) field offsets --------------------
+// Recovered from the pinned gdi32: each accessor reaches its field through
+// `get_dc_attr` (RVA 0x455f0), which walks the PEB+0xF8 handle table.
+/// DC origin x — `gdi32!GetDCOrgEx` (RVA 0x23470) reads `[dc_attr+0x48]`.
+const DC_ATTR_ORG_X: u64 = 0x48;
+/// DC origin y — the dword after it.
+const DC_ATTR_ORG_Y: u64 = 0x4C;
+/// Background colour — `gdi32!GetBkColor` (RVA 0x22430) reads `[dc_attr+0x0c]`.
+const DC_ATTR_BK_COLOR: u64 = 0x0C;
+/// Text colour — `gdi32!GetTextColor` (RVA 0x25930) reads `[dc_attr+0x18]`.
+const DC_ATTR_TEXT_COLOR: u64 = 0x18;
+
+/// `NtGdiGetAndSetDCDword` selectors, from the immediates in gdi32's setters.
+mod dc_dword {
+    /// `SetBkColor` (`gdi32!SetBkColor` RVA 0x3a260: `mov edx, 0x64`).
+    pub const BK_COLOR: u64 = 0x64;
+    /// `SetTextColor` (`gdi32!SetTextColor` RVA 0x3b670: `mov edx, 0x66`).
+    pub const TEXT_COLOR: u64 = 0x66;
+}
+
+/// `PATCOPY` — the raster op `FillRect` issues (`0x00F00021`): paint the
+/// destination with the selected brush.
+const PATCOPY: u32 = 0x00F0_0021;
+/// `BLACKNESS` / `WHITENESS` — the two constant-fill raster ops.
+const BLACKNESS: u32 = 0x0000_0042;
+const WHITENESS: u32 = 0x00FF_0062;
+
 // --- GDI shared handle-table contract (recovered from gdi32.dll disasm) -------
 // gdi32's user-mode HDC decode (`get_gdi_client_ptr` @ RVA 0x455f0) reads the
 // per-process handle-table base from PEB+0xF8 (via TEB gs:[0x30]+0x60→+0xF8),
@@ -98,19 +201,220 @@ const GDI_ENTRY_OBJECT_OFF: u64 = 0x10;
 /// Number of 24-byte slots in the published handle table. Only a handful of DCs
 /// are ever live in the gate, but a full page's worth costs nothing.
 const GDI_TABLE_SLOTS: u64 = 128;
-/// Non-zero type byte written at entry+0xE (any non-zero value passes the
-/// `byte[entry+0xE] != 0` gate; `LO_TYPE_DC`-shaped for readability).
-const GDI_ENTRY_TYPE_DC: u8 = 0x01;
-/// The `(hdc & 0x1F0000) == 0x10000` type prefilter forces bit 16 set, so every
-/// DC handle's high 16 bits are `0x0001`; the generation word must match.
-const HDC_TYPE_BITS: u32 = 0x0001_0000;
-const HDC_GENERATION: u16 = 0x0001;
-/// Size of one minimal user-mode DC object (only offsets +4/+0xA8/+0xB8 are read
-/// by gdi32; round up to cover them with slack).
+/// Non-zero "slot in use" byte written at entry+0xE. gdi32 only tests it against
+/// zero (a free slot); the *type* lives in the generation word, see [`gdi_type`].
+const GDI_ENTRY_IN_USE: u8 = 0x01;
+/// Size of one minimal user-mode GDI object (for a DC only offsets +4/+0xA8/
+/// +0xB8 are read by gdi32; round up to cover them with slack). Brushes and pens
+/// share the arena — nothing on the recovered paths dereferences theirs.
 const GDI_DC_OBJECT_SIZE: u64 = 0x100;
+
+/// GDI object types, as recovered from `gdi32!SelectObject` (RVA 0x39e20).
+///
+/// After validating the handle-table entry, `SelectObject` computes
+/// `type = (byte[entry+0x0C] & 0x7f) << 16` — i.e. **the object type is the low
+/// byte of the entry's generation word** — and dispatches on it:
+/// `0x100000` → `NtGdiSelectBrush`, `0x300000`/`0x320000` → the pen path,
+/// `0x0a0000` and below → bitmap/font/palette. The same word must equal
+/// `handle >> 16` (the entry's generation check), so **a GDI handle is
+/// `(type << 16) | slot`** and one word satisfies both gates. The pre-existing
+/// HDC encoding (`0x0001_0000 | slot`) was already exactly this rule with
+/// `type = 1`; naming it makes brushes and pens fall out.
+mod gdi_type {
+    /// A device context — what the `(hdc & 0x1F0000) == 0x10000` prefilter in
+    /// `gdi32!get_dc_attr` demands.
+    pub const DC: u16 = 0x01;
+    /// A region (`SelectObject` sends `0x040000` to its clip-region arm).
+    pub const REGION: u16 = 0x04;
+    /// A palette. **Not** recovered from the binary — `SelectObject` never sees
+    /// one (`SelectPalette` handles palettes) — so this is the documented NT GDI
+    /// value, used only to make the stock-palette slot non-empty.
+    pub const PALETTE: u16 = 0x08;
+    /// A bitmap (`SelectObject` sends `0x090000` to `NtGdiSelectBitmap`).
+    pub const BITMAP: u16 = 0x09;
+    /// A font (`SelectObject` sends `0x0a0000` to `NtGdiSelectFont`).
+    pub const FONT: u16 = 0x0a;
+    /// A brush (`SelectObject` dispatches `0x100000` to `NtGdiSelectBrush`).
+    pub const BRUSH: u16 = 0x10;
+    /// A pen (`SelectObject` accepts `0x300000` and `0x320000`, the plain and
+    /// extended pens; exemu mints the plain one).
+    pub const PEN: u16 = 0x30;
+}
+
+// --- Stock objects: fixed handle-table slots, recovered from GetStockObject ---
+//
+// `gdi32!GetStockObject` (RVA 0x25610) does **not** issue a syscall. It maps the
+// index to a fixed slot, reads `PEB[0xF8] + slot*24` directly, and — this is the
+// load-bearing part — **executes `ud2` if that entry's in-use byte is zero**
+// (the branch at RVA 0x256bb into the trap block at 0x4d770). A win32k that
+// leaves the stock slots empty therefore does not merely return NULL: it crashes
+// any Wine control that asks for a stock brush, pen or font, which is exactly
+// what `ButtonWndProc` does while painting.
+//
+// The mapping, straight out of that disassembly:
+//   index > 0x14 or index == 9      -> NULL (no table read)
+//   index 0x0a  -> slot 0x2a (96 DPI) / 0x29    | the DPI-variant fonts, each of
+//   index 0x0d  -> slot 0x2d (96 DPI) / 0x35    | which owns *two* slots chosen
+//   index 0x10  -> slot 0x30 (96 DPI) / 0x36    | by `user32!GetDpiForSystem`
+//   index 0x11  -> slot 0x31 (96 DPI) / 0x37    |
+//   anything else -> slot = index + 0x20
+// and the handle it returns is rebuilt as `(word[entry+0x0C] << 16) | slot` —
+// the same `(type << 16) | slot` encoding as every other GDI handle.
+
+/// First slot reserved for stock objects (`index + 0x20`).
+const STOCK_SLOT_BASE: u64 = 0x20;
+/// Last stock slot — `0x37`, the high-DPI variant of `DEFAULT_GUI_FONT`.
+/// Dynamic allocation starts above it so nothing overwrites a stock entry.
+const STOCK_SLOT_LAST: u64 = 0x37;
+
+/// `(slot, type, brush COLORREF)` for every stock slot exemu publishes. The
+/// colours are the documented stock-brush shades; a font/pen/palette slot has
+/// none (`None`), and `NULL_BRUSH` deliberately has none either — an unregistered
+/// brush handle is exactly the hollow brush [`nt_gdi_pat_blt`] treats as "paint
+/// nothing", which is the correct behaviour for it.
+const STOCK_OBJECTS: [(u64, u16, Option<u32>); 24] = [
+    (0x20, gdi_type::BRUSH, Some(0x00FF_FFFF)), // WHITE_BRUSH
+    (0x21, gdi_type::BRUSH, Some(0x00C0_C0C0)), // LTGRAY_BRUSH
+    (0x22, gdi_type::BRUSH, Some(0x0080_8080)), // GRAY_BRUSH
+    (0x23, gdi_type::BRUSH, Some(0x0040_4040)), // DKGRAY_BRUSH
+    (0x24, gdi_type::BRUSH, Some(0x0000_0000)), // BLACK_BRUSH
+    (0x25, gdi_type::BRUSH, None),              // NULL_BRUSH (hollow)
+    (0x26, gdi_type::PEN, None),                // WHITE_PEN
+    (0x27, gdi_type::PEN, None),                // BLACK_PEN
+    (0x28, gdi_type::PEN, None),                // NULL_PEN
+    (0x29, gdi_type::FONT, None),               // OEM_FIXED_FONT (non-96 DPI)
+    (0x2a, gdi_type::FONT, None),               // OEM_FIXED_FONT (96 DPI)
+    (0x2b, gdi_type::FONT, None),               // ANSI_FIXED_FONT
+    (0x2c, gdi_type::FONT, None),               // ANSI_VAR_FONT
+    (0x2d, gdi_type::FONT, None),               // SYSTEM_FONT (96 DPI)
+    (0x2e, gdi_type::FONT, None),               // DEVICE_DEFAULT_FONT
+    (0x2f, gdi_type::PALETTE, None),            // DEFAULT_PALETTE
+    (0x30, gdi_type::FONT, None),               // SYSTEM_FIXED_FONT (96 DPI)
+    (0x31, gdi_type::FONT, None),               // DEFAULT_GUI_FONT (96 DPI)
+    (0x32, gdi_type::BRUSH, Some(0x00FF_FFFF)), // DC_BRUSH
+    (0x33, gdi_type::PEN, None),                // DC_PEN
+    (0x34, gdi_type::BITMAP, None),             // index 0x14, the last accepted
+    (0x35, gdi_type::FONT, None),               // SYSTEM_FONT (non-96 DPI)
+    (0x36, gdi_type::FONT, None),               // SYSTEM_FIXED_FONT (non-96 DPI)
+    (0x37, gdi_type::FONT, None),               // DEFAULT_GUI_FONT (non-96 DPI)
+];
 
 /// The base of the Windows `RegisterClass` atom range (0xC000–0xFFFF).
 const CLASS_ATOM_BASE: u16 = 0xC000;
+
+/// `WS_VISIBLE` — set in a child control's creation style (a `WS_CHILD |
+/// WS_VISIBLE` control is never given its own `ShowWindow` call), so window
+/// visibility is seeded from it at creation.
+const WS_VISIBLE: u32 = 0x1000_0000;
+/// `WS_CHILD` — a child window's `hMenu` argument is its control id, not a menu.
+const WS_CHILD: u32 = 0x4000_0000;
+
+// --- WNDCLASSEXW (64-bit) field offsets the class registration reads ---------
+/// `lpfnWndProc`.
+const WNDCLASSEXW_WNDPROC: u64 = 0x08;
+/// `style`.
+const WNDCLASSEXW_STYLE: u64 = 0x04;
+/// `cbWndExtra` — bytes of per-window scratch (`cbClsExtra` precedes it at
+/// +0x10). The load-bearing field for a control's instance data.
+const WNDCLASSEXW_CB_WND_EXTRA: u64 = 0x14;
+/// `hbrBackground`.
+const WNDCLASSEXW_BACKGROUND: u64 = 0x30;
+/// Ceiling on a class's `cbWndExtra`, so a garbage read cannot ask for a huge
+/// allocation per window. Real classes reserve a few pointers.
+const WND_EXTRA_MAX: u32 = 4096;
+
+// --- `GetWindowLong*` / `SetWindowLong*` negative offsets (documented Win32) --
+/// `GWLP_WNDPROC`.
+const GWLP_WNDPROC: i64 = -4;
+/// `GWLP_HINSTANCE`.
+const GWLP_HINSTANCE: i64 = -6;
+/// `GWLP_HWNDPARENT`.
+const GWLP_HWNDPARENT: i64 = -8;
+/// `GWL_STYLE`.
+const GWL_STYLE: i64 = -16;
+/// `GWL_EXSTYLE`.
+const GWL_EXSTYLE: i64 = -20;
+/// `GWLP_USERDATA`.
+const GWLP_USERDATA: i64 = -21;
+/// `GWLP_ID`.
+const GWLP_ID: i64 = -12;
+
+// --- The `NtUserCall*` fan-in multiplexers (roadmap W4.8) -------------------
+// One syscall index carries a whole family of tiny operations, selected by a
+// trailing "call number". The numbers are **not public**; they were recovered by
+// disassembling the pinned `user32.dll`, whose thin wrapper for each public API
+// loads the selector as an immediate straight before the win32u thunk — e.g.
+//
+//   user32!GetClientRect  @ RVA 0x2eda0:  mov r8d, 0xe   ; call NtUserCallHwndParam
+//   user32!IsWindow       @ RVA 0x34c10:  mov edx, 0xa   ; call NtUserCallHwnd
+//   user32!GetSysColorBrush @ RVA 0x313e0: mov edx, 7    ; call NtUserCallOneParam
+//   user32!IsIconic       @ RVA 0x349f0:  mov rdx, -16 (GWL_STYLE); mov r8d, 0xa
+//                                         ; call NtUserCallHwndParam
+//
+// so each constant below is re-derivable from the binary, and the last of those
+// pins the *meaning* of code 0xa: `IsIconic` reads `WS_MINIMIZE` out of what it
+// returns for `GWL_STYLE`, which makes 0xa `GetWindowLong`.
+// (`crates/app/tests/comctl_gate.rs` re-derives the whole set from the pinned
+// binary so a Wine bump that renumbers them fails loudly.)
+
+/// `NtUserCallHwnd(hwnd, code)` selectors.
+mod call_hwnd {
+    /// `GetDpiForWindow`.
+    pub const GET_DPI_FOR_WINDOW: u64 = 0x02;
+    /// `GetParent`.
+    pub const GET_PARENT: u64 = 0x05;
+    /// `IsWindow`.
+    pub const IS_WINDOW: u64 = 0x0a;
+    /// `IsWindowEnabled`.
+    pub const IS_WINDOW_ENABLED: u64 = 0x0b;
+    /// `IsWindowUnicode`.
+    pub const IS_WINDOW_UNICODE: u64 = 0x0c;
+    /// `IsWindowVisible`.
+    pub const IS_WINDOW_VISIBLE: u64 = 0x0d;
+    /// The "does this window belong to the calling thread" probe every
+    /// `GetWindowText` / `SetWindowText` / `GetWindowModuleFileName` makes first
+    /// (recovered from `user32!SetWindowTextW` @ RVA 0x47590, which sends the
+    /// message itself when this answers non-zero).
+    pub const IS_SELF_THREAD: u64 = 0x10;
+}
+
+/// `NtUserCallHwndParam(hwnd, param, code)` selectors.
+mod call_hwnd_param {
+    /// `GetWindowLong{A,W}` — `param` is the offset, sign-extended.
+    pub const GET_WINDOW_LONG: u64 = 0x0a;
+    /// `GetWindowLongPtrA`.
+    pub const GET_WINDOW_LONG_PTR_A: u64 = 0x0b;
+    /// `GetWindowLongPtrW`.
+    pub const GET_WINDOW_LONG_PTR_W: u64 = 0x0c;
+    /// `GetWindowRect` — `param` → `{ RECT *rect; DWORD dpi_context; }`.
+    pub const GET_WINDOW_RECT: u64 = 0x0d;
+    /// `GetClientRect` — same `param` shape as [`GET_WINDOW_RECT`].
+    pub const GET_CLIENT_RECT: u64 = 0x0e;
+    /// `IsChild` — `param` is the candidate parent HWND.
+    pub const IS_CHILD: u64 = 0x13;
+}
+
+/// `NtUserCallOneParam(arg, code)` selectors.
+mod call_one_param {
+    /// `GetSysColor` — `arg` is the `COLOR_*` index.
+    pub const GET_SYS_COLOR: u64 = 0x06;
+    /// `GetSysColorBrush` — `arg` is the `COLOR_*` index.
+    pub const GET_SYS_COLOR_BRUSH: u64 = 0x07;
+    /// `GetSystemMetrics` — `arg` is the `SM_*` index.
+    pub const GET_SYSTEM_METRICS: u64 = 0x09;
+}
+
+/// The `{ RECT *rect; DWORD dpi_context; }` block `GetWindowRect`/`GetClientRect`
+/// pass as `param` (recovered from `user32!GetClientRect`, which stores the
+/// caller's `RECT*` at +0 and `(dpi_ctx >> 8) & 0x1ff` at +8). exemu is 96 DPI
+/// throughout, so only the pointer is read.
+const CALL_RECT_PARAM_RECT: u64 = 0x00;
+
+/// Longest parent chain any ancestry walk will follow. Bounds every
+/// `surface_owner` / `client_origin` / `chain_visible` loop so a cyclic or
+/// corrupted parent link degrades to "treat it as top-level" instead of hanging
+/// a syscall handler. Real window nesting is a handful deep.
+const WINDOW_ANCESTRY_MAX: usize = 64;
 
 // --- user32's built-in control WndProcs, via the client-PFN arrays (W6.2) ----
 // Wine's split leaves the built-in control classes (BUTTON / EDIT / STATIC /
@@ -199,6 +503,19 @@ const BUILTIN_CLASSES: [(&str, usize); 14] = [
 /// belong to the system, not to one module's instance.
 const BUILTIN_CLASS_STYLE: u32 = 0x4000 | 0x0008 | 0x0080;
 
+/// `cbWndExtra` reserved for each built-in control class (roadmap W4.8).
+///
+/// A registered class states its own `cbWndExtra`, but the built-ins are
+/// registered by the *kernel* side — which for Wine is `win32u.so`, a binary
+/// exemu does not have and cannot disassemble. What the PE side does show is
+/// the **use**: user32's `ButtonWndProc` and comctl32's `ProgressWindowProc`
+/// both store one instance pointer at offset 0 (`SetWindowLongPtr(hwnd, 0, p)`
+/// during `WM_NCCREATE`) and read it back on every message. So exemu reserves a
+/// generous fixed block rather than pretending to know the real number; a
+/// control that stored past it would read back 0, which is the same honest
+/// failure as before rather than a silent corruption.
+const BUILTIN_WND_EXTRA: u32 = 8 * 8;
+
 /// `CW_USEDEFAULT` — the "let the manager choose" sentinel for x/y/cx/cy. Read
 /// as an i32 it is negative (0x80000000); substitute a sane default before
 /// storing the window and calling the driver, since a headless driver has no
@@ -266,12 +583,19 @@ const ENUM_REGISTRY_SETTINGS: u32 = 0xFFFF_FFFE;
 /// A registered window class. `name` keys the registry (atom lookup on
 /// CreateWindow / GetClassInfoEx); `wndproc`/`style`/`background` are stored for
 /// the WndProc kernel-callback + paint path (W4.3/W4.6) but not yet read.
-#[allow(dead_code)] // wndproc/style/background: consumed by W4.3/W4.6.
+#[allow(dead_code)] // style/background: consumed by W4.3/W4.6.
 struct Class {
     name: String,
     wndproc: u64,
     style: u32,
     background: u64,
+    /// `cbWndExtra` — bytes of per-window scratch the class reserves
+    /// ([`WNDCLASSEXW_CB_WND_EXTRA`]). **This is where a Wine control keeps its
+    /// instance-data pointer**: `ButtonWndProc` / `ProgressWindowProc` store it
+    /// at offset 0 with `SetWindowLongPtr` during `WM_NCCREATE` and read it back
+    /// with `GetWindowLongPtr` on every later message, so a class whose extra
+    /// bytes do not persist has a control that cannot function.
+    wnd_extra: u32,
 }
 
 /// A live window object. The HWND is an opaque monotonic counter (the recovered
@@ -301,8 +625,23 @@ struct Window {
     needs_paint: bool,
     /// The per-window backing surface (W4.3), allocated lazily on the first
     /// GetDC/BeginPaint. Top-down BGRA32, guest-mapped so gdi32's PE code and
-    /// the presenter share one allocation.
+    /// the presenter share one allocation. Only a [`surface_owner`] carries one;
+    /// a child window's stays `None` and it renders into its ancestor's.
+    ///
+    /// [`surface_owner`]: Win32kState::surface_owner
     surface: Option<Surface>,
+    /// The class's `cbWndExtra` scratch bytes, zero-initialized at creation
+    /// (roadmap W4.8). Read and written through `GetWindowLongPtr` /
+    /// `SetWindowLongPtr` at non-negative offsets — the store every Wine control
+    /// keeps its instance data in.
+    extra: Vec<u8>,
+    /// `GWLP_USERDATA` — the one negative slot with no other home.
+    user_data: u64,
+    /// `GWLP_ID` — the control id, taken from the `hMenu` argument of a child
+    /// window's `CreateWindowEx` (documented Win32 overload).
+    id: u64,
+    /// `GWLP_HINSTANCE`.
+    instance: u64,
 }
 
 /// A per-window backing surface (W4.3): a guest-mapped top-down BGRA32 DIB the
@@ -315,11 +654,39 @@ struct Surface {
     h: u32,
 }
 
-/// A device context bound to a window (W4.3). Every HDC handed back by
+/// A device context bound to a window (W4.3 / W4.8). Every HDC handed back by
 /// GetDC/GetDCEx/BeginPaint records the hwnd it draws into so the NtGdi paint
 /// handlers can resolve `hdc → hwnd → surface`.
+///
+/// **The child-window half (W4.8).** A child window has no surface of its own —
+/// it renders into its top-level ancestor's, which is what makes its pixels
+/// appear inside the parent. The DC therefore carries the two things that turns
+/// "the window's own client coordinates" (what gdi32 hands the kernel) into
+/// "surface coordinates": an **origin** (`org`, the window's client origin
+/// inside the surface owner) and a **clip rect** (`clip`, the visible slice of
+/// that surface the window may touch, already intersected with every ancestor's
+/// client rect). Both are computed once, at DC allocation, by
+/// [`window_visible_rect`].
 struct Dc {
+    /// The window the DC draws for (**not** necessarily the surface owner).
     hwnd: u32,
+    /// The currently selected brush handle, or 0 for "none".
+    ///
+    /// Windows starts a DC on `WHITE_BRUSH`; exemu starts it on *nothing*, and
+    /// [`nt_gdi_pat_blt`] treats that as the hollow brush. The divergence is
+    /// deliberate and bounded: every recovered paint path selects a brush before
+    /// it fills (`user32!FillRect` does `SelectObject` → `PatBlt(PATCOPY)` →
+    /// restore), so nothing reaches the fill without one — and "fills nothing"
+    /// is a visible, debuggable failure, where a default white would silently
+    /// blank whatever the parent had already drawn underneath a control.
+    brush: u32,
+    /// The window's client origin in surface coordinates: every logical `(x, y)`
+    /// a GDI primitive is given is offset by this before it hits a pixel.
+    org: (i32, i32),
+    /// The visible rect in surface coordinates, `[left, top, right, bottom)` —
+    /// nothing outside it is drawn. For a top-level window this is the whole
+    /// client area; for a child it is its rect clipped by every ancestor.
+    clip: [i32; 4],
 }
 
 /// win32k unix-backend state (roadmap W4.1/W4.2): the client PFN table, the
@@ -351,6 +718,15 @@ pub(crate) struct Win32kState {
     /// Live device contexts, keyed by HDC. Binds each HDC to its window +
     /// handle-table slot for the GDI paint path (W4.3).
     dcs: Vec<(u32, Dc)>,
+    /// Live brushes, `handle → COLORREF` (roadmap W4.8). A brush is the only
+    /// GDI object the recovered paint paths actually consume: `FillRect` selects
+    /// one and `PatBlt`s `PATCOPY` with it.
+    brushes: Vec<(u32, u32)>,
+    /// `GetSysColorBrush` cache, `COLOR_* index → handle`. Windows hands back the
+    /// *same* handle for a given index every time (the caller must not delete
+    /// it), so this both matches the contract and stops a repainting control
+    /// from exhausting the handle table.
+    sys_brushes: Vec<(u32, u32)>,
     /// Guest base of the GDI shared handle table (published at PEB+0xF8), or 0
     /// before the first HDC is allocated. Lazily mapped by `ensure_gdi_table`.
     gdi_table_base: u64,
@@ -387,20 +763,117 @@ impl Win32kState {
         self.window(hwnd).map(|w| w.wndproc).unwrap_or(0)
     }
 
-    /// The first shown window — the target for synthesized native input
-    /// (roadmap W4.6). Single top-level window is the model for now.
+    /// The first shown *top-level* window — the target for synthesized native
+    /// input (roadmap W4.6). Child windows never take raw input directly; the
+    /// hit-test that routes a click to a control is W6-follow-up work.
     fn shown_window(&self) -> Option<u32> {
-        self.windows.iter().find(|(_, w)| w.shown).map(|(h, _)| *h)
+        self.windows
+            .iter()
+            .find(|(h, w)| w.shown && self.surface_owner(*h) == *h)
+            .map(|(h, _)| *h)
     }
 
-    /// A shown window owing a WM_PAINT, clearing its flag. Used by the pump to
-    /// synthesize a WM_PAINT when the queue is empty.
+    /// A window owing a WM_PAINT, clearing its flag. Used by the pump to
+    /// synthesize a WM_PAINT when the queue is empty. A window counts as
+    /// paintable when it is visible *and every ancestor is* — a child of a
+    /// hidden parent paints nothing, exactly as on Windows.
     fn take_paint_pending(&mut self) -> Option<u32> {
-        let hwnd = self.windows.iter().find(|(_, w)| w.needs_paint && w.shown).map(|(h, _)| *h)?;
+        let hwnd = self
+            .windows
+            .iter()
+            .find(|(h, w)| w.needs_paint && self.chain_visible(*h))
+            .map(|(h, _)| *h)?;
         if let Some(w) = self.window_mut(hwnd) {
             w.needs_paint = false;
         }
         Some(hwnd)
+    }
+
+    /// Is `hwnd` visible *and* is every ancestor up to the top level visible?
+    /// A `WS_CHILD` window is created with `WS_VISIBLE` already in its style and
+    /// never gets its own `ShowWindow` call, so its `shown` flag is seeded from
+    /// [`WS_VISIBLE`] at creation.
+    fn chain_visible(&self, hwnd: u32) -> bool {
+        let mut cur = hwnd;
+        for _ in 0..WINDOW_ANCESTRY_MAX {
+            let Some(w) = self.window(cur) else { return false };
+            if !w.shown {
+                return false;
+            }
+            if w.parent == 0 || self.window(w.parent).is_none() {
+                return true;
+            }
+            cur = w.parent;
+        }
+        false
+    }
+
+    /// The window that owns the backing surface `hwnd` renders into: itself if
+    /// it is top-level, otherwise its top-most mapped ancestor (roadmap W4.8).
+    ///
+    /// **This is the child-window painting model.** Wine gives a surface to a
+    /// window that has somewhere to *put* pixels — a top-level window backed by
+    /// a native window. A child has none: it draws into its ancestor's surface
+    /// through a DC carrying an origin offset and a clip region ([`Dc`]), which
+    /// is why a control's pixels land inside its parent. Walking the chain is
+    /// bounded so a corrupted parent link cannot hang the handler.
+    fn surface_owner(&self, hwnd: u32) -> u32 {
+        let mut cur = hwnd;
+        for _ in 0..WINDOW_ANCESTRY_MAX {
+            let Some(w) = self.window(cur) else { return cur };
+            if w.parent == 0 || self.window(w.parent).is_none() {
+                return cur;
+            }
+            cur = w.parent;
+        }
+        cur
+    }
+
+    /// `hwnd`'s client origin **in its surface owner's coordinates** — the sum of
+    /// every intervening child's `(x, y)`. `(0, 0)` for a top-level window.
+    fn client_origin(&self, hwnd: u32) -> (i32, i32) {
+        let (mut ox, mut oy) = (0i32, 0i32);
+        let mut cur = hwnd;
+        for _ in 0..WINDOW_ANCESTRY_MAX {
+            let Some(w) = self.window(cur) else { break };
+            if w.parent == 0 || self.window(w.parent).is_none() {
+                break;
+            }
+            ox += w.rect[0];
+            oy += w.rect[1];
+            cur = w.parent;
+        }
+        (ox, oy)
+    }
+
+    /// `hwnd`'s visible rect in surface coordinates, `[left, top, right, bottom)`
+    /// — its client rect at [`client_origin`], intersected with every ancestor's
+    /// client rect so a control can never paint outside its parent. An empty
+    /// result (`right <= left`) means the window is entirely clipped away.
+    fn window_visible_rect(&self, hwnd: u32) -> [i32; 4] {
+        let (ox, oy) = self.client_origin(hwnd);
+        let Some(w) = self.window(hwnd) else { return [0; 4] };
+        let (cx, cy) = client_size(w);
+        let mut r = [ox, oy, ox + cx as i32, oy + cy as i32];
+        // Clip against each ancestor's client rect, expressed in the same
+        // surface coordinates.
+        let mut cur = hwnd;
+        for _ in 0..WINDOW_ANCESTRY_MAX {
+            let Some(w) = self.window(cur) else { break };
+            let parent = w.parent;
+            if parent == 0 || self.window(parent).is_none() {
+                break;
+            }
+            let (px, py) = self.client_origin(parent);
+            let Some(p) = self.window(parent) else { break };
+            let (pcx, pcy) = client_size(p);
+            r[0] = r[0].max(px);
+            r[1] = r[1].max(py);
+            r[2] = r[2].min(px + pcx as i32);
+            r[3] = r[3].min(py + pcy as i32);
+            cur = parent;
+        }
+        r
     }
 
     fn window_mut(&mut self, hwnd: u32) -> Option<&mut Window> {
@@ -463,9 +936,29 @@ pub(crate) fn register(os: &mut WinOs) {
         NT_USER_MSG_WAIT_FOR_MULTIPLE_OBJECTS_EX,
         nt_user_msg_wait_for_multiple_objects_ex,
     );
+    // The NtUserCall* fan-in multiplexers + the window-long store (W4.8) — what
+    // a real control consults on every message it handles.
+    os.set_win32k_handler(NT_USER_CALL_HWND, nt_user_call_hwnd);
+    os.set_win32k_handler(NT_USER_CALL_HWND_PARAM, nt_user_call_hwnd_param);
+    os.set_win32k_handler(NT_USER_CALL_ONE_PARAM, nt_user_call_one_param);
+    os.set_win32k_handler(NT_USER_SET_WINDOW_LONG, nt_user_set_window_long);
+    os.set_win32k_handler(NT_USER_SET_WINDOW_LONG_PTR, nt_user_set_window_long_ptr);
     // NtGdi paint path (W4.3): rasterize into the per-window surface.
     os.set_win32k_handler(NT_GDI_EXT_TEXT_OUT_W, nt_gdi_ext_text_out_w);
     os.set_win32k_handler(NT_GDI_RECTANGLE, nt_gdi_rectangle);
+    // The physdev primitive set (W4.8): brush/pen objects + the fill blitter.
+    os.set_win32k_handler(NT_GDI_CREATE_SOLID_BRUSH, nt_gdi_create_solid_brush);
+    os.set_win32k_handler(NT_GDI_CREATE_PEN, nt_gdi_create_pen);
+    os.set_win32k_handler(NT_GDI_SELECT_BRUSH, nt_gdi_select_brush);
+    os.set_win32k_handler(NT_GDI_SELECT_PEN, nt_gdi_select_pen);
+    os.set_win32k_handler(NT_GDI_PAT_BLT, nt_gdi_pat_blt);
+    os.set_win32k_handler(NT_GDI_GET_AND_SET_DC_DWORD, nt_gdi_get_and_set_dc_dword);
+    os.set_win32k_handler(NT_GDI_SELECT_FONT, nt_gdi_select_font);
+    os.set_win32k_handler(NT_GDI_CREATE_RECT_RGN, nt_gdi_create_rect_rgn);
+    os.set_win32k_handler(NT_GDI_DELETE_OBJECT_APP, nt_gdi_delete_object_app);
+    os.set_win32k_handler(NT_GDI_INTERSECT_CLIP_RECT, nt_gdi_intersect_clip_rect);
+    os.set_win32k_handler(NT_GDI_GET_TEXT_METRICS_W, nt_gdi_get_text_metrics_w);
+    os.set_win32k_handler(NT_GDI_GET_TEXT_EXTENT_EX_W, nt_gdi_get_text_extent_ex_w);
 }
 
 /// Allocate a fresh nonzero handle (HWND/HDC) from the shared handle space. The
@@ -716,6 +1209,7 @@ fn register_builtin_classes(os: &mut WinOs) {
                 wndproc,
                 style: BUILTIN_CLASS_STYLE,
                 background: 0,
+                wnd_extra: BUILTIN_WND_EXTRA,
             },
         ));
     }
@@ -769,10 +1263,15 @@ fn nt_user_register_class_ex_wow(
     let name_ptr = os.syscall_arg(cpu, mem, 1)?;
     let name = read_unicode_string(mem, name_ptr)?;
 
-    let (style, wndproc, background) = if wc != 0 {
-        (mem.read_u32(wc + 0x04)?, mem.read_u64(wc + 0x08)?, mem.read_u64(wc + 0x30)?)
+    let (style, wndproc, background, wnd_extra) = if wc != 0 {
+        (
+            mem.read_u32(wc + WNDCLASSEXW_STYLE)?,
+            mem.read_u64(wc + WNDCLASSEXW_WNDPROC)?,
+            mem.read_u64(wc + WNDCLASSEXW_BACKGROUND)?,
+            mem.read_u32(wc + WNDCLASSEXW_CB_WND_EXTRA)?.min(WND_EXTRA_MAX),
+        )
     } else {
-        (0, 0, 0)
+        (0, 0, 0, 0)
     };
 
     // A duplicate registration of the same name reuses its atom (matches
@@ -784,7 +1283,7 @@ fn nt_user_register_class_ex_wow(
     let atom = CLASS_ATOM_BASE.wrapping_add(os.win32k_state.classes.len() as u16);
     os.win32k_state
         .classes
-        .push((atom, Class { name, wndproc, style, background }));
+        .push((atom, Class { name, wndproc, style, background, wnd_extra }));
     Ok(atom as u32)
 }
 
@@ -835,8 +1334,11 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     // Resolve the class atom from the registered name so the driver + window
     // carry a stable identifier; 0 when the class was never registered.
     let class_atom = os.win32k_state.class_by_name(&class_name).unwrap_or(0);
-    // The class WndProc is the guest procedure NtUserDispatchMessage invokes.
-    let wndproc = os.win32k_state.class_by_atom(class_atom).map(|c| c.wndproc).unwrap_or(0);
+    // The class WndProc is the guest procedure NtUserDispatchMessage invokes;
+    // `cbWndExtra` sizes the per-window scratch a control keeps its state in.
+    let class = os.win32k_state.class_by_atom(class_atom);
+    let wndproc = class.map(|c| c.wndproc).unwrap_or(0);
+    let wnd_extra = class.map(|c| c.wnd_extra).unwrap_or(0) as usize;
 
     let hwnd = alloc_handle(os);
     os.win32k_state.windows.push((
@@ -849,10 +1351,21 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
             style,
             ex_style,
             parent,
-            shown: false,
+            // A `WS_CHILD | WS_VISIBLE` control is visible the moment it is
+            // created — nothing ever calls `ShowWindow` on it — so seed
+            // visibility (and the WM_PAINT it is owed) straight from the style.
+            // A top-level window's `WS_VISIBLE` is honoured for the same reason.
+            shown: style & WS_VISIBLE != 0,
             wndproc,
-            needs_paint: false,
+            needs_paint: style & WS_VISIBLE != 0,
             surface: None,
+            extra: vec![0u8; wnd_extra],
+            user_data: 0,
+            // A child window's `hMenu` argument is its control id (the
+            // documented `CreateWindowEx` overload); a top-level window's is a
+            // real menu handle and has no id.
+            id: if style & WS_CHILD != 0 { menu } else { 0 },
+            instance,
         },
     ));
 
@@ -1096,6 +1609,233 @@ fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
     dispatch_to_wndproc(os, cpu, mem, hwnd as u64, msg, wparam, lparam)
 }
 
+/// The system colour for a documented `COLOR_*` index, as a `COLORREF`
+/// (`0x00BBGGRR`). These are the classic (non-themed) Windows values — the
+/// palette Wine's own built-in controls draw with when no theme is active,
+/// which is exemu's case (`uxtheme` reports no active theme).
+///
+/// Indices outside the table answer `COLOR_BTNFACE`'s grey rather than black, so
+/// an unlisted element is drawn in a plausible neutral instead of a hole.
+fn sys_color(index: u32) -> u32 {
+    const COLOR_WINDOW: u32 = 5;
+    const COLOR_WINDOWFRAME: u32 = 6;
+    const COLOR_WINDOWTEXT: u32 = 8;
+    const COLOR_BTNSHADOW: u32 = 16;
+    const COLOR_GRAYTEXT: u32 = 17;
+    const COLOR_BTNTEXT: u32 = 18;
+    const COLOR_BTNHIGHLIGHT: u32 = 20;
+    const COLOR_3DDKSHADOW: u32 = 21;
+    const COLOR_3DLIGHT: u32 = 22;
+    const COLOR_HIGHLIGHT: u32 = 13;
+    const COLOR_HIGHLIGHTTEXT: u32 = 14;
+    const GREY: u32 = 0x00C0_C0C0;
+    match index {
+        COLOR_WINDOW | COLOR_BTNHIGHLIGHT => 0x00FF_FFFF,
+        COLOR_WINDOWFRAME | COLOR_WINDOWTEXT | COLOR_BTNTEXT | COLOR_3DDKSHADOW => 0x0000_0000,
+        COLOR_BTNSHADOW | COLOR_GRAYTEXT => 0x0080_8080,
+        COLOR_3DLIGHT => 0x00E0_E0E0,
+        COLOR_HIGHLIGHT => 0x0080_0000,
+        COLOR_HIGHLIGHTTEXT => 0x00FF_FFFF,
+        _ => GREY, // COLOR_BTNFACE and everything unlisted
+    }
+}
+
+/// A documented `SM_*` system metric. Only the ones a control consults while
+/// painting are answered; the rest report 0, which is the honest "no such
+/// metric" and never a fabricated size.
+fn system_metric(index: u32) -> u32 {
+    const SM_CXSCREEN: u32 = 0;
+    const SM_CYSCREEN: u32 = 1;
+    const SM_CXBORDER: u32 = 5;
+    const SM_CYBORDER: u32 = 6;
+    const SM_CXEDGE: u32 = 45;
+    const SM_CYEDGE: u32 = 46;
+    match index {
+        SM_CXSCREEN => 1920,
+        SM_CYSCREEN => 1080,
+        SM_CXBORDER | SM_CYBORDER => 1,
+        SM_CXEDGE | SM_CYEDGE => 2,
+        _ => 0,
+    }
+}
+
+// ================= W4.8: the NtUserCall* fan-in multiplexers =================
+
+/// `NtUserCallHwnd(hwnd, code)` — the one-argument window query family.
+///
+/// Every unrecognised selector returns 0, the same honest "no" the blanket stub
+/// gave, so adding a member here can only ever turn a false answer true.
+fn nt_user_call_hwnd(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let code = os.syscall_arg(cpu, mem, 1)?;
+    let st = &os.win32k_state;
+    Ok(match code {
+        call_hwnd::IS_WINDOW => st.window(hwnd).is_some() as u32,
+        // Nothing disables a window yet; a live window is enabled.
+        call_hwnd::IS_WINDOW_ENABLED => st.window(hwnd).is_some() as u32,
+        // Every class exemu registers is Unicode (the `RegisterClassExWOW` ansi
+        // flag is not tracked yet), and so is every Wine built-in.
+        call_hwnd::IS_WINDOW_UNICODE => st.window(hwnd).is_some() as u32,
+        call_hwnd::IS_WINDOW_VISIBLE => st.chain_visible(hwnd) as u32,
+        call_hwnd::GET_PARENT => st.window(hwnd).map(|w| w.parent).unwrap_or(0),
+        call_hwnd::GET_DPI_FOR_WINDOW => 96,
+        // Single-threaded guest: every window belongs to the calling thread, so
+        // `SetWindowTextW` sends `WM_SETTEXT` itself instead of failing.
+        call_hwnd::IS_SELF_THREAD => st.window(hwnd).is_some() as u32,
+        _ => 0,
+    })
+}
+
+/// `NtUserCallHwndParam(hwnd, param, code)` — the two-argument window family:
+/// the `GetWindowLong*` readers and the rect queries.
+fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let param = os.syscall_arg(cpu, mem, 1)?;
+    let code = os.syscall_arg(cpu, mem, 2)?;
+    match code {
+        call_hwnd_param::GET_WINDOW_LONG
+        | call_hwnd_param::GET_WINDOW_LONG_PTR_A
+        | call_hwnd_param::GET_WINDOW_LONG_PTR_W => {
+            let value = get_window_long(os, hwnd, param as i64);
+            // A 64-bit result cannot come back through the u32 syscall return, so
+            // seat it in RAX directly and tell the dispatcher to leave it alone.
+            os.return_u64_from_syscall(value);
+            Ok(0)
+        }
+        call_hwnd_param::GET_WINDOW_RECT | call_hwnd_param::GET_CLIENT_RECT => {
+            let Some(w) = os.win32k_state.window(hwnd) else { return Ok(0) };
+            let (cx, cy) = client_size(w);
+            // `GetClientRect` is always origin-relative; `GetWindowRect` is in
+            // screen coordinates, which for a child is its ancestors' origins
+            // summed plus the top-level window's own screen position.
+            let rect = if code == call_hwnd_param::GET_CLIENT_RECT {
+                [0, 0, cx as i32, cy as i32]
+            } else {
+                let owner = os.win32k_state.surface_owner(hwnd);
+                let (ox, oy) = os.win32k_state.client_origin(hwnd);
+                let screen = os.win32k_state.window(owner).map(|w| (w.rect[0], w.rect[1])).unwrap_or((0, 0));
+                let (x, y) = (screen.0 + ox, screen.1 + oy);
+                [x, y, x + cx as i32, y + cy as i32]
+            };
+            let out = mem.read_u64(param + CALL_RECT_PARAM_RECT)?;
+            if out == 0 {
+                return Ok(0);
+            }
+            for (i, v) in rect.iter().enumerate() {
+                mem.write_u32(out + (i as u64) * 4, *v as u32)?;
+            }
+            Ok(1)
+        }
+        call_hwnd_param::IS_CHILD => {
+            let ancestor = param as u32;
+            let mut cur = os.win32k_state.window(hwnd).map(|w| w.parent).unwrap_or(0);
+            for _ in 0..WINDOW_ANCESTRY_MAX {
+                if cur == 0 {
+                    return Ok(0);
+                }
+                if cur == ancestor {
+                    return Ok(1);
+                }
+                cur = os.win32k_state.window(cur).map(|w| w.parent).unwrap_or(0);
+            }
+            Ok(0)
+        }
+        _ => Ok(0),
+    }
+}
+
+/// `NtUserCallOneParam(arg, code)` — the system-metric / system-colour family.
+fn nt_user_call_one_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let arg = os.syscall_arg(cpu, mem, 0)?;
+    let code = os.syscall_arg(cpu, mem, 1)?;
+    match code {
+        call_one_param::GET_SYS_COLOR => Ok(sys_color(arg as u32)),
+        call_one_param::GET_SYS_COLOR_BRUSH => {
+            // A stock system brush: a real GDI handle carrying the colour, so a
+            // control's `FillRect(hdc, &r, GetSysColorBrush(COLOR_BTNFACE))`
+            // paints the right shade.
+            let h = sys_color_brush(os, mem, arg as u32)?;
+            Ok(h)
+        }
+        call_one_param::GET_SYSTEM_METRICS => Ok(system_metric(arg as u32)),
+        _ => Ok(0),
+    }
+}
+
+/// Read a window's `GetWindowLong*` slot. Negative offsets are the documented
+/// named fields; a non-negative offset indexes the class's `cbWndExtra` scratch
+/// as a little-endian qword — which is where a Wine control keeps its instance
+/// data. An out-of-range offset reads 0 rather than faulting.
+fn get_window_long(os: &WinOs, hwnd: u32, offset: i64) -> u64 {
+    let Some(w) = os.win32k_state.window(hwnd) else { return 0 };
+    match offset {
+        GWL_STYLE => w.style as u64,
+        GWL_EXSTYLE => w.ex_style as u64,
+        GWLP_WNDPROC => w.wndproc,
+        GWLP_HINSTANCE => w.instance,
+        GWLP_HWNDPARENT => w.parent as u64,
+        GWLP_USERDATA => w.user_data,
+        GWLP_ID => w.id,
+        off if off >= 0 => {
+            let off = off as usize;
+            if off + 8 > w.extra.len() {
+                return 0;
+            }
+            u64::from_le_bytes(w.extra[off..off + 8].try_into().unwrap_or([0; 8]))
+        }
+        _ => 0,
+    }
+}
+
+/// Write a window's `SetWindowLong*` slot, returning the previous value. The
+/// mirror of [`get_window_long`]; an out-of-range offset is a no-op returning 0.
+fn set_window_long(os: &mut WinOs, hwnd: u32, offset: i64, value: u64) -> u64 {
+    let previous = get_window_long(os, hwnd, offset);
+    let Some(w) = os.win32k_state.window_mut(hwnd) else { return 0 };
+    match offset {
+        GWL_STYLE => w.style = value as u32,
+        GWL_EXSTYLE => w.ex_style = value as u32,
+        GWLP_WNDPROC => w.wndproc = value,
+        GWLP_HINSTANCE => w.instance = value,
+        GWLP_USERDATA => w.user_data = value,
+        GWLP_ID => w.id = value,
+        off if off >= 0 => {
+            let off = off as usize;
+            if off + 8 <= w.extra.len() {
+                w.extra[off..off + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        _ => {}
+    }
+    previous
+}
+
+/// `NtUserSetWindowLong(hwnd, offset, value, ansi)` /
+/// `NtUserSetWindowLongPtr(hwnd, offset, value, ansi)` — the write half of
+/// [`set_window_long`]. The offset arrives sign-extended; the 32-bit form
+/// truncates its value, the pointer form does not.
+fn nt_user_set_window_long(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let offset = os.syscall_arg(cpu, mem, 1)? as i32 as i64;
+    let value = os.syscall_arg(cpu, mem, 2)? as u32 as u64;
+    let previous = set_window_long(os, hwnd, offset, value);
+    Ok(previous as u32)
+}
+
+/// `NtUserSetWindowLongPtr` — as above but full-width in and out.
+fn nt_user_set_window_long_ptr(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let offset = os.syscall_arg(cpu, mem, 1)? as i32 as i64;
+    let value = os.syscall_arg(cpu, mem, 2)?;
+    let previous = set_window_long(os, hwnd, offset, value);
+    os.return_u64_from_syscall(previous);
+    Ok(0)
+}
+
 /// `NtUserInternalGetWindowText(hwnd, buffer, maxCount)` — the kernel-side text
 /// reader backing `GetWindowTextW`'s fast path. Copy the stored title into the
 /// guest buffer (bounded by `maxCount` WCHARs incl. terminator), return the
@@ -1166,8 +1906,30 @@ fn ensure_gdi_table(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
     }
     os.win32k_state.gdi_table_base = table;
     os.win32k_state.gdi_dc_arena = arena;
-    os.win32k_state.gdi_next_slot = 1; // slot 0 reserved (index 0 == null)
-    true
+    // Dynamic objects start above the stock block so nothing can overwrite a
+    // slot `GetStockObject` reads directly (slot 0 stays reserved: index 0 would
+    // make `handle & 0xFFFF == 0`, indistinguishable from a null handle).
+    os.win32k_state.gdi_next_slot = STOCK_SLOT_LAST + 1;
+    publish_stock_objects(os, mem).is_ok()
+}
+
+/// Fill the fixed stock-object slots ([`STOCK_OBJECTS`]) so `gdi32!GetStockObject`
+/// finds a live entry instead of executing its `ud2`, and register the stock
+/// brushes' colours so selecting one really fills.
+fn publish_stock_objects(os: &mut WinOs, mem: &mut dyn Memory) -> Result<()> {
+    let (table, arena) = (os.win32k_state.gdi_table_base, os.win32k_state.gdi_dc_arena);
+    for (slot, ty, color) in STOCK_OBJECTS {
+        debug_assert!((STOCK_SLOT_BASE..=STOCK_SLOT_LAST).contains(&slot));
+        let entry = table + slot * GDI_ENTRY_SIZE;
+        mem.write_u16(entry + GDI_ENTRY_GENERATION_OFF, ty)?;
+        mem.write_u8(entry + GDI_ENTRY_TYPE_OFF, GDI_ENTRY_IN_USE)?;
+        mem.write_u64(entry + GDI_ENTRY_OBJECT_OFF, arena + slot * GDI_DC_OBJECT_SIZE)?;
+        if let Some(color) = color {
+            let handle = ((ty as u32) << 16) | (slot as u32);
+            os.win32k_state.brushes.push((handle, color));
+        }
+    }
+    Ok(())
 }
 
 /// Allocate a GDI-formatted HDC bound to `hwnd`: claim a table slot, fill its
@@ -1175,45 +1937,99 @@ fn ensure_gdi_table(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
 /// accepts it, and zero the DC object (offsets +4/+0xA8/+0xB8 = 0 → the direct
 /// syscall fast path). Returns 0 if the table could not be published or the
 /// slots are exhausted.
+///
+/// The DC captures `hwnd`'s origin and visible rect **in surface coordinates**
+/// (roadmap W4.8), so a child control's primitives land inside its parent's
+/// backing store, clipped to the child. gdi32 cannot compute that itself: the
+/// user-mode DC object exemu publishes carries no origin fields, so every
+/// coordinate arrives in the window's own client space and the offset is applied
+/// here, kernel-side.
 fn alloc_dc(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<u32> {
+    let (hdc, obj) = match alloc_gdi_object(os, mem, gdi_type::DC)? {
+        Some(v) => v,
+        None => return Ok(0),
+    };
+    let org = os.win32k_state.client_origin(hwnd);
+    let clip = os.win32k_state.window_visible_rect(hwnd);
+    // Publish the DC origin where gdi32 reads it. `gdi32!GetDCOrgEx` (RVA
+    // 0x23470) answers straight out of `dc_attr[+0x48]` / `[+0x4c]` and issues no
+    // syscall — across the whole DLL those two dwords are read and never written,
+    // so the kernel side is the only thing that can fill them. A child control
+    // asking where its DC sits therefore gets its real offset in the parent.
+    mem.write_u32(obj + DC_ATTR_ORG_X, org.0 as u32)?;
+    mem.write_u32(obj + DC_ATTR_ORG_Y, org.1 as u32)?;
+    os.win32k_state.dcs.push((hdc, Dc { hwnd, brush: 0, org, clip }));
+    Ok(hdc)
+}
+
+/// Claim a handle-table slot for a GDI object of `ty` (see [`gdi_type`]) and
+/// return `(handle, client_object_address)`, or `None` when the table could not
+/// be published or its slots are exhausted.
+///
+/// The entry is filled exactly as gdi32's decoders demand: generation word
+/// (@+0x0C) = `ty`, which must equal `handle >> 16` **and** carries the type in
+/// its low byte; in-use byte (@+0x0E) non-zero; client-object pointer (@+0x10)
+/// into the zeroed arena. A DC's zeroed object additionally selects gdi32's
+/// direct-syscall fast path (dword[+4] == 0, qword[+0xA8] == 0, qword[+0xB8] == 0
+/// — no batch, no open path, not disabled).
+fn alloc_gdi_object(os: &mut WinOs, mem: &mut dyn Memory, ty: u16) -> Result<Option<(u32, u64)>> {
     if !ensure_gdi_table(os, mem) {
-        return Ok(0);
+        return Ok(None);
     }
     let slot = os.win32k_state.gdi_next_slot;
     if slot >= GDI_TABLE_SLOTS {
-        return Ok(0);
+        return Ok(None);
     }
     os.win32k_state.gdi_next_slot += 1;
 
     let entry = os.win32k_state.gdi_table_base + slot * GDI_ENTRY_SIZE;
     let obj = os.win32k_state.gdi_dc_arena + slot * GDI_DC_OBJECT_SIZE;
-    // Zero the DC object: dword[+4]==0, qword[+0xA8]==0, qword[+0xB8]==0 select
-    // gdi32's direct-syscall fast path (no batch, no open path).
     for off in (0..GDI_DC_OBJECT_SIZE).step_by(8) {
         mem.write_u64(obj + off, 0)?;
     }
-    // Handle-table entry: generation (word @+0xC) must equal (hdc>>16); type
-    // byte (@+0xE) must be non-zero; object pointer (@+0x10).
-    mem.write_u16(entry + GDI_ENTRY_GENERATION_OFF, HDC_GENERATION)?;
-    mem.write_u8(entry + GDI_ENTRY_TYPE_OFF, GDI_ENTRY_TYPE_DC)?;
+    mem.write_u16(entry + GDI_ENTRY_GENERATION_OFF, ty)?;
+    mem.write_u8(entry + GDI_ENTRY_TYPE_OFF, GDI_ENTRY_IN_USE)?;
     mem.write_u64(entry + GDI_ENTRY_OBJECT_OFF, obj)?;
-
-    // hdc: low 16 = slot index; high 16 = generation, which also carries the
-    // 0x0001 DC type bit the `(hdc & 0x1F0000) == 0x10000` prefilter demands
-    // (HDC_TYPE_BITS == HDC_GENERATION << 16, so one word satisfies both gates).
-    debug_assert_eq!((HDC_GENERATION as u32) << 16, HDC_TYPE_BITS);
-    let hdc = ((HDC_GENERATION as u32) << 16) | (slot as u32 & 0xFFFF);
-    os.win32k_state.dcs.push((hdc, Dc { hwnd }));
-    Ok(hdc)
+    Ok(Some((((ty as u32) << 16) | (slot as u32 & 0xFFFF), obj)))
 }
 
-/// Ensure `hwnd`'s backing surface exists (lazy on first GetDC/BeginPaint):
-/// map a guest-addressable top-down BGRA32 DIB (`w*h*4`, stride `w*4`),
-/// initialize it to opaque white, store it on the window, and notify the
-/// driver. Idempotent. Returns the surface, or `None` if the window is unknown
-/// or the map fails.
+/// Mint a solid brush of `color` (a `COLORREF`, `0x00BBGGRR`) and register it,
+/// returning its handle (0 if the table is exhausted).
+fn alloc_brush(os: &mut WinOs, mem: &mut dyn Memory, color: u32) -> Result<u32> {
+    let Some((handle, _)) = alloc_gdi_object(os, mem, gdi_type::BRUSH)? else {
+        return Ok(0);
+    };
+    os.win32k_state.brushes.push((handle, color));
+    Ok(handle)
+}
+
+/// `GetSysColorBrush(index)` — the cached stock brush for a `COLOR_*` index.
+fn sys_color_brush(os: &mut WinOs, mem: &mut dyn Memory, index: u32) -> Result<u32> {
+    if let Some((_, h)) = os.win32k_state.sys_brushes.iter().find(|(i, _)| *i == index) {
+        return Ok(*h);
+    }
+    let handle = alloc_brush(os, mem, sys_color(index))?;
+    if handle != 0 {
+        os.win32k_state.sys_brushes.push((index, handle));
+    }
+    Ok(handle)
+}
+
+/// Ensure the backing surface `hwnd` renders into exists (lazy on first
+/// GetDC/BeginPaint): map a guest-addressable top-down BGRA32 DIB (`w*h*4`,
+/// stride `w*4`), initialize it to opaque white, store it on the window, and
+/// notify the driver. Idempotent. Returns the surface, or `None` if the window
+/// is unknown or the map fails.
+///
+/// **The surface belongs to `hwnd`'s [`surface_owner`]** (roadmap W4.8): a child
+/// control shares its top-level ancestor's store rather than getting one of its
+/// own, so its pixels appear inside the parent window and one `flush_surface`
+/// presents the whole composed frame.
+///
+/// [`surface_owner`]: Win32kState::surface_owner
 fn ensure_surface(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Option<Surface> {
-    let w = os.win32k_state.window(hwnd)?;
+    let owner = os.win32k_state.surface_owner(hwnd);
+    let w = os.win32k_state.window(owner)?;
     if let Some(s) = w.surface {
         return Some(s);
     }
@@ -1225,16 +2041,19 @@ fn ensure_surface(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Option<Sur
         mem.write_u32(base + off, 0xFFFF_FFFF).ok()?;
     }
     let surface = Surface { base, w: cx, h: cy };
-    if let Some(w) = os.win32k_state.window_mut(hwnd) {
+    if let Some(w) = os.win32k_state.window_mut(owner) {
         w.surface = Some(surface);
     }
-    os.driver.create_window_surface(hwnd, cx, cy);
+    os.driver.create_window_surface(owner, cx, cy);
     Some(surface)
 }
 
-/// Read `hwnd`'s surface pixels out of guest memory and present them through
-/// the driver (`flush_surface`). Fire-and-forget; a missing surface is a no-op.
+/// Read the surface `hwnd` renders into out of guest memory and present it
+/// through the driver (`flush_surface`). Fire-and-forget; a missing surface is a
+/// no-op. A child window presents its **owner's** surface — the composed frame,
+/// parent pixels and control pixels together (roadmap W4.8).
 fn present_surface(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<()> {
+    let hwnd = os.win32k_state.surface_owner(hwnd);
     let Some(surface) = os.win32k_state.window(hwnd).and_then(|w| w.surface) else {
         return Ok(());
     };
@@ -1264,13 +2083,18 @@ fn nt_user_get_dc(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> R
 }
 
 /// Resolve the window an HDC should bind to. A real hwnd is used directly; a
-/// NULL hwnd (GetDC(NULL) = the screen DC) binds to the single live top-level
+/// NULL hwnd (GetDC(NULL) = the screen DC) binds to the first live **top-level**
 /// window so the gate's `GetDC(hwnd)`/`GetDC(NULL)` both land on a surface.
 fn resolve_dc_hwnd(os: &WinOs, hwnd_arg: u32) -> u32 {
     if hwnd_arg != 0 && os.win32k_state.window(hwnd_arg).is_some() {
         return hwnd_arg;
     }
-    os.win32k_state.windows.first().map(|(h, _)| *h).unwrap_or(0)
+    os.win32k_state
+        .windows
+        .iter()
+        .map(|(h, _)| *h)
+        .find(|h| os.win32k_state.surface_owner(*h) == *h)
+        .unwrap_or(0)
 }
 
 /// `NtUserReleaseDC(hwnd, hdc)` → present the surface (the guest is done
@@ -1294,18 +2118,22 @@ fn nt_user_begin_paint(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
     if os.win32k_state.window(hwnd).is_none() {
         return Ok(0);
     }
-    let surface = ensure_surface(os, mem, hwnd);
+    if ensure_surface(os, mem, hwnd).is_none() {
+        return Ok(0);
+    }
     let hdc = alloc_dc(os, mem, hwnd)?;
     if ps != 0 {
         // PAINTSTRUCT { HDC hdc @0; BOOL fErase @8; RECT rcPaint @0xC (l,t,r,b) }.
         mem.write_u64(ps, hdc as u64)?;
         mem.write_u32(ps + 8, 0)?;
-        // rcPaint = the full client rect (0,0,cx,cy) — the whole window is dirty.
-        let (cx, cy) = surface.map(|s| (s.w as i32, s.h as i32)).unwrap_or((0, 0));
+        // rcPaint = **this window's** full client rect (0,0,cx,cy) in its own
+        // client coordinates — for a child that is its own extent, not the
+        // surface's, which is what a control's WndProc paints against.
+        let (cx, cy) = os.win32k_state.window(hwnd).map(client_size).unwrap_or((0, 0));
         mem.write_u32(ps + 0xC, 0)?; // left
         mem.write_u32(ps + 0x10, 0)?; // top
-        mem.write_u32(ps + 0x14, cx as u32)?; // right
-        mem.write_u32(ps + 0x18, cy as u32)?; // bottom
+        mem.write_u32(ps + 0x14, cx)?; // right
+        mem.write_u32(ps + 0x18, cy)?; // bottom
     }
     Ok(hdc)
 }
@@ -1583,18 +2411,46 @@ fn nt_user_msg_wait_for_multiple_objects_ex(
 /// black on the white surface.
 const BGRA_BLACK: u32 = 0xFF00_0000;
 
-/// Resolve `hdc → hwnd → surface` for a paint handler. Returns `None` (the
-/// honest "unbound HDC" failure) when the HDC was never issued by this module
-/// or its window has no surface.
-fn dc_surface(os: &WinOs, hdc: u32) -> Option<(u32, Surface)> {
-    let hwnd = os.win32k_state.dc(hdc)?.hwnd;
-    let surface = os.win32k_state.window(hwnd)?.surface?;
-    Some((hwnd, surface))
+/// A DC resolved to the pixels it may touch (roadmap W4.8): the surface it
+/// renders into, the window's origin inside that surface, and the visible rect
+/// every primitive is clipped to. This is the whole child-window painting
+/// contract in one value — a top-level DC has `org == (0, 0)` and a full-surface
+/// clip, a control's DC carries its offset and its slice of the parent.
+#[derive(Clone, Copy)]
+struct DcTarget {
+    surface: Surface,
+    /// The DC window's client origin in surface coordinates.
+    org: (i32, i32),
+    /// The clip rect in surface coordinates, `[left, top, right, bottom)`.
+    clip: [i32; 4],
 }
 
-/// Write one BGRA32 pixel into a surface, clipped to its bounds. `x`/`y` in
-/// client-area pixels (top-down).
-fn put_pixel(mem: &mut dyn Memory, s: &Surface, x: i32, y: i32, bgra: u32) -> Result<()> {
+impl DcTarget {
+    /// Map a logical `(x, y)` in the DC window's client space to surface pixels.
+    fn map(&self, x: i32, y: i32) -> (i32, i32) {
+        (x + self.org.0, y + self.org.1)
+    }
+}
+
+/// Resolve `hdc → window → surface + origin + clip` for a paint handler. Returns
+/// `None` (the honest "unbound HDC" failure) when the HDC was never issued by
+/// this module or the surface it would draw into does not exist.
+fn dc_surface(os: &WinOs, hdc: u32) -> Option<DcTarget> {
+    let dc = os.win32k_state.dc(hdc)?;
+    let (org, clip) = (dc.org, dc.clip);
+    let owner = os.win32k_state.surface_owner(dc.hwnd);
+    let surface = os.win32k_state.window(owner)?.surface?;
+    Some(DcTarget { surface, org, clip })
+}
+
+/// Write one BGRA32 pixel into a DC's surface, in **surface** coordinates,
+/// clipped to both the surface bounds and the DC's visible rect. Callers map
+/// logical coordinates with [`DcTarget::map`] first.
+fn put_pixel(mem: &mut dyn Memory, t: &DcTarget, x: i32, y: i32, bgra: u32) -> Result<()> {
+    let s = &t.surface;
+    if x < t.clip[0] || y < t.clip[1] || x >= t.clip[2] || y >= t.clip[3] {
+        return Ok(());
+    }
     if x < 0 || y < 0 || x >= s.w as i32 || y >= s.h as i32 {
         return Ok(());
     }
@@ -1602,16 +2458,17 @@ fn put_pixel(mem: &mut dyn Memory, s: &Surface, x: i32, y: i32, bgra: u32) -> Re
     mem.write_u32(s.base + off, bgra)
 }
 
-/// Rasterize one UTF-16 code unit as an 8×8 `font8x8` glyph at `(x, y)`, top-
-/// left origin, in `bgra`, clipped to the surface. Non-representable units draw
+/// Rasterize one UTF-16 code unit as an 8×8 `font8x8` glyph at logical `(x, y)`,
+/// top-left origin, in `bgra`, clipped to the DC. Non-representable units draw
 /// nothing (a blank cell), matching a metric-only stub font.
-fn draw_glyph(mem: &mut dyn Memory, s: &Surface, ch: char, x: i32, y: i32, bgra: u32) -> Result<()> {
+fn draw_glyph(mem: &mut dyn Memory, t: &DcTarget, ch: char, x: i32, y: i32, bgra: u32) -> Result<()> {
     use font8x8::UnicodeFonts;
     if let Some(rows) = font8x8::BASIC_FONTS.get(ch) {
         for (ry, bits) in rows.iter().enumerate() {
             for rx in 0..8i32 {
                 if bits & (1 << rx) != 0 {
-                    put_pixel(mem, s, x + rx, y + ry as i32, bgra)?;
+                    let (px, py) = t.map(x + rx, y + ry as i32);
+                    put_pixel(mem, t, px, py, bgra)?;
                 }
             }
         }
@@ -1633,7 +2490,7 @@ fn nt_gdi_ext_text_out_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
     let str_ptr = os.syscall_arg(cpu, mem, 5)?;
     let count = os.syscall_arg(cpu, mem, 6)? as u32;
 
-    let Some((_hwnd, surface)) = dc_surface(os, hdc) else {
+    let Some(target) = dc_surface(os, hdc) else {
         return Ok(0);
     };
 
@@ -1650,12 +2507,20 @@ fn nt_gdi_ext_text_out_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
     // The HFONT-selected size isn't tracked yet, so a default cell height stands
     // in (proportional metrics come from the rasterizer regardless).
     const DEFAULT_TEXT_PX: u32 = 16;
+    // The text colour is the DC's own — `SetTextColor` wrote it into the
+    // guest-visible DC object at `DC_ATTR_TEXT_COLOR`, and a zeroed object is
+    // already the default black, so this reads correctly with or without a
+    // `SetTextColor` call (roadmap W4.8).
+    let color = gdi_client_object(os, mem, hdc)
+        .and_then(|obj| mem.read_u32(obj + DC_ATTR_TEXT_COLOR).ok())
+        .map(colorref_to_bgra)
+        .unwrap_or(BGRA_BLACK);
     if let Some(tb) = os.driver.rasterize_text(&text, DEFAULT_TEXT_PX) {
-        composite_coverage(mem, &surface, x, y, &tb)?;
+        composite_coverage(mem, &target, x, y, &tb, color)?;
     } else {
         let mut cx = x;
         for ch in text.chars() {
-            draw_glyph(mem, &surface, ch, cx, y, BGRA_BLACK)?;
+            draw_glyph(mem, &target, ch, cx, y, color)?;
             cx += 8;
         }
     }
@@ -1663,27 +2528,39 @@ fn nt_gdi_ext_text_out_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
 }
 
 /// Composite a top-down 8-bit alpha `coverage` (from the driver's text
-/// rasterizer) onto the surface at `(x, y)`, blending each covered pixel toward
-/// black — the default text colour (roadmap W4.8). Clipped to the surface;
-/// `SetTextColor` / opaque background modes are deferred.
-fn composite_coverage(mem: &mut dyn Memory, s: &Surface, x: i32, y: i32, tb: &exemu_core::TextBitmap) -> Result<()> {
+/// rasterizer) onto the DC's surface at logical `(x, y)`, blending each covered
+/// pixel toward `color` — the DC's text colour (roadmap W4.8). Clipped to the
+/// DC's visible rect; opaque background modes (`SetBkMode(OPAQUE)`) are deferred.
+fn composite_coverage(
+    mem: &mut dyn Memory,
+    t: &DcTarget,
+    x: i32,
+    y: i32,
+    tb: &exemu_core::TextBitmap,
+    color: u32,
+) -> Result<()> {
+    let s = &t.surface;
+    let (fb, fg, fr) = (color & 0xff, (color >> 8) & 0xff, (color >> 16) & 0xff);
     for gy in 0..tb.height {
         for gx in 0..tb.width {
             let a = tb.coverage[(gy * tb.width + gx) as usize] as u32;
             if a == 0 {
                 continue; // fully transparent: leave the background pixel
             }
-            let (px, py) = (x + gx as i32, y + gy as i32);
+            let (px, py) = t.map(x + gx as i32, y + gy as i32);
+            if px < t.clip[0] || py < t.clip[1] || px >= t.clip[2] || py >= t.clip[3] {
+                continue;
+            }
             if px < 0 || py < 0 || px >= s.w as i32 || py >= s.h as i32 {
                 continue;
             }
             let off = s.base + (py as u64 * s.w as u64 + px as u64) * 4;
             let existing = mem.read_u32(off)?;
-            // out = existing * (1 - a): blend toward black, per BGR channel; keep A.
+            // out = existing*(1-a) + color*a, per BGR channel; keep A.
             let inv = 255 - a;
-            let b = (existing & 0xff) * inv / 255;
-            let g = ((existing >> 8) & 0xff) * inv / 255;
-            let r = ((existing >> 16) & 0xff) * inv / 255;
+            let b = ((existing & 0xff) * inv + fb * a) / 255;
+            let g = (((existing >> 8) & 0xff) * inv + fg * a) / 255;
+            let r = (((existing >> 16) & 0xff) * inv + fr * a) / 255;
             mem.write_u32(off, (existing & 0xff00_0000) | (r << 16) | (g << 8) | b)?;
         }
     }
@@ -1705,24 +2582,429 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
     let right = os.syscall_arg(cpu, mem, 3)? as i32;
     let bottom = os.syscall_arg(cpu, mem, 4)? as i32;
 
-    let Some((_hwnd, surface)) = dc_surface(os, hdc) else {
+    let Some(target) = dc_surface(os, hdc) else {
         return Ok(0);
     };
     if right <= left || bottom <= top {
         return Ok(1); // degenerate rect: nothing to draw, still success.
     }
-    let (x0, y0, x1, y1) = (left, top, right - 1, bottom - 1);
+    let (x0, y0) = target.map(left, top);
+    let (x1, y1) = target.map(right - 1, bottom - 1);
     // Top + bottom edges.
     for x in x0..=x1 {
-        put_pixel(mem, &surface, x, y0, BGRA_BLACK)?;
-        put_pixel(mem, &surface, x, y1, BGRA_BLACK)?;
+        put_pixel(mem, &target, x, y0, BGRA_BLACK)?;
+        put_pixel(mem, &target, x, y1, BGRA_BLACK)?;
     }
     // Left + right edges.
     for y in y0..=y1 {
-        put_pixel(mem, &surface, x0, y, BGRA_BLACK)?;
-        put_pixel(mem, &surface, x1, y, BGRA_BLACK)?;
+        put_pixel(mem, &target, x0, y, BGRA_BLACK)?;
+        put_pixel(mem, &target, x1, y, BGRA_BLACK)?;
     }
     Ok(1)
+}
+
+/// **The recovered win32u / GDI boundary, published for the ABI gate.**
+///
+/// Every value here was read out of the pinned Wine binaries, never guessed, and
+/// `crates/app/tests/win32k_abi.rs` re-derives each one from those same bytes on
+/// every run. Re-exporting the module's own constants (rather than mirroring
+/// them in the test) means the gate checks *what the handlers actually use*: a
+/// Wine bump that renumbers a syscall, a call selector or a DC_ATTR field fails
+/// there, loudly, instead of turning into a silently wrong answer at paint time.
+pub mod abi {
+    /// win32u syscall indices, as `(export name, index)`. The index is the
+    /// `mov eax, imm32` immediate in that export's stub.
+    pub const SYSCALLS: [(&str, u32); 26] = [
+        ("NtUserCreateWindowEx", super::NT_USER_CREATE_WINDOW_EX),
+        ("NtUserShowWindow", super::NT_USER_SHOW_WINDOW),
+        ("NtUserDestroyWindow", super::NT_USER_DESTROY_WINDOW),
+        ("NtUserSetWindowPos", super::NT_USER_SET_WINDOW_POS),
+        ("NtUserMessageCall", super::NT_USER_MESSAGE_CALL),
+        ("NtUserGetDC", super::NT_USER_GET_DC),
+        ("NtUserGetDCEx", super::NT_USER_GET_DC_EX),
+        ("NtUserReleaseDC", super::NT_USER_RELEASE_DC),
+        ("NtUserBeginPaint", super::NT_USER_BEGIN_PAINT),
+        ("NtUserEndPaint", super::NT_USER_END_PAINT),
+        ("NtUserGetMessage", super::NT_USER_GET_MESSAGE),
+        ("NtUserDispatchMessage", super::NT_USER_DISPATCH_MESSAGE),
+        ("NtUserCallHwnd", super::NT_USER_CALL_HWND),
+        ("NtUserCallHwndParam", super::NT_USER_CALL_HWND_PARAM),
+        ("NtUserCallOneParam", super::NT_USER_CALL_ONE_PARAM),
+        ("NtUserSetWindowLong", super::NT_USER_SET_WINDOW_LONG),
+        ("NtUserSetWindowLongPtr", super::NT_USER_SET_WINDOW_LONG_PTR),
+        ("NtGdiExtTextOutW", super::NT_GDI_EXT_TEXT_OUT_W),
+        ("NtGdiRectangle", super::NT_GDI_RECTANGLE),
+        ("NtGdiPatBlt", super::NT_GDI_PAT_BLT),
+        ("NtGdiSelectBrush", super::NT_GDI_SELECT_BRUSH),
+        ("NtGdiSelectPen", super::NT_GDI_SELECT_PEN),
+        ("NtGdiSelectFont", super::NT_GDI_SELECT_FONT),
+        ("NtGdiCreateSolidBrush", super::NT_GDI_CREATE_SOLID_BRUSH),
+        ("NtGdiCreatePen", super::NT_GDI_CREATE_PEN),
+        ("NtGdiGetAndSetDCDword", super::NT_GDI_GET_AND_SET_DC_DWORD),
+    ];
+
+    /// `NtUserCallHwnd(hwnd, code)` selectors, as `(user32 export that issues
+    /// this code, code)`.
+    pub const CALL_HWND: [(&str, u64); 5] = [
+        ("IsWindow", super::call_hwnd::IS_WINDOW),
+        ("IsWindowEnabled", super::call_hwnd::IS_WINDOW_ENABLED),
+        ("IsWindowUnicode", super::call_hwnd::IS_WINDOW_UNICODE),
+        ("IsWindowVisible", super::call_hwnd::IS_WINDOW_VISIBLE),
+        ("GetParent", super::call_hwnd::GET_PARENT),
+    ];
+
+    /// `NtUserCallHwndParam(hwnd, param, code)` selectors, likewise.
+    pub const CALL_HWND_PARAM: [(&str, u64); 5] = [
+        ("GetWindowRect", super::call_hwnd_param::GET_WINDOW_RECT),
+        ("GetClientRect", super::call_hwnd_param::GET_CLIENT_RECT),
+        ("GetWindowLongPtrA", super::call_hwnd_param::GET_WINDOW_LONG_PTR_A),
+        ("GetWindowLongPtrW", super::call_hwnd_param::GET_WINDOW_LONG_PTR_W),
+        ("IsChild", super::call_hwnd_param::IS_CHILD),
+    ];
+
+    /// `NtUserCallOneParam(arg, code)` selectors, likewise.
+    pub const CALL_ONE_PARAM: [(&str, u64); 3] = [
+        ("GetSysColor", super::call_one_param::GET_SYS_COLOR),
+        ("GetSysColorBrush", super::call_one_param::GET_SYS_COLOR_BRUSH),
+        ("GetSystemMetrics", super::call_one_param::GET_SYSTEM_METRICS),
+    ];
+
+    /// `NtGdiGetAndSetDCDword` selectors, as `(gdi32 setter, code)`.
+    pub const DC_DWORD: [(&str, u64); 2] = [
+        ("SetTextColor", super::dc_dword::TEXT_COLOR),
+        ("SetBkColor", super::dc_dword::BK_COLOR),
+    ];
+
+    /// DC_ATTR field offsets, as `(gdi32 accessor that reads it, offset)`.
+    pub const DC_ATTR: [(&str, u64); 3] = [
+        ("GetDCOrgEx", super::DC_ATTR_ORG_X),
+        ("GetTextColor", super::DC_ATTR_TEXT_COLOR),
+        ("GetBkColor", super::DC_ATTR_BK_COLOR),
+    ];
+
+    /// The GDI shared handle table's entry stride and the three field offsets
+    /// gdi32's decoders read: generation/type word, in-use byte, object pointer.
+    pub const GDI_ENTRY_SIZE: u64 = super::GDI_ENTRY_SIZE;
+    pub const GDI_ENTRY_GENERATION_OFF: u64 = super::GDI_ENTRY_GENERATION_OFF;
+    pub const GDI_ENTRY_TYPE_OFF: u64 = super::GDI_ENTRY_TYPE_OFF;
+    pub const GDI_ENTRY_OBJECT_OFF: u64 = super::GDI_ENTRY_OBJECT_OFF;
+    /// Where the table base is published in the PEB.
+    pub const GDI_PEB_TABLE_PTR_OFF: u64 = super::GDI_PEB_TABLE_PTR_OFF;
+    /// The GDI object type of a brush — the value `gdi32!SelectObject` compares
+    /// `(byte[entry+0x0C] & 0x7f) << 16` against before calling
+    /// `NtGdiSelectBrush`.
+    pub const GDI_TYPE_BRUSH: u16 = super::gdi_type::BRUSH;
+    /// Stock-object slots: base (`slot = index + BASE`) and the last slot.
+    pub const STOCK_SLOT_BASE: u64 = super::STOCK_SLOT_BASE;
+    pub const STOCK_SLOT_LAST: u64 = super::STOCK_SLOT_LAST;
+    /// Every stock slot exemu publishes, `(slot, type)`.
+    pub fn stock_slots() -> Vec<(u64, u16)> {
+        super::STOCK_OBJECTS.iter().map(|(s, t, _)| (*s, *t)).collect()
+    }
+    /// Entries in each client-PFN array (roadmap W6.2).
+    pub const CLIENT_PFN_COUNT: usize = super::CLIENT_PFN_COUNT;
+}
+
+/// Convert a Win32 `COLORREF` (`0x00BBGGRR`) to the surface's opaque BGRA32.
+fn colorref_to_bgra(c: u32) -> u32 {
+    let (r, g, b) = (c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF);
+    0xFF00_0000 | (r << 16) | (g << 8) | b
+}
+
+/// `NtGdiCreateSolidBrush(color, unused)` — `gdi32!CreateSolidBrush` is a bare
+/// `xor edx,edx; jmp` into this, so the COLORREF arrives untouched in arg0.
+fn nt_gdi_create_solid_brush(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let color = os.syscall_arg(cpu, mem, 0)? as u32;
+    alloc_brush(os, mem, color)
+}
+
+/// `NtGdiCreatePen(style, width, color, brush)` — minted as a typed handle so
+/// `gdi32!SelectObject`'s pen arm accepts it. exemu draws 1-px frames only, so
+/// style and width are recorded nowhere yet; the handle exists so a control that
+/// creates and selects a pen proceeds instead of failing.
+fn nt_gdi_create_pen(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    Ok(alloc_gdi_object(os, mem, gdi_type::PEN)?.map(|(h, _)| h).unwrap_or(0))
+}
+
+/// `NtGdiSelectBrush(hdc, hbrush)` → the previously selected brush. This is
+/// where `FillRect`'s `SelectObject(hdc, hbr)` lands.
+fn nt_gdi_select_brush(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let brush = os.syscall_arg(cpu, mem, 1)? as u32;
+    let Some(dc) = os.win32k_state.dcs.iter_mut().find(|(h, _)| *h == hdc).map(|(_, d)| d) else {
+        return Ok(0);
+    };
+    let previous = dc.brush;
+    dc.brush = brush;
+    // A brush was really selected even when the DC had none before: report the
+    // handle back so `FillRect`'s restoring `SelectObject` is not a no-op.
+    Ok(previous)
+}
+
+/// `NtGdiSelectPen(hdc, hpen, ...)` → the previous pen. exemu tracks no pen
+/// state yet (frames are 1-px black), so this only has to succeed.
+fn nt_gdi_select_pen(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    Ok(os.syscall_arg(cpu, mem, 1)? as u32)
+}
+
+/// `NtGdiSelectFont(hdc, hfont)` → the previous font. The CoreText path picks
+/// its own metrics (design §5), so an HFONT is only a handle that must
+/// round-trip; selecting one must not fail or a control abandons its text.
+fn nt_gdi_select_font(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    Ok(os.syscall_arg(cpu, mem, 1)? as u32)
+}
+
+/// `NtGdiGetTextMetricsW(hdc, TEXTMETRICW*, flags)` — fill the caller's metrics
+/// from the stand-in font cell.
+///
+/// **Load-bearing for a control's label.** `DrawTextW` asks for the metrics
+/// before it lays anything out; with the honest-0 stub it received a zero line
+/// height and drew no text at all, which is why Wine's `BUTTON` came out blank
+/// even once it was filling its own background.
+fn nt_gdi_get_text_metrics_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let tm = os.syscall_arg(cpu, mem, 1)?;
+    if tm == 0 || os.win32k_state.dc(hdc).is_none() {
+        return Ok(0);
+    }
+    let (h, d) = (STUB_FONT_CELL_H, STUB_FONT_DESCENT);
+    mem.write_u32(tm + TM_HEIGHT, h)?;
+    mem.write_u32(tm + TM_ASCENT, h - d)?;
+    mem.write_u32(tm + TM_DESCENT, d)?;
+    mem.write_u32(tm + TM_INTERNAL_LEADING, 2)?;
+    mem.write_u32(tm + TM_EXTERNAL_LEADING, 0)?;
+    mem.write_u32(tm + TM_AVE_CHAR_WIDTH, STUB_FONT_CELL_W)?;
+    mem.write_u32(tm + TM_MAX_CHAR_WIDTH, STUB_FONT_CELL_W)?;
+    mem.write_u32(tm + TM_WEIGHT, 400)?; // FW_NORMAL
+    mem.write_u32(tm + TM_OVERHANG, 0)?;
+    mem.write_u32(tm + TM_DIGITIZED_ASPECT_X, 96)?;
+    mem.write_u32(tm + TM_DIGITIZED_ASPECT_Y, 96)?;
+    mem.write_u16(tm + TM_FIRST_CHAR, 0x20)?;
+    mem.write_u16(tm + TM_LAST_CHAR, 0xFF)?;
+    mem.write_u16(tm + TM_DEFAULT_CHAR, 0x1F)?;
+    mem.write_u16(tm + TM_BREAK_CHAR, 0x20)?;
+    mem.write_u8(tm + TM_ITALIC, 0)?;
+    mem.write_u8(tm + TM_UNDERLINED, 0)?;
+    mem.write_u8(tm + TM_STRUCK_OUT, 0)?;
+    // Fixed pitch (bit 0 clear), FF_DONTCARE — true of the deterministic
+    // `font8x8` cell the headless path renders with.
+    mem.write_u8(tm + TM_PITCH_AND_FAMILY, 0)?;
+    mem.write_u8(tm + TM_CHARSET, 0)?; // ANSI_CHARSET
+    Ok(1)
+}
+
+/// `NtGdiGetTextExtentExW(hdc, str, count, maxExtent, lpnFit, alpDx, lpSize,
+/// flags)` — measure a run.
+///
+/// Recovered arg layout from `gdi32!GetTextExtentExPointW` (RVA 0x25c10): at its
+/// call site (0x25d85) `rcx`/`rdx`/`r8d` carry hdc/string/count and the caller's
+/// `LPSIZE` is stored into the 7th argument slot (`[rsp+0x30]` of its frame).
+///
+/// **The other half of a control's label.** `DrawTextW` measures before it
+/// positions: with this unserviced it centred the text against an uninitialized
+/// width and placed the run a million pixels off-surface, so nothing appeared
+/// even though `ExtTextOutW` really was called. The width comes from the same
+/// rasterizer the draw uses, so measure and draw agree.
+fn nt_gdi_get_text_extent_ex_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let str_ptr = os.syscall_arg(cpu, mem, 1)?;
+    let count = os.syscall_arg(cpu, mem, 2)? as u32;
+    let alp_dx = os.syscall_arg(cpu, mem, 5)?;
+    let size = os.syscall_arg(cpu, mem, 6)?;
+    if os.win32k_state.dc(hdc).is_none() {
+        return Ok(0);
+    }
+    let mut units = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        units.push(mem.read_u16(str_ptr + i as u64 * 2)?);
+    }
+    let text = String::from_utf16_lossy(&units);
+    let (cx, cy) = measure_run(os, &text);
+    if size != 0 {
+        // SIZE { LONG cx; LONG cy; }
+        mem.write_u32(size, cx)?;
+        mem.write_u32(size + 4, cy)?;
+    }
+    if alp_dx != 0 {
+        // Cumulative advance after each character — uniform for the stand-in
+        // cell, and the same advance `nt_gdi_ext_text_out_w`'s fallback steps by.
+        for i in 0..count {
+            mem.write_u32(alp_dx + i as u64 * 4, (i + 1) * STUB_FONT_CELL_W)?;
+        }
+    }
+    Ok(1)
+}
+
+/// The pixel extent of `text`: the driver's real rasterizer when it has one
+/// (so measure and draw agree glyph for glyph), else the stand-in cell.
+fn measure_run(os: &WinOs, text: &str) -> (u32, u32) {
+    const DEFAULT_TEXT_PX: u32 = 16;
+    match os.driver.rasterize_text(text, DEFAULT_TEXT_PX) {
+        Some(tb) => (tb.width, tb.height),
+        None => (text.chars().count() as u32 * STUB_FONT_CELL_W, STUB_FONT_CELL_H),
+    }
+}
+
+/// `NtGdiCreateRectRgn(left, top, right, bottom)` → a region handle typed so
+/// `gdi32!SelectObject`'s `0x040000` arm accepts it. Regions are handles-only for
+/// now: [`nt_gdi_intersect_clip_rect`] is the clip path a control actually uses.
+fn nt_gdi_create_rect_rgn(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    Ok(alloc_gdi_object(os, mem, gdi_type::REGION)?.map(|(h, _)| h).unwrap_or(0))
+}
+
+/// `NtGdiDeleteObjectApp(handle)` — release a GDI object. Stock objects are
+/// never deleted (Windows ignores the attempt and reports success); a dynamic
+/// slot is marked free so it can be reused. Returns TRUE.
+fn nt_gdi_delete_object_app(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let handle = os.syscall_arg(cpu, mem, 0)? as u32;
+    let slot = (handle & 0xFFFF) as u64;
+    if slot == 0 || slot >= GDI_TABLE_SLOTS {
+        return Ok(0);
+    }
+    if (STOCK_SLOT_BASE..=STOCK_SLOT_LAST).contains(&slot) {
+        return Ok(1); // a stock object outlives every caller
+    }
+    let base = os.win32k_state.gdi_table_base;
+    if base != 0 {
+        mem.write_u8(base + slot * GDI_ENTRY_SIZE + GDI_ENTRY_TYPE_OFF, 0)?;
+    }
+    os.win32k_state.brushes.retain(|(h, _)| *h != handle);
+    os.win32k_state.dcs.retain(|(h, _)| *h != handle);
+    Ok(1)
+}
+
+/// `NtGdiIntersectClipRect(hdc, left, top, right, bottom)` — narrow the DC's
+/// clip to the given logical rect, returning the resulting region complexity.
+/// This is how a control confines its painting to its own client area, so it has
+/// to really clip: the rect is mapped through the DC origin and intersected with
+/// the visible rect the DC was created with.
+fn nt_gdi_intersect_clip_rect(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let left = os.syscall_arg(cpu, mem, 1)? as i32;
+    let top = os.syscall_arg(cpu, mem, 2)? as i32;
+    let right = os.syscall_arg(cpu, mem, 3)? as i32;
+    let bottom = os.syscall_arg(cpu, mem, 4)? as i32;
+    let Some(dc) = os.win32k_state.dcs.iter_mut().find(|(h, _)| *h == hdc).map(|(_, d)| d) else {
+        return Ok(0); // ERROR: not one of ours
+    };
+    let (ox, oy) = dc.org;
+    dc.clip[0] = dc.clip[0].max(left + ox);
+    dc.clip[1] = dc.clip[1].max(top + oy);
+    dc.clip[2] = dc.clip[2].min(right + ox);
+    dc.clip[3] = dc.clip[3].min(bottom + oy);
+    if dc.clip[2] <= dc.clip[0] || dc.clip[3] <= dc.clip[1] {
+        return Ok(1); // NULLREGION — everything is clipped away
+    }
+    Ok(SIMPLEREGION)
+}
+
+/// `NtGdiGetAndSetDCDword(hdc, code, value, *previous)` — the read-modify-write
+/// gdi32's `SetTextColor` / `SetBkColor` reach. Stores into the guest-visible
+/// DC object so the *next* `get_dc_attr` read sees it, writes the old value
+/// through `previous`, and returns TRUE.
+fn nt_gdi_get_and_set_dc_dword(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let code = os.syscall_arg(cpu, mem, 1)?;
+    let value = os.syscall_arg(cpu, mem, 2)? as u32;
+    let out = os.syscall_arg(cpu, mem, 3)?;
+    let off = match code {
+        dc_dword::TEXT_COLOR => DC_ATTR_TEXT_COLOR,
+        dc_dword::BK_COLOR => DC_ATTR_BK_COLOR,
+        _ => return Ok(0),
+    };
+    let Some(obj) = gdi_client_object(os, mem, hdc) else {
+        return Ok(0);
+    };
+    let previous = mem.read_u32(obj + off)?;
+    mem.write_u32(obj + off, value)?;
+    if out != 0 {
+        mem.write_u32(out, previous)?;
+    }
+    Ok(1)
+}
+
+/// The guest address of an HDC's client-side DC object, read back out of the
+/// published handle table (the same walk gdi32 does).
+fn gdi_client_object(os: &WinOs, mem: &dyn Memory, handle: u32) -> Option<u64> {
+    let base = os.win32k_state.gdi_table_base;
+    if base == 0 {
+        return None;
+    }
+    let slot = (handle & 0xFFFF) as u64;
+    if slot == 0 || slot >= GDI_TABLE_SLOTS {
+        return None;
+    }
+    let entry = base + slot * GDI_ENTRY_SIZE;
+    if mem.read_u16(entry + GDI_ENTRY_GENERATION_OFF).ok()? != (handle >> 16) as u16 {
+        return None;
+    }
+    mem.read_u64(entry + GDI_ENTRY_OBJECT_OFF).ok()
+}
+
+/// `NtGdiPatBlt(hdc, x, y, cx, cy, rop)` — the fill primitive every
+/// `FillRect`/`DrawEdge`/theme-less control paint bottoms out in.
+///
+/// Only the three constant-source raster ops are honoured: `PATCOPY` (paint with
+/// the selected brush — what `FillRect` issues), `BLACKNESS` and `WHITENESS`.
+/// Anything else returns FALSE rather than guessing a blend, so an unhandled ROP
+/// is visible as "nothing was drawn" instead of a wrong colour.
+fn nt_gdi_pat_blt(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let x = os.syscall_arg(cpu, mem, 1)? as i32;
+    let y = os.syscall_arg(cpu, mem, 2)? as i32;
+    let cx = os.syscall_arg(cpu, mem, 3)? as i32;
+    let cy = os.syscall_arg(cpu, mem, 4)? as i32;
+    let rop = os.syscall_arg(cpu, mem, 5)? as u32;
+
+    let brush = os.win32k_state.dc(hdc).map(|d| d.brush).unwrap_or(0);
+    let bgra = match rop {
+        BLACKNESS => 0xFF00_0000,
+        WHITENESS => 0xFFFF_FFFF,
+        PATCOPY => match os.win32k_state.brushes.iter().find(|(h, _)| *h == brush) {
+            Some((_, color)) => colorref_to_bgra(*color),
+            // PATCOPY with no brush selected: the hollow brush paints nothing.
+            None => return Ok(1),
+        },
+        _ => return Ok(0),
+    };
+    let Some(target) = dc_surface(os, hdc) else {
+        return Ok(0);
+    };
+    fill_rect(mem, &target, x, y, cx, cy, bgra)?;
+    Ok(1)
+}
+
+/// Fill `cx × cy` logical pixels at `(x, y)` with `bgra`, mapped through the
+/// DC's origin and clipped to its visible rect.
+fn fill_rect(
+    mem: &mut dyn Memory,
+    t: &DcTarget,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    bgra: u32,
+) -> Result<()> {
+    if cx <= 0 || cy <= 0 {
+        return Ok(());
+    }
+    let (sx, sy) = t.map(x, y);
+    // Clip in surface space first so a huge rect costs only its visible part.
+    let x0 = sx.max(t.clip[0]).max(0);
+    let y0 = sy.max(t.clip[1]).max(0);
+    let x1 = (sx + cx).min(t.clip[2]).min(t.surface.w as i32);
+    let y1 = (sy + cy).min(t.clip[3]).min(t.surface.h as i32);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let off = t.surface.base + (py as u64 * t.surface.w as u64 + px as u64) * 4;
+            mem.write_u32(off, bgra)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1871,6 +3153,149 @@ mod tests {
         assert_eq!(os.win32k_state.classes.len(), BUILTIN_CLASSES.len());
     }
 
+    // ---- W4.8: the child-window painting model ------------------------------
+
+    /// Register a class and create `hwnd` as a child of `parent` at `rect`, with
+    /// no driver and no memory — enough to exercise the ancestry maths.
+    fn child(os: &mut WinOs, parent: u32, rect: [i32; 4]) -> u32 {
+        let hwnd = alloc_handle(os);
+        os.win32k_state.windows.push((
+            hwnd,
+            Window {
+                class_atom: 0,
+                class_name: "C".into(),
+                title: String::new(),
+                rect,
+                style: if parent == 0 { WS_VISIBLE } else { WS_CHILD | WS_VISIBLE },
+                ex_style: 0,
+                parent,
+                shown: true,
+                wndproc: 0,
+                needs_paint: false,
+                surface: None,
+                extra: vec![0u8; 16],
+                user_data: 0,
+                id: 0,
+                instance: 0,
+            },
+        ));
+        hwnd
+    }
+
+    /// **The child-window model.** A child has no surface of its own: it renders
+    /// into its top-level ancestor's, at an origin that is the sum of every
+    /// intervening child's position, clipped by every ancestor's client rect.
+    #[test]
+    fn a_child_renders_into_its_top_level_ancestors_surface() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let top = child(&mut os, 0, [100, 100, 400, 300]);
+        let panel = child(&mut os, top, [10, 20, 200, 150]);
+        let button = child(&mut os, panel, [5, 5, 60, 24]);
+
+        let st = &os.win32k_state;
+        assert_eq!(st.surface_owner(top), top, "a top-level window owns its surface");
+        assert_eq!(st.surface_owner(panel), top, "a child renders into its ancestor's");
+        assert_eq!(st.surface_owner(button), top, "…however deep it is nested");
+
+        assert_eq!(st.client_origin(top), (0, 0));
+        assert_eq!(st.client_origin(panel), (10, 20));
+        assert_eq!(st.client_origin(button), (15, 25), "origins accumulate down the chain");
+
+        // The button's visible rect is its own extent at that origin…
+        assert_eq!(st.window_visible_rect(button), [15, 25, 75, 49]);
+        // …and the whole top-level client area for the owner.
+        assert_eq!(st.window_visible_rect(top), [0, 0, 400, 300]);
+    }
+
+    /// A child that overhangs its parent is **clipped to it**, so a control can
+    /// never paint over its parent's siblings. An entirely-outside child ends up
+    /// with an empty rect rather than a negative one.
+    #[test]
+    fn a_child_is_clipped_to_every_ancestor() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let top = child(&mut os, 0, [0, 0, 200, 100]);
+        let panel = child(&mut os, top, [50, 20, 100, 60]);
+        // Overhangs the panel on the right and bottom.
+        let wide = child(&mut os, panel, [80, 50, 200, 200]);
+        assert_eq!(
+            os.win32k_state.window_visible_rect(wide),
+            [130, 70, 150, 80],
+            "clipped to the panel's right/bottom edge, not the top-level window's"
+        );
+        // Entirely past the parent: empty, not inverted.
+        let gone = child(&mut os, panel, [500, 500, 20, 20]);
+        let r = os.win32k_state.window_visible_rect(gone);
+        assert!(r[2] <= r[0] || r[3] <= r[1], "a fully clipped child has an empty rect: {r:?}");
+    }
+
+    /// A cyclic parent link degrades to "treat it as top-level" instead of
+    /// hanging a syscall handler.
+    #[test]
+    fn a_parent_cycle_terminates() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let a = child(&mut os, 0, [0, 0, 10, 10]);
+        let b = child(&mut os, a, [1, 1, 5, 5]);
+        os.win32k_state.window_mut(a).unwrap().parent = b;
+        // Both calls must return, and the walk must be bounded.
+        let _ = os.win32k_state.surface_owner(b);
+        let _ = os.win32k_state.client_origin(b);
+        assert!(!os.win32k_state.chain_visible(b), "a cycle never reaches a top level");
+    }
+
+    /// `GetWindowLong*` / `SetWindowLong*`: the documented negative offsets map
+    /// to the named fields, and a non-negative offset indexes the class's
+    /// `cbWndExtra` — the store every Wine control keeps its instance data in.
+    #[test]
+    fn window_longs_cover_the_named_fields_and_the_extra_bytes() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let hwnd = child(&mut os, 0, [1, 2, 30, 40]);
+
+        assert_eq!(get_window_long(&os, hwnd, GWL_STYLE), WS_VISIBLE as u64);
+        assert_eq!(set_window_long(&mut os, hwnd, GWL_EXSTYLE, 0x20000), 0, "ex-style started 0");
+        assert_eq!(get_window_long(&os, hwnd, GWL_EXSTYLE), 0x20000);
+
+        // The instance pointer a control stores at extra offset 0 round-trips at
+        // full width — the whole reason the syscall needs a 64-bit result path.
+        const INFO: u64 = 0x4000_0001_7AA0;
+        assert_eq!(get_window_long(&os, hwnd, 0), 0, "extra bytes start zeroed");
+        assert_eq!(set_window_long(&mut os, hwnd, 0, INFO), 0);
+        assert_eq!(get_window_long(&os, hwnd, 0), INFO, "a pointer survives the round trip");
+        assert_eq!(set_window_long(&mut os, hwnd, 0, 1), INFO, "Set returns the previous value");
+
+        // Out-of-range offsets are inert, never a panic or an out-of-bounds write.
+        assert_eq!(get_window_long(&os, hwnd, 4096), 0);
+        assert_eq!(set_window_long(&mut os, hwnd, 4096, 0xFF), 0);
+        assert_eq!(get_window_long(&os, hwnd, -999), 0);
+        assert_eq!(get_window_long(&os, 0xDEAD, 0), 0, "an unknown hwnd reads nothing");
+    }
+
+    /// A GDI handle is `(type << 16) | slot`, the encoding `gdi32!SelectObject`
+    /// demands — and the pre-existing HDC encoding is that same rule with
+    /// `type = DC`, which is why extending it to brushes needed no new scheme.
+    #[test]
+    fn gdi_handles_encode_their_type_in_the_high_word() {
+        for (slot, ty, _) in STOCK_OBJECTS {
+            let handle = ((ty as u32) << 16) | slot as u32;
+            assert_eq!(handle >> 16, ty as u32, "the high word is the type");
+            assert_eq!((handle & 0xFFFF) as u64, slot, "the low word is the slot");
+            assert_ne!(handle & 0xFFFF, 0, "slot 0 would be indistinguishable from NULL");
+        }
+        // The DC type is what gdi32's `(hdc & 0x1F0000) == 0x10000` prefilter
+        // demands, i.e. exactly bit 16.
+        assert_eq!((gdi_type::DC as u32) << 16, 0x0001_0000);
+    }
+
+    /// `COLORREF` is `0x00BBGGRR`; the surface is BGRA32. Getting this backwards
+    /// is invisible on greys (the classic way it hides) and wrong on everything
+    /// else, so it is pinned on a colour with three distinct channels.
+    #[test]
+    fn colorref_converts_to_opaque_bgra() {
+        // COLORREF 0x00204080 = R=0x80, G=0x40, B=0x20.
+        assert_eq!(colorref_to_bgra(0x0020_4080), 0xFF80_4020);
+        assert_eq!(colorref_to_bgra(0x0000_0000), 0xFF00_0000, "black stays opaque");
+        assert_eq!(colorref_to_bgra(0x00FF_FFFF), 0xFFFF_FFFF);
+    }
+
     /// `SizeOfImage` is read out of the mapped PE header, and a non-PE base is
     /// reported as unknown rather than guessed (roadmap W6.2).
     #[test]
@@ -1896,7 +3321,7 @@ mod tests {
         let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
         os.win32k_state.classes.push((
             CLASS_ATOM_BASE,
-            Class { name: "TestClass".into(), wndproc, style: 0, background: 0 },
+            Class { name: "TestClass".into(), wndproc, style: 0, background: 0, wnd_extra: 16 },
         ));
         let hwnd = alloc_handle(&mut os);
         os.win32k_state.windows.push((
@@ -1913,6 +3338,10 @@ mod tests {
                 wndproc,
                 needs_paint: false,
                 surface: None,
+                extra: vec![0u8; 16],
+                user_data: 0,
+                id: 0x65,
+                instance: 0x1_4000_0000,
             },
         ));
         let mut mem = VirtualMemory::new();

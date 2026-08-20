@@ -41,6 +41,11 @@ mod unixlib;
 mod vm;
 mod win;
 mod win32k;
+/// The recovered win32u / GDI boundary constants (roadmap W4.8) — see
+/// [`win32k::abi`]. Published so `crates/app/tests/win32k_abi.rs` can re-derive
+/// each one from the pinned Wine binaries and assert it against the value the
+/// handlers really use.
+pub use win32k::abi as win32k_abi;
 pub mod wow64;
 
 use std::collections::HashMap;
@@ -376,6 +381,13 @@ pub struct WinOs {
     /// context restore/return and resumes the guest exactly as the handler left
     /// it (roadmap W2.9). Cleared at the start of every dispatch.
     syscall_resume_as_is: bool,
+    /// A full 64-bit syscall result, seated by a handler whose value does not fit
+    /// the `u32` NTSTATUS return (roadmap W4.8). The win32k `GetWindowLongPtr` /
+    /// `SetWindowLongPtr` family returns real pointers — a control's instance
+    /// data — which a `u32` would silently truncate. When set, the dispatcher
+    /// puts *this* in RAX after its ordinary context restore, instead of the
+    /// handler's status. Cleared at the start of every dispatch.
+    syscall_result64: Option<u64>,
 
     /// Registered native unixlibs for the `__wine_unix_call` fast path (roadmap
     /// W2.4). A PE DLL's `unixlib_handle_t` is the index into this `Vec`; the
@@ -489,6 +501,7 @@ impl WinOs {
             unix_stack_top: 0,
             syscall_guest_rsp: 0,
             syscall_resume_as_is: false,
+            syscall_result64: None,
             unixlibs: Vec::new(),
             unixlib_of_module: HashMap::new(),
             wine_unix_call_thunk: 0,
