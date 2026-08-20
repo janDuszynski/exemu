@@ -1001,6 +1001,216 @@ impl WinOs {
         }
         Ok(STATUS_SUCCESS)
     }
+
+    /// `NtSetInformationThread(handle, ThreadWow64Context, ctx, 0x2cc)` — the
+    /// write half of the WoW64 context (roadmap W5.7).
+    ///
+    /// The class and length come from `ntdll!RtlWow64SetThreadContext` (rva
+    /// 0x3aee0), which is four instructions: `mov r9d,0x2cc; mov r8,rdx; mov
+    /// edx,0x1d; jmp NtSetInformationThread` — the exact mirror of the query
+    /// side. `wow64cpu!BTCpuSetContext` is itself a two-instruction tail-jump
+    /// into it, so this is how **every** context Wine's WoW64 layer installs —
+    /// including the one that seats a fresh 32-bit thread on
+    /// `ntdll32!LdrInitializeThunk` — reaches the CPU-reserved area.
+    ///
+    /// Writing the context also **arms the reload bit** in the area's
+    /// machine-type header. `BTCpuSimulate`'s entry does `btr dword
+    /// [area], 0`: with the bit clear it takes the fast path (rva 0x116d),
+    /// which restores only `edi/esi/ebx/ebp` + `Eip`/`SegCs`/`Esp` — right for
+    /// resuming a syscall, wrong for a context that was replaced wholesale,
+    /// because `Eax`/`Ecx`/`Edx` and the segment registers would keep their old
+    /// values. With the bit set it takes the full restore (rva 0x11b3). `btr`
+    /// consumes the bit, so one write arms exactly one reload.
+    fn set_wow64_context(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, buffer: u64, length: u64) -> Result<u32> {
+        if buffer == 0 || length < WOW64_CONTEXT_SIZE {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        let teb = if cpu.gs_base != 0 { cpu.gs_base } else { self.cfg.teb_base };
+        let area = mem.read_u64(teb + crate::wow64::TEB_CPU_AREA_PTR_OFF)?;
+        if area == 0 {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        let mut buf = vec![0u8; WOW64_CONTEXT_SIZE as usize];
+        mem.read(buffer, &mut buf)?;
+        mem.write(area + crate::wow64::CPU_AREA_HEADER_LEN, &buf)?;
+        let header = mem.read_u32(area)?;
+        mem.write_u32(area, header | crate::wow64::CPU_AREA_RELOAD_BIT)?;
+        Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtSetInformationThread(handle, class, buffer, length)` (roadmap W5.7) —
+    /// implemented for `ThreadWow64Context` only; every other class keeps the
+    /// honest `STATUS_NOT_IMPLEMENTED` it returned before this slot existed.
+    pub(crate) fn nt_set_information_thread(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let handle = self.syscall_arg(cpu, mem, 0)?;
+        let class = self.syscall_arg(cpu, mem, 1)? as u32;
+        let buffer = self.syscall_arg(cpu, mem, 2)?;
+        let length = self.syscall_arg(cpu, mem, 3)?;
+        if class != THREAD_WOW64_CONTEXT {
+            return Ok(STATUS_NOT_IMPLEMENTED);
+        }
+        if self.nt_thread_index(handle).is_none() {
+            return Ok(STATUS_INVALID_HANDLE);
+        }
+        self.set_wow64_context(cpu, mem, buffer, length)
+    }
+
+    /// `NtQueryInformationProcess(handle, class, buffer, length, &return_length)`
+    /// (roadmap W5.6).
+    ///
+    /// Implemented for the two classes the WoW64 boot actually drives:
+    ///
+    /// * `ProcessBasicInformation` (0) — the PEB pointer and the pids.
+    /// * `ProcessWow64Information` (0x1a) — a pointer to the **32-bit PEB**,
+    ///   or `NULL` for a process that is not WoW64. `wow64.dll`'s process init
+    ///   asks for exactly this (`mov edx,0x1a; mov r9d,8`) and then treats the
+    ///   answer as `PEB32`, reading the `WOW64INFO` at `PEB32+0x480`.
+    ///
+    /// Anything else is an honest `STATUS_NOT_IMPLEMENTED` rather than a zeroed
+    /// buffer, so a class exemu has not thought about surfaces as a failure at
+    /// the caller instead of as plausible-looking garbage.
+    pub(crate) fn nt_query_information_process(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let _handle = self.syscall_arg(cpu, mem, 0)?;
+        let class = self.syscall_arg(cpu, mem, 1)? as u32;
+        let buffer = self.syscall_arg(cpu, mem, 2)?;
+        let length = self.syscall_arg(cpu, mem, 3)?;
+        let return_length = self.syscall_arg(cpu, mem, 4)?;
+        let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
+        match class {
+            crate::wow64::PROCESS_WOW64_INFORMATION => {
+                if buffer == 0 || length < ptr {
+                    return Ok(STATUS_INFO_LENGTH_MISMATCH);
+                }
+                mem.write(buffer, &self.wow64_peb32.to_le_bytes()[..ptr as usize])?;
+                if return_length != 0 {
+                    mem.write_u32(return_length, ptr as u32)?;
+                }
+                Ok(STATUS_SUCCESS)
+            }
+            PROCESS_BASIC_INFORMATION => {
+                // PROCESS_BASIC_INFORMATION: ExitStatus, PebBaseAddress,
+                // AffinityMask, BasePriority, UniqueProcessId,
+                // InheritedFromUniqueProcessId — 6 pointer-sized-ish fields.
+                let need = if self.cfg.is_64bit { 0x30 } else { 0x18 };
+                if buffer == 0 || length < need {
+                    return Ok(STATUS_INFO_LENGTH_MISMATCH);
+                }
+                if self.cfg.is_64bit {
+                    mem.write_u64(buffer, 0)?; // ExitStatus (+ pad)
+                    mem.write_u64(buffer + 0x08, self.cfg.peb_addr)?;
+                    mem.write_u64(buffer + 0x10, 1)?; // AffinityMask
+                    mem.write_u64(buffer + 0x18, 0)?; // BasePriority
+                    mem.write_u64(buffer + 0x20, PROCESS_ID)?;
+                    mem.write_u64(buffer + 0x28, 0)?;
+                } else {
+                    mem.write_u32(buffer, 0)?;
+                    mem.write_u32(buffer + 0x04, self.cfg.peb_addr as u32)?;
+                    mem.write_u32(buffer + 0x08, 1)?;
+                    mem.write_u32(buffer + 0x0c, 0)?;
+                    mem.write_u32(buffer + 0x10, PROCESS_ID as u32)?;
+                    mem.write_u32(buffer + 0x14, 0)?;
+                }
+                if return_length != 0 {
+                    mem.write_u32(return_length, need as u32)?;
+                }
+                Ok(STATUS_SUCCESS)
+            }
+            _ => Ok(STATUS_NOT_IMPLEMENTED),
+        }
+    }
+
+    /// `NtQuerySystemInformation(class, buffer, length, &return_length)`
+    /// (roadmap W5.7) — implemented for `SystemEmulationBasicInformation`, the
+    /// one class a WoW64 process asks for and no other path does.
+    ///
+    /// `wow64.dll`'s process init issues it (rva 0x44a2: `mov ecx,0x3e; mov
+    /// r8d,0x40`) and keeps **one** field: the `ULONG_PTR` at `+0x28` of
+    /// `SYSTEM_BASIC_INFORMATION`, `MaximumUserModeAddress`, which it stores at
+    /// its own rva 0x16210. Every pointer a 32-bit guest hands to a thunked
+    /// service is bounds-checked against it (`cmp [rip+0x39a0], rdi; jb
+    /// <STATUS_INVALID_PARAMETER>` in the `NtQueryVirtualMemory` thunk, rva
+    /// 0x12869), so leaving it unanswered does not fail loudly — it makes
+    /// wow64.dll reject the 32-bit guest's own addresses as out of range.
+    pub(crate) fn nt_query_system_information(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        let class = self.syscall_arg(cpu, mem, 0)? as u32;
+        let buffer = self.syscall_arg(cpu, mem, 1)?;
+        let length = self.syscall_arg(cpu, mem, 2)?;
+        let return_length = self.syscall_arg(cpu, mem, 3)?;
+        if class != SYSTEM_EMULATION_BASIC_INFORMATION {
+            return Ok(STATUS_NOT_IMPLEMENTED);
+        }
+        const NEED: u64 = 0x40; // sizeof(SYSTEM_BASIC_INFORMATION) on x64
+        if buffer == 0 || length < NEED {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        mem.write(buffer, &[0u8; NEED as usize])?;
+        mem.write_u32(buffer + 0x08, 0x1000)?; // PageSize
+        mem.write_u32(buffer + 0x18, 0x1_0000)?; // AllocationGranularity
+        mem.write_u64(buffer + 0x20, 0x1_0000)?; // MinimumUserModeAddress
+        // The *emulated* (32-bit) address-space ceiling. This is the whole point
+        // of the "Emulation" variant of the class: the answer describes the
+        // machine the WoW64 guest thinks it is on, not the host one.
+        mem.write_u64(buffer + 0x28, 0x7FFF_FFFF)?; // MaximumUserModeAddress
+        mem.write_u64(buffer + 0x30, 1)?; // ActiveProcessorsAffinityMask
+        mem.write_u8(buffer + 0x38, 1)?; // NumberOfProcessors
+        if return_length != 0 {
+            mem.write_u32(return_length, NEED as u32)?;
+        }
+        Ok(STATUS_SUCCESS)
+    }
+
+    /// `NtQuerySystemInformationEx(class, input, input_len, buffer, length,
+    /// &return_length)` (roadmap W5.6) — implemented for
+    /// `SystemSupportedProcessorArchitectures`, the one class
+    /// `ntdll!RtlWow64GetProcessMachines` issues, and therefore the one
+    /// `wow64.dll`'s process init depends on to learn that it is running an
+    /// i386 guest on an x86-64 host.
+    ///
+    /// The answer is an array of 32-bit entries `{machine:16, flags}` ending in
+    /// a zero machine — the shape read straight out of that routine's loop
+    /// (`word [e]` = machine, `byte [e+2]` = flags, `test cl,4` → native,
+    /// `and ecx,8` → the process's own machine). A WoW64 process therefore
+    /// reports **two** entries, because one entry can be either the native or
+    /// the current machine, never both.
+    pub(crate) fn nt_query_system_information_ex(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+        use crate::wow64::arch_entry;
+        let class = self.syscall_arg(cpu, mem, 0)? as u32;
+        let buffer = self.syscall_arg(cpu, mem, 3)?;
+        let length = self.syscall_arg(cpu, mem, 4)?;
+        let return_length = self.syscall_arg(cpu, mem, 5)?;
+        if class != crate::wow64::SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES {
+            return Ok(STATUS_NOT_IMPLEMENTED);
+        }
+        let native = arch_entry::entry(
+            crate::wow64::MACHINE_AMD64,
+            arch_entry::KERNEL_MODE | arch_entry::USER_MODE | arch_entry::NATIVE,
+        );
+        let entries: [u32; 3] = if self.wow64_peb32 != 0 {
+            // A WoW64 process: i386 is what it runs, x86-64 is what the machine is.
+            [
+                arch_entry::entry(crate::wow64::MACHINE_I386, arch_entry::USER_MODE | arch_entry::PROCESS),
+                native,
+                0,
+            ]
+        } else {
+            [
+                arch_entry::entry(crate::wow64::MACHINE_AMD64, arch_entry::USER_MODE | arch_entry::PROCESS),
+                native,
+                0,
+            ]
+        };
+        let need = entries.len() as u64 * 4;
+        if buffer == 0 || length < need {
+            return Ok(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        for (i, e) in entries.iter().enumerate() {
+            mem.write_u32(buffer + i as u64 * 4, *e)?;
+        }
+        if return_length != 0 {
+            mem.write_u32(return_length, need as u32)?;
+        }
+        Ok(STATUS_SUCCESS)
+    }
 }
 
 // ---- NT thread syscall status codes + SSDT wiring (roadmap W2.9) ----------
@@ -1011,6 +1221,11 @@ const NT_CURRENT_THREAD: u64 = u64::MAX - 1;
 const CREATE_SUSPENDED_NT: u32 = 0x0000_0001;
 /// `ThreadBasicInformation` `THREADINFOCLASS` value.
 const THREAD_BASIC_INFORMATION: u32 = 0;
+/// `ProcessBasicInformation` `PROCESSINFOCLASS` value.
+const PROCESS_BASIC_INFORMATION: u32 = 0;
+/// `SystemEmulationBasicInformation` `SYSTEM_INFORMATION_CLASS` value — the
+/// `SYSTEM_BASIC_INFORMATION` of the *emulated* (32-bit) machine.
+const SYSTEM_EMULATION_BASIC_INFORMATION: u32 = 0x3e;
 /// `ThreadWow64Context` + `sizeof(WOW64_CONTEXT)` — both read out of the pinned
 /// 64-bit `ntdll.dll`'s own `RtlWow64GetThreadContext`; see [`crate::wow64`].
 use crate::wow64::{THREAD_WOW64_CONTEXT, WOW64_CONTEXT_SIZE};
@@ -1031,6 +1246,17 @@ pub(crate) const SSDT_NT_TERMINATE_PROCESS: u32 = 0x2c;
 pub(crate) const SSDT_NT_SUSPEND_THREAD: u32 = 0xf5;
 pub(crate) const SSDT_NT_RESUME_THREAD: u32 = 0x52;
 pub(crate) const SSDT_NT_QUERY_INFORMATION_THREAD: u32 = 0x25;
+/// `NtQueryInformationProcess` (roadmap W5.6) — index 0x19 in **both** the
+/// pinned 32- and 64-bit ntdlls (they share one index space).
+pub(crate) const SSDT_NT_QUERY_INFORMATION_PROCESS: u32 = 0x19;
+/// `NtQuerySystemInformationEx` (roadmap W5.6) — index 0xcb, the service
+/// `RtlWow64GetProcessMachines` issues.
+pub(crate) const SSDT_NT_QUERY_SYSTEM_INFORMATION_EX: u32 = 0xcb;
+/// `NtQuerySystemInformation` (roadmap W5.7) — index 0x36.
+pub(crate) const SSDT_NT_QUERY_SYSTEM_INFORMATION: u32 = 0x36;
+/// `NtSetInformationThread` (roadmap W5.7) — index 0xd; the service
+/// `RtlWow64SetThreadContext` (and therefore `wow64cpu!BTCpuSetContext`) issues.
+pub(crate) const SSDT_NT_SET_INFORMATION_THREAD: u32 = 0xd;
 
 pub(crate) fn ssdt_nt_create_thread_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_create_thread_ex(cpu, mem)
@@ -1049,4 +1275,24 @@ pub(crate) fn ssdt_nt_resume_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mu
 }
 pub(crate) fn ssdt_nt_query_information_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_query_information_thread(cpu, mem)
+}
+pub(crate) fn ssdt_nt_set_information_thread(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_set_information_thread(cpu, mem)
+}
+pub(crate) fn ssdt_nt_query_information_process(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    os.nt_query_information_process(cpu, mem)
+}
+pub(crate) fn ssdt_nt_query_system_information(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    os.nt_query_system_information(cpu, mem)
+}
+pub(crate) fn ssdt_nt_query_system_information_ex(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    os.nt_query_system_information_ex(cpu, mem)
 }

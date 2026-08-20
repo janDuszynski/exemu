@@ -28,6 +28,16 @@ pub const TEB_CPU_AREA_PTR_OFF: u64 = 0x1488;
 /// the resume flag (`btr [r13-4],0`): clear → the fast far-jmp forward path.
 pub const CPU_AREA_HEADER_LEN: u64 = 4;
 
+/// The header's "reload the whole 32-bit register file" bit.
+///
+/// `BTCpuSimulate` opens with `btr dword ptr [area], 0` (rva 0x1189) and
+/// branches on the *old* value: clear → the fast forward path (rva 0x116d,
+/// which restores only `Edi/Esi/Ebx/Ebp` plus `Eip`/`SegCs`/`Esp` and far-jumps),
+/// set → the full restore (rva 0x11b3, which also loads `Eax/Ecx/Edx`, the
+/// segment registers and `EFlags`, and enters via `iretq`). `btr` clears it, so
+/// each arming is consumed by exactly one simulate.
+pub const CPU_AREA_RELOAD_BIT: u32 = 1;
+
 // --- WOW64_CONTEXT (== the 32-bit CONTEXT) field offsets --------------------
 /// `Edi`.
 pub const CTX_EDI: u64 = 0x9c;
@@ -103,6 +113,138 @@ pub const THREAD_WOW64_CONTEXT: u32 = 0x1d;
 /// `sizeof(WOW64_CONTEXT)` (= the 32-bit `CONTEXT`), from the same stub.
 pub const WOW64_CONTEXT_SIZE: u64 = 0x2cc;
 
+// --- `ntdll!LdrSystemDllInitBlock` — the kernel→wow64.dll hand-off block -----
+
+/// `PS_SYSTEM_DLL_INIT_BLOCK.Wow64SharedInformation[0]` — the **32-bit**
+/// `ntdll!LdrInitializeThunk`.
+///
+/// Recovered from `wow64.dll`'s per-thread init (rva 0x570e): `mov rax,
+/// [LdrSystemDllInitBlock]; mov rax,[rax+0x18]; mov [ctx+Eip], eax` — i.e. the
+/// value it seats a fresh WoW64 thread's 32-bit `Eip` on. That is what makes
+/// the 32-bit guest start inside **Wine's own loader** rather than at the
+/// program's entry point.
+pub const SYSDLL_LDR_INITIALIZE_THUNK: u64 = 0x18;
+/// `Wow64SharedInformation[1]` — 32-bit `KiUserExceptionDispatcher`.
+/// `wow64.dll` rva 0x3838 loads `[block+0x20]` and stores it as the 32-bit
+/// `Eip` of the context it builds for an exception (`ContextFlags` 0x10001 is
+/// written two instructions later).
+pub const SYSDLL_KI_USER_EXCEPTION_DISPATCHER: u64 = 0x20;
+/// `Wow64SharedInformation[2]` — 32-bit `KiUserApcDispatcher`
+/// (`wow64.dll!Wow64ApcRoutine`, rva 0x28dc / 0x298a: `[block+0x28]` → ctx Eip).
+pub const SYSDLL_KI_USER_APC_DISPATCHER: u64 = 0x28;
+/// `Wow64SharedInformation[3]` — 32-bit `KiUserCallbackDispatcher`
+/// (`wow64.dll!Wow64KiUserCallbackDispatcher`, rva 0x2b08: `[block+0x30]`).
+pub const SYSDLL_KI_USER_CALLBACK_DISPATCHER: u64 = 0x30;
+/// The **32-bit ntdll's image base**. `wow64.dll`'s process init (rva 0x4879)
+/// does `mov rcx,[block+0x48]` and hands it straight to
+/// `RtlFindExportedRoutineByName("Wow64Transition")` — so this field is a
+/// module handle, not a routine.
+pub const SYSDLL_NTDLL32_BASE: u64 = 0x48;
+/// Bytes of the block exemu fills (through the last field above, rounded up).
+pub const SYSDLL_BLOCK_SIZE: u64 = 0x50;
+
+/// The 32-bit `ntdll` entry points `LdrSystemDllInitBlock` publishes, resolved
+/// by name by the caller from the mapped i386 image.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemDllInitBlock {
+    /// Image base of the 32-bit `ntdll.dll`.
+    pub ntdll32_base: u64,
+    /// `ntdll32!LdrInitializeThunk`.
+    pub ldr_initialize_thunk: u64,
+    /// `ntdll32!KiUserExceptionDispatcher`.
+    pub exception_dispatcher: u64,
+    /// `ntdll32!KiUserApcDispatcher`.
+    pub apc_dispatcher: u64,
+    /// `ntdll32!KiUserCallbackDispatcher`.
+    pub callback_dispatcher: u64,
+}
+
+/// Fill `ntdll!LdrSystemDllInitBlock` — the block through which the loader
+/// tells `wow64.dll` where the 32-bit `ntdll` and its entry points are
+/// (roadmap W5.6).
+///
+/// On Windows this is the kernel's job; in Wine it is the **Unix side** of
+/// ntdll, which exemu stands in for. Every consumer is `wow64.dll`, and every
+/// offset above was read out of `wow64.dll`'s own use sites — so a drifted
+/// field fails `crates/app/tests/wow64_abi.rs` rather than silently seating a
+/// 32-bit thread on a null `Eip`.
+///
+/// All five values must be 32-bit addressable: `wow64.dll` narrows the
+/// dispatcher entries into a 32-bit `CONTEXT` (`mov [ctx+Eip], eax`), so a
+/// higher address would be truncated rather than rejected.
+pub fn publish_system_dll_init_block(mem: &mut dyn Memory, block: u64, v: &SystemDllInitBlock) -> Result<()> {
+    for (name, addr) in [
+        ("ntdll32 base", v.ntdll32_base),
+        ("LdrInitializeThunk", v.ldr_initialize_thunk),
+        ("KiUserExceptionDispatcher", v.exception_dispatcher),
+        ("KiUserApcDispatcher", v.apc_dispatcher),
+        ("KiUserCallbackDispatcher", v.callback_dispatcher),
+    ] {
+        if addr > u32::MAX as u64 {
+            return Err(EmuError::Os(format!(
+                "LdrSystemDllInitBlock: 32-bit ntdll {name} at {addr:#x} is above 4 GiB — \
+                 wow64.dll narrows it into a 32-bit CONTEXT"
+            )));
+        }
+    }
+    mem.write_u32(block, SYSDLL_BLOCK_SIZE as u32)?; // Size
+    mem.write_u64(block + SYSDLL_LDR_INITIALIZE_THUNK, v.ldr_initialize_thunk)?;
+    mem.write_u64(block + SYSDLL_KI_USER_EXCEPTION_DISPATCHER, v.exception_dispatcher)?;
+    mem.write_u64(block + SYSDLL_KI_USER_APC_DISPATCHER, v.apc_dispatcher)?;
+    mem.write_u64(block + SYSDLL_KI_USER_CALLBACK_DISPATCHER, v.callback_dispatcher)?;
+    mem.write_u64(block + SYSDLL_NTDLL32_BASE, v.ntdll32_base)?;
+    Ok(())
+}
+
+// --- The two NT queries wow64.dll's process init issues ---------------------
+
+/// `ProcessWow64Information` — the `PROCESSINFOCLASS` whose answer is a
+/// pointer to the process's **32-bit PEB**.
+///
+/// Recovered from `wow64.dll`'s process init (rva 0x44e0): `mov edx,0x1a; mov
+/// r9d,8; lea r8,[rsp+0x50]; mov rcx,-1; call [NtQueryInformationProcess]`,
+/// whose result it immediately treats as `PEB32` (`lea rcx,[rdx+0x480]` — the
+/// `WOW64INFO` that follows the PEB32 — and stores that at `TEB64+0x14d0`).
+pub const PROCESS_WOW64_INFORMATION: u32 = 0x1a;
+
+/// `SystemSupportedProcessorArchitectures2` — the `SYSTEM_INFORMATION_CLASS`
+/// behind `ntdll!RtlWow64GetProcessMachines`.
+///
+/// Recovered from that routine's own bytes (64-bit ntdll rva 0x3a851): `mov
+/// ecx,0xb5` into `NtQuerySystemInformationEx`, with the process handle passed
+/// as an 8-byte *input* buffer and a 0x20-byte output buffer.
+pub const SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES: u32 = 0xb5;
+
+/// One `SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION` entry: a 32-bit
+/// word whose low 16 bits are the machine and whose next bits are flags. The
+/// decode is recovered from `RtlWow64GetProcessMachines`' loop, which reads
+/// `word [entry]` as the machine and `byte [entry+2]` as the flag byte,
+/// stopping at a zero machine.
+pub mod arch_entry {
+    /// `KernelMode` (bit 16 overall, bit 0 of the flag byte).
+    pub const KERNEL_MODE: u32 = 1 << 16;
+    /// `UserMode`.
+    pub const USER_MODE: u32 = 1 << 17;
+    /// `Native` — `RtlWow64GetProcessMachines` reports this entry's machine as
+    /// the *native* one (`test cl,4` → `mov r8d,edx`).
+    pub const NATIVE: u32 = 1 << 18;
+    /// `Process` — …and this one as the process's *current* machine
+    /// (`and ecx,8` → `cmovne r10d,edx`).
+    pub const PROCESS: u32 = 1 << 19;
+
+    /// Build one entry.
+    pub const fn entry(machine: u16, flags: u32) -> u32 {
+        machine as u32 | flags
+    }
+}
+
+/// `IMAGE_FILE_MACHINE_I386` — the machine a WoW64 guest reports as *current*.
+/// `wow64.dll` compares its recovered current machine against `0x14c` at three
+/// sites (rva 0x4498, 0x458e, 0x559d) to select the i386 personality.
+pub const MACHINE_I386: u16 = 0x014c;
+/// `IMAGE_FILE_MACHINE_AMD64` — the native machine of an exemu WoW64 process.
+pub const MACHINE_AMD64: u16 = 0x8664;
+
 /// `TEB32.NtTib.Self` (public winternl 32-bit TEB layout).
 pub const TEB32_SELF: u64 = 0x18;
 /// `TEB32.ProcessEnvironmentBlock` — where 32-bit guest code finds its PEB32
@@ -116,6 +258,36 @@ pub const TEB32_STACK_LIMIT: u64 = 0x08;
 pub const TEB32_EXCEPTION_LIST: u64 = 0x00;
 /// `TEB32.ClientId.UniqueProcess` / `.UniqueThread`.
 pub const TEB32_CLIENT_ID: u64 = 0x20;
+/// `TEB32.ActivationContextStackPointer`. Wine's i386 ntdll dereferences it
+/// two levels deep in its SxS lookup — `RtlFindActivationContextSectionString`
+/// (rva 0x22481) does `mov eax, fs:[0x18]; mov eax,[eax+0x1a8]; mov eax,[eax]`
+/// — so it must point at a real, empty `ACTIVATION_CONTEXT_STACK`, exactly like
+/// the 64-bit `+0x2c8` this crate already seeds.
+pub const TEB32_ACTIVATION_CONTEXT_STACK_POINTER: u64 = 0x1a8;
+/// Where the per-thread, inline 32-bit `ACTIVATION_CONTEXT_STACK` is laid down:
+/// past the end of the 32-bit `TEB` struct but inside its 0x2000-byte region,
+/// so it needs no separate allocation.
+pub const TEB32_ACTIVATION_CONTEXT_STACK: u64 = 0x1800;
+
+/// Seed the 32-bit `NT_TIB` + the fields Wine's i386 `ntdll` dereferences off
+/// `fs:` before its loader has run (roadmap W5.7).
+///
+/// The `ACTIVATION_CONTEXT_STACK` is left in its empty initial state — the
+/// region is zero-mapped, so `ActiveFrame`/`Flags`/`StackId` already read 0 —
+/// with only the `FrameListCache` `LIST_ENTRY` made self-referential, matching
+/// a live process's initial thread.
+pub fn seed_teb32(mem: &mut dyn Memory, teb32: u64, peb32: u64, stack_base: u64, stack_top: u64) -> Result<()> {
+    mem.write_u32(teb32 + TEB32_EXCEPTION_LIST, u32::MAX)?;
+    mem.write_u32(teb32 + TEB32_STACK_BASE, stack_top as u32)?;
+    mem.write_u32(teb32 + TEB32_STACK_LIMIT, stack_base as u32)?;
+    mem.write_u32(teb32 + TEB32_SELF, teb32 as u32)?;
+    mem.write_u32(teb32 + TEB32_PEB, peb32 as u32)?;
+    let actx = teb32 + TEB32_ACTIVATION_CONTEXT_STACK;
+    mem.write_u32(teb32 + TEB32_ACTIVATION_CONTEXT_STACK_POINTER, actx as u32)?;
+    mem.write_u32(actx + 0x04, actx as u32 + 0x04)?; // FrameListCache.Flink → self
+    mem.write_u32(actx + 0x08, actx as u32 + 0x04)?; // FrameListCache.Blink → self
+    Ok(())
+}
 
 /// `PEB32` field offsets (public winternl 32-bit PEB layout).
 pub mod peb32 {
@@ -144,18 +316,51 @@ pub mod peb32 {
 /// Initial `EFlags` for a fresh 32-bit thread (only the reserved bit 1 set).
 const EFLAGS_INIT: u32 = 0x0000_0202;
 
+/// The register state a fresh 32-bit thread starts in, in the shape Wine's
+/// **32-bit** `ntdll` expects (roadmap W5.6).
+///
+/// Recovered from `ntdll32!RtlUserThreadStart` (rva 0xe1d0), which is three
+/// instructions long:
+///
+/// ```text
+///   mov [esp+8], ebx      ; arg1 = Arg
+///   mov [esp+4], eax      ; arg0 = EntryPoint
+///   jmp  <thread start>
+/// ```
+///
+/// — i.e. the i386 convention is **`Eax` = entry point, `Ebx` = argument**,
+/// with `Eip` on `RtlUserThreadStart`, not the 64-bit `Rcx`/`Rdx` pair. That
+/// difference is exactly why the 32-bit bootstrap had to be read out of the
+/// i386 binary instead of mirrored from the 64-bit one.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Start32 {
+    /// `Eip` — for a boot through Wine's own loader this is
+    /// `ntdll32!RtlUserThreadStart`, which `wow64.dll`'s per-thread init then
+    /// *replaces* with `LdrInitializeThunk`, passing this record along as the
+    /// `CONTEXT` the loader eventually `NtContinue`s back into.
+    pub eip: u32,
+    /// `Esp` — top of the 32-bit stack.
+    pub esp: u32,
+    /// `Eax` — the thread's entry point.
+    pub eax: u32,
+    /// `Ebx` — the thread's argument.
+    pub ebx: u32,
+}
+
 /// Lay out the WoW64 CPU-reserved area for a fresh 32-bit guest thread (roadmap
 /// W5.4): publish the area pointer at `teb_base + 0x1488`, clear the machine-type
 /// header (so `BTCpuSimulate` takes the fast forward path), and seed the
-/// `WOW64_CONTEXT` at `area + 4` with the guest entry `eip`, stack `esp`, initial
-/// flags, and the 32-bit CS/SS selectors. General-purpose registers are left
-/// zeroed. After this, `wow64cpu!BTCpuSimulate` will drop the CPU into the guest.
-pub fn init_cpu_area(mem: &mut dyn Memory, teb_base: u64, area: u64, eip: u32, esp: u32) -> Result<()> {
+/// `WOW64_CONTEXT` at `area + 4` with [`Start32`], initial flags, and the 32-bit
+/// CS/SS selectors. The remaining general-purpose registers are left zeroed.
+/// After this, `wow64cpu!BTCpuSimulate` will drop the CPU into the guest.
+pub fn init_cpu_area(mem: &mut dyn Memory, teb_base: u64, area: u64, start: Start32) -> Result<()> {
     mem.write_u64(teb_base + TEB_CPU_AREA_PTR_OFF, area)?;
     mem.write_u32(area, 0)?; // header: bit0=0 → fast far-jmp forward path
     let ctx = area + CPU_AREA_HEADER_LEN;
-    mem.write_u32(ctx + CTX_EIP, eip)?;
-    mem.write_u32(ctx + CTX_ESP, esp)?;
+    mem.write_u32(ctx + CTX_EIP, start.eip)?;
+    mem.write_u32(ctx + CTX_ESP, start.esp)?;
+    mem.write_u32(ctx + CTX_EAX, start.eax)?;
+    mem.write_u32(ctx + CTX_EBX, start.ebx)?;
     mem.write_u32(ctx + CTX_EFLAGS, EFLAGS_INIT)?;
     mem.write_u32(ctx + CTX_SEGCS, SEL_CS32)?;
     mem.write_u32(ctx + CTX_SEGSS, SEL_SS32)?;
@@ -245,9 +450,11 @@ pub fn teb32_of(mem: &dyn Memory, teb64: u64) -> Result<Option<u64>> {
     Ok(Some(teb64.wrapping_add(off as i64 as u64)))
 }
 
-/// The three 32-bit cells Wine's own `wow64.dll` fills with the BOP address, and
-/// the one place exemu has to stand in for it because exemu — not
-/// `Wow64LdrpInitialize` — builds the WoW64 process.
+/// The three 32-bit cells Wine's own `wow64.dll` fills with the BOP address.
+///
+/// On the default WoW64 bring-up `Wow64LdrpInitialize` fills them itself and
+/// exemu writes none of them; these are used by the shorter *direct* bring-up
+/// (`wow64_boot::Bringup::Direct`), which skips Wine's process init entirely.
 ///
 /// **Recovered by disassembling the pinned `wow64.dll`,** which resolves each
 /// name out of the 32-bit ntdll with `RtlFindExportedRoutineByName` and stores
@@ -432,13 +639,20 @@ mod tests {
         mem.map(Region::new("teb", teb, 0x2000, Perm::RW)).unwrap();
         mem.map(Region::new("cpu", area, 0x1000, Perm::RW)).unwrap();
 
-        init_cpu_area(&mut mem, teb, area, 0x0040_1234, 0x0041_0000).unwrap();
+        init_cpu_area(
+            &mut mem,
+            teb,
+            area,
+            Start32 { eip: 0x0040_1234, esp: 0x0041_0000, eax: 0x0040_5678, ebx: 0 },
+        )
+        .unwrap();
 
         assert_eq!(mem.read_u64(teb + TEB_CPU_AREA_PTR_OFF).unwrap(), area, "area ptr at TEB+0x1488");
         assert_eq!(mem.read_u32(area).unwrap(), 0, "header cleared → forward path");
         let ctx = area + CPU_AREA_HEADER_LEN;
         assert_eq!(mem.read_u32(ctx + CTX_EIP).unwrap(), 0x0040_1234, "Eip");
         assert_eq!(mem.read_u32(ctx + CTX_ESP).unwrap(), 0x0041_0000, "Esp");
+        assert_eq!(mem.read_u32(ctx + CTX_EAX).unwrap(), 0x0040_5678, "Eax = the thread entry point");
         assert_eq!(mem.read_u32(ctx + CTX_SEGCS).unwrap(), SEL_CS32, "SegCs = 0x23");
         assert_eq!(mem.read_u32(ctx + CTX_SEGSS).unwrap(), SEL_SS32, "SegSs = 0x2b");
         assert_eq!(mem.read_u32(ctx + CTX_EFLAGS).unwrap(), EFLAGS_INIT, "EFlags");
