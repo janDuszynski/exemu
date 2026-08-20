@@ -391,9 +391,10 @@ the instruction set:
   constant-count `shl`/`shr`/`sar`, `inc`/`dec`, `neg`, `not`, `cmov<cc>`,
   `push`/`pop`, and `j<cc>`/`jmp` as compiled block terminators;
 * **everything else side-exits to the interpreter** — every SSE/x87/AVX
-  instruction, `syscall`, `call`/`ret`, the string ops, `adc`/`sbb`, the
-  rotates, `mul`/`div`, the `LOCK`/`REP` prefixes. Deferring is always safe;
-  compiling something whose flag semantics are not proven is not.
+  instruction, `syscall`, `call`/`ret`, indirect jumps, the string ops,
+  `adc`/`sbb`, the rotates, CL-count shifts, `mul`/`div`, the `LOCK`/`REP`
+  prefixes, the address-size override, and `fs:` in 64-bit mode. Deferring is
+  always safe; compiling something whose flag semantics are not proven is not.
 
 That slice was chosen by measuring, not guessing: an instrumented build
 (`--opcode-profile`) counts every instruction shape a real run executes. On
