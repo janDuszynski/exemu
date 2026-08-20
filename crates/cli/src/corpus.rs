@@ -107,6 +107,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::toml_lite::{quote, Value};
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -282,12 +284,10 @@ fn absolute(p: PathBuf) -> PathBuf {
 // ---------------------------------------------------------------------------
 // Manifest parsing / emitting
 //
-// A deliberately tiny TOML subset — `[[binary]]` table arrays of scalar keys —
-// parsed and emitted by hand. The workspace has no third-party dependency
-// outside a single dev-dependency, and the CLI already hand-rolls its argument
-// parsing "to keep the dependency graph and build time small"; pulling in
-// serde + a TOML crate for eleven scalar keys would be the larger cost. Hand
-// emitting also gives `--update` a canonical, minimal, reviewable diff.
+// `[[binary]]` table arrays of scalar keys, over the [`crate::toml_lite`]
+// value parser this module shares with [`crate::profile`] (roadmap W9.4) — see
+// that module for why there is no third-party TOML dependency. Hand emitting
+// also gives `--update` a canonical, minimal, reviewable diff.
 // ---------------------------------------------------------------------------
 
 impl Manifest {
@@ -413,74 +413,9 @@ impl Manifest {
     }
 }
 
-#[derive(Clone, Debug)]
-enum Value {
-    Str(String),
-    Int(i64),
-    Bool(bool),
-}
-
-impl Value {
-    fn parse(s: &str) -> Option<Value> {
-        // Strip a trailing `# comment` outside of quotes.
-        let s = if s.starts_with('"') {
-            s
-        } else {
-            s.split('#').next().unwrap_or(s).trim()
-        };
-        if let Some(rest) = s.strip_prefix('"') {
-            let mut out = String::new();
-            let mut chars = rest.chars();
-            while let Some(c) = chars.next() {
-                match c {
-                    '"' => return Some(Value::Str(out)),
-                    '\\' => out.push(chars.next()?),
-                    _ => out.push(c),
-                }
-            }
-            return None; // unterminated
-        }
-        match s {
-            "true" => return Some(Value::Bool(true)),
-            "false" => return Some(Value::Bool(false)),
-            _ => {}
-        }
-        let cleaned = s.replace('_', "");
-        if let Some(hex) = cleaned.strip_prefix("0x") {
-            return i64::from_str_radix(hex, 16).ok().map(Value::Int);
-        }
-        cleaned.parse::<i64>().ok().map(Value::Int)
-    }
-
-    fn as_u64(&self) -> Option<u64> {
-        match self {
-            // Addresses above `i64::MAX` come through negative; the bit pattern
-            // is what a `rip` means, so reinterpret rather than reject.
-            Value::Int(i) => Some(*i as u64),
-            // Addresses are written quoted (`rip = "0x20001c2c"`) to read as
-            // addresses rather than decimal integers; unwrap them here.
-            Value::Str(s) => Value::parse(s).and_then(|v| v.as_u64()),
-            Value::Bool(_) => None,
-        }
-    }
-}
-
-fn quote(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        if c == '"' || c == '\\' {
-            o.push('\\');
-        }
-        o.push(c);
-    }
-    o.push('"');
-    o
-}
-
 impl Entry {
     fn from_pairs(kv: &[(String, Value)], at: usize) -> Result<Entry, String> {
-        let get = |k: &str| kv.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v);
+        let get = |k: &str| crate::toml_lite::get(kv, k);
         let want_str = |k: &str| -> Result<String, String> {
             match get(k) {
                 Some(Value::Str(s)) => Ok(s.clone()),

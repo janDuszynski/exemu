@@ -13,10 +13,10 @@
 
 use std::process::ExitCode;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use exemu_app::{audio_sample, gui_sample, sample, Process, RunConfig};
-use exemu_cli::corpus;
+use exemu_cli::{corpus, profile};
 use exemu_core::{rank_opcode_misses, EmuError, ImportSymbol, MissRecord};
 
 fn main() -> ExitCode {
@@ -50,7 +50,22 @@ fn run(args: Vec<String>) -> Result<u8, String> {
             println!("exemu {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
-        Some(other) => Err(format!("unknown command '{other}' (try `exemu --help`)")),
+        Some(other) => {
+            // Finder delivers a drag-onto-the-icon or double-click of a
+            // registered document type to a bundled, non-AppKit executable as
+            // a plain command-line argument (roadmap W9.7) — there is no
+            // "run" subcommand in that invocation, just the dropped file's
+            // path. Treat the whole argument list as `run <args...>` when the
+            // first token is not a known subcommand but does name a real
+            // file, so `exemu.app` with an `.exe` dropped on it works without
+            // a wrapper script. A typo'd subcommand (no such file) still
+            // falls through to the ordinary error below.
+            if Path::new(other).is_file() {
+                cmd_run(&args)
+            } else {
+                Err(format!("unknown command '{other}' (try `exemu --help`)"))
+            }
+        }
     }
 }
 
@@ -59,7 +74,8 @@ fn print_help() {
         "exemu {} — run Windows x86-64 .exe files on Apple Silicon\n\
 \n\
 USAGE:\n\
-    exemu run <file.exe> [--trace] [--no-echo] [--virtual-clock] [--jit] [-- <args>...]\n\
+    exemu run <file.exe> [--profile P] [--trace] [--no-echo] [--virtual-clock] [--jit] [-- <args>...]\n\
+    exemu run --profile P                 (a profile can supply <file.exe> itself)\n\
     exemu info <file.exe>\n\
     exemu opcodes [--telemetry <path>] [--clear]\n\
     exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]\n\
@@ -93,11 +109,26 @@ Use a --release build: a debug build is ~10x slower and 7-Zip alone executes\n\
 ~496M instructions.\n\
 \n\
 RUN OPTIONS:\n\
+    --profile P     Load run settings from the [profile] in TOML file P —\n\
+                    max-steps, sandbox root, Wine prefix, DPI, backend, --jit,\n\
+                    --virtual-clock — so a known-good binary runs without\n\
+                    remembering flags. A profile sets DEFAULTS: any flag you\n\
+                    also type, or a positional <file.exe>, still wins over what\n\
+                    the profile says (roadmap W9.4). See corpus.toml's sibling\n\
+                    format, documented in exemu_cli::profile\n\
     --trace         Log calls to unimplemented Windows APIs\n\
     --no-echo       Do not mirror guest console output to the host\n\
     --gui           Render dialogs in a real window (drive them yourself)\n\
-    --wine-boot D   Boot on Wine's PE DLL set in dir D; with --gui on macOS the\n\
-                    guest's windows appear as native NSWindows (roadmap W4.5)\n\
+    --sandbox-root P  Root the guest filesystem at P instead of the shared\n\
+                    $TMPDIR/exemu-sandbox (also settable per-binary via a\n\
+                    --profile's sandbox_root, roadmap W9.4)\n\
+    --dpi N         Logical DPI a DPI-aware guest is told the system runs at\n\
+                    (default 96). Reaches GetSystemDpiForProcess/GetDpiForWindow\n\
+                    only — NOT the EnumDisplaySettings device mode, which still\n\
+                    reports 96 (roadmap W9.4)\n\
+    --wine-boot D   Boot on Wine's PE DLL set in dir D — the \"Wine prefix\"; with\n\
+                    --gui on macOS the guest's windows appear as native\n\
+                    NSWindows (roadmap W4.5)\n\
     --virtual-clock Drive every clock the guest can read (RDTSC, GetTickCount,\n\
                     QueryPerformanceCounter, NtQuerySystemTime, KUSER_SHARED_\n\
                     DATA) from the instruction count instead of the host clock,\n\
@@ -132,19 +163,44 @@ sandbox under $TMPDIR/exemu-sandbox. For real installers, build with\n\
 }
 
 fn cmd_run(rest: &[String]) -> Result<u8, String> {
+    // First pass: find `--profile <path>` only (stopping at a bare `--`, so a
+    // guest argument never gets mistaken for it), so its settings can seed
+    // the defaults every other flag below is parsed on top of. Merge order is
+    // built-in default < profile file < explicit flag/positional — see
+    // `exemu_cli::profile`'s module docs (roadmap W9.4).
+    let mut loaded_profile: Option<profile::Profile> = None;
+    for (idx, a) in rest.iter().enumerate() {
+        if a == "--" {
+            break;
+        }
+        if a == "--profile" {
+            let p = rest.get(idx + 1).ok_or("--profile needs a <path>")?;
+            loaded_profile = Some(
+                profile::Profile::load(Path::new(p)).map_err(|e| format!("--profile: {e}"))?,
+            );
+            break;
+        }
+    }
+    let prof = loaded_profile.as_ref();
+
     let mut path: Option<&str> = None;
-    let mut trace = false;
+    let mut trace = prof.and_then(|p| p.trace).unwrap_or(false);
     let mut echo = true;
-    let mut gui = false;
-    let mut max_steps: Option<u64> = None;
+    let mut gui = prof.and_then(|p| p.backend) == Some(profile::Backend::Window);
+    let mut max_steps: Option<u64> = prof.and_then(|p| p.max_steps);
     let mut telemetry: Option<String> = None;
     let mut load_base: Option<u64> = None;
-    let mut wine_boot: Option<String> = None;
-    let mut virtual_clock = false;
-    let mut audio = false;
+    let mut wine_boot: Option<String> = prof.and_then(|p| p.wine_boot_dir.clone());
+    let mut virtual_clock = prof.and_then(|p| p.virtual_clock).unwrap_or(false);
+    let mut audio = prof.and_then(|p| p.audio).unwrap_or(false);
     let mut opcode_profile = false;
-    let mut jit = false;
+    let mut jit = prof.and_then(|p| p.jit).unwrap_or(false);
+    let mut sandbox_root: Option<String> = prof.and_then(|p| p.sandbox_root.clone());
+    let mut dpi: Option<u32> = prof.and_then(|p| p.dpi);
+    let profile_path = prof.and_then(|p| p.path.clone());
+    let profile_args: Vec<String> = prof.map(|p| p.args.clone()).unwrap_or_default();
     let mut guest_args: Vec<String> = Vec::new();
+    let mut explicit_args_given = false;
 
     let mut i = 0;
     while i < rest.len() {
@@ -156,10 +212,24 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             "--audio" => audio = true,
             "--opcode-profile" => opcode_profile = true,
             "--jit" => jit = true,
+            // Value already consumed by the pre-scan above; just skip over it
+            // here so it doesn't fall into "unknown option" / a stray path.
+            "--profile" => {
+                i += 1;
+            }
             "--max-steps" => {
                 i += 1;
                 let v = rest.get(i).ok_or("--max-steps needs a value (0 = unlimited)")?;
                 max_steps = Some(v.replace('_', "").parse().map_err(|_| "bad --max-steps value")?);
+            }
+            "--sandbox-root" => {
+                i += 1;
+                sandbox_root = Some(rest.get(i).ok_or("--sandbox-root needs a <path>")?.clone());
+            }
+            "--dpi" => {
+                i += 1;
+                let v = rest.get(i).ok_or("--dpi needs a value")?;
+                dpi = Some(v.parse().map_err(|_| "bad --dpi value")?);
             }
             "--telemetry" => {
                 i += 1;
@@ -179,6 +249,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             }
             "--" => {
                 guest_args.extend(rest[i + 1..].iter().cloned());
+                explicit_args_given = true;
                 break;
             }
             other if other.starts_with('-') => {
@@ -195,12 +266,17 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         i += 1;
     }
 
-    let path = path.ok_or("run: missing <file.exe>")?;
+    // A positional path or `--` argv always beats the profile's; the profile
+    // only fills in what the command line left unspecified.
+    let path = path
+        .or(profile_path.as_deref())
+        .ok_or("run: missing <file.exe> (or a --profile that sets `path`)")?;
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let final_guest_args = if explicit_args_given { guest_args } else { profile_args };
 
     // arg0 is conventionally the program name.
     let mut argv = vec![path.to_string()];
-    argv.extend(guest_args);
+    argv.extend(final_guest_args);
 
     let mut cfg = RunConfig {
         args: argv,
@@ -210,12 +286,14 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         load_base,
         virtual_clock,
         jit,
+        dpi: dpi.unwrap_or(96),
         ..RunConfig::default()
     };
     if let Some(m) = max_steps {
         cfg.max_steps = m;
     }
     cfg.wine_boot_dir = wine_boot;
+    cfg.sandbox_root = sandbox_root.map(PathBuf::from);
     // Roadmap W7.2. Opt-in, because the default (`NoAudio`, accept and drop) is
     // what keeps a headless run and a machine with no audio device working. On
     // the emulated path there is no audio stack to reach it, so this only ever
@@ -224,8 +302,12 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         cfg.audio_sink = Some(Box::new(exemu_audio::CoreAudioSink::new()));
     }
 
-    // The guest filesystem lives here regardless of how the run ends.
-    let sandbox = std::env::temp_dir().join("exemu-sandbox");
+    // The guest filesystem lives here regardless of how the run ends — same
+    // resolution `Process::load` uses internally, so `--sandbox-root`/a
+    // profile's `sandbox_root` moves what this reports, not just what the
+    // guest actually sees.
+    let sandbox =
+        cfg.sandbox_root.clone().unwrap_or_else(|| std::env::temp_dir().join("exemu-sandbox"));
 
     // Live macOS window path (roadmap W4.5): `--gui` with a Wine boot dir runs
     // the interpreter on a spawned thread while the main thread owns AppKit and
