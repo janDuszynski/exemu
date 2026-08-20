@@ -186,6 +186,13 @@ pub struct Entry {
     /// entry left on the host clock keeps its host-clock pin. Turning it on is
     /// what lets [`Entry::default_tolerance`] drop that entry's tolerance to 0.
     pub virtual_clock: bool,
+    /// Run this entry through the **block JIT** (`--jit`, roadmap W8). Pinned to
+    /// the *same* numbers as the interpreter entry for the same binary: the JIT
+    /// is required to be bit-for-bit identical, so a JIT entry that drifts from
+    /// its interpreter twin is precisely the failure this gate exists to catch.
+    /// Per-entry for the same reason `virtual_clock` is — it selects which
+    /// engine the pin describes.
+    pub jit: bool,
     /// Free prose kept verbatim across `--update` rewrites.
     pub note: Option<String>,
 }
@@ -359,6 +366,9 @@ impl Manifest {
             if e.virtual_clock {
                 let _ = writeln!(o, "virtual_clock = {}", e.virtual_clock);
             }
+            if e.jit {
+                let _ = writeln!(o, "jit       = {}", e.jit);
+            }
             let _ = writeln!(o, "max_steps = {}", e.max_steps);
             let _ = writeln!(o, "outcome   = {}", quote(e.outcome.as_str()));
             if e.outcome == Outcome::Exit {
@@ -515,6 +525,7 @@ impl Entry {
             },
             quick: matches!(get("quick"), Some(Value::Bool(true))),
             virtual_clock: matches!(get("virtual_clock"), Some(Value::Bool(true))),
+            jit: matches!(get("jit"), Some(Value::Bool(true))),
             note: match get("note") {
                 Some(Value::Str(s)) => Some(s.clone()),
                 _ => None,
@@ -599,9 +610,15 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
         .env("TMPDIR", &work)
         // Never inherit the developer's clock choice: an entry runs under
         // exactly the mode its pin was measured in, whatever the shell says.
-        .env_remove("EXEMU_VIRTUAL_CLOCK");
+        .env_remove("EXEMU_VIRTUAL_CLOCK")
+        // Same reasoning for the JIT: an entry runs on the engine its pin
+        // describes, never on whatever the developer's environment selects.
+        .env_remove("EXEMU_JIT");
     if e.virtual_clock {
         cmd.arg("--virtual-clock");
+    }
+    if e.jit {
+        cmd.arg("--jit");
     }
     let out = cmd
         .output()
@@ -1187,6 +1204,30 @@ tolerance = 0
         let host = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
         assert!(!host.entries[0].virtual_clock);
         assert!(!host.to_toml().contains("virtual_clock"));
+    }
+
+    /// The JIT flag round-trips, and is absent by default — so an entry never
+    /// silently changes which engine its pin describes.
+    #[test]
+    fn the_jit_flag_round_trips() {
+        const TEXT: &str = r#"[[binary]]
+path      = "example_exe/j.exe"
+quick     = true
+virtual_clock = true
+jit       = true
+max_steps = 1000
+outcome   = "exit"
+exit_code = 0
+steps     = 12345
+tolerance = 0
+"#;
+        let m = Manifest::parse(TEXT, PathBuf::from("/repo")).expect("parse");
+        assert!(m.entries[0].jit);
+        let again = Manifest::parse(&m.to_toml(), PathBuf::from("/repo")).expect("reparse");
+        assert!(again.entries[0].jit, "the flag survives a rewrite");
+        let interp = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
+        assert!(!interp.entries[0].jit);
+        assert!(!interp.to_toml().contains("jit"));
     }
 
     #[test]

@@ -553,6 +553,22 @@ gets ~0.1% slack. The corpus binaries are git-ignored third-party installers, so
 a fresh checkout has none and the gate skips cleanly; it also skips on a debug
 build, because the pins are release-measured.
 
+**JIT twins.** Three entries (`jit = true`) run the same binary through the
+[block JIT](#block-jit---jit) and are pinned to *exactly the interpreter
+entry's numbers*, because the JIT is required to be bit-for-bit identical. Any
+difference between a twin pair — one instruction, one artifact, a different
+fault site — is a JIT bug, and catching it is the reason the pair exists. The
+current table:
+
+```
+  PASS   7z2602-x64.exe                      exit 0            496,505,572     108   19.8s
+  PASS   SteamSetup.exe                      fault @ 0x20001c2c 92,865,377       3    3.2s
+  PASS   Firefox Installer.exe               fault @ 0x0         4,665,426       1    0.1s
+  PASS   7z2602-x64.exe (jit)                exit 0            496,505,572     108    2.2s
+  PASS   SteamSetup.exe (jit)                fault @ 0x20001c2c 92,865,377       3    1.4s
+  PASS   Firefox Installer.exe (jit)         fault @ 0x0         4,665,426       1    0.1s
+```
+
 ### Deterministic guest clock
 
 `exemu run --virtual-clock` (or `EXEMU_VIRTUAL_CLOCK=1`) makes **every clock the

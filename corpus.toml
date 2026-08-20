@@ -20,6 +20,13 @@
 #   note          prose, preserved verbatim across `--update`
 #   quick         run in the cheap default tier (seconds, not minutes)
 #   virtual_clock run with `--virtual-clock` — the deterministic guest clock
+#   jit           run with `--jit` — the block JIT (roadmap W8). A `jit` entry is
+#                 the TWIN of the interpreter entry for the same binary and is
+#                 pinned to identical numbers, because the JIT is required to be
+#                 bit-for-bit identical to the interpreter. Any difference
+#                 between a twin pair — one instruction, one artifact, a
+#                 different fault site — is a JIT bug, and catching that is the
+#                 reason the pair exists.
 #   max_steps     instruction budget for the run; exhausting it is a failure
 #   outcome       "exit" (clean ExitProcess) | "fault" | "budget"
 #   exit_code     expected process exit code, outcome = "exit" only
@@ -167,6 +174,50 @@ max_steps = 300000000
 outcome   = "fault"
 steps     = 4665426
 tolerance = 4665
+artifacts = 1
+rip       = "0x0"
+stop      = "unmapped memory access at 0x0000000000000000 (1 bytes)"
+
+[[binary]]
+name      = "7z2602-x64.exe (jit)"
+path      = "example_exe/7z2602-x64.exe"
+note      = "The SAME binary through the block JIT (roadmap W8). The JIT is required to be bit-for-bit identical to the interpreter, so this entry is pinned to exactly the interpreter entry's numbers: any drift between the twins — one instruction, one artifact, a different exit — is a JIT bug, and that is the whole point of the pair. 99.3% of this run executes as native ARM64; the rest side-exits. Wall time on the same machine: ~2.4 s against ~16.6 s interpreted."
+quick     = false
+virtual_clock = true
+jit       = true
+max_steps = 800000000
+outcome   = "exit"
+exit_code = 0
+steps     = 496505572
+tolerance = 0
+artifacts = 108
+
+[[binary]]
+name      = "SteamSetup.exe (jit)"
+path      = "example_exe/SteamSetup.exe"
+note      = "The 32-bit NSIS installer through the block JIT. Pinned to the interpreter twin's numbers, including the fault SITE and TEXT: a fault is where the JIT's rewind path is exercised for real — the block returns rip to the faulting instruction having changed nothing, and the interpreter re-executes it to raise the error. 90.7% native."
+quick     = false
+virtual_clock = true
+jit       = true
+max_steps = 300000000
+outcome   = "fault"
+steps     = 92865377
+tolerance = 0
+artifacts = 3
+rip       = "0x20001c2c"
+stop      = "unmapped memory access at 0x0000000000001010 (4 bytes)"
+
+[[binary]]
+name      = "Firefox Installer.exe (jit)"
+path      = "example_exe/Firefox Installer.exe"
+note      = "The 32-bit UPX-packed installer through the block JIT — the corpus's only self-modifying guest, so this entry is what keeps the code-cache invalidation honest: the UPX stub decompresses over its own image, and the JIT must recompile from the new bytes rather than run the old ones. 82.8% native."
+quick     = true
+virtual_clock = true
+jit       = true
+max_steps = 300000000
+outcome   = "fault"
+steps     = 4665426
+tolerance = 0
 artifacts = 1
 rip       = "0x0"
 stop      = "unmapped memory access at 0x0000000000000000 (1 bytes)"

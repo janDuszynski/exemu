@@ -35,6 +35,14 @@ end-to-end on the default path.
   7-Zip 19.7/16.6 s → 3.5/2.4 s, SteamSetup 3.3/3.4 s → 1.44/1.46 s, Firefox
   Installer 0.19/0.17 s → 0.16/0.16 s. Every run matched the interpreter's exit
   code, instruction count, fault site, register dump and artifact count exactly.
+- **The A/B is now a standing gate, not a one-off measurement.** `corpus.toml`
+  gains a `jit` field and three **twin entries** — the same binaries through the
+  JIT, pinned to exactly the interpreter entries' numbers. `exemu corpus` runs
+  8 of 8 green: 7-Zip `exit 0` @ 496,505,572 / 108 artifacts on both engines
+  (19.8 s vs 2.2 s), SteamSetup `fault @ 0x20001c2c` @ 92,865,377 / 3 on both
+  (3.2 s vs 1.4 s), Firefox `fault @ 0x0` @ 4,665,426 / 1 on both. A difference
+  between a twin pair — one instruction, one artifact, a moved fault — fails the
+  gate.
 - **The opcode slice was measured, not guessed.** A new feature-gated build
   (`--features opcode-profile`, `exemu run --opcode-profile`) counts every
   instruction *shape* — opcode, `0F` escape, `REX.W`/`66`, group sub-opcode —
