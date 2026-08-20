@@ -207,6 +207,7 @@ fn diff_mem(a: &VirtualMemory, b: &VirtualMemory) -> Option<String> {
 
 /// Run one trial. Returns `(retired, interpreted_after, reason)`.
 fn run_one(jit: &mut Jit, bits: Bits, code: &[u8], seed: &Seed) -> (Run, Option<String>) {
+    let mode = mode_of(bits);
     let Some((mut mem_j, mut cpu_j)) = setup(bits, code, seed) else {
         return (Run::NotCompiled, Some("could not build the address space".into()));
     };
@@ -216,7 +217,7 @@ fn run_one(jit: &mut Jit, bits: Bits, code: &[u8], seed: &Seed) -> (Run, Option<
     let before = cpu_j.state().clone();
 
     jit.invalidate(); // fresh address space every trial
-    let run = jit.run(cpu_j.state_mut(), &mut mem_j);
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode);
 
     let retired = match run {
         Run::NotCompiled => {
@@ -275,8 +276,7 @@ fn run_one(jit: &mut Jit, bits: Bits, code: &[u8], seed: &Seed) -> (Run, Option<
 }
 
 pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
-    let mut jit = Jit::new(mode_of(cfg.bits), 4 << 20)
-        .map_err(|e| format!("no JIT on this platform: {e}"))?;
+    let mut jit = Jit::new(4 << 20).map_err(|e| format!("no JIT on this platform: {e}"))?;
     let mut s = JitSummary::default();
     for index in 0..cfg.count {
         let (bytes, label, seed, generated) = trial_at(cfg.bits, cfg.seed, index, cfg.chain);

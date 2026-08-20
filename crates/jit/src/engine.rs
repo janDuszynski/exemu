@@ -94,15 +94,20 @@ struct CacheLine {
     rip: u64,
     idx: u32,
     gen: u32,
+    long: bool,
 }
 
 const LINES: usize = 8192;
 
 pub struct Jit {
     buffer: CodeBuffer,
-    mode: Mode,
     blocks: Vec<Block>,
-    map: HashMap<u64, u32>,
+    /// Keyed by `(guest address, 64-bit mode)`. The mode is part of the key
+    /// because the *same bytes* decode differently in the two modes — and a
+    /// WoW64 guest really does run both, switching on every transition
+    /// (roadmap W5.2). Keying them apart lets both stay cached instead of
+    /// flushing on every switch.
+    map: HashMap<(u64, bool), u32>,
     lines: Vec<CacheLine>,
     /// Bumped on every flush; a cache line is live only at the current value.
     cache_gen: u32,
@@ -113,14 +118,14 @@ pub struct Jit {
 }
 
 impl Jit {
-    /// Create a JIT with a `capacity`-byte code buffer.
-    pub fn new(mode: Mode, capacity: usize) -> Result<Jit, BufferError> {
+    /// Create a JIT with a `capacity`-byte code buffer. The guest CPU mode is
+    /// passed per call to [`Jit::run`], not fixed here.
+    pub fn new(capacity: usize) -> Result<Jit, BufferError> {
         Ok(Jit {
             buffer: CodeBuffer::with_capacity(capacity)?,
-            mode,
             blocks: Vec::new(),
             map: HashMap::new(),
-            lines: vec![CacheLine { rip: 0, idx: 0, gen: 0 }; LINES],
+            lines: vec![CacheLine { rip: 0, idx: 0, gen: 0, long: false }; LINES],
             cache_gen: 1,
             code_gen: 0,
             stats: JitStats::default(),
@@ -130,10 +135,6 @@ impl Jit {
 
     pub fn stats(&self) -> &JitStats {
         &self.stats
-    }
-
-    pub fn mode(&self) -> Mode {
-        self.mode
     }
 
     /// Cap the number of guest instructions per block (the differential uses
@@ -148,8 +149,9 @@ impl Jit {
     }
 
     #[inline]
-    fn line_of(rip: u64) -> usize {
-        (rip.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 51) as usize & (LINES - 1)
+    fn line_of(rip: u64, long: bool) -> usize {
+        (rip.wrapping_add(long as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 51) as usize
+            & (LINES - 1)
     }
 
     /// Throw the whole cache away. Called when guest code changed underneath it
@@ -177,18 +179,19 @@ impl Jit {
         self.code_gen = 0;
     }
 
-    /// Compile (or find) the block at `rip` and return its index.
-    fn block_at(&mut self, rip: u64, mem: &dyn Memory) -> u32 {
-        let line = Self::line_of(rip);
+    /// Compile (or find) the block at `rip` in `mode` and return its index.
+    fn block_at(&mut self, rip: u64, mode: Mode, mem: &dyn Memory) -> u32 {
+        let long = mode == Mode::Long;
+        let line = Self::line_of(rip, long);
         let l = self.lines[line];
-        if l.gen == self.cache_gen && l.rip == rip {
+        if l.gen == self.cache_gen && l.rip == rip && l.long == long {
             return l.idx;
         }
-        if let Some(&idx) = self.map.get(&rip) {
-            self.lines[line] = CacheLine { rip, idx, gen: self.cache_gen };
+        if let Some(&idx) = self.map.get(&(rip, long)) {
+            self.lines[line] = CacheLine { rip, idx, gen: self.cache_gen, long };
             return idx;
         }
-        let plan = Compiler::compile(mem, self.mode, rip, self.max_insns);
+        let plan = Compiler::compile(mem, mode, rip, self.max_insns);
         let lo = plan.start;
         let hi = plan.end_rip.max(plan.start);
         let page0 = lo & !(exemu_core::CODE_PAGE_SIZE - 1);
@@ -247,8 +250,8 @@ impl Jit {
         };
         let idx = self.blocks.len() as u32;
         self.blocks.push(block);
-        self.map.insert(rip, idx);
-        self.lines[Self::line_of(rip)] = CacheLine { rip, idx, gen: self.cache_gen };
+        self.map.insert((rip, long), idx);
+        self.lines[Self::line_of(rip, long)] = CacheLine { rip, idx, gen: self.cache_gen, long };
         idx
     }
 
@@ -280,17 +283,21 @@ impl Jit {
         false
     }
 
-    /// Execute the block at `state.rip`, if there is one.
-    pub fn run(&mut self, state: &mut CpuState, mem: &mut dyn Memory) -> Run {
+    /// Execute the block at `state.rip` in `mode`, if there is one.
+    ///
+    /// `mode` is the *interpreter's current* mode, not a property of the image:
+    /// a WoW64 process runs 32- and 64-bit code in the same address space, and
+    /// the same bytes mean different things in each.
+    pub fn run(&mut self, state: &mut CpuState, mem: &mut dyn Memory, mode: Mode) -> Run {
         let rip = state.rip;
-        let mut idx = self.block_at(rip, &*mem) as usize;
+        let mut idx = self.block_at(rip, mode, &*mem) as usize;
         if !self.validate(idx, &*mem) {
             // The bytes under a cached block changed. Invalidation is still
             // whole-cache (indexing pages back to the blocks that cover them is
             // W8.5); what matters here is that it now happens only when guest
             // *code* really changed.
             self.flush();
-            idx = self.block_at(rip, &*mem) as usize;
+            idx = self.block_at(rip, mode, &*mem) as usize;
         }
         let (code, insns, lo, hi) = match &self.blocks[idx] {
             Block { code: Some(c), insns, lo, hi, .. } => (*c, *insns, *lo, *hi),
@@ -365,8 +372,8 @@ mod tests {
         let mut mem = mem_with(&code);
         let mut st = CpuState::new();
         st.rip = CODE;
-        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let r = jit.run(&mut st, &mut mem, Mode::Long);
         assert_eq!(r, Run::Executed { insns: 2 });
         assert_eq!(st.gpr[0], 12);
         assert_eq!(st.rip, CODE + 8);
@@ -379,8 +386,8 @@ mod tests {
         let mut mem = mem_with(&code);
         let mut st = CpuState::new();
         st.rip = CODE;
-        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
-        assert_eq!(jit.run(&mut st, &mut mem), Run::NotCompiled);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::NotCompiled);
         assert_eq!(st.rip, CODE, "a declined block must not move rip");
     }
 
@@ -395,8 +402,8 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         st.gpr[2] = 0xDEAD_0000; // unmapped
-        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let r = jit.run(&mut st, &mut mem, Mode::Long);
         assert_eq!(r, Run::Faulted { insns: 1 });
         assert_eq!(st.gpr[0], 1, "the first instruction did run");
         assert_eq!(st.rip, CODE + 5, "rip rewound to the faulting instruction");
@@ -412,8 +419,8 @@ mod tests {
         let mut mem = mem_with(&code);
         let mut st = CpuState::new();
         st.rip = CODE;
-        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
-        assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 2 });
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 2 });
         assert_eq!(st.rip, CODE + 6, "branch taken");
     }
 
@@ -432,8 +439,8 @@ mod tests {
         mem.poke(CODE, &code).unwrap();
         let mut st = CpuState::new();
         st.rip = CODE;
-        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let r = jit.run(&mut st, &mut mem, Mode::Long);
         assert_eq!(r, Run::Executed { insns: 1 }, "stopped after the self-modifying store");
         assert_eq!(st.rip, CODE + 8);
         assert_eq!(st.gpr[0], 0, "the instruction after the store did NOT run");
@@ -451,21 +458,53 @@ mod tests {
         let b = [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3];
         mem.poke(CODE, &a).unwrap();
         mem.poke(CODE + 0x40, &b).unwrap();
-        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
+        let mut jit = Jit::new(64 * 1024).unwrap();
 
         let mut st = CpuState::new();
         st.rip = CODE + 0x40;
-        assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 1 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
         assert_eq!(st.gpr[0], 1);
 
         st.rip = CODE;
-        assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 1 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
 
         let flushes = jit.stats().flushes;
         st.rip = CODE + 0x40;
-        assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 1 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
         assert_eq!(st.gpr[0], 2, "block B was recompiled from the rewritten bytes");
         assert!(jit.stats().flushes > flushes, "the stale block was invalidated");
+    }
+
+    /// A WoW64 guest runs 32- and 64-bit code in one address space, switching on
+    /// every transition — so the block cache is keyed by mode, not just by
+    /// address. These bytes mean genuinely different things in the two modes:
+    /// `48 FF C0` is `inc rax` in long mode, but `dec eax` followed by
+    /// `inc eax` in protected mode.
+    #[test]
+    fn the_same_bytes_are_cached_separately_per_cpu_mode() {
+        let code = [0x48, 0xFF, 0xC0, 0xC3];
+        let mut mem = mem_with(&code);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+
+        let mut st = CpuState::new();
+        st.rip = CODE;
+        st.gpr[0] = 5;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
+        assert_eq!(st.gpr[0], 6, "long mode: one `inc rax`");
+        assert_eq!(st.rip, CODE + 3);
+
+        st.rip = CODE;
+        st.gpr[0] = 5;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Protected), Run::Executed { insns: 2 });
+        assert_eq!(st.gpr[0], 5, "protected mode: `dec eax` then `inc eax`");
+        assert_eq!(st.rip, CODE + 3);
+
+        // And back again, from the cache rather than a recompile.
+        st.rip = CODE;
+        st.gpr[0] = 5;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
+        assert_eq!(st.gpr[0], 6);
+        assert_eq!(jit.stats().flushes, 0, "switching modes must not flush");
     }
 
     #[test]
@@ -481,11 +520,11 @@ mod tests {
         // mov byte [DATA], 1 ; ret
         let code = [0xC6, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x01, 0xC3];
         mem.poke(CODE, &code).unwrap();
-        let mut jit = Jit::new(Mode::Long, 64 * 1024).unwrap();
+        let mut jit = Jit::new(64 * 1024).unwrap();
         let mut st = CpuState::new();
         for _ in 0..8 {
             st.rip = CODE;
-            assert_eq!(jit.run(&mut st, &mut mem), Run::Executed { insns: 1 });
+            assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
         }
         assert_eq!(jit.stats().flushes, 0, "a data store must not invalidate the cache");
         assert_eq!(jit.stats().blocks_compiled, 1, "and the block is compiled once");

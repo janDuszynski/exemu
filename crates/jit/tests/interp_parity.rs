@@ -81,8 +81,8 @@ fn parity(bits: Bits, code: &[u8], what: &str, seed: &CpuState) -> u32 {
         Bits::B32 => Mode::Protected,
         Bits::B64 => Mode::Long,
     };
-    let mut jit = Jit::new(mode, 256 * 1024).expect("JIT should be available");
-    let run = jit.run(cpu_j.state_mut(), &mut mem_j);
+    let mut jit = Jit::new(256 * 1024).expect("JIT should be available");
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode);
     let n = match run {
         Run::NotCompiled => panic!("{what}: the JIT compiled nothing at all"),
         Run::Executed { insns } | Run::Faulted { insns } => insns,

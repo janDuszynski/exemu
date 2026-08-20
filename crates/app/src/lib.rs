@@ -729,8 +729,7 @@ impl Process {
         // degrades in speed and nothing else.
         let want_jit = cfg.jit || std::env::var("EXEMU_JIT").is_ok_and(|v| v != "0");
         let jit = if want_jit {
-            let mode = if image.is_64bit { exemu_jit::Mode::Long } else { exemu_jit::Mode::Protected };
-            match exemu_jit::Jit::new(mode, JIT_CODE_BYTES) {
+            match exemu_jit::Jit::new(JIT_CODE_BYTES) {
                 Ok(j) => Some(j),
                 Err(e) => {
                     eprintln!("[exemu] JIT unavailable, running on the interpreter: {e}");
@@ -1009,7 +1008,14 @@ impl Process {
             // interpreter takes that address and `Hooks::intercept` fires as
             // usual.
             if let Some(jit) = self.jit.as_mut() {
-                let ran = jit.run(self.cpu.state_mut(), &mut self.mem);
+                // The mode is the CPU's *current* one, not the image's: a WoW64
+                // process runs 32- and 64-bit code in one address space and the
+                // same bytes decode differently in each (roadmap W5.2).
+                let mode = match self.cpu.bits() {
+                    Bits::B64 => exemu_jit::Mode::Long,
+                    Bits::B32 => exemu_jit::Mode::Protected,
+                };
+                let ran = jit.run(self.cpu.state_mut(), &mut self.mem, mode);
                 let insns = match ran {
                     exemu_jit::Run::NotCompiled => 0,
                     exemu_jit::Run::Executed { insns } | exemu_jit::Run::Faulted { insns } => insns,
