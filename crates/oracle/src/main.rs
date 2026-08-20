@@ -1,20 +1,131 @@
 //! `exemu-oracle` CLI. See the crate docs; the real work lives behind the
 //! `unicorn` feature.
 
-#[cfg(not(feature = "unicorn"))]
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    // The JIT differential needs no reference emulator, so it is always
+    // available — including in a build without the `unicorn` feature.
+    if argv.iter().any(|a| a == "jit") {
+        jit_main(&argv);
+        return;
+    }
+    unicorn_main(&argv);
+}
+
+/// `exemu-oracle jit [--bits 32|64|both] [--count N] [--seed S] [--chain K]`
+fn jit_main(argv: &[String]) {
+    use exemu_cpu::Bits;
+    use exemu_oracle::jitdiff::{fuzz, render, JitFuzzConfig};
+
+    let mut bits_list = vec![Bits::B32, Bits::B64];
+    let mut count: u64 = 200_000;
+    let mut seed: u64 = 1;
+    let mut report: usize = 25;
+    let mut chain: u32 = 8;
+    let mut i = 1;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "jit" => {}
+            "--bits" => {
+                i += 1;
+                bits_list = match argv.get(i).map(|s| s.as_str()) {
+                    Some("32") => vec![Bits::B32],
+                    Some("64") => vec![Bits::B64],
+                    _ => vec![Bits::B32, Bits::B64],
+                };
+            }
+            "--count" => {
+                i += 1;
+                count = argv.get(i).and_then(|s| parse_count(s)).unwrap_or(count);
+            }
+            "--seed" => {
+                i += 1;
+                seed = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(seed);
+            }
+            "--chain" => {
+                i += 1;
+                chain = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(chain);
+            }
+            "--report" => {
+                i += 1;
+                report = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(report);
+            }
+            other => {
+                eprintln!("unknown argument: {other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+
+    let mut total_div = 0u64;
+    for bits in bits_list {
+        let name = match bits {
+            Bits::B32 => "32-bit",
+            Bits::B64 => "64-bit",
+        };
+        println!("== JIT-vs-interpreter differential ({name}): {count} trials × {chain} instructions, seed {seed} ==");
+        let s = match fuzz(&JitFuzzConfig { bits, count, seed, max_report: report, chain }) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  {e}");
+                std::process::exit(2);
+            }
+        };
+        for d in &s.first {
+            println!("{}", render(d));
+        }
+        println!(
+            "  -> {} trials, {} JIT-compiled ({} guest instructions natively, {:.1}% of the stream), \
+             {} declined, {} rewound on a fault, {} divergences",
+            s.trials,
+            s.compiled,
+            s.insns,
+            s.coverage(),
+            s.not_compiled,
+            s.faults,
+            s.divergences
+        );
+        let declined: Vec<String> = s
+            .declined_ops
+            .iter()
+            .take(12)
+            .map(|(k, c)| {
+                if k & 0x100 != 0 {
+                    format!("0f{:02x}×{c}", k & 0xff)
+                } else {
+                    format!("{:02x}×{c}", k & 0xff)
+                }
+            })
+            .collect();
+        if !declined.is_empty() {
+            println!("     declined (opcode×blocks): {}", declined.join(" "));
+        }
+        total_div += s.divergences;
+    }
+    if total_div == 0 {
+        println!("ZERO DIVERGENCE ✓");
+        std::process::exit(0);
+    }
+    println!("{total_div} divergence(s) — the JIT is NOT interpreter-identical");
+    std::process::exit(1);
+}
+
+#[cfg(not(feature = "unicorn"))]
+fn unicorn_main(_argv: &[String]) {
     eprintln!("exemu-oracle was built without the `unicorn` feature (the CI-safe default).");
     eprintln!("Build the differential oracle with:");
     eprintln!("  cargo run -p exemu-oracle --features unicorn --release -- fuzz [--bits 32|64] [--count N] [--seed S]");
+    eprintln!("The JIT-vs-interpreter differential needs no reference emulator:");
+    eprintln!("  cargo run -p exemu-oracle --release -- jit [--bits 32|64|both] [--count N] [--chain K]");
     std::process::exit(2);
 }
 
 #[cfg(feature = "unicorn")]
-fn main() {
+fn unicorn_main(argv: &[String]) {
     use exemu_cpu::Bits;
     use exemu_oracle::{debug_index, fuzz, render, FuzzConfig};
 
-    let argv: Vec<String> = std::env::args().collect();
     let mut bits_list = vec![Bits::B32];
     let mut count: u64 = 1_000_000;
     let mut seed: u64 = 1;
@@ -100,7 +211,6 @@ fn main() {
     }
 }
 
-#[cfg(feature = "unicorn")]
 fn parse_count(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(n) = s.strip_suffix(['k', 'K']) {

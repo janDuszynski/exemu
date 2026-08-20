@@ -172,6 +172,7 @@ dependencies = [
  "exemu-core",
  "exemu-cpu",
  "exemu-gui",
+ "exemu-jit",
  "exemu-loader",
  "exemu-memory",
  "exemu-os",
@@ -248,6 +249,7 @@ version = "0.0.4"
 dependencies = [
  "exemu-core",
  "exemu-cpu",
+ "exemu-jit",
  "exemu-memory",
  "unicorn-engine",
 ]
