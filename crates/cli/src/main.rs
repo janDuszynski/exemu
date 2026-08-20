@@ -58,7 +58,7 @@ fn print_help() {
         "exemu {} — run Windows x86-64 .exe files on Apple Silicon\n\
 \n\
 USAGE:\n\
-    exemu run <file.exe> [--trace] [--no-echo] [--virtual-clock] [-- <args>...]\n\
+    exemu run <file.exe> [--trace] [--no-echo] [--virtual-clock] [--opcode-profile] [-- <args>...]\n\
     exemu info <file.exe>\n\
     exemu opcodes [--telemetry <path>] [--clear]\n\
     exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]\n\
@@ -99,6 +99,9 @@ RUN OPTIONS:\n\
                     at 10M instructions/second from a fixed 2026-01-01 epoch, so\n\
                     a run executes the SAME instruction count every time. Also\n\
                     settable with EXEMU_VIRTUAL_CLOCK=1 (roadmap W9.6)\n\
+    --opcode-profile  Print a dynamic opcode-frequency profile of the run\n\
+                    (roadmap W8.3). Needs an instrumented build:\n\
+                    cargo build --release -p exemu-cli --features opcode-profile\n\
     --max-steps N   Instruction budget (0 = unlimited; default 2e9)\n\
     --load-base H   Map the image at hex address H instead of its preferred\n\
                     ImageBase and apply its base relocations (needs a .reloc)\n\
@@ -127,6 +130,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let mut load_base: Option<u64> = None;
     let mut wine_boot: Option<String> = None;
     let mut virtual_clock = false;
+    let mut opcode_profile = false;
     let mut guest_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -136,6 +140,7 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             "--no-echo" => echo = false,
             "--gui" => gui = true,
             "--virtual-clock" => virtual_clock = true,
+            "--opcode-profile" => opcode_profile = true,
             "--max-steps" => {
                 i += 1;
                 let v = rest.get(i).ok_or("--max-steps needs a value (0 = unlimited)")?;
@@ -205,6 +210,9 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     let run = proc.run();
 
     report_sandbox(&sandbox);
+    if opcode_profile {
+        print_opcode_profile();
+    }
 
     match run {
         Ok(result) => {
@@ -224,6 +232,24 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             }
             Err(e.to_string())
         }
+    }
+}
+
+/// Dump the interpreter's dynamic opcode-frequency profile (roadmap W8.3) — the
+/// measurement that tells the JIT which instruction shapes are worth compiling.
+/// Only a feature-gated build carries the counters; a default build says so
+/// rather than printing an empty (and therefore misleading) table.
+fn print_opcode_profile() {
+    #[cfg(feature = "opcode-profile")]
+    {
+        eprintln!("\n{}", exemu_cpu::profile::report(60));
+    }
+    #[cfg(not(feature = "opcode-profile"))]
+    {
+        eprintln!(
+            "\n[exemu] --opcode-profile needs an instrumented build:\n\
+             \x20        cargo build --release -p exemu-cli --features opcode-profile"
+        );
     }
 }
 

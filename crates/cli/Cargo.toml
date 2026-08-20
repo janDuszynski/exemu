@@ -19,8 +19,18 @@ path = "src/main.rs"
 [dependencies]
 exemu-core = { workspace = true }
 exemu-loader = { workspace = true }
+exemu-cpu = { workspace = true }
 exemu-app = { workspace = true }
 exemu-gui = { workspace = true }
+
+[features]
+default = []
+# Turn on the interpreter's dynamic opcode-frequency counters (roadmap W8.3) and
+# the `exemu run --opcode-profile` report they feed. A separate binary on
+# purpose: the instrumentation must never exist in the build the corpus pins
+# measure. Build with
+#   cargo build --release -p exemu-cli --features opcode-profile
+opcode-profile = ["exemu-cpu/profile"]
 
 [lints.rust]
 unsafe_code = "forbid"

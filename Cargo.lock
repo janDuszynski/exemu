@@ -184,6 +184,7 @@ version = "0.0.4"
 dependencies = [
  "exemu-app",
  "exemu-core",
+ "exemu-cpu",
  "exemu-gui",
  "exemu-loader",
 ]
@@ -216,6 +217,15 @@ dependencies = [
  "objc2-metal",
  "objc2-quartz-core",
  "png",
+]
+
+[[package]]
+name = "exemu-jit"
+version = "0.0.4"
+dependencies = [
+ "exemu-core",
+ "exemu-cpu",
+ "exemu-memory",
 ]
 
 [[package]]
