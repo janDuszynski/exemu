@@ -708,7 +708,7 @@ fn def_window_proc_forwards_the_hit_test_and_trusts_call_hwnd_0x10() {
 
     // No WM_NCHITTEST arm: the message id never appears as a comparison
     // immediate anywhere in the body.
-    let hit = u32::from(abi::WM_NCHITTEST);
+    let hit = abi::WM_NCHITTEST;
     for cmp in [
         [0x81, 0xFE].as_slice(), // cmp esi, imm32
         [0x81, 0xFA].as_slice(), // cmp edx, imm32
