@@ -485,9 +485,9 @@ end-to-end on the default path.
   vtable's true end (+0xA8/+0xB0 both `NULL`) — confirming the *offset* is
   right; the `pszFile` argument was echoed back byte-for-byte correct before
   the call. The fault is therefore inside Wine's real `SetPath`, hitting
-  some *other*, not-yet-identified stub — worth its own investigation. The
-  full "write a real `.lnk` into `CSIDL_PROGRAMS`" pin (the 7-Zip
-  start-menu-shortcut scenario) is therefore **not yet reached**.
+  some *other*, not-yet-identified stub — worth its own investigation.
+  **(Resolved: it was the all-zero NLS case table — see the section above. The
+  isolation recorded here was correct and is what made the search tractable.)**
 
 ## v0.0.4 — the windowing substrate
 
