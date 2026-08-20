@@ -323,8 +323,15 @@ pub struct WinOs {
     sched_ticks: u64,
 
     /// Process start instant, the zero for `GetTickCount`/`QueryPerformance
-    /// Counter` (roadmap P3.8).
+    /// Counter` (roadmap P3.8) on the host-clock path.
     start_time: std::time::Instant,
+
+    /// The process clock (roadmap W9.6). Default [`exemu_core::GuestClock::host`]
+    /// — every time API falls back to `start_time`/`SystemTime::now()`, exactly
+    /// as before. When the deterministic clock is installed (the same handle the
+    /// interpreter retires instructions into), every guest-visible "now" becomes
+    /// a function of the guest's own instruction stream. See [`crate::time`].
+    clock: exemu_core::GuestClock,
 
     /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
@@ -475,6 +482,7 @@ impl WinOs {
             thread_entry_thunk: 0,
             sched_ticks: 0,
             start_time: std::time::Instant::now(),
+            clock: exemu_core::GuestClock::host(),
             stdout_buf: Vec::new(),
             stderr_buf: Vec::new(),
             function_table: Vec::new(),
@@ -637,6 +645,20 @@ impl WinOs {
         os
     }
 
+    /// Install the process clock (roadmap W9.6) — the same handle the
+    /// interpreter retires instructions into, so `RDTSC` and the Win32/NT time
+    /// APIs report one consistent "now". Call once, at load time; the default is
+    /// [`exemu_core::GuestClock::host`] (unchanged host-clock behaviour).
+    pub fn set_clock(&mut self, clock: exemu_core::GuestClock) {
+        self.clock = clock;
+    }
+
+    /// The process clock — which mode is in force, and how much virtual time
+    /// has elapsed.
+    pub fn clock(&self) -> &exemu_core::GuestClock {
+        &self.clock
+    }
+
     /// Hand the emulated OS the image's parsed x64 unwind table so the native
     /// `Rtl*` exception APIs and exception dispatch can walk guest frames
     /// (roadmap P4.3). No-op for 32-bit images (the table is empty).
@@ -775,6 +797,12 @@ impl WinOs {
     /// Block the interpreter thread until an input event arrives or `timeout`
     /// elapses, applying whatever arrives (roadmap W4.5c). Used by the message
     /// pump when the guest's queue is empty. A dropped channel quits the guest.
+    ///
+    /// This is a **host** wait, and deliberately not virtualised (roadmap W9.6):
+    /// it exists only to wait on a human moving a real mouse, so there is no
+    /// deterministic answer to give it. It is inert unless an input channel is
+    /// installed — the headless and corpus paths return immediately — so it
+    /// cannot affect a pinned instruction count.
     fn wait_for_input(&mut self, timeout: std::time::Duration) {
         use std::sync::mpsc::RecvTimeoutError;
         let Some(rx) = &self.input else { return };

@@ -13,19 +13,21 @@
 //!    has none, so the test prints SKIP and passes, the same skip-guard idiom as
 //!    `crates/app/tests/wine_gate.rs`.
 //! 2. **Debug build.** The pins are measured on a `--release` build, and a debug
-//!    build is ~10x slower. That is not only a runtime problem (7-Zip alone
-//!    executes ~496M instructions): the emulator services real clock APIs, so a
-//!    guest that polls the clock spins a different number of times at a
-//!    different host speed and the counts genuinely differ. Debug pins would be
-//!    a second, unmaintained set of numbers. Run `cargo test --release`.
+//!    build is ~10x slower — 7-Zip alone executes ~496M instructions. On the
+//!    host-clock entry it is worse than slow: a guest that polls the clock spins
+//!    a different number of times at a different host speed, so the count
+//!    genuinely differs and debug pins would be a second, unmaintained set of
+//!    numbers. (A `virtual_clock` entry has no such excuse — its count is a pure
+//!    function of the guest's instruction stream — but the runtime alone still
+//!    rules a debug run out.) Run `cargo test --release`.
 //!
 //! # Tiers
 //!
-//! By default only the entries flagged `quick = true` run (~1.5 s — Firefox
-//! Installer and tcc). Set `EXEMU_CORPUS=full` to include the minutes-long ones
-//! (7-Zip's full install, SteamSetup's 93M-instruction reach). The full tier is
-//! the release gate; the quick tier is what `cargo test --release` can afford to
-//! run on every change.
+//! By default only the entries flagged `quick = true` run (~2 s — Firefox
+//! Installer on both clocks, and tcc). Set `EXEMU_CORPUS=full` to include the
+//! minutes-long ones (7-Zip's full install, SteamSetup's 93M-instruction reach).
+//! The full tier is the release gate; the quick tier is what `cargo test
+//! --release` can afford to run on every change.
 
 use std::path::{Path, PathBuf};
 
@@ -125,17 +127,31 @@ fn manifest_is_well_formed() {
             e.name,
             e.tolerance
         );
+        // The virtual clock leaves no host input to jitter on, so such an entry
+        // is an equality — for a fault's reach metric as much as for an exit.
+        // Any slack here would be un-earned and would hide a real one-instruction
+        // change (roadmap W9.6).
+        if e.virtual_clock {
+            assert_eq!(
+                e.tolerance, 0,
+                "{}: a virtual-clock pin is exact; a tolerance would hide real drift",
+                e.name
+            );
+        }
         match e.outcome {
             exemu_cli::corpus::Outcome::Exit => {
-                // A completed trace is the strongest assertion available, so it
-                // is pinned at the bare measurement noise floor — never scaled
-                // to the length of the run the way a fault's reach metric is.
-                assert_eq!(
-                    e.tolerance,
-                    exemu_cli::corpus::Entry::JITTER_FLOOR,
-                    "{}: a clean exit is pinned at the noise floor, not a percentage",
-                    e.name
-                );
+                // On the host clock a completed trace is the strongest assertion
+                // available, so it is pinned at the bare measurement noise floor
+                // — never scaled to the length of the run the way a fault's reach
+                // metric is.
+                if !e.virtual_clock {
+                    assert_eq!(
+                        e.tolerance,
+                        exemu_cli::corpus::Entry::JITTER_FLOOR,
+                        "{}: a host-clock exit is pinned at the noise floor, not a percentage",
+                        e.name
+                    );
+                }
                 assert!(e.rip.is_none(), "{}: an exit has no fault site", e.name);
             }
             exemu_cli::corpus::Outcome::Fault => {
@@ -150,6 +166,17 @@ fn manifest_is_well_formed() {
     assert!(
         manifest.entries.iter().any(|e| e.quick),
         "at least one entry must be in the quick tier or the default gate is empty"
+    );
+    // Both clock paths stay covered. The virtual clock is the high-resolution
+    // instrument, but the host clock is what a plain `exemu run` still does, so
+    // dropping it from the gate would stop testing the default.
+    assert!(
+        manifest.entries.iter().any(|e| e.virtual_clock),
+        "at least one entry must pin the deterministic clock (roadmap W9.6)"
+    );
+    assert!(
+        manifest.entries.iter().any(|e| !e.virtual_clock && e.quick),
+        "at least one quick entry must stay on the default host clock"
     );
     // `--update` must be able to round-trip whatever is committed, or a
     // re-blessed manifest would silently lose fields.

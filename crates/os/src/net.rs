@@ -370,6 +370,16 @@ const SD_SEND: u32 = 1;
 /// that an unsatisfiable wait must surface, not hang (see `sync.rs`'s deadlock
 /// fault). Twenty seconds is far longer than any loopback exchange and short
 /// enough that a stuck guest is reported rather than endured.
+///
+/// **Deliberately NOT virtualised (roadmap W9.6).** The deterministic guest
+/// clock makes every clock the guest can *ask* for a function of its own
+/// instruction stream, but this wait is not a clock read — it is exemu parking
+/// on a **real** BSD socket whose peer is a real process on the network. How
+/// long the bytes take is a property of the host world, so a virtual deadline
+/// would either expire before a real packet arrived or never expire at all. A
+/// guest that blocks on a socket therefore remains non-replayable, and a corpus
+/// entry that did real network I/O could not be pinned exactly. None currently
+/// does; if one ever does, this is the reason its count will wander.
 pub const BLOCKING_WAIT_LIMIT: Duration = Duration::from_secs(20);
 
 /// Poll slice while parked: tight for the first few iterations (a peer that is

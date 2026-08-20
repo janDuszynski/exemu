@@ -713,7 +713,19 @@ impl WinOs {
 
     /// Sleep(ms) / SleepEx(ms, alertable): complete the (void/DWORD) call, then
     /// yield to another runnable thread. `argc` keeps the stdcall stack balanced.
+    ///
+    /// The yield itself is instantaneous — exemu does not park the host thread —
+    /// so under the virtual clock the requested interval is *credited* to the
+    /// guest clock instead (roadmap W9.6). Without that, `while (GetTickCount() -
+    /// t0 < 5000) Sleep(10);` would have to grind out 5×10^7 instructions at
+    /// 100 ns each to escape; with it the loop terminates after about as many
+    /// iterations as a real machine would need. Deterministic, because the
+    /// interval is the guest's own argument. A no-op on the host-clock path,
+    /// where real time passed on its own.
     pub(crate) fn sleep(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, argc: u32) -> Result<Outcome> {
+        // Read arg0 (dwMilliseconds) BEFORE `complete_and_yield` pops the args.
+        let ms = self.arg(cpu, mem, 0)? & 0xFFFF_FFFF;
+        self.clock.credit_ms(ms);
         self.complete_and_yield(cpu, mem, 0, argc)
     }
 

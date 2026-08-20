@@ -1,11 +1,30 @@
-//! Time and date APIs backed by the host clock (roadmap P3.8).
+//! Time and date APIs (roadmap P3.8), routed through the process clock (W9.6).
 //!
 //! `GetTickCount`/`QueryPerformanceCounter` measure from the process start
 //! instant (monotonic); `GetSystemTimeAsFileTime`/`GetSystemTime`/`GetLocalTime`
-//! report the real wall-clock time. These were previously stubs that always
-//! returned 0 — enough to null-deref-avoid, but a program computing
-//! `elapsed = now - start` then dividing by it, or seeding a temp name from the
-//! clock, needs real, advancing values.
+//! report the wall-clock time. These were previously stubs that always returned
+//! 0 — enough to null-deref-avoid, but a program computing `elapsed = now -
+//! start` then dividing by it, or seeding a temp name from the clock, needs
+//! real, advancing values.
+//!
+//! # One clock, two sources
+//!
+//! Every "now" in this module is fetched from [`WinOs::clock`], an
+//! [`exemu_core::GuestClock`]:
+//!
+//! * **Host mode (default)** — the clock declines to answer and each accessor
+//!   falls back to the host `Instant`/`SystemTime` reads below. Byte-for-byte
+//!   the behaviour that shipped before W9.6.
+//! * **Virtual mode (opt-in)** — the clock answers from the guest's own retired-
+//!   instruction count, so *no* value in this module depends on how fast the
+//!   host is, and a run replays exactly. See `exemu_core::clock`.
+//!
+//! Every guest-visible time source funnels through the three accessors here
+//! ([`WinOs::filetime_now`], [`WinOs::monotonic_100ns`], [`WinOs::tick_count_ms`]):
+//! the Win32 seam, the `Nt*` syscalls, the `__wine_unix_call`
+//! `RtlGetSystemTimePrecise` entry (`crate::unixlib`) and the registry
+//! `LastWriteTime` stamps (`crate::reg`). Adding a fourth caller means calling
+//! one of these, not `SystemTime::now()`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,13 +35,18 @@ use crate::WinOs;
 
 /// The `QueryPerformanceFrequency` value we report: 10 MHz, so a performance
 /// counter tick is 100 ns — matching a common Windows QPC frequency and making
-/// the counter directly convertible to/from `FILETIME` units.
-pub(crate) const QPC_FREQ: u64 = 10_000_000;
+/// the counter directly convertible to/from `FILETIME` units. Shared with the
+/// virtual clock, whose whole unit system is built on it.
+pub(crate) const QPC_FREQ: u64 = exemu_core::QPC_FREQUENCY;
 
 /// Seconds between the FILETIME epoch (1601-01-01) and the Unix epoch.
 const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
 
-/// Current wall-clock time as a Windows FILETIME (100-ns ticks since 1601).
+/// The **host** wall clock as a Windows FILETIME (100-ns ticks since 1601).
+///
+/// Prefer [`WinOs::filetime_now`], which honours the virtual clock; this is the
+/// host fallback behind it (and is used directly only by tests that deliberately
+/// bracket a value against real time).
 pub(crate) fn filetime_now() -> u64 {
     let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     (dur.as_secs() + EPOCH_DIFF_SECS) * QPC_FREQ + dur.subsec_nanos() as u64 / 100
@@ -59,20 +83,41 @@ fn systemtime_fields(filetime: u64) -> [u16; 8] {
 }
 
 impl WinOs {
-    fn elapsed_100ns(&self) -> u64 {
-        (self.start_time.elapsed().as_nanos() / 100) as u64
+    // ---- the three clock accessors ---------------------------------------
+    //
+    // Virtual clock first, host clock as the fallback. Everything guest-visible
+    // in this crate goes through one of these three.
+
+    /// Wall-clock time as a Windows FILETIME (100-ns ticks since 1601).
+    pub(crate) fn filetime_now(&self) -> u64 {
+        self.clock.filetime().unwrap_or_else(filetime_now)
+    }
+
+    /// Monotonic time since process start, in 100-ns units (the
+    /// `QueryPerformanceCounter` value at [`QPC_FREQ`]).
+    pub(crate) fn monotonic_100ns(&self) -> u64 {
+        self.clock
+            .monotonic_100ns()
+            .unwrap_or_else(|| (self.start_time.elapsed().as_nanos() / 100) as u64)
+    }
+
+    /// Monotonic time since process start, in milliseconds (`GetTickCount`).
+    pub(crate) fn tick_count_ms(&self) -> u64 {
+        self.clock
+            .tick_count_ms()
+            .unwrap_or_else(|| self.start_time.elapsed().as_millis() as u64)
     }
 
     /// GetTickCount()/GetTickCount64(): milliseconds since process start.
     pub(crate) fn get_tick_count(&self) -> Result<Outcome> {
-        Ok(Outcome::Return(self.start_time.elapsed().as_millis() as u64))
+        Ok(Outcome::Return(self.tick_count_ms()))
     }
 
     /// QueryPerformanceCounter(*lpPerformanceCount): 100-ns ticks since start.
     pub(crate) fn query_performance_counter(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let ptr = self.arg(cpu, mem, 0)?;
         if ptr != 0 {
-            mem.write_u64(ptr, self.elapsed_100ns())?;
+            mem.write_u64(ptr, self.monotonic_100ns())?;
         }
         Ok(Outcome::Return(1))
     }
@@ -90,7 +135,8 @@ impl WinOs {
     pub(crate) fn get_system_time_as_filetime(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let ptr = self.arg(cpu, mem, 0)?;
         if ptr != 0 {
-            mem.write_u64(ptr, filetime_now())?; // FILETIME is two DWORDs, little-endian == u64
+            let now = self.filetime_now();
+            mem.write_u64(ptr, now)?; // FILETIME is two DWORDs, little-endian == u64
         }
         Ok(Outcome::Return(0))
     }
@@ -100,7 +146,7 @@ impl WinOs {
     pub(crate) fn get_system_time(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let ptr = self.arg(cpu, mem, 0)?;
         if ptr != 0 {
-            let f = systemtime_fields(filetime_now());
+            let f = systemtime_fields(self.filetime_now());
             for (i, field) in f.iter().enumerate() {
                 mem.write_u16(ptr + i as u64 * 2, *field)?;
             }
@@ -110,16 +156,17 @@ impl WinOs {
 
     // ---- NT time syscalls (roadmap W2.14) --------------------------------
     //
-    // The NTSTATUS face of the same host-clock math the Win32 seam uses,
-    // reached via a raw guest `SYSCALL` through the W2.3 dispatcher. Args come
-    // via [`WinOs::syscall_arg`] (arg0=R10, arg1=RDX, …). Signatures are the
-    // public NT headers (winternl.h / ntddk.h); no Wine `.c` read.
+    // The NTSTATUS face of the same clock the Win32 seam uses, reached via a raw
+    // guest `SYSCALL` through the W2.3 dispatcher. Args come via
+    // [`WinOs::syscall_arg`] (arg0=R10, arg1=RDX, …). Signatures are the public
+    // NT headers (winternl.h / ntddk.h); no Wine `.c` read.
     //
     // `NtGetTickCount` is deliberately absent: on x64 it is NOT a syscall — the
     // pinned guest ntdll implements it inline by reading `KUSER_SHARED_DATA.
     // TickCount` (`gs`-free RIP-relative load), so there is no SSDT slot to fill.
-    // Keeping that page live is the standing W2.1/W2.10 follow-up (the page is
-    // guest-read-only, so it needs a permission-bypassing host writer).
+    // That page is refreshed from this same clock by the run loop when the
+    // virtual clock is on (`exemu_app`'s `refresh_kuser_time`); on the host-clock
+    // path it stays the load-time snapshot it has always been.
 
     /// `NtQuerySystemTime(PLARGE_INTEGER SystemTime)` — current wall-clock time
     /// as a FILETIME (100-ns ticks since 1601). NULL out-pointer →
@@ -129,7 +176,8 @@ impl WinOs {
         if ptr == 0 {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
-        mem.write_u64(ptr, filetime_now())?;
+        let now = self.filetime_now();
+        mem.write_u64(ptr, now)?;
         Ok(NT_STATUS_SUCCESS)
     }
 
@@ -143,7 +191,7 @@ impl WinOs {
         if counter_ptr == 0 {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
-        mem.write_u64(counter_ptr, self.elapsed_100ns())?;
+        mem.write_u64(counter_ptr, self.monotonic_100ns())?;
         if freq_ptr != 0 {
             mem.write_u64(freq_ptr, QPC_FREQ)?;
         }

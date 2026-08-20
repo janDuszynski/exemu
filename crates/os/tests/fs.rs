@@ -406,3 +406,60 @@ fn copy_then_move_file_roundtrip() {
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+/// **Known gap, pinned deliberately (roadmap W9.6).** The virtual clock makes
+/// every clock the guest can *ask* for deterministic, but a file's timestamp is
+/// not a clock read — it is a property of a real file on the real host
+/// filesystem, and `FindFirstFileW` (like `NtQueryDirectoryFile` and
+/// `NtQueryAttributesFile`) reports it verbatim. So a guest that enumerates a
+/// directory still sees host wall-clock values, and two runs that create a file
+/// see two different `ftLastWriteTime`s.
+///
+/// This is left un-virtualised on purpose rather than papered over. Reporting
+/// the virtual clock for every file would be wrong (a file's mtime is not
+/// "now"), and reporting one fixed constant would flatten the newer/older
+/// ordering installers compare — so making it deterministic *and* correct needs
+/// a virtual-FS metadata overlay that records, per path, the virtual time at
+/// which the guest created or wrote it. Until that exists this test is the
+/// honest statement of the limit: if someone virtualises file times, this is
+/// what tells them to come back and update the claim.
+///
+/// It has cost nothing measurable so far: with the virtual clock on, every
+/// corpus binary — including 7-Zip, which writes 107 files and then enumerates
+/// them — repeats its instruction count exactly.
+#[test]
+fn file_timestamps_are_still_the_host_clock_a_pinned_gap() {
+    let sandbox = unique_sandbox();
+    let dir_c = sandbox.join("C").join("dir");
+    std::fs::create_dir_all(&dir_c).unwrap();
+    std::fs::write(dir_c.join("a.txt"), b"hello").unwrap();
+
+    let (mut os, mut mem) = make_os(sandbox.to_str().unwrap());
+    // Even with the deterministic clock installed…
+    os.set_clock(exemu_core::GuestClock::virtualized());
+    let mut cpu = CpuState::new();
+
+    let (pattern_ptr, find_data_ptr) = (DATA, DATA + 0x100);
+    write_utf16(&mut mem, pattern_ptr, "C:\\dir\\a.txt");
+    cpu.set_reg(Reg::Rcx, pattern_ptr);
+    cpu.set_reg(Reg::Rdx, find_data_ptr);
+    let handle = call_k32(&mut os, &mut mem, &mut cpu, "FindFirstFileW");
+    assert_ne!(handle, INVALID_HANDLE_VALUE, "FindFirstFileW must succeed");
+
+    // ftLastWriteTime lives at WIN32_FIND_DATAW +20 (low) / +24 (high).
+    let lo = mem.read_u32(find_data_ptr + 20).unwrap() as u64;
+    let hi = mem.read_u32(find_data_ptr + 24).unwrap() as u64;
+    let mtime = (hi << 32) | lo;
+
+    // …the reported mtime is the host's, which is far past the virtual epoch
+    // (2026-01-01 plus a handful of 100-ns ticks) rather than next to it.
+    assert!(
+        mtime > exemu_core::VIRTUAL_EPOCH_FILETIME + 10_000_000,
+        "file times are documented as un-virtualised; got {mtime}, virtual epoch is {}",
+        exemu_core::VIRTUAL_EPOCH_FILETIME
+    );
+
+    cpu.set_reg(Reg::Rcx, handle);
+    call_k32(&mut os, &mut mem, &mut cpu, "FindClose");
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

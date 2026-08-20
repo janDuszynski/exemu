@@ -97,7 +97,7 @@ Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
 
 ```
 exemu run <file.exe> [--trace] [--no-echo] [--gui] [--wine-boot <dir>]
-                     [--max-steps N] [--load-base <hex>]
+                     [--virtual-clock] [--max-steps N] [--load-base <hex>]
                      [--telemetry <path>] [-- <args>...]
 exemu info <file.exe>
 exemu opcodes [--telemetry <path>] [--clear]
@@ -113,7 +113,10 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   `--max-steps N` sets the instruction budget (0 = unlimited); `--load-base`
   maps the image away from its preferred `ImageBase` and applies its base
   relocations. `--wine-boot <dir>` selects the Wine PE personality
-  ([below](#running-on-wines-pe-personality---wine-boot)).
+  ([below](#running-on-wines-pe-personality---wine-boot)); `--virtual-clock`
+  (also `EXEMU_VIRTUAL_CLOCK=1`) replaces the host clock with a
+  [deterministic one](#deterministic-guest-clock) driven by the instruction
+  counter, so a run replays with the exact same instruction count.
   If a run stops on an instruction the decoder doesn't implement, the opcode
   is appended to a telemetry log (`--telemetry <path>`, else the
   `EXEMU_TELEMETRY` env var, else `$TMPDIR/exemu-telemetry.log`).
@@ -168,7 +171,8 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   bit-test family, `BSF`/`BSR`/`BSWAP`, the bit-count instructions
   `POPCNT`/`TZCNT`/`LZCNT`, `XADD`/`CMPXCHG`, `LOOP`/`JECXZ`, the string ops
   (`MOVS`/`STOS`/`CMPS`/`LODS`/`SCAS` with `REP`/`REPE`/`REPNE`),
-  `RDTSC`/`RDTSCP` (monotonic counter; `RDTSCP` reports `TSC_AUX`=0 for the
+  `RDTSC`/`RDTSCP` (monotonic counter, or a 1 GHz ramp off the retired-
+  instruction count under `--virtual-clock`; `RDTSCP` reports `TSC_AUX`=0 for the
   single-vCPU model), `PAUSE`, and a broad **SSE/SSE2** surface: moves,
   logical, scalar+packed float arithmetic, compares and conversions
   (incl. `CVTDQ2PS`/`CVTPS2DQ`/`CVTTPS2DQ`), the packed-integer family —
@@ -223,8 +227,12 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   - **Real synchronization objects:** events (auto/manual-reset), mutexes
     (ownership + recursion), semaphores (counts), waitable timers, with
     named-object sharing; `WaitForSingle/MultipleObjects` truly block and wake.
-  - **Host-clock time:** `GetTickCount(64)`, `QueryPerformanceCounter/
-    Frequency`, `GetSystemTimeAsFileTime`, `GetSystemTime`/`GetLocalTime`.
+  - **Time:** `GetTickCount(64)`, `QueryPerformanceCounter/Frequency`,
+    `GetSystemTimeAsFileTime`, `GetSystemTime`/`GetLocalTime`, and the
+    `NtQuerySystemTime`/`NtQueryPerformanceCounter` syscalls. Host-backed by
+    default; `--virtual-clock` switches every one of them (plus `RDTSC` and
+    `KUSER_SHARED_DATA`) onto a [deterministic clock](#deterministic-guest-clock)
+    driven by the instruction counter.
   - **Registry:** an in-memory hive with W **and A** variants —
     create/open/set/query/delete, enumeration (`RegEnumKeyEx`/`RegEnumValue`/
     `RegQueryInfoKey`), every `REG_*` value type, and seeded HKLM/HKCU keys.
@@ -319,11 +327,11 @@ catch resumes execution, an unmatched throw terminates like `std::terminate`.
 
 ### What real installers do today
 
-| Executable | Kind | Result |
-| ---------- | ---- | ------ |
 These rows are not prose — they are the pins in `corpus.toml`, enforced by the
-[corpus regression gate](#corpus-regression-gate), and the numbers below are
-what it measures against a fresh sandbox.
+[corpus regression gate](#corpus-regression-gate). The numbers are what it
+measures against a fresh sandbox with the
+[deterministic clock](#deterministic-guest-clock) on, so they are exact rather
+than approximate: the gate pins them with zero tolerance.
 
 | Executable | Kind | Result |
 | ---------- | ---- | ------ |
@@ -331,7 +339,7 @@ what it measures against a fresh sandbox.
 | **extracted `7z.exe`** | 64-bit console | **runs and prints its banner/usage** (`7-Zip 26.02 … Igor Pavlov`); `7z i` also runs |
 | generated `hello.exe` | 64-bit console | **runs fully**, prints output incl. an SSE2 computation, exits 0 |
 | Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; the inner program runs CRT init + setup + SEH frame build + thread/sync init for **4,665,426** instructions, then calls through a NULL function pointer (`rip=0`) |
-| SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for **92,865,709** instructions, then writes through a NULL pointer at `0x20001c2c` |
+| SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for **92,865,377** instructions, then writes through a NULL pointer at `0x20001c2c` |
 | tcc.exe | 32-bit console | dies after **728** instructions calling through a NULL returned by the `VerifyVersionInfoW`/`VerSetConditionMask` stub |
 
 The last three are the *same* defect class, not three bugs: a stubbed Win32 API
@@ -456,7 +464,7 @@ cargo test --release -p exemu-cli --test corpus_gate   # the gate (quick tier)
 EXEMU_CORPUS=full cargo test --release -p exemu-cli --test corpus_gate
 ```
 
-Two things make the counts reproducible at all, and both are load-bearing:
+Three things make the counts reproducible, and all three are load-bearing:
 
 * **A fresh sandbox per binary.** The guest filesystem sandbox
   (`$TMPDIR/exemu-sandbox`) persists and accumulates across runs, and an
@@ -471,16 +479,62 @@ Two things make the counts reproducible at all, and both are load-bearing:
   instructions (measured: 936 of them on Firefox Installer). Each binary is
   invoked by file name from its own directory, which keeps the counts a property
   of the emulator rather than of where the repo lives.
+* **A virtual clock** (`virtual_clock = true` on an entry, below). Without it the
+  emulator services the real host clock and a guest comparing two timestamps
+  branches on host speed, so execution repeats only to about ±1 instruction —
+  and, on the 93M-instruction SteamSetup run, to ±hundreds.
 
-Even so, execution repeats only to about ±1 instruction — the emulator services
-the real host clock, so a guest comparing two timestamps can branch on host
-speed. Tolerances are therefore noise floors, not change budgets: a clean
-**exit** is a completed trace and gets the bare 64-instruction floor, while a
-**fault** pin's meaning is *where and why* it dies, so `rip` and the fault text
-are exact and only the "how far did we get" step count gets ~0.1% slack. The
-corpus binaries are git-ignored third-party installers, so a fresh checkout has
-none and the gate skips cleanly; it also skips on a debug build, because the
-pins are release-measured.
+Tolerances follow from that. An entry on the **virtual clock** is pinned
+*exactly* (`tolerance = 0`), because there is no host input left to jitter on.
+An entry left on the host clock gets a noise floor instead of a change budget: a
+clean **exit** is a completed trace and gets the bare 64-instruction floor, while
+a **fault** pin's meaning is *where and why* it dies, so `rip` and the fault text
+are compared exactly on both paths and only the "how far did we get" step count
+gets ~0.1% slack. The corpus binaries are git-ignored third-party installers, so
+a fresh checkout has none and the gate skips cleanly; it also skips on a debug
+build, because the pins are release-measured.
+
+### Deterministic guest clock
+
+`exemu run --virtual-clock` (or `EXEMU_VIRTUAL_CLOCK=1`) makes **every clock the
+guest can read a function of the guest's own instruction stream**, so the same
+binary executes the same number of instructions on every run and on every
+machine. Off by default; the host-clock path is unchanged.
+
+The model is one instruction = one 100-ns tick — a nominal **10M
+instructions/second** machine — plus a fixed **2026-01-01T00:00:00Z** epoch. That
+rate is not arbitrary: it is roughly what a release build actually interprets at,
+so switching the clock on does not hand the guest a machine orders of magnitude
+faster or slower than the one it was seeing, and it makes the units exact (the
+performance counter already runs at 10 MHz, so *the QPC value is the instruction
+count*, and a `FILETIME` is the epoch plus that count). A blocking `Sleep(ms)` is
+credited the interval it asked for — it is a cooperative yield in exemu, so
+without that a `Sleep`-paced timeout loop would have to grind out 10^4 iterations
+per virtual millisecond to escape.
+
+Everything guest-visible goes through it: `RDTSC`/`RDTSCP`, `GetTickCount(64)`,
+`QueryPerformanceCounter`, `GetSystemTime(AsFileTime)`/`GetLocalTime`,
+`NtQuerySystemTime`, `NtQueryPerformanceCounter`, the Wine-path
+`RtlGetSystemTimePrecise` unix call, registry `LastWriteTime` stamps, and
+`KUSER_SHARED_DATA`'s `SystemTime`/`InterruptTime`/`TickCount` — the last of
+which the guest reads by *plain load* with no call to intercept, so the run loop
+rewrites it every 65,536 instructions (6.55 ms of virtual time, finer than the
+15.625 ms tick it is quantised to). **Not** virtualised: host filesystem
+timestamps (`FindFirstFile`/`NtQueryDirectoryFile` report the real mtimes of real
+files) and real socket timeouts, which are properties of the host world rather
+than of the guest — both pinned as tests rather than left silent.
+
+Measured through the corpus runner, the two binaries that used to wander:
+
+| binary | host clock (3 runs) | virtual clock |
+| --- | --- | --- |
+| `Firefox Installer.exe` | 4,665,427 / 4,665,427 / 4,665,426 | 4,665,426 ×5 |
+| `SteamSetup.exe` | 92,864,324 / 92,864,324 / 92,864,999 | 92,865,377 ×4 |
+
+7-Zip still installs identically with it on (exit 0, 496,505,572 instructions,
+108 artifacts — the same numbers as the host-clock pin). This is also the
+prerequisite for the planned JIT-vs-interpreter differential, which can only diff
+two engines instruction-for-instruction if a run replays exactly.
 
 A **golden-image gate** (`gui_gate.rs`) pins the GUI sample's first painted frame
 against a committed PNG so any pixel drift in the GDI paint path fails CI; it
