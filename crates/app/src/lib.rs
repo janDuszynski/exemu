@@ -21,6 +21,8 @@ pub mod gui_sample;
 pub mod sample;
 pub mod shell_sample;
 pub mod socket_sample;
+pub mod wow64_boot;
+pub mod wow64_sample;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -142,6 +144,27 @@ impl Layout {
             }
         }
     }
+
+    /// The layout of a **WoW64** process (roadmap W5.4): a 32-bit guest running
+    /// on Wine's 64-bit PE set.
+    ///
+    /// It is the *64-bit* layout — because that is what the process is: a 64-bit
+    /// NT process whose kernel-facing structures (PEB64, TEB64, the NT-syscall
+    /// frame, every `Nt*` handler) are 64-bit — with one change: the TEB pair is
+    /// moved **below 4 GiB**. `TEB64.WowTebOffset` is a signed 32-bit delta to
+    /// TEB32, and 32-bit guest code must be able to hold a TEB32 pointer, so the
+    /// two TEBs must sit adjacently in the low 4 GiB (`exemu_os::wow64`'s
+    /// `link_teb32` refuses anything else rather than truncating).
+    ///
+    /// The 32-bit half of the address space — the guest image, its stack, the
+    /// 32-bit `ntdll` and `wow64cpu.dll` — is placed by [`wow64_boot`].
+    fn for_wow64() -> Layout {
+        Layout {
+            teb_base: wow64_boot::WOW64_TEB64,
+            peb_addr: wow64_boot::WOW64_PEB64,
+            ..Layout::for_bits(true)
+        }
+    }
 }
 
 /// Options controlling a run.
@@ -260,6 +283,9 @@ pub struct Process {
     /// and falls through to the fault reporter. Reset to 0 whenever `NtContinue`
     /// resumes the guest (a handled exception).
     exc_depth: u32,
+    /// The WoW64 process model, when this is a 32-bit guest on Wine's 64-bit PE
+    /// set (roadmap W5.4). `None` on every other path.
+    wow64: Option<wow64_boot::Wow64Boot>,
 }
 
 impl Process {
@@ -315,8 +341,67 @@ impl Process {
             mem.map_with_data(section_name(&s.name), addr, size, &s.data, perm)?;
         }
 
-        let lay = Layout::for_bits(image.is_64bit);
+        // --- Wine-boot opt-in (roadmap W3.2) ------------------------------
+        // `EXEMU_WINE_BOOT` selects the experimental path that boots the real
+        // Wine PE core (ntdll→kernelbase→kernel32→ucrtbase) as guest images and
+        // hands off through `LdrInitializeThunk`, instead of the emulated-DLL
+        // thunks. Off by default so the corpus is byte-for-byte unaffected while
+        // the boot path (W3.3 exc bridge, W3.4 console) is still being built. The
+        // DLL directory defaults to the pinned prefix but is overridable via
+        // `EXEMU_WINE_DLLS`; `wine_dll_dir` stays `None` unless the opt-in is set
+        // AND the directory exists, so `load_wine_core` only ever runs on request.
+        //
+        // Resolved *before* the address-space layout because a 32-bit image on
+        // this path is not a 32-bit process at all — it is a **WoW64** process
+        // (roadmap W5.4), whose layout is the 64-bit one with a 32-bit view laid
+        // over it.
+        let wine_dll_dir = if let Some(dir) = cfg.wine_boot_dir.clone() {
+            // Explicit request (e.g. the W3 gate test) — hermetic, no env vars.
+            if std::path::Path::new(&dir).is_dir() {
+                Some(dir)
+            } else {
+                None
+            }
+        } else if std::env::var_os("EXEMU_WINE_BOOT").is_some() {
+            let dir = std::env::var("EXEMU_WINE_DLLS")
+                .unwrap_or_else(|_| "example_exe/wine-dlls/x86_64-windows".to_string());
+            if std::path::Path::new(&dir).is_dir() {
+                Some(dir)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // A 32-bit image + the Wine PE set = a WoW64 boot, provided the pinned
+        // prefix carries **both** halves (the 64-bit thunk DLLs and the 32-bit
+        // ntdll). A partial prefix falls back to the ordinary 32-bit path rather
+        // than half-booting WoW64.
+        let wow64_dir32 = wine_dll_dir
+            .as_ref()
+            .map(|d| wow64_boot::sibling_i386_dir(std::path::Path::new(d)));
+        let is_wow64 = !image.is_64bit
+            && match (&wine_dll_dir, &wow64_dir32) {
+                (Some(d64), Some(d32)) => wow64_boot::Wow64Dirs {
+                    dir64: std::path::Path::new(d64),
+                    dir32: d32,
+                }
+                .complete(),
+                _ => false,
+            };
+
+        let lay = if is_wow64 {
+            Layout::for_wow64()
+        } else {
+            Layout::for_bits(image.is_64bit)
+        };
+        // Width of a pointer **in the image's own structures** (its IAT slots),
+        // and of a pointer in the *process*'s NT structures — which differ under
+        // WoW64: a PE32 guest inside a 64-bit NT process.
         let ptr_size = if image.is_64bit { 8 } else { 4 };
+        let proc_is_64 = image.is_64bit || is_wow64;
+        let proc_ptr_size = if proc_is_64 { 8 } else { 4 };
 
         // --- Stack --------------------------------------------------------
         mem.map(Region::new("stack", lay.stack_base, lay.stack_size, Perm::RW))?;
@@ -333,7 +418,7 @@ impl Process {
         mem.map(Region::new("peb", align_down(lay.peb_addr, PAGE), PAGE, Perm::RW))?;
         let stack_top = lay.stack_base + lay.stack_size;
         let write_ptr = |mem: &mut VirtualMemory, addr: u64, val: u64| -> Result<()> {
-            mem.poke(addr, &val.to_le_bytes()[..ptr_size])
+            mem.poke(addr, &val.to_le_bytes()[..proc_ptr_size])
         };
         write_ptr(&mut mem, lay.teb_base + lay.teb_self, lay.teb_base)?;
         write_ptr(&mut mem, lay.teb_base + lay.teb_peb, lay.peb_addr)?;
@@ -408,34 +493,6 @@ impl Process {
         }
         let _ = std::fs::write(&host_exe, pe_bytes);
 
-        // --- Wine-boot opt-in (roadmap W3.2) ------------------------------
-        // `EXEMU_WINE_BOOT` selects the experimental path that boots the real
-        // Wine PE core (ntdll→kernelbase→kernel32→ucrtbase) as guest images and
-        // hands off through `LdrInitializeThunk`, instead of the emulated-DLL
-        // thunks. Off by default so the corpus is byte-for-byte unaffected while
-        // the boot path (W3.3 exc bridge, W3.4 console) is still being built. The
-        // DLL directory defaults to the pinned prefix but is overridable via
-        // `EXEMU_WINE_DLLS`; `wine_dll_dir` stays `None` unless the opt-in is set
-        // AND the directory exists, so `load_wine_core` only ever runs on request.
-        let wine_dll_dir = if let Some(dir) = cfg.wine_boot_dir.clone() {
-            // Explicit request (e.g. the W3 gate test) — hermetic, no env vars.
-            if std::path::Path::new(&dir).is_dir() {
-                Some(dir)
-            } else {
-                None
-            }
-        } else if std::env::var_os("EXEMU_WINE_BOOT").is_some() {
-            let dir = std::env::var("EXEMU_WINE_DLLS")
-                .unwrap_or_else(|_| "example_exe/wine-dlls/x86_64-windows".to_string());
-            if std::path::Path::new(&dir).is_dir() {
-                Some(dir)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         // --- The OS layer and import resolution ---------------------------
         let mut os = WinOs::new(WinConfig {
             api_base: lay.api_base,
@@ -446,7 +503,11 @@ impl Process {
             cmdline_ptr_w: cmd_w,
             echo: cfg.echo,
             trace: cfg.trace,
-            is_64bit: image.is_64bit,
+            // A WoW64 process **is** a 64-bit NT process: its PEB/TEB, its
+            // NT-syscall frame and every `Nt*` handler are 64-bit. Only the
+            // guest image and the 32-bit view laid over it are 32-bit, and those
+            // reach the kernel exclusively through wow64.dll's 64-bit thunks.
+            is_64bit: proc_is_64,
             sandbox: sandbox.to_string_lossy().into_owned(),
             module_path_w,
             dll_base: lay.dll_base,
@@ -459,7 +520,7 @@ impl Process {
             image_size: align_up(image.size_of_image as u64, PAGE).max(PAGE),
             image_entry: image.entry_va(),
             image_name: module_name.clone(),
-            wine_dll_dir,
+            wine_dll_dir: wine_dll_dir.clone(),
         });
 
         // Map the thunk region as real read/write memory. Function imports
@@ -486,7 +547,10 @@ impl Process {
 
         mem.map(Region::new("imports", lay.api_base, API_SIZE, Perm::RW))?;
 
-        for imp in &image.imports {
+        // Under WoW64 the guest's imports are bound later, against the **32-bit**
+        // `ntdll` (`wow64_boot::bind_guest_imports`): resolving them here would
+        // write 64-bit thunk (or 64-bit ntdll) addresses into 4-byte IAT slots.
+        for imp in image.imports.iter().filter(|_| !is_wow64) {
             // Bind to a co-loaded guest module's real export when one is
             // present (forwarders chased); otherwise this returns an OS thunk.
             // At initial process load no plugins are mapped yet, so the main
@@ -639,6 +703,66 @@ impl Process {
             }
         }
 
+        // --- WoW64 boot (roadmap W5.4/W5.1) -------------------------------
+        // A 32-bit guest on the Wine set. exemu builds the WoW64 process — the
+        // module set, the dual TEB/PEB, the CPU-reserved area — and then hands
+        // control to Wine's own binary translator through a 64-bit bring-up
+        // trampoline. Everything past that hand-off is Wine's code.
+        let mut wow64 = None;
+        if is_wow64 {
+            let Some(ntdll_base) = os.load_wine_core(&mut mem)? else {
+                return Err(EmuError::Os(
+                    "WoW64 boot: the 64-bit Wine core would not load from the pinned prefix".into(),
+                ));
+            };
+            map_wine_debug_pages(&mut mem, lay.teb_base, lay.peb_addr)?;
+            // Steer the 64-bit ntdll stubs onto the bare `syscall` route into
+            // the W2.3 dispatcher (as on the W3 boot path).
+            mem.poke(KUSER_SHARED_DATA_BASE + KUSER_SYSTEM_CALL, &0u32.to_le_bytes())?;
+
+            let dir64 = wine_dll_dir.clone().unwrap_or_default();
+            let dir32 = wow64_dir32.clone().unwrap_or_default();
+            let dirs = wow64_boot::Wow64Dirs {
+                dir64: std::path::Path::new(&dir64),
+                dir32: &dir32,
+            };
+            let ntdll64_bytes = std::fs::read(dirs.dir64.join("ntdll.dll"))
+                .map_err(|e| EmuError::Os(format!("WoW64 boot: cannot re-read ntdll.dll: {e}")))?;
+            let ntdll64 = exemu_os::wow64::image_view(&ntdll64_bytes, ntdll_base)?;
+
+            let boot = wow64_boot::build(&mut mem, &dirs, &ntdll64, base)?;
+            // The 32-bit guest's imports bind to the **32-bit** ntdll.
+            let (bound, missing) =
+                wow64_boot::bind_guest_imports(&mut mem, base, &image.imports, &boot)?;
+            if !missing.is_empty() {
+                return Err(EmuError::Os(format!(
+                    "WoW64 boot: {} guest import(s) unresolved against the 32-bit Wine set: {}",
+                    missing.len(),
+                    missing.join(", ")
+                )));
+            }
+            let _ = bound;
+
+            // `BTCpuProcessInit` calls `ntdll!LdrGetDllHandle` to find the
+            // 64-bit ntdll. Wine's own `LdrGetDllHandleEx` walks a module hash
+            // table only its `loader_init` fills, which this boot deliberately
+            // does not run — so that one slot is bound to exemu's native loader
+            // query instead (see `Api::LdrGetDllHandle`). Every other import of
+            // wow64cpu's process init is Wine's real 64-bit ntdll code.
+            let native_ldr_get = os.resolve_import(
+                "ntdll.dll",
+                &exemu_core::ImportSymbol::Named("LdrGetDllHandle".into()),
+            );
+            for (iat_rva, _dll, sym) in &boot.wow64cpu.imports {
+                if sym == "LdrGetDllHandle" {
+                    mem.write_u64(boot.wow64cpu.base + *iat_rva as u64, native_ldr_get)?;
+                }
+            }
+
+            wow64_boot::seat(&mut cpu, &mut mem, &boot, image.entry_va(), stack_top)?;
+            wow64 = Some(boot);
+        }
+
         Ok(Process {
             mem,
             cpu,
@@ -648,7 +772,15 @@ impl Process {
             max_steps: cfg.max_steps,
             image_base: base,
             exc_depth: 0,
+            wow64,
         })
+    }
+
+    /// The WoW64 process model this boot built, when the image is a 32-bit guest
+    /// running on Wine's 64-bit PE set (roadmap W5.4). `None` on every other
+    /// path. Gate tests read the module bases and the TEB/PEB pair out of it.
+    pub fn wow64(&self) -> Option<&wow64_boot::Wow64Boot> {
+        self.wow64.as_ref()
     }
 
     /// The entry-point virtual address.
@@ -666,8 +798,54 @@ impl Process {
         self.mem.read_u32(addr)
     }
 
+    /// Read-only view of the process address space (for tests/tools inspecting
+    /// the built process before or after a run).
+    pub fn memory(&self) -> &dyn Memory {
+        &self.mem
+    }
+
+    /// The address the main image was mapped at.
+    pub fn image_base(&self) -> u64 {
+        self.image_base
+    }
+
+    /// Step the CPU until `rip == target`, at most `max_steps` instructions,
+    /// returning how many ran.
+    ///
+    /// The bounded counterpart of [`Process::run`]: it stops *at* a chosen
+    /// instruction instead of at process exit, which is how a gate can assert on
+    /// the state a multi-stage bootstrap leaves behind at one of its stages (the
+    /// WoW64 bring-up publishes the BOP before it enters the guest — roadmap
+    /// W5.1). Faults surface exactly as in `run`.
+    pub fn run_until_rip(&mut self, target: u64, max_steps: u64) -> Result<u64> {
+        let mut steps = 0u64;
+        while self.cpu.state().rip != target {
+            if steps >= max_steps {
+                return Err(EmuError::Os(format!(
+                    "run_until_rip({target:#x}): not reached within {max_steps} steps (rip {:#x})",
+                    self.cpu.state().rip
+                )));
+            }
+            match self.cpu.step(&mut self.mem, &mut self.os)? {
+                Exit::Continue => steps += 1,
+                other => {
+                    return Err(EmuError::Os(format!(
+                        "run_until_rip({target:#x}): process left the run loop with {other:?} after {steps} steps"
+                    )))
+                }
+            }
+        }
+        Ok(steps)
+    }
+
     /// Run until the process exits (or the step cap / a fault is hit).
     pub fn run(mut self) -> Result<RunResult> {
+        self.run_borrowed()
+    }
+
+    /// [`Process::run`] without consuming the process, so a caller can inspect
+    /// guest memory afterwards.
+    pub fn run_borrowed(&mut self) -> Result<RunResult> {
         let mut steps: u64 = 0;
         // Rolling window of the most recent instruction pointers, for the
         // fault report (helps trace how a bad jump was reached).
