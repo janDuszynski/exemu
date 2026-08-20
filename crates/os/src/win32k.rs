@@ -1851,8 +1851,13 @@ fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
     let wparam = os.syscall_arg(cpu, mem, 2)?;
     let lparam = os.syscall_arg(cpu, mem, 3)?;
     let result_info = os.syscall_arg(cpu, mem, 4)?;
-    let call_type = os.syscall_arg(cpu, mem, 5)?;
-    let ansi = os.syscall_arg(cpu, mem, 6)? != 0;
+    // `type` and `ansi` are **DWORD** slots: every user32 wrapper fills them with
+    // `mov dword ptr [rsp+0x28], imm` / `[rsp+0x30]`, leaving whatever the stack
+    // already held in the upper half. Reading the full qword picks that garbage
+    // up — which is how `SetWindowTextW` came out as ANSI on one call and Unicode
+    // on the next, purely from what the previous frame had left behind.
+    let call_type = os.syscall_arg(cpu, mem, 5)? as u32 as u64;
+    let ansi = os.syscall_arg(cpu, mem, 6)? as u32 != 0;
 
     match call_type {
         message_call::DEF_WINDOW_PROC => {

@@ -638,7 +638,23 @@ fn wine_client_pfn_arrays_publish_the_builtin_wndprocs() {
 /// per window still owing one — parent first, then each child — and only then
 /// delivers the `WM_QUIT` that ends the loop. No threads, no timing, no AppKit.
 fn pumped_run_config(driver: Box<dyn exemu_core::UserDriver>) -> RunConfig {
+    input_run_config(driver, Vec::new())
+}
+
+/// The same, with `events` queued on the channel ahead of the run. The pump
+/// drains them into its raw-input queue, delivers every message the windows
+/// already owe (the `WM_PAINT`s), then routes the events — and only once both
+/// are exhausted does the dropped sender become the `WM_QUIT` that ends the
+/// loop. So a click injected here lands **after** the controls have painted
+/// themselves, exactly as a click on a live window would.
+fn input_run_config(
+    driver: Box<dyn exemu_core::UserDriver>,
+    events: Vec<exemu_core::InputEvent>,
+) -> RunConfig {
     let (tx, rx) = std::sync::mpsc::channel::<exemu_core::InputEvent>();
+    for ev in events {
+        tx.send(ev).expect("the receiver is alive");
+    }
     drop(tx);
     RunConfig {
         echo: false,
@@ -802,6 +818,297 @@ fn comctl_children_paint_into_the_parent_surface_on_wine() {
         0,
         "a control painted outside its own rect at {gap:?} — the DC clip rect is not holding"
     );
+}
+
+/// **THE INTERACTION GATE — a click reaches Wine's own `ButtonWndProc`.**
+///
+/// W4.8 painted the controls but left input routing pinned to the first shown
+/// top-level window, so a click never got near a child. This drives a real
+/// press-and-release at the `BUTTON`'s coordinates and requires the two things
+/// only Wine's own control code can produce.
+///
+/// **1. The parent is notified.** Nothing in exemu knows what a button is. For
+/// the sample's WndProc to see a `WM_COMMAND`, user32's `ButtonWndProc` had to
+/// run the whole documented sequence: take the capture and push itself on
+/// `WM_LBUTTONDOWN`, and on `WM_LBUTTONUP` un-push, check the release point
+/// against `GetClientRect`, `ReleaseCapture`, read its control id back out of
+/// `GWLP_ID`, ask `GetParent`, and `SendMessageW(parent, WM_COMMAND, id, hwnd)`.
+/// The handler answers by setting the window text of the HWND it was handed in
+/// **lParam** — so the recorded `SetWindowText` naming the *button* proves the
+/// notification carried the button's real handle, and the id filter proves it
+/// carried the right `wParam`.
+///
+/// **2. It repaints itself pressed.** `ButtonWndProc` answers its own
+/// `BM_SETSTATE` by taking a DC (`NtUserGetDC`) and painting immediately, so the
+/// button's pixels inside the parent's surface must change while the button is
+/// down and change **back** when it comes up. Both frames are captured; the
+/// assertion is that the pressed rendering differs from the released one and the
+/// released one recurs afterwards.
+///
+/// A click delivered to the top-level window instead of the button — the
+/// pre-routing behaviour — fails both halves.
+#[test]
+fn clicking_the_button_reaches_wine_button_wndproc_on_wine() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} control DLLs not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    use exemu_core::{InputEvent, MouseButton};
+
+    // The centre of the BUTTON, in the top-level window's client coordinates —
+    // which is exemu's screen space (the surface is the client area).
+    let b = comctl_sample::BUTTON_RECT;
+    let (cx, cy) = (b[0] + b[2] / 2, b[1] + b[3] / 2);
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let exe = comctl_sample::build();
+    let res = load_and_run(
+        &exe,
+        input_run_config(
+            Box::new(RecordingDriver::with_inner(
+                Arc::clone(&log),
+                Box::new(FrameCapture { frames: Arc::clone(&frames) }),
+            )),
+            vec![
+                InputEvent::MouseButton { button: MouseButton::Left, down: true, x: cx, y: cy },
+                InputEvent::MouseButton { button: MouseButton::Left, down: false, x: cx, y: cy },
+            ],
+        ),
+    )
+    .expect("the comctl sample runs its pump to completion with a click injected");
+    assert_eq!(res.exit_code, 0, "the guest exits cleanly after the click");
+    eprintln!("comctl_sample clicked: exit={} steps={}", res.exit_code, res.steps);
+
+    let calls = log.lock().unwrap();
+    let button_hwnd = calls
+        .iter()
+        .find_map(|c| match c {
+            DriverCall::CreateWindow { hwnd, params }
+                if params.class_name.eq_ignore_ascii_case("BUTTON") =>
+            {
+                Some(*hwnd)
+            }
+            _ => None,
+        })
+        .expect("the BUTTON child was created");
+
+    // 1. THE NOTIFICATION.
+    let notified = calls.iter().any(|c| matches!(
+        c,
+        DriverCall::SetWindowText { hwnd, text }
+            if *hwnd == button_hwnd && text == comctl_sample::CLICKED_TEXT
+    ));
+    assert!(
+        notified,
+        "no WM_COMMAND/BN_CLICKED reached the parent: the click never got to \
+         Wine's ButtonWndProc (control id {}, button hwnd {button_hwnd:#x})",
+        comctl_sample::ID_BUTTON
+    );
+    drop(calls);
+
+    // 2. THE PRESSED REPAINT. Collapse the presented frames to the successive
+    // *distinct* renderings of the button's own rect; the button must have
+    // changed and changed back.
+    let frames = frames.lock().unwrap();
+    let mut renderings: Vec<Vec<u8>> = Vec::new();
+    for (pixels, w, h) in frames.iter() {
+        let r = rect_pixels(pixels, *w, *h, b);
+        if renderings.last() != Some(&r) {
+            renderings.push(r);
+        }
+    }
+    eprintln!("button rect renderings across {} frames: {}", frames.len(), renderings.len());
+    assert!(
+        renderings.len() >= 3,
+        "the button never changed appearance: {} distinct renderings of {b:?}",
+        renderings.len()
+    );
+    let last = renderings.last().unwrap();
+    let pressed = &renderings[renderings.len() - 2];
+    let before = &renderings[renderings.len() - 3];
+    assert_ne!(
+        pressed, last,
+        "the button's pressed and released renderings are identical — BM_SETSTATE painted nothing"
+    );
+    assert_eq!(
+        before, last,
+        "the button did not return to its released appearance after the button-up"
+    );
+    let changed = pressed.iter().zip(last).filter(|(a, b)| a != b).count();
+    eprintln!("pressed vs released: {changed}/{} bytes differ in {b:?}", last.len());
+    assert!(changed > 100, "only {changed} bytes changed while the button was down");
+
+    // 3. WHAT changed: the classic Win95 edge swap. A raised push button has a
+    //    white (`COLOR_BTNHIGHLIGHT`) inner edge along its top-left and the near
+    //    black `COLOR_3DDKSHADOW` along its bottom-right; pushed, the highlight
+    //    is replaced by `COLOR_BTNSHADOW` grey and the dark edge goes. exemu
+    //    supplies the palette through `GetSysColor`, but *which colour goes on
+    //    which edge in which state* is Wine's `UITOOLS95_DFC_ButtonPush` and
+    //    nothing else.
+    let px = |v: &Vec<u8>, x: i32, y: i32| {
+        let off = ((y * b[2] + x) * 4) as usize;
+        [v[off], v[off + 1], v[off + 2]]
+    };
+    const BTNHIGHLIGHT: [u8; 3] = [0xFF, 0xFF, 0xFF];
+    const BTNSHADOW: [u8; 3] = [0x80, 0x80, 0x80];
+    const DKSHADOW: [u8; 3] = [0x00, 0x00, 0x00];
+    let (rx, ry) = (b[2] - 2, b[3] - 2);
+    assert_eq!(px(last, 1, 1), BTNHIGHLIGHT, "released: the top-left inner edge is the highlight");
+    assert_eq!(px(pressed, 1, 1), BTNSHADOW, "pressed: the highlight becomes the shadow grey");
+    assert_eq!(px(last, rx, ry), DKSHADOW, "released: the bottom-right edge is the dark shadow");
+    assert_eq!(px(pressed, rx, ry), BTNSHADOW, "pressed: the dark bottom-right edge lifts");
+}
+
+/// **The pressed button, pinned pixel-for-pixel.**
+///
+/// The companion golden to [`comctl_painted_controls_match_golden_on_wine`],
+/// for the *interactive* state: the frame Wine's `ButtonWndProc` paints while
+/// the button is held down. Rendered headlessly through the deterministic
+/// [`OffscreenPresenter`] (the built-in `font8x8` stub, so the golden is
+/// platform-independent). The pressed frame is found by its own content — the
+/// first flush whose button top-left inner pixel is the shadow grey rather than
+/// the highlight — so the pin does not depend on how many frames the pump
+/// happens to present.
+///
+/// Set `EXEMU_BLESS=1` to re-bless after an intended rendering change.
+#[test]
+fn the_pressed_button_matches_golden_on_wine() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} control DLLs not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    use exemu_core::{InputEvent, MouseButton};
+
+    let shot_dir = std::env::temp_dir().join(format!(
+        "exemu-w48-pressed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_dir_all(&shot_dir);
+
+    let b = comctl_sample::BUTTON_RECT;
+    let (cx, cy) = (b[0] + b[2] / 2, b[1] + b[3] / 2);
+    let exe = comctl_sample::build();
+    let res = load_and_run(
+        &exe,
+        input_run_config(
+            Box::new(PresenterDriver::new(OffscreenPresenter::with_dir(Some(shot_dir.clone())))),
+            vec![
+                InputEvent::MouseButton { button: MouseButton::Left, down: true, x: cx, y: cy },
+                InputEvent::MouseButton { button: MouseButton::Left, down: false, x: cx, y: cy },
+            ],
+        ),
+    )
+    .expect("the comctl sample paints its pressed button");
+    assert_eq!(res.exit_code, 0, "the guest exits cleanly through the click");
+
+    let mut frames: Vec<_> = std::fs::read_dir(&shot_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("png"))
+        .collect();
+    frames.sort();
+    // The pressed frame identifies itself: `COLOR_BTNSHADOW` where the raised
+    // button has `COLOR_BTNHIGHLIGHT`.
+    let rendered = frames
+        .iter()
+        .find(|p| {
+            let (w, _, px) = decode_png(p);
+            let off = (((b[1] + 1) as usize) * w as usize + (b[0] + 1) as usize) * 4;
+            px[off..off + 3] == [0x80, 0x80, 0x80]
+        })
+        .expect("one presented frame has the button pushed in")
+        .clone();
+
+    let golden =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/goldens/comctl_button_pressed.png");
+    if std::env::var_os("EXEMU_BLESS").is_some() {
+        std::fs::create_dir_all(golden.parent().unwrap()).unwrap();
+        std::fs::copy(&rendered, &golden).unwrap();
+        eprintln!("BLESSED golden: {} (from {})", golden.display(), rendered.display());
+        let _ = std::fs::remove_dir_all(&shot_dir);
+        return;
+    }
+    assert!(
+        golden.exists(),
+        "no golden at {} — run once with EXEMU_BLESS=1 to create it",
+        golden.display()
+    );
+
+    let (rw, rh, rpix) = decode_png(&rendered);
+    let (gw, gh, gpix) = decode_png(&golden);
+    let _ = std::fs::remove_dir_all(&shot_dir);
+    assert_eq!((rw, rh), (gw, gh), "pressed-frame dimensions match the golden");
+    if rpix != gpix {
+        let diff = rpix.iter().zip(&gpix).filter(|(a, b)| a != b).count();
+        let first = rpix.iter().zip(&gpix).position(|(a, b)| a != b).unwrap_or(0);
+        panic!(
+            "the pressed button drifted from the golden: {diff}/{} bytes differ \
+             (first at byte {first}); set EXEMU_BLESS=1 to re-bless after an intended change",
+            rpix.len()
+        );
+    }
+}
+
+/// **The other half of the routing claim: a click that misses the button must
+/// not press it.**
+///
+/// The pre-routing behaviour sent every mouse event to the first shown top-level
+/// window; a hit test that always answered "the button", or one that ignored the
+/// point, would pass [`clicking_the_button_reaches_wine_button_wndproc_on_wine`]
+/// just as well. This clicks the *progress bar* instead — a real child, with a
+/// real WndProc, that has no notion of `BN_CLICKED` — and requires silence.
+#[test]
+fn a_click_that_misses_the_button_notifies_nobody_on_wine() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} control DLLs not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    use exemu_core::{InputEvent, MouseButton};
+
+    let p = comctl_sample::PROGRESS_RECT;
+    let (cx, cy) = (p[0] + p[2] / 2, p[1] + p[3] / 2);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exe = comctl_sample::build();
+    let res = load_and_run(
+        &exe,
+        input_run_config(
+            Box::new(RecordingDriver::new(Arc::clone(&log))),
+            vec![
+                InputEvent::MouseButton { button: MouseButton::Left, down: true, x: cx, y: cy },
+                InputEvent::MouseButton { button: MouseButton::Left, down: false, x: cx, y: cy },
+            ],
+        ),
+    )
+    .expect("the comctl sample survives a click on the progress bar");
+    assert_eq!(res.exit_code, 0, "clicking a control that ignores clicks is harmless");
+
+    let calls = log.lock().unwrap();
+    assert!(
+        !calls.iter().any(|c| matches!(
+            c,
+            DriverCall::SetWindowText { text, .. } if text == comctl_sample::CLICKED_TEXT
+        )),
+        "a click at {cx},{cy} — inside the progress bar, outside the button — still \
+         reached the BUTTON: the hit test is not using the point"
+    );
+}
+
+/// The `[B, G, R, A]` bytes inside `rect` of a top-down BGRA32 frame, row-major.
+fn rect_pixels(pixels: &[u8], w: u32, h: u32, rect: [i32; 4]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for y in rect[1].max(0)..(rect[1] + rect[3]).min(h as i32) {
+        for x in rect[0].max(0)..(rect[0] + rect[2]).min(w as i32) {
+            let off = (y as usize * w as usize + x as usize) * 4;
+            out.extend_from_slice(&pixels[off..off + 4]);
+        }
+    }
+    out
 }
 
 /// **W4.8 gate — a control's WndProc runs to completion.**

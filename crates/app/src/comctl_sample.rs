@@ -64,7 +64,7 @@ pub const PROGRESS_RECT: [i32; 4] = [184, 204, 300, 24];
 const ICC_FLAGS: i32 = 0x0000_00FF | 0x0000_4000;
 
 /// The two child-control IDs (the `hMenu` argument of `CreateWindowExW`).
-const ID_BUTTON: i32 = 100;
+pub const ID_BUTTON: i32 = 100;
 const ID_PROGRESS: i32 = 101;
 
 // --- progress-bar control messages (documented `commctrl.h` values) ----------
@@ -93,6 +93,16 @@ const CS_LPSZ_CLASS: i8 = 0x40;
 // --- window messages the sample's WndProc handles ---------------------------
 const WM_CREATE: i32 = 0x0001;
 const WM_NCCREATE: i32 = 0x0081;
+/// `WM_COMMAND` — what a `BUTTON` sends its **parent** when it is clicked:
+/// `wParam = MAKEWPARAM(control id, BN_CLICKED)` and `lParam = the button's
+/// HWND`. `BN_CLICKED` is 0, so `wParam` is the bare id.
+const WM_COMMAND: i32 = 0x0111;
+
+/// The text the sample's WndProc puts on **the button** when it receives that
+/// notification. It sets it through the `lParam` it was handed, so the text
+/// landing on the button is itself the evidence that `lParam` carried the
+/// button's real HWND (roadmap W4.8 input routing).
+pub const CLICKED_TEXT: &str = "Clicked!";
 
 
 /// Build the common-controls sample executable.
@@ -186,7 +196,7 @@ fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
 }
 
 /// The wide strings the sample references, in `.rdata` order.
-const WIDE_STRINGS: [&str; 7] = [
+const WIDE_STRINGS: [&str; 8] = [
     CLASS_NAME,
     WINDOW_TITLE,
     BUTTON_CLASS,
@@ -194,6 +204,7 @@ const WIDE_STRINGS: [&str; 7] = [
     PROGRESS_CLASS,
     PAINT_LINE1,
     PAINT_LINE2,
+    CLICKED_TEXT,
 ];
 
 struct Rdata {
@@ -519,7 +530,27 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.je("nccreate");
     a.cmp_rdx_imm32(WM_CREATE);
     a.je("create");
+    a.cmp_rdx_imm32(WM_COMMAND);
+    a.je("command");
     a.call_iat(r.slot("DefWindowProcW"));
+    a.jmp("wp_ret");
+
+    // WM_COMMAND → **the button notification**. Reached only if a real click
+    // travelled the whole way: exemu's win32k hit-tested the point onto the
+    // BUTTON child, Wine's own `ButtonWndProc` took the capture, pushed itself,
+    // released the capture on the button-up, read its control id back out of
+    // `GWLP_ID`, asked `GetParent` and sent this message. The handler answers by
+    // setting the window text of the HWND in **lParam**, so the recorded driver
+    // call names the button — proof the notification carried its handle, not
+    // just its id.
+    a.label("command");
+    a.cmp_r8_imm32(ID_BUTTON); // wParam = MAKEWPARAM(id, BN_CLICKED), BN_CLICKED = 0
+    a.jne("command_done");
+    a.mov_reg_reg(RCX, R9); // lParam = the button's HWND
+    a.lea_rip(RDX, r.wstr(CLICKED_TEXT));
+    a.call_iat(r.slot("SetWindowTextW"));
+    a.label("command_done");
+    a.xor32(RAX);
     a.jmp("wp_ret");
 
     // WM_NCCREATE → TRUE ("keep creating me"), the documented contract. Handled
@@ -716,6 +747,12 @@ impl Asm {
     /// `cmp rdx, imm32` — the message ids above 0x7F (`WM_NCCREATE` = 0x81).
     fn cmp_rdx_imm32(&mut self, imm: i32) {
         self.code.extend_from_slice(&[0x48, 0x81, 0xFA]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+    /// `cmp r8, imm32` — test the WndProc's `wParam` (the control id a
+    /// `WM_COMMAND` carries).
+    fn cmp_r8_imm32(&mut self, imm: i32) {
+        self.code.extend_from_slice(&[0x49, 0x81, 0xF8]);
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
     /// `cmp qword [r9+disp8], imm32` — test a field of the `CREATESTRUCTW` lParam.
