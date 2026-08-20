@@ -72,6 +72,20 @@
 //! procs into every mapped ntdll copy, which fixes `DefWindowProc`; the
 //! duplicate load itself is a loader-level gap that remains.
 //!
+//! **Historical note — the Wine boot used to map ntdll twice.** exemu pre-maps
+//! ntdll (the running image, and the only copy whose `user_procs` user32 ever
+//! fills), and Wine's own loader then mapped a *second* copy for the name
+//! `NTDLL.dll` while resolving forwarders. Because `user32!DefWindowProcW` is a
+//! forwarder to `NTDLL.NtdllDefWindowProc_W` — literally
+//! `jmp qword [user_procs+0xa8]` — every module bound after that second map (the
+//! exe, comctl32) reached `DefWindowProc` through a NULL slot. W6.2 papered over
+//! the symptom by mirroring the recovered client-PFN procs into every mapped
+//! ntdll copy. The duplicate load itself was fixed later, in W6.6: it was caused
+//! by exemu handing ntdll an all-zero **case-mapping** table, which made every
+//! case-insensitive comparison in the process case-sensitive, so `NTDLL.dll`
+//! never matched the loaded `ntdll.dll` (see `crates/os/src/nls.rs`). The
+//! mirroring stays as defence in depth — it is a no-op when there is one copy.
+//!
 //! Everything here skip-guards on the git-ignored Wine DLL set.
 
 use std::collections::HashMap;

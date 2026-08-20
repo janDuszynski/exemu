@@ -210,13 +210,16 @@ fn run_steps(exe: &[u8], wine_dir: Option<String>, max_steps: u64) -> (i32, u64)
 /// | run | instructions | exit |
 /// | --- | --- | --- |
 /// | emulated (no Wine) | 22,033 | 1 |
-/// | Wine boot, prefix **without** cabinet.dll | 3,569,341 | 1 |
-/// | Wine boot, full prefix | 4,057,410 | 1 |
+/// | Wine boot, prefix **without** cabinet.dll | 2,885,697 | 1 |
+/// | Wine boot, full prefix | 3,366,974 | 1 |
 ///
 /// The totals move a little with the command line, the build profile and what
-/// exemu has seeded into the sandbox (the release CLI, with a different argv,
-/// gives 25,553 / 4,082,535 / 3,542,988) — which is why every assertion below
-/// is an inequality with a wide margin rather than an equality.
+/// exemu has seeded into the sandbox — which is why every assertion below is an
+/// inequality with a wide margin rather than an equality. They also move when
+/// the *boot itself* gets cheaper: the Wine-boot figure dropped from ~4.06M when
+/// the NLS case tables landed, because the process no longer maps and relocates
+/// a second, redundant copy of ntdll (see `crates/os/src/nls.rs`). The exit code
+/// — the thing this pin is actually about — did not move.
 ///
 /// What that establishes:
 ///
@@ -256,7 +259,7 @@ fn total_commander_loads_wine_cabinet_but_still_exits_early() {
     let (wine_code, wine_steps) = run_steps(&exe, Some(WINE_DLLS.to_string()), 50_000_000);
     eprintln!("tcmd wine-boot:           exit {wine_code} after {wine_steps} steps");
     assert!(
-        wine_steps > 3_500_000,
+        wine_steps > 3_000_000,
         "the Wine boot should carry tcmd millions of instructions in, got {wine_steps}"
     );
     assert!(wine_steps > emu_steps * 100, "{wine_steps} vs {emu_steps} emulated");

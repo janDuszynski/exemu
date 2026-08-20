@@ -159,3 +159,59 @@ fn the_virtual_clock_leaves_a_run_identical_and_repeatable() {
         "the clock must not change what the program does, only where its time comes from"
     );
 }
+
+/// **The NULL-deref diagnostic**, against the real thing.
+///
+/// exemu's most common failure shape is: an unimplemented API returns 0, the
+/// guest keeps it as a pointer or a function pointer, and faults an arbitrary
+/// distance later — 728 instructions for `tcc.exe`, 4.7M for the Firefox
+/// installer, 93M for SteamSetup. The fault itself says nothing about where the
+/// zero came from, which is exactly what made those read as three unrelated
+/// bugs (`knowledge/known-issues.know`).
+///
+/// The report now recognises the shape — a faulting address inside the
+/// never-mapped null-guard region — and names the unimplemented stubs that
+/// returned 0, most recent first. `tcc.exe` is the tightest case in the corpus:
+/// it dies at 728 instructions calling through a NULL, and the two suspects the
+/// report prints are exactly the pair the notes record as its cause.
+///
+/// Skip-guarded on the git-ignored corpus.
+#[test]
+fn a_null_deref_fault_names_the_stubs_that_returned_zero() {
+    const TCC: &str = "../../example_exe/tcc.exe";
+    if !std::path::Path::new(TCC).exists() {
+        eprintln!("SKIP: {TCC} not present (the corpus is git-ignored)");
+        return;
+    }
+    let bytes = std::fs::read(TCC).expect("read the pinned tcc.exe");
+    let dir = std::env::temp_dir().join(format!("exemu-nullref-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let outcome = load_and_run(
+        &bytes,
+        RunConfig {
+            echo: false,
+            max_steps: 100_000,
+            sandbox_root: Some(dir.clone()),
+            ..RunConfig::default()
+        },
+    );
+    let Err(err) = outcome else {
+        let _ = std::fs::remove_dir_all(&dir);
+        panic!("tcc.exe is expected to fault on the emulated path; it ran to completion");
+    };
+    let report = err.to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(report.contains("NULL dereference"), "the shape is recognised; report:\n{report}");
+    for sym in ["VerifyVersionInfoW", "VerSetConditionMask"] {
+        assert!(
+            report.contains(sym),
+            "the suspect list should name {sym} — the stub that produced this NULL; report:\n{report}"
+        );
+    }
+    // And the raw addresses are attributed, so the trail can be disassembled.
+    // (The module name is the loader's — `program.exe` for an image handed over
+    // as bytes rather than opened from a path.)
+    assert!(report.contains(".exe+0x"), "the rip trail is module-attributed; report:\n{report}");
+    assert!(report.contains("loaded modules:"), "the report lists the mapped images; report:\n{report}");
+}

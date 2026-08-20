@@ -578,7 +578,83 @@ end-to-end on the default path.
   (`\users\` with no name) so a regression reads immediately as "the old bug is
   back".
 
-### IShellLink through COM (W6.6 stretch, partial)
+### Start-menu shortcuts, and the zero that broke case-insensitivity (W6.6)
+- **A guest writes a real `.lnk` into `CSIDL_PROGRAMS` through Wine's own
+  shell32** — the whole installer sequence: `CoCreateInstance(CLSID_ShellLink)`
+  → `IShellLinkW::SetPath` → `GetPath` (which hands the target back) →
+  `QueryInterface(IID_IPersistFile)` → `IPersistFile::Save`. The gate reads the
+  file back out of the sandbox and walks it as the format Microsoft publishes
+  (MS-SHLLINK): the 0x4C header, `LinkCLSID = CLSID_ShellLink`,
+  `LinkFlags.HasLinkInfo`, `ShowCommand = SW_SHOWNORMAL`, and a `LinkInfo` whose
+  `LocalBasePath` is exactly the target `SetPath` was given. exemu implements no
+  COM, no shell namespace and no `.lnk` serializer; the emulated path is the
+  control (its `CoCreateInstance` cannot produce an object at all). Exit 0 after
+  2,616,308 guest instructions.
+- **Root cause of the `SetPath` fault: a stubbed API returned a *plausible
+  zero*, and four subsystems later the guest dereferenced NULL.** exemu answered
+  `NtGetNlsSectionPtr(type 0xA)` — ntdll's **case-mapping** section — with the
+  same zero-filled codepage stub it used for every other section type. ntdll's
+  `locale_init` installed it as the process upcase/downcase tables
+  (`section+4`, and `section+4+2*word[section+2]`), and *because the pointer was
+  non-NULL* every case-insensitive comparison in the process took the table path
+  instead of its ASCII fallback — with a table that maps every character to
+  itself. **Case-insensitive comparison silently became case-sensitive.** So
+  `LdrpFindLoadedDllByName(L"NTDLL.dll")` — reached while resolving a forwarder,
+  the pinned kernel32/user32 spell it uppercase — failed to match the already
+  loaded `ntdll.dll`, and Wine's loader mapped a **second, uninitialised copy of
+  ntdll**. shell32's delay-load stub bound to that copy, and the first
+  delay-load resolution walked its never-initialised `LdrpHashTable`, found a
+  bucket whose `LIST_ENTRY.Flink` was `NULL`, and read a field at `+0xBC` off
+  it — the reported `page fault on read access to 00000000000000BC`, two million
+  instructions and four subsystems away from the stub.
+- **Fix: real case tables** (`crates/os/src/nls.rs`). The three-level 8/4/4
+  sparse delta format was recovered from the pinned `ntdll.dll`
+  (`RtlCompareUnicodeStrings` @ RVA 0x1c9c0 and `RtlHashUnicodeString` @ 0x27ea0
+  index it identically: `ch += T[T[T[ch>>8] + ((ch>>4)&0xF)] + (ch&0xF)]`), and
+  the deltas come from Rust's own Unicode data — simple 1:1 mappings only, which
+  is exactly what a per-character delta table can express. Identical blocks are
+  shared, so the whole BMP costs a few KiB. A unit test walks the emitted table
+  with the guest's own indexing across all 65,536 code points and checks it
+  against `char::to_uppercase`/`to_lowercase`, with a floor on how many
+  characters must actually map so a degenerate table cannot pass. The duplicate
+  ntdll load — a loader-level gap pinned in `comctl_gate.rs` since W6.2 — is
+  gone with it.
+- **Every address in a fault report is now module-attributed.** `WinOs::module_at`
+  / `describe_addr` / `loaded_modules` resolve a guest address to
+  `shell32.dll+0x39600`, consulting both exemu's own loader **and** the image
+  views the *guest* loader maps through `NtCreateSection(SEC_IMAGE)` /
+  `NtMapViewOfSection` — which matters because on the Wine boot exemu maps only
+  ntdll and everything else arrives that way, so previously every faulting
+  address in Wine's code was an unattributable number. The report gains the
+  named rip, a named rip trail, a named call stack and a loaded-module list; a
+  duplicate image map is warned about under `--trace`. `EXEMU_DBG=1` prints the
+  whole report for an exception that is *delivered to the guest* rather than
+  fatal — without it, an access violation Wine then swallows leaves no trace at
+  all. This is what turned the hunt above from hours into minutes.
+- **A NULL-dereference fault now names the stubs that returned the NULL.** The
+  commonest failure shape in exemu is an unimplemented API returning 0 that the
+  guest keeps as a pointer and faults on an arbitrary distance later — 728
+  instructions for `tcc.exe`, 4.7M for the Firefox installer, 93M for
+  SteamSetup — and the fault itself carried no trace of where the zero came
+  from, which is why those read as three unrelated bugs. The OS layer now
+  remembers every unimplemented stub that hands the guest a 0 (newest first,
+  deduplicated, capped), and the report recognises the *shape* of the fault (an
+  address inside the never-mapped 64 KiB null-guard region — a null pointer plus
+  at most a struct-field offset) and prints the suspects. On `tcc.exe` it names
+  `kernel32.dll!VerifyVersionInfoW` and `kernel32.dll!VerSetConditionMask` —
+  exactly the pair `knowledge/known-issues.know` records as its cause, now
+  produced automatically rather than by hand. Pinned as a test against the real
+  binary. **Finding worth recording:** on the Firefox installer the same
+  diagnostic reports that *no* unimplemented stub returned 0 in the whole run —
+  so despite being filed in the same class, its NULL comes from somewhere else
+  (guest logic, or an *implemented* API returning the wrong thing).
+- **PINNED GAP:** the saved `.lnk` carries no `LinkTargetIDList`. Real Windows
+  also stores the target as a PIDL, which `SetPath` builds by walking the shell
+  namespace (`SHGetDesktopFolder` → `IShellFolder::ParseDisplayName`); that walk
+  does not produce one here, so the shortcut resolves by path only. Asserted, so
+  closing it fails the test and forces this note to be updated.
+
+### IShellLink through COM (W6.6 stretch, partial — superseded above)
 - **`CoCreateInstance(CLSID_ShellLink, IID_IShellLinkW)` resolves through
   exemu's registry to shell32's own `IShellLinkW`** — the same
   in-proc-server mechanism W6.3/W6.4 proved for the ole32 moniker classes,
@@ -604,9 +680,9 @@ end-to-end on the default path.
   vtable's true end (+0xA8/+0xB0 both `NULL`) — confirming the *offset* is
   right; the `pszFile` argument was echoed back byte-for-byte correct before
   the call. The fault is therefore inside Wine's real `SetPath`, hitting
-  some *other*, not-yet-identified stub — worth its own investigation. The
-  full "write a real `.lnk` into `CSIDL_PROGRAMS`" pin (the 7-Zip
-  start-menu-shortcut scenario) is therefore **not yet reached**.
+  some *other*, not-yet-identified stub — worth its own investigation.
+  **(Resolved: it was the all-zero NLS case table — see the section above. The
+  isolation recorded here was correct and is what made the search tractable.)**
 
 ## v0.0.4 — the windowing substrate
 

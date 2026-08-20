@@ -2900,6 +2900,10 @@ impl WinOs {
                 if self.cfg.trace {
                     eprintln!("[exemu] unimplemented API {sym} -> returning 0");
                 }
+                // Remember it: this zero is the single most common cause of a
+                // fault somewhere else entirely, and the fault carries no trace
+                // of where it came from (see `WinOs::zero_returning_stubs`).
+                self.note_zero_returning_stub(sym);
                 ret(0)
             }
         }
@@ -3405,5 +3409,40 @@ mod tests {
                 "{name} must be a success-returning stub that pops 1 arg, got {api:?}"
             );
         }
+    }
+
+    /// Every unimplemented stub that hands the guest a 0 must be remembered, so
+    /// a later NULL dereference can name its suspects instead of leaving the
+    /// reader to guess which of a few hundred stubs was the wrong one. Newest
+    /// first, one entry per symbol however often it is called, capped.
+    #[test]
+    fn unimplemented_stubs_that_return_zero_are_remembered() {
+        use exemu_memory::VirtualMemory;
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, echo: false, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        let mut cpu = CpuState::default();
+        let mut call = |os: &mut WinOs, sym: &str| {
+            let api = Api::Unsupported { sym: sym.to_string(), argc: 0 };
+            let out = os.dispatch(&api, &mut cpu, &mut mem).expect("stub dispatch");
+            assert!(matches!(out, Outcome::Return(0)), "an unimplemented stub returns 0");
+        };
+
+        call(&mut os, "kernel32.dll!Alpha");
+        call(&mut os, "kernel32.dll!Beta");
+        assert_eq!(os.zero_returning_stubs(), ["kernel32.dll!Beta", "kernel32.dll!Alpha"], "newest first");
+
+        // Calling one again moves it to the front rather than duplicating it —
+        // a stub called in a loop must not crowd the others out of the trail.
+        call(&mut os, "kernel32.dll!Alpha");
+        assert_eq!(os.zero_returning_stubs(), ["kernel32.dll!Alpha", "kernel32.dll!Beta"]);
+
+        // The trail is bounded, and keeps the most recent.
+        for i in 0..crate::ZERO_STUB_TRAIL + 5 {
+            call(&mut os, &format!("kernel32.dll!Fill{i}"));
+        }
+        let trail = os.zero_returning_stubs();
+        assert_eq!(trail.len(), crate::ZERO_STUB_TRAIL, "bounded");
+        assert_eq!(trail[0], format!("kernel32.dll!Fill{}", crate::ZERO_STUB_TRAIL + 4), "newest kept");
+        assert!(!trail.iter().any(|s| s == "kernel32.dll!Beta"), "the oldest is dropped");
     }
 }

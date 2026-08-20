@@ -117,6 +117,12 @@ pub(crate) struct SectionImage {
     pub headers: Vec<u8>,
     /// Per-section placement: `(rva, virtual_size, raw_data, r, w, x)`.
     pub sections: Vec<ImageSection>,
+    /// The module's own name from its export directory (`shell32.dll`), if it
+    /// has one. Carried so a mapped view can be *named* in a fault report — on
+    /// the Wine boot only ntdll is mapped by exemu's loader, every other DLL is
+    /// mapped by the guest loader through this path, so without it a faulting
+    /// address in Wine's own code is an unattributable raw number.
+    pub dll_name: Option<String>,
 }
 
 /// One section's in-memory placement, straight from `exemu_loader::parse`.
@@ -215,6 +221,7 @@ impl WinOs {
                 subsystem: pe.subsystem,
                 stack_reserve: pe.stack_reserve,
                 headers: pe.headers,
+                dll_name: pe.dll_name.clone(),
                 sections: pe
                     .sections
                     .into_iter()
@@ -435,6 +442,7 @@ impl WinOs {
         let img = section.image.as_ref().expect("image view requires parsed PE");
         let view_size = align_up(img.size_of_image.max(PAGE), PAGE);
         let headers = img.headers.clone();
+        let dll_name = img.dll_name.clone();
         let sections: Vec<(u32, u32, Vec<u8>)> = img
             .sections
             .iter()
@@ -482,7 +490,9 @@ impl WinOs {
             }
         }
 
-        // Register the view so NtQueryVirtualMemory reports it as MEM_IMAGE.
+        // Register the view so NtQueryVirtualMemory reports it as MEM_IMAGE,
+        // and record it by name so a fault inside it can be attributed to a
+        // module (see `WinOs::module_at`).
         self.vm_insert_view(VmAlloc {
             base,
             size: view_size,
@@ -490,6 +500,21 @@ impl WinOs {
             committed: true,
             mtype: MEM_IMAGE,
         });
+        if self.cfg.trace {
+            if let Some(n) = &dll_name {
+                if let Some((prev, pbase, _)) =
+                    self.loaded_modules().into_iter().find(|(m, _, _)| m.eq_ignore_ascii_case(n))
+                {
+                    // A second, independent copy of an already-mapped image is
+                    // almost always a bug: its runtime-initialised globals are
+                    // zero, so any stateful call through it misbehaves far from
+                    // here (see `nls::build_casemap_nls` for the case that made
+                    // this worth reporting).
+                    eprintln!("[exemu] warning: duplicate image map {n} at {base:#x} (already {prev} at {pbase:#x})");
+                }
+            }
+        }
+        self.record_image_view(base, view_size, dll_name);
 
         mem.write_u64(base_ptr, base)?;
         // Report the full image size back through *ViewSize, and echo the (zero)
@@ -514,6 +539,7 @@ impl WinOs {
             return Ok(STATUS_INVALID_PARAMETER);
         }
         self.vm_free_region(mem, base, MEM_RELEASE);
+        self.forget_image_view(base);
         Ok(STATUS_SUCCESS)
     }
 }

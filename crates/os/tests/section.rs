@@ -381,6 +381,27 @@ fn sec_image_kernel32_query_and_map_unrelocated() {
     assert_eq!(st, STATUS_SUCCESS);
     assert_eq!(mem.read_u32(mbi + 0x28).unwrap(), MEM_IMAGE, "MBI.Type = MEM_IMAGE");
 
+    // 5) The view is *named*: an address inside it resolves to `kernel32.dll`
+    //    plus its RVA. On the Wine boot exemu's own loader maps only ntdll —
+    //    every other module arrives through this syscall — so without this a
+    //    fault anywhere in Wine's code is an unattributable raw address.
+    let (name, rva) = os.module_at(base + known_rva as u64).expect("the mapped view is attributed to a module");
+    assert!(name.eq_ignore_ascii_case("kernel32.dll"), "named from the export directory, got {name:?}");
+    assert_eq!(rva, known_rva as u64, "RVA within the module");
+    // The name is the module's own, verbatim from its export directory — Wine's
+    // kernel32 spells itself `KERNEL32.dll`, and a report should say what the
+    // binary says rather than a normalised guess.
+    assert_eq!(os.describe_addr(base + 0x1234), format!("{name}+0x1234"));
+    assert!(os.loaded_modules().iter().any(|(n, b, s)| n.eq_ignore_ascii_case("kernel32.dll") && *b == base && *s == view_size));
+    // An address outside every mapped image is reported as such, not guessed at.
+    assert_eq!(os.describe_addr(base.wrapping_sub(0x1_0000_0000)), "?");
+
+    // 6) Unmapping the view forgets the attribution (a stale name is worse than
+    //    none — it would point a reader at the wrong binary).
+    let st = syscall(&mut os, &mut mem, NT_UNMAP_VIEW, &[0xFFFF_FFFF_FFFF_FFFF, base]);
+    assert_eq!(st, STATUS_SUCCESS, "NtUnmapViewOfSection releases the view");
+    assert!(os.module_at(base + known_rva as u64).is_none(), "the unmapped view is no longer attributed");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
