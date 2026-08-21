@@ -1,0 +1,36 @@
+WRITTEN OFFER -- SOURCE CODE FOR WINE COMPONENTS
+
+This product includes the Wine project's PE builtin DLLs, licensed under the
+GNU Lesser General Public License version 2.1 or (at your option) any later
+version.
+
+For a period of three (3) years from the date you received this product, we
+will supply, to anyone who asks, a complete machine-readable copy of the
+corresponding source code for those components -- including any
+modifications we made -- for a charge no greater than our cost of physically
+performing the distribution.
+
+Requests to: <OWNER-SUPPLIED: MAINTAINED CONTACT ADDRESS -- e.g. an email
+address the owner commits to monitoring for the full three years. Not
+guessed at here; see docs/COMPLIANCE.md B3.3.>
+
+Please quote the exemu version and the Wine version recorded in
+licenses/wine/PROVENANCE.
+
+The source is also available without charge at:
+<OWNER-SUPPLIED: STABLE URL -- e.g. a release page or source mirror the owner
+commits to keeping live for the offer's full term. The project's repository,
+https://github.com/janDuszynski/exe-emulator, is a plausible starting point
+but the owner must confirm it is where the corresponding Wine source (not
+just exemu's own source) will actually be published or mirrored -- see B3.1
+and B3.4, which require the *corresponding* source: the exact tree the
+shipped DLLs were built from, not "whatever upstream has today".>
+
+---
+Template text: docs/COMPLIANCE.md B3.2. Compliance checklist: docs/
+COMPLIANCE.md Part B3. This file is a TEMPLATE -- both bracketed fields above
+must be filled in with real, monitored values, and this notice paragraph
+removed, before any artifact containing this file is distributed. It ships
+today only inside a bundle that also ships the Wine DLLs themselves
+(`--wine-dist` given to .github/scripts/build_app.sh); a bundle without Wine
+has nothing this offer needs to cover and the script does not include it.

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  exemu's code-signing entitlements (roadmap W9.7).
+
+  Exactly one entitlement, because exactly one is needed and justified:
+
+  com.apple.security.cs.allow-jit -- crates/jit/src/buffer.rs's W^X code
+  buffer calls mmap(..., MAP_JIT). That works unentitled for an ad-hoc-signed
+  binary (a plain `cargo build`/`cargo test`), which is why the JIT's own
+  tests never needed this file. The moment exemu ships as a notarized .app
+  signed with the HARDENED RUNTIME (`codesign --options runtime`), the same
+  mmap call fails with EPERM unless the binary carries this entitlement --
+  see buffer.rs's "Packaging requirement" doc section, which this file exists
+  to satisfy.
+
+  Deliberately NOT used: com.apple.security.cs.allow-unsigned-executable-memory
+  and com.apple.security.cs.disable-executable-page-protection are weaker
+  alternatives that also silence the EPERM, by disabling W^X protection more
+  broadly than the one mmap call that needs it. buffer.rs's docs call this out
+  explicitly; do not add either without a documented reason that overrides
+  that guidance.
+
+  No App Sandbox entitlement here on purpose -- that is a substantially
+  bigger decision (arbitrary --wine-boot prefix directories, the guest
+  sandbox filesystem, real BSD sockets, CoreAudio) that roadmap W9.5 (the
+  security model) owns; bolting on a partial, unaudited sandbox here would be
+  worse than the status quo.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+</dict>
+</plist>
