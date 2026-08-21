@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  exemu.app Info.plist template (roadmap W9.7).
+
+  `__VERSION__` is substituted by .github/scripts/build_app.sh from the
+  workspace version in Cargo.toml at bundle-assembly time -- this file is a
+  template, not the shipped plist. CFBundleIdentifier is a placeholder the
+  owner should confirm/replace with whatever they register for signing and
+  notarization; nothing else here depends on which identifier is chosen.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>exemu</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.github.janduszynski.exemu</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>exemu</string>
+	<key>CFBundleDisplayName</key>
+	<string>exemu</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+
+	<!-- Compliance checklist B2.2: prominent notice, encountered in the
+	     ordinary course of using the product (Finder's Get Info / About panel
+	     read this field), not only inside a nested resources directory. -->
+	<key>NSHumanReadableCopyright</key>
+	<string>© 2026 Jan Duszyński. When run with --wine-boot, exemu executes the Wine project's PE builtin DLLs, free software licensed under the GNU Lesser General Public License, version 2.1 or (at your option) any later version. The licence text and copyright notices ship with this app at Contents/Resources/licenses/wine/. Wine is a trademark of its respective owners; exemu is not affiliated with or endorsed by the Wine project.</string>
+
+	<!-- Drag-a-.exe-onto-the-icon UX (roadmap W9.7). exemu's own binary is a
+	     plain argv-reading executable, not an NSApplication: macOS delivers a
+	     Finder drag/double-click of a registered document type to a bundled,
+	     non-AppKit executable as a command-line argument rather than an Apple
+	     Event. `crates/cli/src/main.rs`'s dispatcher already treats a bare file
+	     path with no subcommand as an implicit `run <path>` for exactly this
+	     reason. This declaration is what makes Finder offer exemu as a handler
+	     for `.exe` and put the dropped file's path on that argv in the first
+	     place -- without it the drop target never gets picked. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Windows Executable</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.microsoft.windows-executable</string>
+			</array>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>exe</string>
+			</array>
+		</dict>
+	</array>
+
+	<!-- Declared defensively so recognition does not depend on whether the
+	     host system already knows this UTI -- exemu does not control that. -->
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.microsoft.windows-executable</string>
+			<key>UTTypeDescription</key>
+			<string>Windows Executable</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+				<string>public.executable</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>exe</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>

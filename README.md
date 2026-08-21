@@ -98,9 +98,10 @@ Hello from exemu! This Windows x64 .exe is running on Apple Silicon.
 ### CLI
 
 ```
-exemu run <file.exe> [--trace] [--no-echo] [--gui] [--wine-boot <dir>]
-                     [--virtual-clock] [--jit] [--audio] [--max-steps N] [--load-base <hex>]
-                     [--telemetry <path>] [-- <args>...]
+exemu run <file.exe> [--profile <path>] [--trace] [--no-echo] [--gui] [--wine-boot <dir>]
+                     [--sandbox-root <path>] [--dpi N] [--virtual-clock] [--jit] [--audio]
+                     [--max-steps N] [--load-base <hex>] [--telemetry <path>] [-- <args>...]
+exemu run --profile <path>              (a profile can supply <file.exe> itself)
 exemu info <file.exe>
 exemu opcodes [--telemetry <path>] [--clear]
 exemu corpus [--manifest <path>] [--only <substr>] [--quick] [--update]
@@ -144,6 +145,17 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
   unimplemented stubs that returned 0**, most recent first. On `tcc.exe` that is
   `VerifyVersionInfoW` and `VerSetConditionMask`: the actual cause, printed at
   the fault instead of guessed at afterwards.
+* `--profile <path>` loads a **per-exe profile** (roadmap W9.4) — a TOML file
+  saying "this binary wants these settings" (max-steps, sandbox root, Wine
+  prefix, DPI, backend, `--jit`, `--virtual-clock`, …) so a known-good binary
+  runs with no flags to remember: `exemu run --profile profiles/7z2602-x64.toml`.
+  It extends `corpus.toml`'s own idea rather than inventing a second mechanism
+  — same tiny TOML parser, a `[profile]` table instead of `[[binary]]`, settings
+  only (no pinned outcome to check). Merge order is **built-in default <
+  profile file < explicit CLI flag/positional**, so any flag you also type
+  still wins; see [`profiles/`](profiles/) for a worked example and
+  `exemu_cli::profile`'s module docs for the exact field list and what `dpi`
+  and `backend` do and do not affect.
 * `info` dumps headers, sections, imports and the x64 unwind data
   (`.pdata` runtime-function count).
 * `opcodes` reads that telemetry log and prints a **most-wanted ranking** of

@@ -1447,13 +1447,14 @@ fn register_builtin_classes(os: &mut WinOs) {
     }
 }
 
-/// `NtUserGetSystemDpiForProcess` → 96 (100% scaling; Retina/DPI is deferred).
+/// `NtUserGetSystemDpiForProcess` → `WinConfig::dpi` (96 = 100% scaling by
+/// default; settable per-exe via a W9.4 profile's `dpi` key).
 fn nt_user_get_system_dpi_for_process(
-    _os: &mut WinOs,
+    os: &mut WinOs,
     _cpu: &mut CpuState,
     _mem: &mut dyn Memory,
 ) -> Result<u32> {
-    Ok(96)
+    Ok(os.cfg.dpi)
 }
 
 /// `NtUserSetProcessDpiAwarenessContext` → nonzero (accepted).
@@ -2116,7 +2117,7 @@ fn nt_user_call_hwnd(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
         call_hwnd::IS_WINDOW_UNICODE => st.window(hwnd).is_some() as u32,
         call_hwnd::IS_WINDOW_VISIBLE => st.chain_visible(hwnd) as u32,
         call_hwnd::GET_PARENT => st.window(hwnd).map(|w| w.parent).unwrap_or(0),
-        call_hwnd::GET_DPI_FOR_WINDOW => 96,
+        call_hwnd::GET_DPI_FOR_WINDOW => os.cfg.dpi,
         // **Not a boolean — the validated HWND.** `user32!WIN_IsCurrentProcess`
         // is `mov edx,0x10; call NtUserCallHwnd; mov eax,eax; ret`, and
         // `DefWindowProcW` uses what it returns *as the window handle* it passes

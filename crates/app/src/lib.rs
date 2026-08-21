@@ -317,6 +317,13 @@ pub struct RunConfig {
     /// same exit code, same artifacts, same instruction count, less wall time.
     /// Also settable with `EXEMU_JIT=1`.
     pub jit: bool,
+    /// Logical DPI a DPI-aware guest is told the system runs at (roadmap
+    /// W9.4, a per-exe profile setting). Reaches
+    /// `NtUserGetSystemDpiForProcess` and `GetDpiForWindow` only — see
+    /// [`exemu_os::WinConfig::dpi`] for exactly what this does and does not
+    /// affect. `96` (the default) is 100% scaling, unchanged from before this
+    /// field existed.
+    pub dpi: u32,
 }
 
 impl Default for RunConfig {
@@ -341,6 +348,7 @@ impl Default for RunConfig {
             environment: Vec::new(),
             spawn_depth: 0,
             jit: false,
+            dpi: 96,
         }
     }
 }
@@ -689,6 +697,7 @@ impl Process {
             image_entry: image.entry_va(),
             image_name: module_name.clone(),
             wine_dll_dir: wine_dll_dir.clone(),
+            dpi: cfg.dpi,
         });
 
         // Map the thunk region as real read/write memory. Function imports

@@ -27,6 +27,40 @@ Tests grew 199 → 635, clippy clean at `-D warnings`; 7-Zip still installs
 Tests grew 199 → 670, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### Per-exe profiles (W9.4)
+- **`exemu run --profile <path>`** loads a TOML `[profile]` table of run
+  settings — `max_steps`, `sandbox_root`, `wine_boot` (Wine prefix), `dpi`,
+  `backend` (`headless`/`window`), `jit`, `virtual_clock`, `trace`, `audio`,
+  extra guest `args`, and the exe's own `path` — so a known-good binary runs
+  without remembering flags. Extends `corpus.toml`'s existing idea rather than
+  inventing a second mechanism: a new shared module (`crates/cli/src/
+  toml_lite.rs`) carries the tiny hand-rolled value parser both `corpus.rs`
+  and the new `profile.rs` use, so a profile is a second **vocabulary**
+  (settings only, no pinned outcome), not a second parser. Merge order is
+  built-in default < profile file < explicit CLI flag/positional argument, so
+  any flag typed on the command line still wins. `profiles/7z2602-x64.toml`
+  is a worked example mirroring the corpus's own known-good settings for the
+  one binary that installs end to end.
+- **Two settings that did not exist as CLI-observable knobs before this**, now
+  added alongside the profile mechanism: `--sandbox-root <path>` (previously
+  only settable in-process via `RunConfig::sandbox_root`, e.g. by tests and
+  the corpus runner's private-`TMPDIR` isolation) and `--dpi <n>` (new
+  `WinConfig::dpi` field, wired to exactly `NtUserGetSystemDpiForProcess` and
+  `NtUserCallHwnd`'s `GetDpiForWindow` selector — **not** to the
+  `EnumDisplaySettings`/`DEVMODE` device mode, which still reports a fixed 96
+  from the display driver's `DisplayMode`; the two can disagree, and the
+  profile module docs say so).
+- Fixed a latent bug this surfaced: `cmd_run`'s "files created" report computed
+  its own sandbox path independently of `RunConfig::sandbox_root`, so setting
+  a custom sandbox root would have made the end-of-run file listing silently
+  report the wrong (empty) directory. Now derived from the same
+  `cfg.sandbox_root` the run itself used.
+- Drag-and-drop groundwork for the W9.7 `.app` (see below): `exemu` invoked
+  with a bare file path and no subcommand — exactly how macOS delivers a
+  Finder drag-onto-the-icon or double-click to a bundled, non-AppKit
+  executable — now dispatches as `exemu run <path>` instead of erroring
+  "unknown command".
+
 ### The block JIT (W8.2 / W8.3 / W8.7)
 - **7-Zip installs in ~2.4 s instead of ~16.6 s — 7× faster — executing exactly
   the same 496,505,572 instructions and producing the same 108 artifacts.**

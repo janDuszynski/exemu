@@ -1,0 +1,22 @@
+# Example per-exe profile (roadmap W9.4). Run it with:
+#
+#   exemu run --profile profiles/7z2602-x64.toml
+#
+# No other flags needed — `path` names the binary, and every setting below is
+# exactly what `corpus.toml`'s pinned entry for the same binary measures
+# against (see the repository root `corpus.toml`), so this profile is a
+# reproducible, known-good way to run the one corpus binary that installs
+# end to end, instead of memorizing `--max-steps 800000000 --virtual-clock
+# --jit`.
+#
+# Format reference: `crates/cli/src/profile.rs` module docs. Any flag you
+# also type on the command line still overrides what is set here.
+
+[profile]
+name          = "7-Zip installer"
+path          = "../example_exe/7z2602-x64.exe"
+note          = "64-bit MSVC GUI installer. Drives its own dialog, decompresses its LZMA archive, exits 0. Settings mirror the corpus.toml pin."
+max_steps     = 800000000
+virtual_clock = true
+jit           = true
+backend       = "headless"

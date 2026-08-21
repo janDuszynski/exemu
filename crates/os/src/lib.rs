@@ -133,6 +133,15 @@ pub struct WinConfig {
     /// ucrtbase from this same directory (roadmap W3.2). `None` (the default)
     /// keeps every binary on the existing emulated-DLL path, byte-for-byte.
     pub wine_dll_dir: Option<String>,
+    /// Logical DPI reported to a DPI-aware guest by
+    /// `NtUserGetSystemDpiForProcess` and `NtUserCallHwnd`'s
+    /// `GetDpiForWindow` selector (roadmap W9.4, a per-exe profile setting).
+    /// Does **not** reach the `EnumDisplaySettings`/`DEVMODE` device-mode DPI,
+    /// which comes from the installed [`exemu_core::UserDriver`]'s
+    /// `display_mode()` instead and still reports a fixed 96 — see
+    /// `crates/os/src/win32k.rs`'s `write_devmode`. 96 is 100% scaling, the
+    /// same value every caller hardcoded before this field existed.
+    pub dpi: u32,
 }
 
 impl Default for WinConfig {
@@ -160,6 +169,7 @@ impl Default for WinConfig {
             image_entry: 0,
             image_name: String::new(),
             wine_dll_dir: None,
+            dpi: 96,
         }
     }
 }
