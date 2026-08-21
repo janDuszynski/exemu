@@ -59,6 +59,29 @@ pub const WOW64_SENTINEL: u32 = 0xCAFE_BABE;
 /// Bytes the guest asks `NtAllocateVirtualMemory` for.
 pub const WOW64_ALLOC_SIZE: u32 = 0x2000;
 
+/// Exit code when the 32-bit SEH round trip completed: the guest's own handler
+/// ran, saw an access violation, and execution resumed where it asked.
+pub const WOW64_SEH_OK_EXIT: i32 = 81;
+/// Exit code when execution resumed but the handler never ran.
+pub const WOW64_SEH_FAIL_NOT_HANDLED_EXIT: i32 = 82;
+/// Exit code when the handler ran but saw the wrong `ExceptionCode`.
+pub const WOW64_SEH_FAIL_CODE_EXIT: i32 = 83;
+/// Exit code when the handler ran but the record did not name the faulting
+/// address in `ExceptionInformation[1]`.
+pub const WOW64_SEH_FAIL_INFO_EXIT: i32 = 84;
+
+/// The marker the guest's SEH handler writes so the gate can tell "it ran" from
+/// "the fault was silently swallowed".
+pub const WOW64_SEH_HANDLED: u32 = 0x5E_48_00_01;
+/// The marker written after the handler's requested resume point is reached.
+pub const WOW64_SEH_RESUMED: u32 = 0x5E_48_00_02;
+/// `STATUS_ACCESS_VIOLATION` — what the handler must see.
+pub const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+/// The address the SEH guest deliberately reads through. Deliberately *not*
+/// zero: a NULL deref is the one address every layer special-cases, and this
+/// must exercise the ordinary unmapped-read path.
+pub const WOW64_SEH_FAULT_ADDR: u32 = 0x0000_DEAD;
+
 /// `.data` offsets (from [`DATA_RVA`]) the gate reads back out of guest memory.
 pub mod data {
     /// `PVOID BaseAddress` — the IN/OUT cell `NtAllocateVirtualMemory` fills.
@@ -71,8 +94,24 @@ pub mod data {
     pub const READBACK: u32 = 0x0c;
     /// `esp` after the call, so the gate can prove the stdcall unwound cleanly.
     pub const ESP_AFTER: u32 = 0x10;
+    /// SEH guest: the marker its handler writes.
+    pub const SEH_HANDLED: u32 = 0x20;
+    /// SEH guest: `EXCEPTION_RECORD32.ExceptionCode` as the handler saw it.
+    pub const SEH_CODE: u32 = 0x24;
+    /// SEH guest: `EXCEPTION_RECORD32.ExceptionFlags`.
+    pub const SEH_FLAGS: u32 = 0x28;
+    /// SEH guest: `EXCEPTION_RECORD32.ExceptionAddress` (a 32-bit field — proof
+    /// that `wow64.dll` narrowed the 64-bit record rather than exemu building a
+    /// 32-bit one).
+    pub const SEH_ADDR: u32 = 0x2c;
+    /// SEH guest: `ExceptionInformation[1]`, the faulting data address.
+    pub const SEH_INFO1: u32 = 0x30;
+    /// SEH guest: `ExceptionInformation[0]`, the access kind (0 = read).
+    pub const SEH_INFO0: u32 = 0x34;
+    /// SEH guest: the marker written at the resume point.
+    pub const SEH_RESUMED: u32 = 0x38;
     /// Total bytes of `.data`.
-    pub const LEN: u32 = 0x20;
+    pub const LEN: u32 = 0x40;
 }
 
 /// Absolute VA of a `.data` cell in the built image.
@@ -93,8 +132,32 @@ fn iat_off() -> u32 {
     IMPORT_DIR_SIZE + (N + 1) * 4
 }
 
-/// Build the PE32 WoW64 sample.
+/// Which of the two PE32 WoW64 proof binaries to emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Program {
+    /// The W5.5 allocator: one `NtAllocateVirtualMemory` round trip through
+    /// Wine's whole 32→64 chain, then `NtTerminateProcess`.
+    #[default]
+    Alloc,
+    /// The W5.9 exception guest: install a 32-bit `fs:[0]` SEH frame, read
+    /// through an unmapped address, and let the handler resume execution.
+    Seh,
+}
+
+/// Build the PE32 WoW64 sample ([`Program::Alloc`]).
 pub fn build() -> Vec<u8> {
+    build_program(Program::Alloc)
+}
+
+/// Build the PE32 WoW64 **exception** sample ([`Program::Seh`], roadmap W5.9).
+pub fn build_seh() -> Vec<u8> {
+    build_program(Program::Seh)
+}
+
+/// Build one of the PE32 WoW64 proof binaries. Both share every byte of the PE
+/// scaffolding — same import table, same sections — so a difference in outcome
+/// is a difference in the *program*, not in how it was loaded.
+pub fn build_program(program: Program) -> Vec<u8> {
     let names = ["NtAllocateVirtualMemory", "NtTerminateProcess"];
 
     // --- .rdata: import descriptor + ILT/IAT + name blobs -----------------
@@ -134,7 +197,10 @@ pub fn build() -> Vec<u8> {
     rd[doff..doff + dllname.len()].copy_from_slice(dllname);
 
     let iat = |i: u32| IMAGE_BASE + RDATA_RVA + iat_off + i * 4;
-    let text = build_text(iat(0), iat(1));
+    let text = match program {
+        Program::Alloc => build_text(iat(0), iat(1)),
+        Program::Seh => build_text_seh(iat(1)),
+    };
 
     // --- assemble the file ------------------------------------------------
     let headers_raw = FILE_ALIGN as usize;
@@ -271,6 +337,137 @@ fn build_text(iat_alloc: u32, iat_terminate: u32) -> Vec<u8> {
     emit_exit(&mut c, iat_terminate, WOW64_OK_EXIT as u32);
     c.push(0xF4); // hlt — NtTerminateProcess does not return
     c
+}
+
+/// The 32-bit `.text` of the **exception** guest (roadmap W5.9).
+///
+/// Nothing here is WoW64-aware: it is the ordinary i386 SEH prologue any 1990s
+/// MSVC binary emits — push a handler, chain it through `fs:[0]`, fault, and
+/// let the handler point the `CONTEXT` at a recovery label and return
+/// `ExceptionContinueExecution`. That is the point: if this runs, a *32-bit
+/// program's own* exception handling works, and every step between the fault and
+/// the handler was Wine's code.
+///
+/// ```text
+///   push  <handler>
+///   push  dword ptr fs:[0]
+///   mov   fs:[0], esp             ; EXCEPTION_REGISTRATION_RECORD{prev,handler}
+///   mov   eax, WOW64_SEH_FAULT_ADDR
+///   mov   eax, [eax]              ; ← access violation, unmapped read
+/// resume:                          ; the handler re-seats CONTEXT.Eip here
+///   mov   [SEH_RESUMED], marker
+///   mov   eax, [esp]              ; unlink the frame
+///   mov   fs:[0], eax
+///   add   esp, 8
+///   …checks…  → NtTerminateProcess(-1, code)
+///
+/// handler:                         ; (rec, frame, ctx, disp) — cdecl, no ret pop
+///   record rec->ExceptionCode / Flags / Address / Information[0..1]
+///   ctx->Eip = resume
+///   [SEH_HANDLED] = marker
+///   xor eax, eax                  ; ExceptionContinueExecution
+///   ret
+/// ```
+///
+/// The record fields it copies out are the 32-bit ones
+/// `wow64.dll!Wow64PassExceptionToGuest` narrows from the 64-bit record exemu
+/// hands the kernel-side dispatcher, so reading them back in the gate re-derives
+/// that narrowing from the guest's side of the boundary.
+fn build_text_seh(iat_terminate: u32) -> Vec<u8> {
+    let cell = |off: u32| IMAGE_BASE + DATA_RVA + off;
+    let text_va = IMAGE_BASE + TEXT_RVA;
+    let mut c: Vec<u8> = Vec::new();
+
+    // push <handler>   (address patched once the handler is emitted)
+    c.push(0x68);
+    let handler_imm = c.len();
+    c.extend_from_slice(&0u32.to_le_bytes());
+    // push dword ptr fs:[0]
+    c.extend_from_slice(&[0x64, 0xFF, 0x35, 0, 0, 0, 0]);
+    // mov fs:[0], esp
+    c.extend_from_slice(&[0x64, 0x89, 0x25, 0, 0, 0, 0]);
+
+    // mov eax, WOW64_SEH_FAULT_ADDR ; mov eax, [eax]  ← the access violation
+    c.push(0xB8);
+    c.extend_from_slice(&WOW64_SEH_FAULT_ADDR.to_le_bytes());
+    c.extend_from_slice(&[0x8B, 0x00]);
+
+    // --- resume point -----------------------------------------------------
+    let resume_off = c.len();
+    emit_store_imm(&mut c, cell(data::SEH_RESUMED), WOW64_SEH_RESUMED);
+    // Unlink the registration record: mov eax,[esp]; mov fs:[0],eax; add esp,8
+    c.extend_from_slice(&[0x8B, 0x04, 0x24]);
+    c.extend_from_slice(&[0x64, 0xA3, 0, 0, 0, 0]);
+    c.extend_from_slice(&[0x83, 0xC4, 0x08]);
+
+    // if ([SEH_HANDLED] != marker) exit(NOT_HANDLED)
+    emit_cmp_cell(&mut c, cell(data::SEH_HANDLED), WOW64_SEH_HANDLED);
+    let j1 = c.len();
+    c.extend_from_slice(&[0x74, 0x00]); // je +?
+    emit_exit(&mut c, iat_terminate, WOW64_SEH_FAIL_NOT_HANDLED_EXIT as u32);
+    patch_rel8(&mut c, j1);
+
+    // if ([SEH_CODE] != STATUS_ACCESS_VIOLATION) exit(CODE)
+    emit_cmp_cell(&mut c, cell(data::SEH_CODE), STATUS_ACCESS_VIOLATION);
+    let j2 = c.len();
+    c.extend_from_slice(&[0x74, 0x00]);
+    emit_exit(&mut c, iat_terminate, WOW64_SEH_FAIL_CODE_EXIT as u32);
+    patch_rel8(&mut c, j2);
+
+    // if ([SEH_INFO1] != WOW64_SEH_FAULT_ADDR) exit(INFO)
+    emit_cmp_cell(&mut c, cell(data::SEH_INFO1), WOW64_SEH_FAULT_ADDR);
+    let j3 = c.len();
+    c.extend_from_slice(&[0x74, 0x00]);
+    emit_exit(&mut c, iat_terminate, WOW64_SEH_FAIL_INFO_EXIT as u32);
+    patch_rel8(&mut c, j3);
+
+    emit_exit(&mut c, iat_terminate, WOW64_SEH_OK_EXIT as u32);
+    c.push(0xF4); // hlt — NtTerminateProcess does not return
+
+    // --- the handler ------------------------------------------------------
+    let handler_off = c.len();
+    c[handler_imm..handler_imm + 4].copy_from_slice(&(text_va + handler_off as u32).to_le_bytes());
+    // ecx = ExceptionRecord (arg 0, at [esp+4] — the dispatcher calls this cdecl)
+    c.extend_from_slice(&[0x8B, 0x4C, 0x24, 0x04]);
+    for (rec_off, dst) in [
+        (0x00u8, data::SEH_CODE),
+        (0x04, data::SEH_FLAGS),
+        (0x0c, data::SEH_ADDR),
+        (0x14, data::SEH_INFO0),
+        (0x18, data::SEH_INFO1),
+    ] {
+        if rec_off == 0 {
+            c.extend_from_slice(&[0x8B, 0x01]); // mov eax, [ecx]
+        } else {
+            c.extend_from_slice(&[0x8B, 0x41, rec_off]); // mov eax, [ecx+off]
+        }
+        c.push(0xA3); // mov [dst], eax
+        c.extend_from_slice(&cell(dst).to_le_bytes());
+    }
+    // eax = ContextRecord (arg 2, at [esp+0xc]); ctx->Eip = resume
+    c.extend_from_slice(&[0x8B, 0x44, 0x24, 0x0C]);
+    c.extend_from_slice(&[0xC7, 0x80]);
+    c.extend_from_slice(&(exemu_os::wow64::CTX_EIP as u32).to_le_bytes());
+    c.extend_from_slice(&(text_va + resume_off as u32).to_le_bytes());
+    emit_store_imm(&mut c, cell(data::SEH_HANDLED), WOW64_SEH_HANDLED);
+    c.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax → ExceptionContinueExecution
+    c.push(0xC3); // ret
+    c
+}
+
+/// `mov dword ptr [abs32], imm32`.
+fn emit_store_imm(c: &mut Vec<u8>, at: u32, v: u32) {
+    c.extend_from_slice(&[0xC7, 0x05]);
+    c.extend_from_slice(&at.to_le_bytes());
+    c.extend_from_slice(&v.to_le_bytes());
+}
+
+/// `mov eax,[abs32]; cmp eax, imm32` — leaves ZF set when they match.
+fn emit_cmp_cell(c: &mut Vec<u8>, at: u32, v: u32) {
+    c.push(0xA1); // mov eax, [abs32]
+    c.extend_from_slice(&at.to_le_bytes());
+    c.extend_from_slice(&[0x3D]); // cmp eax, imm32
+    c.extend_from_slice(&v.to_le_bytes());
 }
 
 /// `NtTerminateProcess(NtCurrentProcess, code)` — stdcall, 2 arguments.
