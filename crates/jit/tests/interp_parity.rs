@@ -31,9 +31,9 @@ fn jit_available() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
-fn build(bits: Bits, code: &[u8], seed: &CpuState) -> (VirtualMemory, Interpreter) {
+fn build_with(bits: Bits, code: &[u8], seed: &CpuState, code_perm: Perm) -> (VirtualMemory, Interpreter) {
     let mut mem = VirtualMemory::new();
-    mem.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
+    mem.map(Region::new("code", CODE, 0x1000, code_perm)).unwrap();
     mem.map(Region::new("data", DATA, 0x1000, Perm::RW)).unwrap();
     mem.map(Region::new("stack", 0x3_0000, 0x2000, Perm::RW)).unwrap();
     // TEB pages, so `fs:`/`gs:` operands resolve like they do in a real process.
@@ -72,11 +72,15 @@ fn diff(a: &CpuState, b: &CpuState, what: &str) {
 /// Run `code` on both engines from the same seed and require identical results.
 /// Returns how many instructions the JIT executed natively.
 fn parity(bits: Bits, code: &[u8], what: &str, seed: &CpuState) -> u32 {
+    parity_with(bits, code, what, seed, Perm::RX)
+}
+
+fn parity_with(bits: Bits, code: &[u8], what: &str, seed: &CpuState, code_perm: Perm) -> u32 {
     if !jit_available() {
         return 0;
     }
-    let (mut mem_j, mut cpu_j) = build(bits, code, seed);
-    let (mut mem_i, mut cpu_i) = build(bits, code, seed);
+    let (mut mem_j, mut cpu_j) = build_with(bits, code, seed, code_perm);
+    let (mut mem_i, mut cpu_i) = build_with(bits, code, seed, code_perm);
     let mode = match bits {
         Bits::B32 => Mode::Protected,
         Bits::B64 => Mode::Long,
@@ -96,7 +100,7 @@ fn parity(bits: Bits, code: &[u8], what: &str, seed: &CpuState) -> u32 {
         }
     }
     diff(cpu_j.state(), cpu_i.state(), what);
-    for base in [DATA, TEB32, TEB64, 0x3_0000] {
+    for base in [CODE, DATA, TEB32, TEB64, 0x3_0000] {
         let (mut x, mut y) = (vec![0u8; 0x1000], vec![0u8; 0x1000]);
         mem_j.read(base, &mut x).unwrap();
         mem_i.read(base, &mut y).unwrap();
@@ -344,6 +348,178 @@ fn sib_addressing_with_every_scale() {
     let mut s = seed(Bits::B64);
     s.gpr[6] = 8;
     parity(Bits::B64, &code, "SIB scales", &s);
+}
+
+// ---------------------------------------------------------------------------
+// Deferred flags (roadmap W8.4)
+//
+// An ALU instruction whose flags a later instruction overwrites emits no flag
+// code at all; the operands and result stay in three registers and the six
+// status flags are derived from them at the first point that can observe them.
+// The traps are all in *when* that point is: a fault rewinds onto the start of
+// an instruction, so the state it exposes has to include the flags of the one
+// before it, which by then has been deferred for several instructions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deferred_flags_are_visible_at_a_faulting_load() {
+    // `add` defers (the `xor` at the end overwrites every flag it sets), then a
+    // load faults two instructions later. The rewound state must show the add's
+    // flags — if the fault path skipped them it would show the block's entry
+    // flags instead, which is invisible in the registers and fatal in meaning.
+    let code = [
+        0x48, 0x01, 0xC8, // add rax, rcx
+        0x48, 0xC7, 0xC2, 0x00, 0x00, 0xAD, 0xDE, // mov rdx, 0xffffffffdead0000
+        0x48, 0x8B, 0x32, // mov rsi, [rdx]   <- faults
+        0x4D, 0x31, 0xC0, // xor r8, r8
+    ];
+    parity(Bits::B64, &code, "deferred flags at a faulting load", &seed(Bits::B64));
+}
+
+#[test]
+fn deferred_flags_are_visible_at_a_faulting_store() {
+    let code = [
+        0x48, 0x01, 0xC8, // add rax, rcx
+        0x48, 0xC7, 0xC2, 0x00, 0x00, 0xAD, 0xDE, // mov rdx, 0xffffffffdead0000
+        0x48, 0x89, 0x32, // mov [rdx], rsi   <- faults
+        0x4D, 0x31, 0xC0, // xor r8, r8
+    ];
+    parity(Bits::B64, &code, "deferred flags at a faulting store", &seed(Bits::B64));
+}
+
+#[test]
+fn deferred_flags_are_visible_when_a_store_rewrites_the_block() {
+    // The other exit out of a store: it *succeeded* and landed in the block's
+    // own instructions, so the block commits and stops. That path has to settle
+    // the flags of the store instruction itself — here a read-modify-write into
+    // its own code, whose flags were left pending across the store.
+    // The store target is 0x1000e — the first byte of the `xor` below, and so
+    // inside the range this very block was compiled from.
+    let code = [
+        0x48, 0x01, 0xC8, // add rax, rcx
+        0x80, 0x04, 0x25, 0x0E, 0x00, 0x01, 0x00, 0x07, // add byte [0x1000e], 7
+        0x4D, 0x31, 0xC0, // xor r8, r8
+    ];
+    let n = parity_with(
+        Bits::B64,
+        &code,
+        "deferred flags when a store rewrites the block",
+        &seed(Bits::B64),
+        Perm::RWX,
+    );
+    if jit_available() {
+        assert_eq!(n, 2, "the block must stop on the store into its own bytes");
+    }
+}
+
+#[test]
+fn a_long_alu_chain_matches_in_both_bitnesses() {
+    // Every instruction here overwrites the previous one's flags, so all but
+    // the last computation is elided — and the last is settled at the exit.
+    let code = [
+        0x01, 0xC8, // add eax, ecx
+        0x29, 0xD8, // sub eax, ebx
+        0x21, 0xF0, // and eax, esi
+        0x09, 0xF8, // or  eax, edi
+        0x31, 0xD0, // xor eax, edx
+        0x85, 0xC0, // test eax, eax
+        0x39, 0xC8, // cmp eax, ecx
+    ];
+    parity(Bits::B64, &code, "alu chain 64", &seed(Bits::B64));
+    parity(Bits::B32, &code, "alu chain 32", &seed(Bits::B32));
+}
+
+#[test]
+fn a_superseded_flag_result_costs_no_code() {
+    // The point of the whole exercise, pinned as a measurement rather than a
+    // claim: extend a block by seven more `add`s whose flags are all dead and
+    // the emitted code grows by a handful of words per instruction, not by the
+    // ~19 an eager flag computation takes.
+    if !jit_available() {
+        return;
+    }
+    let one = compile_len(&[0x01, 0xC8, 0xC3]); // add eax, ecx ; ret
+    let eight = compile_len(&[
+        0x01, 0xC8, 0x01, 0xC8, 0x01, 0xC8, 0x01, 0xC8, // add eax, ecx ×4
+        0x01, 0xC8, 0x01, 0xC8, 0x01, 0xC8, 0x01, 0xC8, // ×4
+        0xC3, // ret
+    ]);
+    let marginal = (eight - one) as f64 / 7.0;
+    assert!(
+        marginal <= 6.0,
+        "an `add` whose flags are dead costs {marginal:.1} ARM64 words \
+         (one={one}, eight={eight}) — the flag computation is not being elided"
+    );
+}
+
+/// ARM64 words the compiler emits for `code` as one 64-bit block.
+fn compile_len(code: &[u8]) -> usize {
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
+    mem.poke(CODE, code).unwrap();
+    exemu_jit::compile::Compiler::compile(&mem, Mode::Long, CODE, 64).code.len()
+}
+
+// ---------------------------------------------------------------------------
+// Shapes added because a real 32-bit installer stops blocks on them
+// ---------------------------------------------------------------------------
+
+#[test]
+fn push_immediate_and_leave() {
+    // `push imm8` sign-extends, `push imm32` sign-extends, and `leave` is
+    // `rsp = rbp ; pop rbp` — with the *interpreter's* masking order, which
+    // leaves rsp as `(rbp + width)` masked rather than `rbp` masked.
+    let code = [
+        0x6A, 0x7F, // push 0x7f
+        0x68, 0xEF, 0xBE, 0xAD, 0xDE, // push 0xffffffffdeadbeef (sign-extended)
+        0xC9, // leave
+        0xC3, // ret (declined — ends the block)
+    ];
+    parity(Bits::B64, &code, "push imm / leave 64", &seed(Bits::B64));
+    parity(Bits::B32, &code, "push imm / leave 32", &seed(Bits::B32));
+}
+
+#[test]
+fn mov_to_and_from_an_absolute_offset() {
+    // The moffs forms take an *address*-size immediate, not an operand-size
+    // one — 8 bytes in long mode, 4 in protected mode.
+    let a = DATA + 0x100;
+    let mut code = vec![0x48, 0xA1];
+    code.extend_from_slice(&a.to_le_bytes()); // mov rax, [DATA+0x100]
+    code.extend_from_slice(&[0x48, 0xA3]);
+    code.extend_from_slice(&(a + 8).to_le_bytes()); // mov [DATA+0x108], rax
+    code.push(0xA0);
+    code.extend_from_slice(&(a + 0x20).to_le_bytes()); // mov al, [DATA+0x120]
+    code.push(0xA2);
+    code.extend_from_slice(&(a + 0x21).to_le_bytes()); // mov [DATA+0x121], al
+    code.push(0xC3);
+    parity(Bits::B64, &code, "moffs 64", &seed(Bits::B64));
+
+    let mut code32 = vec![0xA1];
+    code32.extend_from_slice(&(a as u32).to_le_bytes()); // mov eax, [DATA+0x100]
+    code32.push(0xA3);
+    code32.extend_from_slice(&((a + 4) as u32).to_le_bytes()); // mov [DATA+0x104], eax
+    code32.push(0xC3);
+    parity(Bits::B32, &code32, "moffs 32", &seed(Bits::B32));
+}
+
+#[test]
+fn mov_from_an_absolute_offset_through_a_segment_base() {
+    // `gs:`-relative moffs is how a 64-bit guest reads the TEB, and `fs:`
+    // moffs is how Wine's 32-bit ntdll installs its SEH frame — both have to
+    // go through the *live* per-thread base, not a fixed constant.
+    let mut code = vec![0x65, 0x48, 0xA1];
+    code.extend_from_slice(&0x28u64.to_le_bytes()); // mov rax, gs:[0x28]
+    code.push(0xC3);
+    parity(Bits::B64, &code, "gs moffs 64", &seed(Bits::B64));
+
+    let mut code32 = vec![0x64, 0xA1];
+    code32.extend_from_slice(&0x18u32.to_le_bytes()); // mov eax, fs:[0x18]
+    code32.push(0x64);
+    code32.push(0xA3);
+    code32.extend_from_slice(&0x1Cu32.to_le_bytes()); // mov fs:[0x1c], eax
+    code32.push(0xC3);
+    parity(Bits::B32, &code32, "fs moffs 32", &seed(Bits::B32));
 }
 
 #[test]
