@@ -11,6 +11,7 @@
 //!   ntdll.dll     (x86_64-windows)         <guest>.exe        (PE32)
 //!   wow64.dll     — the service thunks     ntdll.dll          (i386-windows)
 //!   wow64win.dll  — the win32k thunks      wow64cpu.dll  ← must be < 4 GiB
+//!   win32u.dll    — the win32k syscalls
 //!   TEB64 (gs:)  ─ WowTebOffset ─────────► TEB32 (fs:)
 //!   PEB64                                  PEB32
 //! ```
@@ -107,6 +108,10 @@ pub struct Wow64Boot {
     pub wow64: Wow64Image,
     /// Wine's `wow64win.dll` — the win32k half (table 1).
     pub wow64win: Wow64Image,
+    /// Wine's **64-bit** `win32u.dll` — the syscall stubs `wow64win`'s 477
+    /// `NtUser*`/`NtGdi*` thunks tail-jump into. Distinct from the 32-bit
+    /// `win32u.dll` the guest's own loader maps.
+    pub win32u: Wow64Image,
     /// The 64-bit TEB (`gs:`).
     pub teb64: u64,
     /// The 32-bit TEB (`fs:`), reachable from `teb64` via `WowTebOffset`.
@@ -137,6 +142,9 @@ impl Wow64Dirs<'_> {
             && self.dir64.join("wow64.dll").is_file()
             && self.dir64.join("wow64cpu.dll").is_file()
             && self.dir64.join("wow64win.dll").is_file()
+            // The 64-bit `win32u.dll` is not optional: it is where every one of
+            // `wow64win`'s 477 win32k thunks tail-jumps.
+            && self.dir64.join("win32u.dll").is_file()
             && self.dir32.join("ntdll.dll").is_file()
     }
 }
@@ -187,6 +195,16 @@ pub fn build(
     let win_bytes = std::fs::read(dirs.dir64.join("wow64win.dll"))
         .map_err(|e| EmuError::Os(format!("WoW64 boot: cannot read wow64win.dll: {e}")))?;
     let wow64win = wow64::map_image(mem, &win_bytes, HIGH + 0x0400_0000, "wow64win")?;
+    // The **64-bit** `win32u.dll`. `wow64win` is only a marshalling layer: each
+    // of its win32k thunks reads the 32-bit argument block and then
+    // `jmp qword ptr [<win32u IAT slot>]` into a *real* `mov r10,rcx; mov
+    // eax,<index>; syscall` stub, which is what reaches exemu's win32k SSDT.
+    // Nothing else in the process provides those stubs — the `win32u.dll` the
+    // guest's own 32-bit loader maps is a different image in a different
+    // bitness — so without this the whole win32k half is a null layer.
+    let win32u_bytes = std::fs::read(dirs.dir64.join("win32u.dll"))
+        .map_err(|e| EmuError::Os(format!("WoW64 boot: cannot read win32u.dll: {e}")))?;
+    let win32u = wow64::map_image(mem, &win32u_bytes, HIGH + 0x0800_0000, "win32u64")?;
 
     // --- Inter-module binding (what a loader does) ------------------------
     // `wow64.dll` reaches the 64-bit NT layer through its own ntdll IAT; its
@@ -200,7 +218,21 @@ pub fn build(
     // `wow64cpu.dll` imports exactly one wow64.dll symbol (Wow64SystemServiceEx)
     // and a handful of ntdll routines its process init calls.
     wow64::bind_imports(mem, &wow64cpu, &[&wow64_img, ntdll64], 8)?;
-    wow64::bind_imports(mem, &wow64win, &[ntdll64, &wow64_img], 8)?;
+    // `win32u.dll` itself imports only four ntdll routines.
+    wow64::bind_imports(mem, &win32u, &[ntdll64], 8)?;
+    // …and `wow64win` imports 10 ntdll + 2 wow64 + **477 win32u** symbols. An
+    // unbound IAT slot in a PE is not null — it still holds the file's ILT
+    // value, i.e. the RVA of the `IMAGE_IMPORT_BY_NAME` — so leaving win32u out
+    // does not fault at the slot, it *jumps into the import name string*. That
+    // is exactly how this was found: SteamSetup's first win32k call
+    // (`NtUserInitializeClientPfnArrays`) executed at `0x302f0`, the RVA of the
+    // 30 bytes spelling its own name. Hence the loud floor below.
+    let win_bound = wow64::bind_imports(mem, &wow64win, &[ntdll64, &wow64_img, &win32u], 8)?;
+    if win_bound < 450 {
+        return Err(EmuError::Os(format!(
+            "WoW64 boot: wow64win.dll bound only {win_bound} imports (expected 480+) — wrong pinned set?"
+        )));
+    }
 
     // --- The dual TEB/PEB pair -------------------------------------------
     // TEB64/PEB64 are mapped by the ordinary layout; this block adds the 32-bit
@@ -271,6 +303,7 @@ pub fn build(
         wow64cpu,
         wow64: wow64_img,
         wow64win,
+        win32u,
         teb64,
         teb32,
         peb64: WOW64_PEB64,
