@@ -1396,12 +1396,20 @@ impl Process {
 
         // For #BP the reported/CONTEXT Rip is fault+1: advance the live rip so
         // write_context captures it (address already computed as rip+1 above).
+        let rip_before = self.cpu.state().rip;
         if let ExcSource::Interrupt(3) = src {
-            let rip = self.cpu.state().rip;
-            self.cpu.state_mut().rip = rip.wrapping_add(1);
+            self.cpu.state_mut().rip = rip_before.wrapping_add(1);
         }
 
-        self.os.deliver_hw_exception(
+        // **Building the frame can itself fail** — the guest's stack may be too
+        // short for the 0x5C0 bytes, or not mapped at all. That is not an
+        // emulator error and must not escape the run loop: it means *this*
+        // exception cannot be delivered, which is precisely what the fault
+        // reporter is for. Propagating it instead (the `?` this replaces) threw
+        // away the report and ended the run with a bare `EmuError`, losing both
+        // the instruction count and the faulting rip — a WoW64 guest that faults
+        // on a short 32-bit stack hit exactly that.
+        if let Err(why) = self.os.deliver_hw_exception(
             self.cpu.state_mut(),
             &mut self.mem,
             ntdll_base,
@@ -1409,7 +1417,16 @@ impl Process {
             address,
             &info,
             mode,
-        )?;
+        ) {
+            // Undo the #BP rip advance so the report names the faulting
+            // instruction rather than the byte after it. A partially written
+            // frame is harmless: the reporter ends the run.
+            self.cpu.state_mut().rip = rip_before;
+            if std::env::var_os("EXEMU_DBG").is_some() {
+                eprintln!("[exemu] could not deliver exception {code:#010x} to the guest: {why}");
+            }
+            return Ok(false);
+        }
         // The NT kernel always returns to user mode in the **native** mode, at
         // the native `KiUserExceptionDispatcher`; a WoW64 guest's own dispatcher
         // is reached later, from 64-bit code, by `wow64.dll`. Without this the
