@@ -109,16 +109,29 @@ fn probe(path: &str, tag: &str, max_steps: u64) -> Option<Probe> {
 
 /// **`SteamSetup.exe` (32-bit NSIS) on the WoW64 path.**
 ///
-/// Measured: **still running at the 60,000,000-instruction budget**, inside the
-/// 64-bit `ntdll` (`rip` in the exception/unwind machinery `wow64.dll` reaches
-/// through). So the number here is a *floor*: raising `max_steps` raises it.
+/// Measured 2026-08-21: **~6.6M instructions**, then a fault inside the 64-bit
+/// `ntdll` with `rsp` off the bottom of the 32-bit stack.
+///
+/// **The previous "still running at 60M" reading was not progress.** With
+/// `EXEMU_DBG=1` the run showed one real fault at ~5.0M followed by 82
+/// `0x80000003` breakpoints, all at the identical address
+/// `ntdll!KiUserExceptionDispatcher+0x2a` — the `int3` Wine puts *after* its
+/// unreachable `call dispatch_exception`. The remaining 595M instructions were
+/// that livelock, not the installer.
+///
+/// What moved it forward: `wow64win.dll`'s 477 `win32u.dll` imports are now
+/// bound (roadmap W5.8). Before that, the first win32k call a GUI guest makes —
+/// `NtUserInitializeClientPfnArrays`, from user32's own `DllMain` — jumped
+/// through an unbound IAT slot into the ASCII of its own name. The visible
+/// effect is the module count: the 32-bit loader now gets **30** modules in,
+/// including `imm32`, `uxtheme`, `oleaut32`, `propsys` and `setupapi`, where it
+/// used to stop at 20.
 ///
 /// For scale, the same binary on the **emulated** path is pinned at 92,865,377
 /// instructions and faults (`corpus.toml`) — but that is a different program:
 /// there NSIS runs against exemu's hand-written Win32, here it runs against
-/// Wine's, after Wine's i386 loader has bound its 166 imports across
-/// kernel32/user32/gdi32/shell32/advapi32/comctl32/ole32. It does **not** reach
-/// its nsDialogs installer; that is the W5 gate, still open.
+/// Wine's. It does **not** reach its nsDialogs installer; that is the W5 gate,
+/// still open.
 #[test]
 fn steamsetup_wow64_probe() {
     let Some(p) = probe("../../example_exe/SteamSetup.exe", "steam", 60_000_000) else {
@@ -135,8 +148,8 @@ fn steamsetup_wow64_probe() {
         p.outcome,
     );
     assert!(
-        p.steps > 20_000_000,
-        "SteamSetup should run tens of millions of instructions on the WoW64 path; ran {} ({})",
+        p.steps > 5_000_000,
+        "SteamSetup should run millions of instructions on the WoW64 path; ran {} ({})",
         p.steps,
         p.outcome,
     );

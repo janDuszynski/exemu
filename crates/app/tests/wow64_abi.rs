@@ -52,6 +52,8 @@ struct Img {
     sections: Vec<(u32, Vec<u8>)>,
     text_rva: u32,
     text: Vec<u8>,
+    /// `(IAT slot rva, dll, symbol)` for every by-name import.
+    imports: Vec<(u32, String, String)>,
 }
 
 fn load(path: &str) -> Img {
@@ -79,7 +81,17 @@ fn load(path: &str) -> Img {
         .find(|s| s.executable && !s.data.is_empty())
         .map(|s| (s.rva, s.data.clone()))
         .expect("an executable section with data");
-    Img { image_base: img.image_base, exports, sections, text_rva, text }
+    let imports = img
+        .imports
+        .iter()
+        .filter_map(|i| match &i.symbol {
+            exemu_core::ImportSymbol::Named(n) => {
+                Some((i.iat_rva, i.dll.to_ascii_lowercase(), n.clone()))
+            }
+            exemu_core::ImportSymbol::Ordinal(_) => None,
+        })
+        .collect();
+    Img { image_base: img.image_base, exports, sections, text_rva, text, imports }
 }
 
 impl Img {
@@ -687,4 +699,93 @@ fn wow64cpu_passes_a_32bit_args_pointer_to_the_unix_dispatcher() {
         n32.exports.contains_key("__wine_unixlib_handle"),
         "the 32-bit ntdll exports its own __wine_unixlib_handle",
     );
+}
+
+/// **`wow64win.dll` is only a marshaller: every win32k thunk tail-jumps into the
+/// 64-bit `win32u.dll`, so that import edge is load-bearing** (roadmap W5.8).
+///
+/// This is the fact SteamSetup died on, and it is worth stating precisely
+/// because the failure mode is *not* a null dereference. An unbound IAT slot in
+/// a PE file does not hold zero — it still holds the file's ILT value, which is
+/// the RVA of the `IMAGE_IMPORT_BY_NAME` for that symbol. So a `jmp qword ptr
+/// [slot]` through an unbound win32u import jumps to a small, plausible-looking
+/// address *inside the import name table* and dies executing the ASCII of its
+/// own name. The test proves all three links:
+///
+/// 1. `wow64win` imports hundreds of names from `win32u.dll` — the edge exists
+///    and is big, so leaving it out is not a corner case;
+/// 2. the shape of a thunk is "load the 32-bit argument block, then
+///    `jmp qword ptr [<a win32u IAT slot>]`" — nothing else stands between the
+///    32-bit guest and win32u;
+/// 3. the unbound slot's file content really is the hint/name RVA, and the
+///    bytes there really do spell the imported symbol — which is exactly how
+///    `NtUserInitializeClientPfnArrays` came to execute at `0x302f0`;
+/// 4. the 64-bit `win32u.dll` answers with a real syscall stub carrying the
+///    win32k table bit, i.e. the thing that reaches exemu's SSDT.
+#[test]
+fn wow64win_win32k_thunks_tail_jump_into_win32u_stubs() {
+    if !have_set() || !std::path::Path::new(DLLS64).join("win32u.dll").is_file() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let w = load(&format!("{DLLS64}/wow64win.dll"));
+    let u = load(&format!("{DLLS64}/win32u.dll"));
+
+    let win32u_imports: Vec<&(u32, String, String)> =
+        w.imports.iter().filter(|(_, dll, _)| dll == "win32u.dll").collect();
+    assert!(
+        win32u_imports.len() > 400,
+        "wow64win tail-jumps into win32u for essentially every win32k service; found {}",
+        win32u_imports.len(),
+    );
+
+    // The one SteamSetup reaches first — user32's DllMain publishes its WndProc
+    // table through it, so it is the very first win32k call a GUI guest makes.
+    const FIRST: &str = "NtUserInitializeClientPfnArrays";
+    let iat_rva: u32 = win32u_imports
+        .iter()
+        .find(|(_, _, s)| s == FIRST)
+        .unwrap_or_else(|| panic!("wow64win imports win32u!{FIRST}"))
+        .0;
+
+    // (2) Some thunk tail-jumps through this slot: `48 FF 25 <disp32>` whose
+    //     rip-relative target is the slot itself.
+    let mut jmp_site = None;
+    for off in 0..w.text.len().saturating_sub(7) {
+        if w.text[off..off + 3] != [0x48, 0xFF, 0x25] {
+            continue;
+        }
+        let disp = i32::from_le_bytes(w.text[off + 3..off + 7].try_into().unwrap());
+        let next = w.text_rva as i64 + off as i64 + 7;
+        if (next + disp as i64) as u32 == iat_rva {
+            jmp_site = Some(w.text_rva + off as u32);
+            break;
+        }
+    }
+    let jmp_site = jmp_site.unwrap_or_else(|| panic!("no `jmp [win32u!{FIRST}]` in wow64win"));
+    // Immediately before it, the 32-bit argument block is unpacked out of RCX
+    // (`mov eax,[rcx]` — a *dword* load, because the caller is 32-bit code).
+    assert_eq!(
+        &w.at(jmp_site - 0x10, 2),
+        &[0x8B, 0x01],
+        "the thunk opens by loading arg0 as a dword from the 32-bit argument block",
+    );
+
+    // (3) The unbound slot is the hint/name RVA, and the bytes there spell the
+    //     symbol — the "executes its own name" failure mode, from the file.
+    let unbound = u64::from_le_bytes(w.at(iat_rva, 8).try_into().expect("8 bytes at the IAT slot"));
+    assert!(
+        unbound != 0 && unbound < w.at(0, 1).len() as u64 + 0x10_0000,
+        "an unbound IAT slot holds a small RVA, not null: {unbound:#x}",
+    );
+    let name = w.at(unbound as u32 + 2, FIRST.len());
+    assert_eq!(
+        std::str::from_utf8(name).unwrap_or(""),
+        FIRST,
+        "…and that RVA ({unbound:#x}) is the IMAGE_IMPORT_BY_NAME for {FIRST}",
+    );
+
+    // (4) win32u answers with a real syscall stub carrying the win32k table bit.
+    let idx = ssdt_index64(&u, FIRST).unwrap_or_else(|| panic!("win32u!{FIRST} is a syscall stub"));
+    assert_ne!(idx & 0x1000, 0, "a win32k service index carries the table-1 bit: {idx:#x}");
 }
