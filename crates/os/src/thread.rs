@@ -325,6 +325,22 @@ impl WinOs {
     /// reports after running a whole block natively (roadmap W8.3). Identical
     /// accounting; only the granularity of the check differs, since the state
     /// can only be saved at a block boundary rather than at any instruction.
+    /// Instructions still owed to the running thread before [`Self::preempt_by`]
+    /// would switch away from it — the budget a chaining JIT may run without
+    /// checking in (roadmap W8.5).
+    ///
+    /// With fewer than two threads `preempt_by` can never switch, so there is
+    /// nothing to be late for and the budget is unbounded. Otherwise it is
+    /// exactly what is left of this timeslice, which makes a chained run stop at
+    /// the same block boundary the block-at-a-time loop stopped at.
+    pub(crate) fn ticks_left(&self) -> u64 {
+        if self.threads.len() < 2 {
+            u64::MAX
+        } else {
+            TIMESLICE.saturating_sub(self.sched_ticks)
+        }
+    }
+
     pub(crate) fn preempt_by(&mut self, cpu: &mut CpuState, n: u64) -> bool {
         if self.threads.len() < 2 {
             return false;

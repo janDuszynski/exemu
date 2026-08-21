@@ -86,10 +86,12 @@ fn parity_with(bits: Bits, code: &[u8], what: &str, seed: &CpuState, code_perm: 
         Bits::B64 => Mode::Long,
     };
     let mut jit = Jit::new(256 * 1024).expect("JIT should be available");
-    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode);
+    // Budget 1 = one block, which is what every case below is written against.
+    // Chaining across block boundaries is exercised separately, at the bottom.
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
     let n = match run {
         Run::NotCompiled => panic!("{what}: the JIT compiled nothing at all"),
-        Run::Executed { insns } | Run::Faulted { insns } => insns,
+        Run::Executed { insns } | Run::SideExit { insns } | Run::Faulted { insns } => insns,
     };
     assert!(n > 0, "{what}: the JIT executed nothing");
     let mut hooks = NoHooks;
