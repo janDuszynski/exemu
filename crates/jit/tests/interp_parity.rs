@@ -31,10 +31,6 @@ fn jit_available() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
-fn build(bits: Bits, code: &[u8], seed: &CpuState) -> (VirtualMemory, Interpreter) {
-    build_with(bits, code, seed, Perm::RX)
-}
-
 fn build_with(bits: Bits, code: &[u8], seed: &CpuState, code_perm: Perm) -> (VirtualMemory, Interpreter) {
     let mut mem = VirtualMemory::new();
     mem.map(Region::new("code", CODE, 0x1000, code_perm)).unwrap();
