@@ -38,8 +38,9 @@
 //!
 //! `exemu run --profile <path> [file.exe] [flags...]` applies, in order:
 //!
-//!     built-in default  <  profile file  <  explicit CLI flag / positional arg
-//!
+//! ```text
+//! built-in default  <  profile file  <  explicit CLI flag / positional arg
+//! ```
 //! A profile supplies *defaults*; any flag actually typed on the command line
 //! (and a positional `<file.exe>`, for `path`) still wins. This is why a known-
 //! good binary can be run with zero flags to remember (`exemu run --profile
