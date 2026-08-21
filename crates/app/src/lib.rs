@@ -1413,10 +1413,7 @@ impl Process {
             self.cpu.state_mut(),
             &mut self.mem,
             ntdll_base,
-            code,
-            address,
-            &info,
-            mode,
+            exemu_os::Trap { code, address, info: &info, mode },
         ) {
             // Undo the #BP rip advance so the report names the faulting
             // instruction rather than the byte after it. A partially written

@@ -48,6 +48,27 @@ pub const EXC_FRAME_BYTES: u64 = 0x5C0;
 /// **32-bit guest code**, so it moves the frame to the 64-bit stack (`r14`) and
 /// calls `wow64cpu!BTCpuResetToConsistentState`, which is what eventually
 /// reaches `ntdll32!KiUserExceptionDispatcher`.
+/// The exception being delivered: what it is, where it happened, its
+/// `ExceptionInformation` words, and which CPU mode faulted.
+///
+/// These four travel together everywhere — they are one description of one
+/// trap, and passing them separately pushed [`WinOs::deliver_hw_exception`]
+/// past a readable argument count.
+#[derive(Debug, Clone, Copy)]
+pub struct Trap<'a> {
+    /// NTSTATUS-shaped exception code, e.g. `0xC0000005` for an access violation.
+    pub code: u32,
+    /// `EXCEPTION_RECORD.ExceptionAddress`.
+    pub address: u64,
+    /// `ExceptionInformation[]` — for an AV, `[access_kind, faulting_address]`.
+    pub info: &'a [u64],
+    /// The mode the CPU was in when it faulted. This is *not* cosmetic: it
+    /// selects the `CONTEXT.SegCs` the frame carries, which is the single field
+    /// `wow64!Wow64PrepareForException` tests to decide whether it is looking at
+    /// a 32-bit guest's fault.
+    pub mode: TrapMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrapMode {
     /// 64-bit long mode — `SegCs` = [`exemu_cpu_sel::CS64`].
@@ -607,11 +628,9 @@ impl WinOs {
         cpu: &mut CpuState,
         mem: &mut dyn Memory,
         ntdll_base: u64,
-        code: u32,
-        address: u64,
-        info: &[u64],
-        mode: TrapMode,
+        trap: Trap<'_>,
     ) -> Result<()> {
+        let Trap { code, address, info, mode } = trap;
         let old_rsp = cpu.rsp();
         // A guest whose stack pointer is below the frame size (a corrupt or
         // mode-confused state — e.g. a 32-bit `esp` after a mis-taken WoW64
