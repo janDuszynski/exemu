@@ -29,7 +29,46 @@ pub const RVA_KI_USER_EXCEPTION_DISPATCHER: u64 = 0x10a30;
 /// Bytes of guest stack the `KiUserExceptionDispatcher` frame occupies:
 /// `CONTEXT` (0x4D0) + `CONTEXT_EX` (0x18) + `EXCEPTION_RECORD` (0x98) + the
 /// machine frame (0x28), rounded to the 16-byte alignment the frame is built at.
-const EXC_FRAME_BYTES: u64 = 0x5C0;
+///
+/// The same constant is baked into `wow64.dll!Wow64PrepareForException`, which
+/// copies `max(0x5C0, CONTEXT_EX.Legacy.Length)` bytes when it has to move this
+/// frame off a 32-bit stack — so the two agree by construction, not by luck
+/// (`crates/app/tests/wow64_abi.rs::wow64_prepare_for_exception_moves_the_5c0_byte_frame`).
+pub const EXC_FRAME_BYTES: u64 = 0x5C0;
+
+/// Which machine mode the faulting instruction was executing in when the
+/// exception was taken (roadmap W5.9).
+///
+/// This decides the `CONTEXT.SegCs` the kernel-side frame carries, and that one
+/// selector is what routes the whole WoW64 exception path: the 64-bit
+/// `KiUserExceptionDispatcher` hands every exception to
+/// `wow64.dll!Wow64PrepareForException`, whose first act is
+/// `mov ax, cs; cmp word ptr [ctx+0x38], ax`. Equal → the fault was 64-bit and
+/// the frame already lives on the 64-bit stack; different → the fault was
+/// **32-bit guest code**, so it moves the frame to the 64-bit stack (`r14`) and
+/// calls `wow64cpu!BTCpuResetToConsistentState`, which is what eventually
+/// reaches `ntdll32!KiUserExceptionDispatcher`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrapMode {
+    /// 64-bit long mode — `SegCs` = [`exemu_cpu_sel::CS64`].
+    #[default]
+    Long,
+    /// 32-bit compatibility mode (a WoW64 guest) — `SegCs` = `CS32`.
+    Compat32,
+}
+
+/// The flat selectors exemu's CPU reports for `mov r/m16, Sreg`. They are
+/// re-exported here because a `CONTEXT` captured by the *kernel* side must agree
+/// with what the guest would see from its own `mov ax, cs` — `wow64.dll`
+/// compares the two directly.
+pub mod exemu_cpu_sel {
+    /// 64-bit code selector (GDT index 6).
+    pub const CS64: u16 = 0x33;
+    /// 32-bit code selector (GDT index 4).
+    pub const CS32: u16 = 0x23;
+    /// Flat data/stack selector (GDT index 5) — ES/SS/DS/FS/GS in both modes.
+    pub const DATA: u16 = 0x2b;
+}
 
 // ---- EXCEPTION_RECORD (x64) -------------------------------------------------
 
@@ -165,6 +204,21 @@ const OFF_GPR: u64 = 0x78;
 const OFF_RIP: u64 = 0xf8;
 /// Xmm0 within the embedded XSAVE/legacy area; Xmm0..Xmm15 step by 16.
 const OFF_XMM0: u64 = 0x1a0;
+/// `CONTEXT.SegCs` — six `WORD` selectors run CS, DS, ES, FS, GS, SS.
+///
+/// Load-bearing, and recovered from both sides: `wow64.dll` reads `[ctx+0x38]`
+/// in `Wow64PrepareForException` and `wow64cpu!BTCpuResetToConsistentState`
+/// copies `[ctx+0x38]`→`WOW64_CONTEXT.SegCs`, `[ctx+0x3a]`→`SegDs`,
+/// `[ctx+0x3c]`→`SegEs` and `[ctx+0x42]`→`SegSs` (it takes FS/GS from its own
+/// cached slots instead).
+const OFF_SEG_CS: u64 = 0x38;
+const OFF_SEG_DS: u64 = 0x3a;
+const OFF_SEG_ES: u64 = 0x3c;
+const OFF_SEG_FS: u64 = 0x3e;
+const OFF_SEG_GS: u64 = 0x40;
+const OFF_SEG_SS: u64 = 0x42;
+/// `CONTEXT_SEGMENTS` — set when the six selectors above are meaningful.
+const CONTEXT_SEGMENTS: u32 = CONTEXT_AMD64 | 0x4;
 
 /// `CONTEXT.ContextFlags` bits we honour. The CRT sets `CONTEXT_ALL`; we
 /// always marshal the full integer + control + XMM state regardless, so the
@@ -514,11 +568,40 @@ impl WinOs {
     ///   +0x000  CONTEXT              (0x4D0)  write_context(cpu)  — RSP the dispatcher reads
     ///   +0x4D0  CONTEXT_EX           (0x18)   zero-filled (never inspected)
     ///   +0x4F0  EXCEPTION_RECORD     (0x98)   code / address / info
-    ///   +0x590  machine frame        (0x28)   RIP / CS=0x33 / RFLAGS / OldRSP / SS=0x2B
+    ///   +0x590  machine frame        (0x28)   RIP / CS / RFLAGS / OldRSP / SS
     /// ```
     ///
     /// No return address is pushed: the dispatcher expects `RSP → CONTEXT` and
     /// does `mov rdx,rsp; lea rcx,[rsp+0x4F0]`.
+    ///
+    /// **`mode` = [`TrapMode::Compat32`] is the WoW64 case (roadmap W5.9)** and it
+    /// is *the same frame*, built on the guest's **32-bit** stack, entered in
+    /// 64-bit mode — which is what the NT kernel does for a 32-bit user-mode
+    /// fault. Nothing else changes here, because everything downstream is Wine's
+    /// own code and it keys entirely off `CONTEXT.SegCs`:
+    ///
+    /// ```text
+    ///   ntdll64!KiUserExceptionDispatcher (rva 0x10a30)
+    ///     → wow64!Wow64PrepareForException(rec, ctx)          rva 0x1598
+    ///         ctx->SegCs != cs  →  move all 0x5C0 bytes to the 64-bit stack (r14)
+    ///       → wow64cpu!BTCpuResetToConsistentState(&ptrs)     rva 0x1590
+    ///           RtlWow64SetThreadContext(-2, ctx32-from-ctx64)   ← the guest's real trap state
+    ///           ctx->Rip = wow64cpu+0x1110 (the BOP return handler)
+    ///           ctx->Rsp = ctx->R14; ctx->SegCs = 0x33            ← now unwindable
+    ///     → ntdll64!RtlDispatchException walks that into wow64's simulate loop
+    ///       → its handler (wow64 rva 0x1564) calls
+    ///         wow64!Wow64PassExceptionToGuest(&ptrs)          rva 0x2d10
+    ///           narrows the record to a 32-bit EXCEPTION_RECORD, builds the
+    ///           32-bit dispatcher frame on the guest's own stack and
+    ///           BTCpuSetContext()s Eip = ntdll32!KiUserExceptionDispatcher
+    ///       → unwinds to `for(;;) pBTCpuSimulate();` (wow64 rva 0x155c)
+    ///         which re-enters the guest — inside its own dispatcher.
+    /// ```
+    ///
+    /// So exemu's whole job is this frame plus the mode switch; it marshals no
+    /// context and knows nothing about the 32-bit dispatcher. The caller is
+    /// responsible for putting the CPU in 64-bit mode (this layer only sees a
+    /// [`CpuState`], which carries no mode).
     pub fn deliver_hw_exception(
         &mut self,
         cpu: &mut CpuState,
@@ -527,6 +610,7 @@ impl WinOs {
         code: u32,
         address: u64,
         info: &[u64],
+        mode: TrapMode,
     ) -> Result<()> {
         let old_rsp = cpu.rsp();
         // A guest whose stack pointer is below the frame size (a corrupt or
@@ -549,7 +633,24 @@ impl WinOs {
         // Rip@+0xf8 = fault_rip).
         write_context(mem, new_rsp, cpu)?;
 
-        // CONTEXT_EX @ +0x4D0 (0x18): zeroed — the dispatcher never reads it.
+        // …and the six selectors, which `write_context` leaves alone because the
+        // CPU keeps no selector state. A zero `SegCs` here is not a harmless
+        // omission on the WoW64 path: it is the field `Wow64PrepareForException`
+        // tests, so leaving it zero would classify every 64-bit fault in a WoW64
+        // process as a 32-bit one.
+        let cs = match mode {
+            TrapMode::Long => exemu_cpu_sel::CS64,
+            TrapMode::Compat32 => exemu_cpu_sel::CS32,
+        };
+        mem.write_u16(new_rsp + OFF_SEG_CS, cs)?;
+        for off in [OFF_SEG_DS, OFF_SEG_ES, OFF_SEG_FS, OFF_SEG_GS, OFF_SEG_SS] {
+            mem.write_u16(new_rsp + off, exemu_cpu_sel::DATA)?;
+        }
+        mem.write_u32(new_rsp + OFF_CONTEXT_FLAGS, CONTEXT_ALL | CONTEXT_SEGMENTS)?;
+
+        // CONTEXT_EX @ +0x4D0 (0x18): zeroed. `Wow64PrepareForException` reads
+        // `Legacy.Length` at +0x4D4 and copies `max(0x5C0, that)` bytes, so zero
+        // means "exactly this frame" — which is the truth.
         for i in 0..3u64 {
             mem.write_u64(new_rsp + 0x4D0 + i * 8, 0)?;
         }
@@ -558,11 +659,14 @@ impl WinOs {
         write_exception_record(mem, new_rsp + 0x4F0, code, 0, address, info)?;
 
         // Machine frame @ +0x590 — the trap frame the kernel synthesizes.
+        // `BTCpuResetToConsistentState` rewrites this frame's RIP/RSP in place
+        // (`rec + 0xa7 & !0xf` is exactly `new_rsp + 0x590`), so its position
+        // relative to the EXCEPTION_RECORD is load-bearing, not decorative.
         mem.write_u64(new_rsp + 0x590, fault_rip)?; // RIP
-        mem.write_u64(new_rsp + 0x598, 0x33)?; // CS (user 64-bit)
+        mem.write_u64(new_rsp + 0x598, cs as u64)?; // CS (0x33 long / 0x23 compat)
         mem.write_u64(new_rsp + 0x5A0, rflags)?; // RFLAGS
         mem.write_u64(new_rsp + 0x5A8, old_rsp)?; // OldRSP (== new_rsp + 0x5A8)
-        mem.write_u64(new_rsp + 0x5B0, 0x2B)?; // SS (user data)
+        mem.write_u64(new_rsp + 0x5B0, exemu_cpu_sel::DATA as u64)?; // SS
 
         // Seat the CPU on the dispatcher with RSP → CONTEXT, no return address.
         cpu.set_rsp(new_rsp);

@@ -1299,17 +1299,20 @@ impl Process {
         let Some(ntdll_base) = self.os.module_base("ntdll.dll") else {
             return Ok(false);
         };
-        // A fault in **32-bit** WoW64 guest code cannot be delivered here: this
-        // path builds a 64-bit `CONTEXT` and seats rip on the *64-bit* ntdll's
-        // `KiUserExceptionDispatcher`, which a CPU in 32-bit mode truncates to a
-        // 32-bit address and then faults on again (roadmap W5.7). Wine routes it
-        // instead through `wow64.dll!Wow64PassExceptionToGuest` →
-        // `ntdll32!KiUserExceptionDispatcher`, which exemu does not drive yet —
-        // so decline, and let the fault reporter say where the guest really
-        // stopped. Pinned as `wow64_32bit_exception_is_not_delivered_to_the_guest`.
-        if self.wow64.is_some() && self.cpu.bits() == Bits::B32 {
-            return Ok(false);
-        }
+        // A fault in **32-bit** WoW64 guest code is delivered through the *same*
+        // 64-bit dispatcher (roadmap W5.9) — that is what the NT kernel does, and
+        // what `wow64.dll` is written against. The only differences are the
+        // `CONTEXT.SegCs` the frame carries (0x23, which is how
+        // `Wow64PrepareForException` recognises the case) and the mode switch
+        // below: the frame is built on the guest's 32-bit stack but entered in
+        // long mode. Everything after that is Wine's own code, all the way to
+        // `ntdll32!KiUserExceptionDispatcher` — see
+        // `WinOs::deliver_hw_exception` for the recovered chain.
+        let mode = if self.wow64.is_some() && self.cpu.bits() == Bits::B32 {
+            exemu_os::TrapMode::Compat32
+        } else {
+            exemu_os::TrapMode::Long
+        };
         // Recursion guard: a fault while already dispatching (esp. a repeated
         // fault at the dispatcher entry) must not re-deliver forever.
         const MAX_EXC_DEPTH: u32 = 8;
@@ -1396,7 +1399,17 @@ impl Process {
             code,
             address,
             &info,
+            mode,
         )?;
+        // The NT kernel always returns to user mode in the **native** mode, at
+        // the native `KiUserExceptionDispatcher`; a WoW64 guest's own dispatcher
+        // is reached later, from 64-bit code, by `wow64.dll`. Without this the
+        // 64-bit entry address would be truncated by the 32-bit CPU and fault
+        // again at the truncated address — the loop this used to decline to
+        // enter.
+        if mode == exemu_os::TrapMode::Compat32 {
+            self.cpu.set_bits(Bits::B64);
+        }
         self.exc_depth += 1;
         Ok(true)
     }
