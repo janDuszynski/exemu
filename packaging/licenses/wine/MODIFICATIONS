@@ -1,9 +1,17 @@
 MODIFICATIONS TO THE SHIPPED WINE COMPONENTS
 
 None. The Wine PE builtin DLLs shipped with this product are unmodified
-upstream builds -- see licenses/wine/PROVENANCE for the exact version, git
-commit, build configuration and per-file SHA-256 hashes they were built from
-(compliance checklist B0, B4.1).
+upstream builds -- see the `PROVENANCE` file (no extension) alongside this
+one for the exact version, git commit, build configuration and per-file
+SHA-256 hashes they were built from (compliance checklist B0, B4.1).
+
+That `PROVENANCE` file is supplied by the Wine build itself (the --wine-dist
+directory passed to .github/scripts/build_app.sh, which requires it) and so
+exists only inside an actual bundled release, alongside this file -- it is
+not tracked in this source repository, and is not the same file as
+`PROVENANCE.md` in this same directory, which instead documents where
+*this directory's own COPYING.LIB text* came from and is unrelated to any
+particular Wine build.
 
 If a patch is ever unavoidable (B4.2: fixed on exemu's native side first;
 patching Wine is the last resort), this file must instead list, per patched

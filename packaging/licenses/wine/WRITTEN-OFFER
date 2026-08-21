@@ -14,8 +14,10 @@ Requests to: <OWNER-SUPPLIED: MAINTAINED CONTACT ADDRESS -- e.g. an email
 address the owner commits to monitoring for the full three years. Not
 guessed at here; see docs/COMPLIANCE.md B3.3.>
 
-Please quote the exemu version and the Wine version recorded in
-licenses/wine/PROVENANCE.
+Please quote the exemu version and the Wine version recorded in the
+`PROVENANCE` file (no extension) that ships alongside this one -- supplied by
+the Wine build itself, not by this source repository (see this same
+directory's `MODIFICATIONS` file for why that file is not tracked here).
 
 The source is also available without charge at:
 <OWNER-SUPPLIED: STABLE URL -- e.g. a release page or source mirror the owner
