@@ -257,6 +257,15 @@ pub fn build(
     };
     wow64::publish_system_dll_init_block(mem, block, &sysdll)?;
 
+    // The other half of what `ntdll`'s own `init_wow64` would have done: the
+    // pointer `KiUserExceptionDispatcher` calls its WoW64 hook through. Without
+    // it a 32-bit guest's exceptions are dispatched as if they were 64-bit ones
+    // and die unhandled (roadmap W5.9).
+    let prepare = wow64_img.export("Wow64PrepareForException").ok_or_else(|| {
+        EmuError::Os("WoW64 boot: wow64.dll does not export Wow64PrepareForException".into())
+    })?;
+    wow64::publish_wow64_exception_hook(mem, ntdll64.base, prepare)?;
+
     Ok(Wow64Boot {
         ntdll32,
         wow64cpu,

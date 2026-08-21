@@ -196,6 +196,56 @@ pub fn publish_system_dll_init_block(mem: &mut dyn Memory, block: u64, v: &Syste
     Ok(())
 }
 
+// --- The 64-bit ntdll's WoW64 exception hook --------------------------------
+
+/// Publish `wow64.dll!Wow64PrepareForException` into the pointer cell the
+/// **64-bit** `ntdll!KiUserExceptionDispatcher` calls it through, and return the
+/// cell's address (roadmap W5.9).
+///
+/// **This is the single seam that makes a 32-bit guest's exceptions work**, and
+/// it is easy to miss because nothing about it is 32-bit. The 64-bit dispatcher
+/// opens with
+///
+/// ```text
+///   cld
+///   mov  rax, qword ptr [rip+disp32]      ; the cell this function fills
+///   test rax, rax
+///   je   .no_wow64
+///   mov  rdx, rsp                         ; ContextRecord
+///   lea  rcx, [rsp+0x4F0]                 ; ExceptionRecord
+///   call rax                              ; Wow64PrepareForException(rec, ctx)
+/// .no_wow64:
+///   …RtlDispatchException…
+/// ```
+///
+/// so a **zero** cell is not an error: the dispatcher simply skips the hook and
+/// runs the ordinary 64-bit dispatch over a context whose `Rip` is a 32-bit
+/// address, which finds no handler and ends in `NtRaiseException`. Wine fills
+/// the cell in `ntdll`'s own `init_wow64` (rva 0x522b3, from
+/// `RtlFindExportedRoutineByName(wow64, "Wow64PrepareForException")` — the
+/// second of exactly two entry points it resolves), which runs inside the
+/// 64-bit `loader_init` that the WoW64 boot deliberately does not run. So exemu
+/// publishes it, exactly as it publishes `LdrSystemDllInitBlock`.
+///
+/// The cell address is **recovered, not hardcoded**: it is decoded from the
+/// dispatcher's own `mov rax, [rip+disp32]`, anchored on the exported
+/// `KiUserExceptionDispatcher`. A drifted prologue fails loudly here.
+pub fn publish_wow64_exception_hook(mem: &mut dyn Memory, ntdll64_base: u64, prepare: u64) -> Result<u64> {
+    let entry = ntdll64_base + crate::RVA_KI_USER_EXCEPTION_DISPATCHER;
+    let mut b = [0u8; 8];
+    mem.read(entry, &mut b)?;
+    if b[0] != 0xFC || b[1..4] != [0x48, 0x8B, 0x05] {
+        return Err(EmuError::Os(format!(
+            "WoW64 boot: the 64-bit KiUserExceptionDispatcher at {entry:#x} does not open with \
+             `cld; mov rax,[rip+disp32]` (saw {b:02x?}) — its WoW64 hook cell cannot be located"
+        )));
+    }
+    let disp = i32::from_le_bytes(b[4..8].try_into().unwrap());
+    let slot = (entry + 8).wrapping_add(disp as i64 as u64);
+    mem.write_u64(slot, prepare)?;
+    Ok(slot)
+}
+
 // --- The two NT queries wow64.dll's process init issues ---------------------
 
 /// `ProcessWow64Information` — the `PROCESSINFOCLASS` whose answer is a
