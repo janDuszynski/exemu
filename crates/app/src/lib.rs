@@ -109,6 +109,21 @@ const KUSER_REFRESH_INSTRUCTIONS: u64 = 65_536;
 /// again rather than degrading to the interpreter forever.
 const JIT_CODE_BYTES: usize = 32 << 20;
 
+/// The longest the block JIT may chain without returning to the run loop
+/// (roadmap W8.5).
+///
+/// The real deadlines are the other terms of the budget — the timeslice, the
+/// `KUSER_SHARED_DATA` refresh, the step cap — and this is the backstop for a
+/// run that has none of them: a single-threaded guest on the **host** clock,
+/// with no step cap, whose compiled hot loop would otherwise never hand control
+/// back at all. It is deliberately the same 65,536 as
+/// [`KUSER_REFRESH_INSTRUCTIONS`], so the two clock paths chain in the same
+/// sized steps and a measurement on one carries over to the other. At ~6 guest
+/// instructions per block that is ~11k blocks per round trip: enough that the
+/// loop's own bookkeeping has disappeared into the noise, short enough that a
+/// runaway guest is still noticed promptly.
+const CHAIN_MAX_INSTRUCTIONS: u64 = 65_536;
+
 /// Where the various regions live, chosen per bitness so 32-bit processes
 /// stay entirely within the low 4 GiB.
 struct Layout {
@@ -360,6 +375,10 @@ impl Default for RunConfig {
 pub struct JitReport {
     pub blocks_compiled: u64,
     pub blocks_executed: u64,
+    /// Entries into the JIT from the run loop. `blocks_executed / chains` is the
+    /// average chain length — how many blocks ran per round trip through the
+    /// caller's bookkeeping (roadmap W8.5).
+    pub chains: u64,
     /// Guest instructions executed as native ARM64.
     pub insns_executed: u64,
     /// Blocks that ended by rewinding onto a faulting access.
@@ -1131,12 +1150,13 @@ impl Process {
         let mut next_kuser_refresh = KUSER_REFRESH_INSTRUCTIONS;
         // Rolling window of the most recent instruction pointers, for the
         // fault report (helps trace how a bad jump was reached). With the JIT
-        // on, this records block entries rather than every instruction.
+        // on, this loop only runs once per *chain* of blocks, so the useful
+        // history is the one the JIT keeps per block — see `jit_tail` below.
         const TAIL: usize = 24;
         let mut recent: std::collections::VecDeque<u64> = std::collections::VecDeque::with_capacity(TAIL + 1);
         let exit_code = loop {
             if self.max_steps != 0 && steps >= self.max_steps {
-                let tail: Vec<u64> = recent.iter().copied().collect();
+                let tail = self.rip_trail(&recent);
                 return Err(self.fault(
                     EmuError::Os(format!("instruction budget exhausted after {steps} steps")),
                     steps,
@@ -1172,11 +1192,35 @@ impl Process {
                     Bits::B64 => exemu_jit::Mode::Long,
                     Bits::B32 => exemu_jit::Mode::Protected,
                 };
-                let ran = jit.run(self.cpu.state_mut(), &mut self.mem, mode);
-                let insns = match ran {
-                    exemu_jit::Run::NotCompiled => 0,
-                    exemu_jit::Run::Executed { insns } | exemu_jit::Run::Faulted { insns } => insns,
+                // --- How far the JIT may chain before checking in (W8.5) ----
+                //
+                // Compiled blocks run back to back, so everything this loop does
+                // *between* blocks has to become a deadline instead: the JIT is
+                // told how many instructions it may retire, and it stops at the
+                // first block boundary at which it has retired that many. That
+                // is the same boundary this loop reached block-at-a-time with
+                // the same running total, so preemption and the KUSER refresh
+                // still fire at the identical instruction and the corpus pins
+                // do not move. Every term below is a thing that has to happen at
+                // a known instruction; the smallest wins.
+                let budget = if self.exc_depth != 0 {
+                    // Mid-exception-delivery the loop inspects the rip of every
+                    // block it enters, so chaining is switched off outright.
+                    // (`0` still runs one block — see `Jit::run`.)
+                    0
+                } else {
+                    let mut b = CHAIN_MAX_INSTRUCTIONS;
+                    b = b.min(exemu_core::Hooks::retire_budget(&self.os));
+                    if refresh_kuser {
+                        b = b.min(next_kuser_refresh.saturating_sub(steps));
+                    }
+                    if self.max_steps != 0 {
+                        b = b.min(self.max_steps.saturating_sub(steps));
+                    }
+                    b
                 };
+                let ran = jit.run(self.cpu.state_mut(), &mut self.mem, mode, budget);
+                let insns = ran.insns();
                 if insns != 0 {
                     self.clock.retire(insns as u64);
                     steps += insns as u64;
@@ -1210,7 +1254,7 @@ impl Process {
                 }
             }
             let outcome = self.cpu.step(&mut self.mem, &mut self.os);
-            let tail = || recent.iter().copied().collect::<Vec<_>>();
+            let tail = || self.rip_trail(&recent);
             match outcome {
                 Ok(Exit::Continue) => {
                     steps += 1;
@@ -1234,10 +1278,11 @@ impl Process {
                     // Wine-boot path a bridgeable CPU exception (#DE/#BP) becomes
                     // a guest EXCEPTION_RECORD delivered via
                     // KiUserExceptionDispatcher instead of terminating here.
-                    if self.try_deliver_hw_exception(ExcSource::Interrupt(n), steps, &tail())? {
+                    let t = tail();
+                    if self.try_deliver_hw_exception(ExcSource::Interrupt(n), steps, &t)? {
                         continue;
                     }
-                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &tail()));
+                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &t));
                 }
                 // A native SYSCALL is serviced inside `Cpu::step` (the OS layer's
                 // syscall seam, roadmap W2.2); an unserviced one surfaces here as
@@ -1250,10 +1295,11 @@ impl Process {
                     ));
                 }
                 Err(e) => {
-                    if self.try_deliver_hw_exception(ExcSource::Error(&e), steps, &tail())? {
+                    let t = tail();
+                    if self.try_deliver_hw_exception(ExcSource::Error(&e), steps, &t)? {
                         continue;
                     }
-                    return Err(self.fault(e, steps, &tail()));
+                    return Err(self.fault(e, steps, &t));
                 }
             }
         };
@@ -1269,6 +1315,20 @@ impl Process {
         })
     }
 
+    /// The rip trail a fault report prints: how the guest reached where it died.
+    ///
+    /// With the JIT chaining blocks (roadmap W8.5) the run loop above turns over
+    /// once per *chain*, so `recent` degrades to a handful of chain entry points
+    /// spread over tens of thousands of instructions — useless for bisecting a
+    /// bad jump. The JIT records every block it enters, so when there is one,
+    /// its trail is strictly the better history and is used instead.
+    fn rip_trail(&self, recent: &std::collections::VecDeque<u64>) -> Vec<u64> {
+        match self.jit.as_ref() {
+            Some(jit) => jit.recent_blocks(),
+            None => recent.iter().copied().collect(),
+        }
+    }
+
     /// What the JIT did, if this process had one (roadmap W8).
     pub fn jit_report(&self) -> Option<JitReport> {
         let jit = self.jit.as_ref()?;
@@ -1276,6 +1336,7 @@ impl Process {
         Some(JitReport {
             blocks_compiled: s.blocks_compiled,
             blocks_executed: s.blocks_executed,
+            chains: s.chains,
             insns_executed: s.insns_executed,
             faults: s.faults,
             not_compiled: s.not_compiled,

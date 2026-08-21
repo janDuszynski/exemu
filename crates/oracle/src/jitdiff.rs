@@ -217,7 +217,13 @@ fn run_one(jit: &mut Jit, bits: Bits, code: &[u8], seed: &Seed) -> (Run, Option<
     let before = cpu_j.state().clone();
 
     jit.invalidate(); // fresh address space every trial
-    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode);
+    // Budget 1 = exactly one block (roadmap W8.5). The generator emits straight
+    // -line integer code, so a trial *is* one block; holding the chain loop to
+    // one keeps this differential measuring the same thing it measured before
+    // chaining existed — the block, not the loop around it. Chaining is gated
+    // instead by the parity tests in `crates/jit/tests` and by the corpus twins,
+    // which are the only harnesses with real control flow in them.
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
 
     let retired = match run {
         Run::NotCompiled => {
@@ -227,7 +233,7 @@ fn run_one(jit: &mut Jit, bits: Bits, code: &[u8], seed: &Seed) -> (Run, Option<
             }
             return (run, None);
         }
-        Run::Executed { insns } | Run::Faulted { insns } => insns,
+        Run::Executed { insns } | Run::SideExit { insns } | Run::Faulted { insns } => insns,
     };
 
     // Step the interpreter exactly as far as the JIT claimed to have got.
@@ -288,7 +294,7 @@ pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
                 s.not_compiled += 1;
                 s.interpreted += 1;
             }
-            Run::Executed { insns } => {
+            Run::Executed { insns } | Run::SideExit { insns } => {
                 s.compiled += 1;
                 s.insns += insns as u64;
             }

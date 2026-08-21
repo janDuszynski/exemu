@@ -358,15 +358,18 @@ fn report_jit(report: &Option<exemu_app::JitReport>, steps: u64) {
     if let Some(j) = report {
         let total = if steps != 0 { steps } else { j.insns_executed + j.not_compiled };
         let share = 100.0 * j.insns_executed as f64 / total.max(1) as f64;
+        let chain = if j.chains != 0 { j.blocks_executed as f64 / j.chains as f64 } else { 0.0 };
         eprintln!(
             "[exemu] jit: {:.1}% of instructions native ({} of {}), {} blocks \
-             ({} KiB of code), {} block entries, {} rewinds, {} side-exits, {} flushes",
+             ({} KiB of code), {} block entries, {:.1} blocks/chain, {} rewinds, \
+             {} side-exits, {} flushes",
             share,
             j.insns_executed,
             total,
             j.blocks_compiled,
             j.code_bytes / 1024,
             j.blocks_executed,
+            chain,
             j.faults,
             j.not_compiled,
             j.flushes

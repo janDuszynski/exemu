@@ -1462,6 +1462,14 @@ impl Hooks for WinOs {
         Ok(None)
     }
 
+    /// What is left of the running thread's timeslice (roadmap W8.5). The
+    /// chaining JIT stops at the first block boundary at which it has retired
+    /// this many instructions, so [`Self::retire`] — and therefore preemption —
+    /// still happens at the boundary it always did.
+    fn retire_budget(&self) -> u64 {
+        self.ticks_left()
+    }
+
     fn intercept(&mut self, rip: u64, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Option<Exit>> {
         // Timeslice preemption (roadmap P3.4): with more than one thread, force
         // a yield every `TIMESLICE` instructions so a CPU-bound thread can't

@@ -21,17 +21,34 @@ type BlockFn = unsafe extern "C" fn(*mut CpuState, *mut BlockCtx<'_>) -> u64;
 /// What one [`Jit::run`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Run {
-    /// `insns` guest instructions executed; `rip` is correct and the caller can
-    /// simply loop.
+    /// `insns` guest instructions executed and the run stopped because the
+    /// **budget** ran out, not because it had to. `rip` sits on a boundary the
+    /// JIT could have carried on from, so the caller does its per-budget
+    /// bookkeeping and comes straight back.
     Executed { insns: u32 },
+    /// `insns` executed, and then the chain reached an address with no compiled
+    /// block. The caller must account `insns`, then interpret **one**
+    /// instruction before coming back.
+    SideExit { insns: u32 },
     /// `insns` executed, then an access faulted: guest state is exactly as it
     /// was before the faulting instruction and `rip` points at it. The caller
     /// must run **one** instruction on the interpreter, which raises the real
     /// error.
     Faulted { insns: u32 },
     /// Nothing compiled at this address: the caller interprets one instruction
-    /// and comes back.
+    /// and comes back. (`SideExit { insns: 0 }`, named separately because the
+    /// caller has no accounting to do for it.)
     NotCompiled,
+}
+
+impl Run {
+    /// Guest instructions this call executed natively.
+    pub fn insns(self) -> u32 {
+        match self {
+            Run::NotCompiled => 0,
+            Run::Executed { insns } | Run::SideExit { insns } | Run::Faulted { insns } => insns,
+        }
+    }
 }
 
 /// Counters for reporting real coverage rather than claimed coverage.
@@ -42,9 +59,13 @@ pub struct JitStats {
     pub insns_executed: u64,
     /// Times a block ended by rewinding to a faulting access.
     pub faults: u64,
-    /// Times `run` found nothing to execute (the interpreter took the
-    /// instruction).
+    /// Times a chain ended because nothing was compiled at the address it
+    /// reached (the interpreter took that instruction).
     pub not_compiled: u64,
+    /// Times [`Jit::run`] was entered — the number of round trips through the
+    /// caller's run loop, as opposed to `blocks_executed`, which counts blocks.
+    /// Their ratio is the chain length (roadmap W8.5).
+    pub chains: u64,
     /// Times the whole cache was thrown away because guest code changed.
     pub flushes: u64,
     /// High-water mark of emitted native code, in bytes. (`Jit::code_bytes`
@@ -99,6 +120,10 @@ struct CacheLine {
 
 const LINES: usize = 8192;
 
+/// Block entry addresses kept for the fault reporter. A power of two so the
+/// ring index is a mask.
+const TRAIL: usize = 32;
+
 pub struct Jit {
     buffer: CodeBuffer,
     blocks: Vec<Block>,
@@ -115,6 +140,11 @@ pub struct Jit {
     code_gen: u64,
     stats: JitStats,
     max_insns: u32,
+    /// Ring of the block entry addresses most recently run, for the fault
+    /// report (roadmap W8.5): with chaining, the caller's run loop sees one
+    /// address per *chain*, so the history has to be kept here.
+    trail: [u64; TRAIL],
+    trail_at: u64,
 }
 
 impl Jit {
@@ -130,6 +160,8 @@ impl Jit {
             code_gen: 0,
             stats: JitStats::default(),
             max_insns: MAX_INSNS,
+            trail: [0; TRAIL],
+            trail_at: 0,
         })
     }
 
@@ -283,60 +315,117 @@ impl Jit {
         false
     }
 
-    /// Execute the block at `state.rip` in `mode`, if there is one.
+    /// Run compiled blocks from `state.rip`, one after another, until `budget`
+    /// guest instructions have retired or the chain has to stop (roadmap W8.5).
     ///
     /// `mode` is the *interpreter's current* mode, not a property of the image:
     /// a WoW64 process runs 32- and 64-bit code in the same address space, and
     /// the same bytes mean different things in each.
-    pub fn run(&mut self, state: &mut CpuState, mem: &mut dyn Memory, mode: Mode) -> Run {
-        let rip = state.rip;
-        let mut idx = self.block_at(rip, mode, &*mem) as usize;
-        if !self.validate(idx, &*mem) {
-            // The bytes under a cached block changed. Invalidation is still
-            // whole-cache (indexing pages back to the blocks that cover them is
-            // W8.5); what matters here is that it now happens only when guest
-            // *code* really changed.
-            self.flush();
-            idx = self.block_at(rip, mode, &*mem) as usize;
-        }
-        let (code, insns, lo, hi) = match &self.blocks[idx] {
-            Block { code: Some(c), insns, lo, hi, .. } => (*c, *insns, *lo, *hi),
-            _ => {
-                self.stats.not_compiled += 1;
-                return Run::NotCompiled;
+    ///
+    /// # The budget is a correctness parameter, not a tuning knob
+    ///
+    /// A compiled block leaves `rip` on the next block, so the JIT could in
+    /// principle run forever without returning. It must not, because the caller
+    /// does things *between* blocks that the guest can observe: timeslice
+    /// preemption, the `KUSER_SHARED_DATA` clock refresh, the step cap. `budget`
+    /// is how many instructions the caller can afford before it has to look
+    /// again, and the rule this loop obeys is:
+    ///
+    /// > run a block, add up what it retired, and stop as soon as the running
+    /// > total has **reached** the budget.
+    ///
+    /// It deliberately does *not* refuse to start a block that might overshoot.
+    /// That is what makes chaining invisible: block-at-a-time, the caller
+    /// accumulated the same per-block counts and acted at the first block
+    /// boundary where the total crossed its threshold — which is exactly the
+    /// boundary this loop returns on. Preemption and the clock refresh therefore
+    /// fire at the same instruction they did before, and the corpus pins do not
+    /// move. A `budget` of 0 or 1 means "one block", which is what the
+    /// differential harness uses.
+    pub fn run(&mut self, state: &mut CpuState, mem: &mut dyn Memory, mode: Mode, budget: u64) -> Run {
+        self.stats.chains += 1;
+        // The running total is reported in a `u32` and a block adds at most
+        // `MAX_INSNS` to it, so cap the budget well clear of the edge rather
+        // than trusting every caller to. `u64::MAX` — the default budget of a
+        // hook with no notion of time — lands here.
+        let budget = budget.min(u32::MAX as u64 - MAX_INSNS as u64);
+        let mut retired: u64 = 0;
+        loop {
+            let rip = state.rip;
+            // The block-entry trail, for the fault reporter: with chaining the
+            // caller's run loop only sees one address per chain, so the JIT has
+            // to keep the trail itself or a fault would come with no history of
+            // how the guest got there.
+            self.trail[self.trail_at as usize & (TRAIL - 1)] = rip;
+            self.trail_at = self.trail_at.wrapping_add(1);
+
+            let mut idx = self.block_at(rip, mode, &*mem) as usize;
+            if !self.validate(idx, &*mem) {
+                // The bytes under a cached block changed. Invalidation is still
+                // whole-cache (indexing pages back to the blocks that cover them
+                // is W8.5's next step); what matters here is that it now happens
+                // only when guest *code* really changed.
+                self.flush();
+                idx = self.block_at(rip, mode, &*mem) as usize;
             }
-        };
-        let ret = {
-            let mut ctx = BlockCtx {
-                mem,
-                parity: PARITY.as_ptr(),
-                code_lo: lo,
-                code_hi: hi,
-                read: jit_read,
-                write: jit_write,
+            let (code, insns, lo, hi) = match &self.blocks[idx] {
+                Block { code: Some(c), insns, lo, hi, .. } => (*c, *insns, *lo, *hi),
+                _ => {
+                    // Nothing here. The caller interprets this one instruction —
+                    // and is told how much ran first, so it can account for it
+                    // before doing so.
+                    self.stats.not_compiled += 1;
+                    return if retired == 0 {
+                        Run::NotCompiled
+                    } else {
+                        Run::SideExit { insns: retired as u32 }
+                    };
+                }
             };
-            // SAFETY: `code` was produced by this crate's emitter for exactly
-            // this signature and written into `self.buffer`, which is still
-            // alive and has not been reset since (a reset only happens in
-            // `flush`, which needs `&mut self` and therefore cannot run while
-            // this call is in progress). The block only writes through the two
-            // pointers below: the `CpuState` — for which no other reference is
-            // live across the call — and the `BlockCtx` on this stack frame.
-            unsafe {
-                let f: BlockFn = code.as_fn();
-                f(state as *mut CpuState, &mut ctx as *mut BlockCtx)
+            let ret = {
+                let mut ctx = BlockCtx {
+                    mem,
+                    parity: PARITY.as_ptr(),
+                    code_lo: lo,
+                    code_hi: hi,
+                    read: jit_read,
+                    write: jit_write,
+                };
+                // SAFETY: `code` was produced by this crate's emitter for exactly
+                // this signature and written into `self.buffer`, which is still
+                // alive and has not been reset since (a reset only happens in
+                // `flush`, which needs `&mut self` and therefore cannot run while
+                // this call is in progress). The block only writes through the two
+                // pointers below: the `CpuState` — for which no other reference is
+                // live across the call — and the `BlockCtx` on this stack frame.
+                unsafe {
+                    let f: BlockFn = code.as_fn();
+                    f(state as *mut CpuState, &mut ctx as *mut BlockCtx)
+                }
+            };
+            let n = (ret & 0xffff_ffff) as u32;
+            debug_assert!(n <= insns, "block reported more instructions than it holds");
+            self.stats.blocks_executed += 1;
+            self.stats.insns_executed += n as u64;
+            retired += n as u64;
+            if ret & RET_FAULT != 0 {
+                self.stats.faults += 1;
+                return Run::Faulted { insns: retired as u32 };
             }
-        };
-        let retired = (ret & 0xffff_ffff) as u32;
-        debug_assert!(retired <= insns, "block reported more instructions than it holds");
-        self.stats.blocks_executed += 1;
-        self.stats.insns_executed += retired as u64;
-        if ret & RET_FAULT != 0 {
-            self.stats.faults += 1;
-            Run::Faulted { insns: retired }
-        } else {
-            Run::Executed { insns: retired }
+            if retired >= budget {
+                return Run::Executed { insns: retired as u32 };
+            }
         }
+    }
+
+    /// The most recent block entry addresses, oldest first — the rip trail the
+    /// fault reporter prints. Chaining moves this bookkeeping in here, because
+    /// the caller's loop no longer sees every block.
+    pub fn recent_blocks(&self) -> Vec<u64> {
+        let n = (self.trail_at as usize).min(TRAIL);
+        (0..n)
+            .map(|i| self.trail[(self.trail_at as usize + TRAIL - n + i) & (TRAIL - 1)])
+            .collect()
     }
 }
 
@@ -373,7 +462,7 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         let mut jit = Jit::new(64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem, Mode::Long);
+        let r = jit.run(&mut st, &mut mem, Mode::Long, 1);
         assert_eq!(r, Run::Executed { insns: 2 });
         assert_eq!(st.gpr[0], 12);
         assert_eq!(st.rip, CODE + 8);
@@ -387,7 +476,7 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         let mut jit = Jit::new(64 * 1024).unwrap();
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::NotCompiled);
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::NotCompiled);
         assert_eq!(st.rip, CODE, "a declined block must not move rip");
     }
 
@@ -403,7 +492,7 @@ mod tests {
         st.rip = CODE;
         st.gpr[2] = 0xDEAD_0000; // unmapped
         let mut jit = Jit::new(64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem, Mode::Long);
+        let r = jit.run(&mut st, &mut mem, Mode::Long, 1);
         assert_eq!(r, Run::Faulted { insns: 1 });
         assert_eq!(st.gpr[0], 1, "the first instruction did run");
         assert_eq!(st.rip, CODE + 5, "rip rewound to the faulting instruction");
@@ -420,7 +509,7 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         let mut jit = Jit::new(64 * 1024).unwrap();
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 2 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 2 });
         assert_eq!(st.rip, CODE + 6, "branch taken");
     }
 
@@ -440,7 +529,7 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         let mut jit = Jit::new(64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem, Mode::Long);
+        let r = jit.run(&mut st, &mut mem, Mode::Long, 1);
         assert_eq!(r, Run::Executed { insns: 1 }, "stopped after the self-modifying store");
         assert_eq!(st.rip, CODE + 8);
         assert_eq!(st.gpr[0], 0, "the instruction after the store did NOT run");
@@ -462,15 +551,15 @@ mod tests {
 
         let mut st = CpuState::new();
         st.rip = CODE + 0x40;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 1 });
         assert_eq!(st.gpr[0], 1);
 
         st.rip = CODE;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 1 });
 
         let flushes = jit.stats().flushes;
         st.rip = CODE + 0x40;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 1 });
         assert_eq!(st.gpr[0], 2, "block B was recompiled from the rewritten bytes");
         assert!(jit.stats().flushes > flushes, "the stale block was invalidated");
     }
@@ -489,20 +578,20 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         st.gpr[0] = 5;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 1 });
         assert_eq!(st.gpr[0], 6, "long mode: one `inc rax`");
         assert_eq!(st.rip, CODE + 3);
 
         st.rip = CODE;
         st.gpr[0] = 5;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Protected), Run::Executed { insns: 2 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Protected, 1), Run::Executed { insns: 2 });
         assert_eq!(st.gpr[0], 5, "protected mode: `dec eax` then `inc eax`");
         assert_eq!(st.rip, CODE + 3);
 
         // And back again, from the cache rather than a recompile.
         st.rip = CODE;
         st.gpr[0] = 5;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 1 });
         assert_eq!(st.gpr[0], 6);
         assert_eq!(jit.stats().flushes, 0, "switching modes must not flush");
     }
@@ -524,9 +613,128 @@ mod tests {
         let mut st = CpuState::new();
         for _ in 0..8 {
             st.rip = CODE;
-            assert_eq!(jit.run(&mut st, &mut mem, Mode::Long), Run::Executed { insns: 1 });
+            assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 1 });
         }
         assert_eq!(jit.stats().flushes, 0, "a data store must not invalidate the cache");
         assert_eq!(jit.stats().blocks_compiled, 1, "and the block is compiled once");
+    }
+
+    // -----------------------------------------------------------------------
+    // Block chaining (roadmap W8.5)
+    // -----------------------------------------------------------------------
+
+    /// Three blocks back to back. `jmp` is a block *terminator* — it is compiled,
+    /// and it ends the block — so this is 2 + 2 + 1 guest instructions in three
+    /// blocks, followed by a `ret` the compiler declines.
+    const CHAIN: [u8; 16] = [
+        0xB8, 0x05, 0x00, 0x00, 0x00, // mov eax, 5      | block 1
+        0xEB, 0x00, //                                   | jmp +0
+        0x83, 0xC0, 0x07, //             add eax, 7      | block 2
+        0xEB, 0x00, //                                   | jmp +0
+        0x83, 0xC0, 0x09, //             add eax, 9      | block 3
+        0xC3, //                         ret (declined)
+    ];
+
+    #[test]
+    fn a_chain_runs_every_block_it_can_in_one_call() {
+        let mut mem = mem_with(&CHAIN);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+
+        // Budget 1 is "one block", which is what the differential harness uses.
+        st.rip = CODE;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 2 });
+        assert_eq!(st.rip, CODE + 7);
+        assert_eq!(jit.stats().blocks_executed, 1);
+
+        // With a real budget the same three blocks run in ONE entry, and the
+        // chain ends only where it must: the `ret`, which has no compiled block.
+        st.rip = CODE;
+        st.gpr[0] = 0;
+        let chains = jit.stats().chains;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1000), Run::SideExit { insns: 5 });
+        assert_eq!(st.gpr[0], 21, "all three blocks ran (5 + 7 + 9)");
+        assert_eq!(st.rip, CODE + 15, "left sitting on the `ret`");
+        assert_eq!(jit.stats().chains, chains + 1, "three blocks, one entry");
+    }
+
+    #[test]
+    fn the_budget_stops_the_chain_at_the_first_boundary_that_reaches_it() {
+        // The rule the whole design rests on: stop at the first block boundary
+        // at which the running total has REACHED the budget — never refuse to
+        // start a block because it might overshoot. Block-at-a-time, the caller
+        // accumulated the same per-block counts and acted at that same boundary,
+        // so preemption and the clock refresh keep firing where they did and the
+        // corpus pins do not move.
+        let mut mem = mem_with(&CHAIN);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        st.rip = CODE;
+        // Blocks retire 2, 2, 1. A budget of 3 is reached by the end of block
+        // two, which has by then retired 4 — the overshoot is the point.
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 3), Run::Executed { insns: 4 });
+        assert_eq!(st.rip, CODE + 12, "stopped on a block boundary, not mid-block");
+        assert_eq!(jit.stats().blocks_executed, 2);
+    }
+
+    #[test]
+    fn a_chain_and_a_sequence_of_single_blocks_are_the_same_run() {
+        // Chaining may change how often the caller is consulted; it may not
+        // change what the guest computes, nor how many instructions it takes.
+        let mut mem = mem_with(&CHAIN);
+        let mut one = Jit::new(64 * 1024).unwrap();
+        let mut many = Jit::new(64 * 1024).unwrap();
+        let (mut a, mut b) = (CpuState::new(), CpuState::new());
+        a.rip = CODE;
+        b.rip = CODE;
+
+        let mut stepped = 0u32;
+        loop {
+            match one.run(&mut a, &mut mem, Mode::Long, 1) {
+                Run::Executed { insns } => stepped += insns,
+                other => {
+                    stepped += other.insns();
+                    break;
+                }
+            }
+        }
+        let chained = many.run(&mut b, &mut mem, Mode::Long, 1000).insns();
+        assert_eq!(stepped, chained, "the same instructions retired either way");
+        assert_eq!(a.rip, b.rip);
+        assert_eq!(a.gpr, b.gpr);
+        assert_eq!(a.rflags, b.rflags);
+    }
+
+    #[test]
+    fn the_trail_records_every_block_a_chain_entered() {
+        // With chaining the caller's run loop sees one address per chain, so a
+        // fault report would lose the history of how the guest got there unless
+        // the JIT keeps it. This is that history.
+        let mut mem = mem_with(&CHAIN);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        st.rip = CODE;
+        jit.run(&mut st, &mut mem, Mode::Long, 1000);
+        assert_eq!(
+            jit.recent_blocks(),
+            vec![CODE, CODE + 7, CODE + 12, CODE + 15],
+            "every block entry, oldest first — including the one that found nothing"
+        );
+    }
+
+    #[test]
+    fn the_trail_keeps_the_most_recent_entries_when_it_wraps() {
+        // A 500M-instruction run enters hundreds of millions of blocks; the ring
+        // has to hand back the *last* few in order, not the first few.
+        let mut mem = mem_with(&CHAIN);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        for _ in 0..40 {
+            st.rip = CODE;
+            jit.run(&mut st, &mut mem, Mode::Long, 1);
+        }
+        let t = jit.recent_blocks();
+        assert_eq!(t.len(), TRAIL, "the ring is full");
+        assert!(t.iter().all(|&r| r == CODE), "and holds the entries, not zeroes");
     }
 }

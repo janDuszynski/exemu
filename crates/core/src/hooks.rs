@@ -68,6 +68,26 @@ pub trait Hooks {
         let _ = (n, cpu, mem);
         Ok(None)
     }
+
+    /// How many guest instructions may retire before [`Hooks::retire`] *must* be
+    /// called again — the budget a block-chaining JIT (roadmap W8.5) is allowed
+    /// to run without checking in.
+    ///
+    /// This exists so that chaining changes only *speed*, never *when the OS
+    /// layer acts*. The JIT runs compiled blocks back to back and stops at the
+    /// first block boundary at which it has retired this many instructions;
+    /// because that is the same boundary the old block-at-a-time loop would have
+    /// reached with the same running total, timeslice preemption fires at
+    /// **exactly the same instruction** it did before. A hook that returns a
+    /// budget smaller than it needs only makes the JIT check in more often,
+    /// which is always safe; one that returns too large a budget would let the
+    /// guest run past a decision point, which is not.
+    ///
+    /// The default is [`u64::MAX`]: a hook with no notion of time cannot be
+    /// surprised by a longer run.
+    fn retire_budget(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 /// A no-op hook, handy for tests that run raw machine code with no OS.
