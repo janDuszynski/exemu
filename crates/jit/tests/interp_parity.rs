@@ -460,6 +460,68 @@ fn compile_len(code: &[u8]) -> usize {
     exemu_jit::compile::Compiler::compile(&mem, Mode::Long, CODE, 64).code.len()
 }
 
+// ---------------------------------------------------------------------------
+// Shapes added because a real 32-bit installer stops blocks on them
+// ---------------------------------------------------------------------------
+
+#[test]
+fn push_immediate_and_leave() {
+    // `push imm8` sign-extends, `push imm32` sign-extends, and `leave` is
+    // `rsp = rbp ; pop rbp` — with the *interpreter's* masking order, which
+    // leaves rsp as `(rbp + width)` masked rather than `rbp` masked.
+    let code = [
+        0x6A, 0x7F, // push 0x7f
+        0x68, 0xEF, 0xBE, 0xAD, 0xDE, // push 0xffffffffdeadbeef (sign-extended)
+        0xC9, // leave
+        0xC3, // ret (declined — ends the block)
+    ];
+    parity(Bits::B64, &code, "push imm / leave 64", &seed(Bits::B64));
+    parity(Bits::B32, &code, "push imm / leave 32", &seed(Bits::B32));
+}
+
+#[test]
+fn mov_to_and_from_an_absolute_offset() {
+    // The moffs forms take an *address*-size immediate, not an operand-size
+    // one — 8 bytes in long mode, 4 in protected mode.
+    let a = DATA + 0x100;
+    let mut code = vec![0x48, 0xA1];
+    code.extend_from_slice(&a.to_le_bytes()); // mov rax, [DATA+0x100]
+    code.extend_from_slice(&[0x48, 0xA3]);
+    code.extend_from_slice(&(a + 8).to_le_bytes()); // mov [DATA+0x108], rax
+    code.push(0xA0);
+    code.extend_from_slice(&(a + 0x20).to_le_bytes()); // mov al, [DATA+0x120]
+    code.push(0xA2);
+    code.extend_from_slice(&(a + 0x21).to_le_bytes()); // mov [DATA+0x121], al
+    code.push(0xC3);
+    parity(Bits::B64, &code, "moffs 64", &seed(Bits::B64));
+
+    let mut code32 = vec![0xA1];
+    code32.extend_from_slice(&(a as u32).to_le_bytes()); // mov eax, [DATA+0x100]
+    code32.push(0xA3);
+    code32.extend_from_slice(&((a + 4) as u32).to_le_bytes()); // mov [DATA+0x104], eax
+    code32.push(0xC3);
+    parity(Bits::B32, &code32, "moffs 32", &seed(Bits::B32));
+}
+
+#[test]
+fn mov_from_an_absolute_offset_through_a_segment_base() {
+    // `gs:`-relative moffs is how a 64-bit guest reads the TEB, and `fs:`
+    // moffs is how Wine's 32-bit ntdll installs its SEH frame — both have to
+    // go through the *live* per-thread base, not a fixed constant.
+    let mut code = vec![0x65, 0x48, 0xA1];
+    code.extend_from_slice(&0x28u64.to_le_bytes()); // mov rax, gs:[0x28]
+    code.push(0xC3);
+    parity(Bits::B64, &code, "gs moffs 64", &seed(Bits::B64));
+
+    let mut code32 = vec![0x64, 0xA1];
+    code32.extend_from_slice(&0x18u32.to_le_bytes()); // mov eax, fs:[0x18]
+    code32.push(0x64);
+    code32.push(0xA3);
+    code32.extend_from_slice(&0x1Cu32.to_le_bytes()); // mov fs:[0x1c], eax
+    code32.push(0xC3);
+    parity(Bits::B32, &code32, "fs moffs 32", &seed(Bits::B32));
+}
+
 #[test]
 fn a_conditional_branch_lands_on_the_right_side() {
     // cmp eax, eax ; je +5 ; (skipped) ; ...

@@ -1121,6 +1121,10 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
             }
             0x6A => imm = c.u8()? as i8 as i64 as u64,
             0x68 => imm = c.u32()? as i32 as i64 as u64,
+            // MOV AL/eAX <-> moffs: the offset is an *address*-size immediate,
+            // not an operand-size one (and the address-size override is refused
+            // above, so the mode alone decides its width).
+            0xA0..=0xA3 => imm = if mode.is64() { c.u64()? } else { c.u32()? as u64 },
             0x70..=0x7F | 0xEB => imm = c.u8()? as i8 as i64 as u64,
             0xE9 => imm = c.u32()? as i32 as i64 as u64,
             0x80 => imm = c.u8()? as u64,
@@ -1214,7 +1218,7 @@ fn flag_effect(insn: &Insn) -> FlagEffect {
         // prefix followed by something this compiler declines).
         0x40..=0x4F => FlagEffect::Reads,
         0x50..=0x5F | 0x63 | 0x88..=0x8B | 0x8D | 0x90 | 0xB0..=0xBF => FlagEffect::Neutral,
-        0xC6 | 0xC7 => FlagEffect::Neutral,
+        0x68 | 0x6A | 0xA0..=0xA3 | 0xC6 | 0xC7 | 0xC9 => FlagEffect::Neutral,
         0x80 | 0x81 | 0x83 => match Alu::from_op(insn.reg & 7) {
             Some(_) => FlagEffect::Overwrites,
             None => FlagEffect::Reads,
@@ -1395,6 +1399,23 @@ impl Compiler {
                 Lowered::Ok
             }
 
+            // ---- PUSH imm8 / imm32 --------------------------------------
+            //
+            // The 0x66 form pushes two bytes and adjusts rsp by two, which is
+            // a different shape; it is not compiled.
+            0x68 | 0x6A if !p.p66 => {
+                let w = self.mode.stack_width();
+                self.asm.mov_imm64(R_VAL, insn.imm);
+                self.asm.ldr(8, T0, R_STATE, gpr_off(4));
+                self.asm.sub_imm(true, R_ADDR, T0, w as u32, false);
+                if !self.mode.is64() {
+                    let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
+                    debug_assert!(ok);
+                }
+                self.emit_store_push(w, next);
+                Lowered::Ok
+            }
+
             // ---- MOVSXD r64, r/m32 --------------------------------------
             0x63 if self.mode.is64() => {
                 let size = self.opsize(&p);
@@ -1500,6 +1521,47 @@ impl Compiler {
             // ---- NOP -----------------------------------------------------
             0x90 if p.b() == 0 => Lowered::Ok,
 
+            // ---- MOV AL/eAX <-> moffs (absolute address) ----------------
+            0xA0..=0xA3 => {
+                // In 64-bit mode the interpreter resolves `fs:` against a fixed
+                // constant that does not live in `CpuState`, so compiled code
+                // has nothing correct to read — the same refusal the ModRM path
+                // makes.
+                if self.mode.is64() && p.seg == 0x64 {
+                    return Lowered::Unsupported;
+                }
+                let size = if insn.opcode & 1 == 0 { 1 } else { self.opsize(&p) };
+                self.asm.mov_imm64(R_ADDR, insn.imm);
+                // The **live** per-thread segment bases, in the interpreter's
+                // order: base first, then the address mask (roadmap W5.7).
+                match p.seg {
+                    0x65 => {
+                        self.asm.ldr(8, T0, R_STATE, st::GS_BASE);
+                        self.asm.add_reg(true, R_ADDR, R_ADDR, T0, 0);
+                    }
+                    0x64 => {
+                        self.asm.ldr(8, T0, R_STATE, st::FS_BASE);
+                        self.asm.add_reg(true, R_ADDR, R_ADDR, T0, 0);
+                    }
+                    _ => {}
+                }
+                if !self.mode.is64() {
+                    let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
+                    debug_assert!(ok);
+                }
+                match insn.opcode {
+                    0xA0 | 0xA1 => {
+                        self.emit_load(R_VAL, size);
+                        self.store_gpr(R_VAL, 0, size, has_rex);
+                    }
+                    _ => {
+                        self.load_gpr(R_VAL, 0, size, has_rex);
+                        self.emit_store(R_VAL, size, Commit::None, next);
+                    }
+                }
+                Lowered::Ok
+            }
+
             // ---- TEST al/eax, imm ---------------------------------------
             0xA8 | 0xA9 => {
                 let size = if insn.opcode == 0xA8 { 1 } else { self.opsize(&p) };
@@ -1551,6 +1613,29 @@ impl Compiler {
                         Lowered::Ok
                     }
                 }
+            }
+
+            // ---- LEAVE ---------------------------------------------------
+            //
+            // `mov rsp, rbp ; pop rbp`, in the interpreter's exact order: the
+            // transient `rsp = rbp` is masked by the pop's own read, and the
+            // committed rsp is `(rbp + width)` masked.
+            0xC9 => {
+                let w = self.mode.stack_width();
+                self.asm.ldr(8, R_ADDR, R_STATE, gpr_off(5));
+                if !self.mode.is64() {
+                    let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
+                    debug_assert!(ok);
+                }
+                self.emit_load(R_VAL, w);
+                self.asm.add_imm(true, T0, R_ADDR, w as u32, false);
+                if !self.mode.is64() {
+                    let ok = self.asm.and_imm(true, T0, T0, 0xffff_ffff);
+                    debug_assert!(ok);
+                }
+                self.asm.str(8, T0, R_STATE, gpr_off(4));
+                self.asm.str(8, R_VAL, R_STATE, gpr_off(5));
+                Lowered::Ok
             }
 
             // ---- JMP rel -------------------------------------------------
