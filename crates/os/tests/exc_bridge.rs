@@ -11,7 +11,7 @@
 use exemu_core::{flags, Cpu, CpuState, Exit, Memory, Perm, Reg, Region};
 use exemu_cpu::{Bits, Interpreter, GS_BASE};
 use exemu_memory::VirtualMemory;
-use exemu_os::{WinConfig, WinOs, RVA_KI_USER_EXCEPTION_DISPATCHER};
+use exemu_os::{TrapMode, WinConfig, WinOs, RVA_KI_USER_EXCEPTION_DISPATCHER};
 
 // A synthetic ntdll base for the direct-delivery assertions. `deliver_hw_exception`
 // only uses it to compute the dispatcher rip; no image need be mapped.
@@ -59,7 +59,7 @@ fn deliver_av_builds_dispatcher_frame() {
     cpu.set_reg(Reg::Rbx, 0xB16B_00B5); // a live GPR that must survive into CONTEXT
     cpu.rflags = flags::RESERVED_ONE | flags::CF | flags::ZF;
 
-    os.deliver_hw_exception(&mut cpu, &mut mem, NTDLL_BASE, 0xC000_0005, fault_addr, &[0, fault_addr])
+    os.deliver_hw_exception(&mut cpu, &mut mem, NTDLL_BASE, 0xC000_0005, fault_addr, &[0, fault_addr], TrapMode::Long)
         .unwrap();
 
     // The CPU is seated on the dispatcher with RSP → CONTEXT, no return pushed.
@@ -103,7 +103,8 @@ fn deliver_bp_reports_rip_plus_one() {
     cpu.rip = int3_rip + 1;
     cpu.set_rsp(old_rsp);
 
-    os.deliver_hw_exception(&mut cpu, &mut mem, NTDLL_BASE, 0x8000_0003, int3_rip + 1, &[]).unwrap();
+    os.deliver_hw_exception(&mut cpu, &mut mem, NTDLL_BASE, 0x8000_0003, int3_rip + 1, &[], TrapMode::Long)
+        .unwrap();
 
     let new_rsp = (old_rsp - 0x5C0) & !0xF;
     assert_eq!(mem.read_u64(new_rsp + CTX_RIP).unwrap(), int3_rip + 1, "CONTEXT.Rip = int3 rip + 1");
@@ -139,7 +140,7 @@ fn delivered_context_round_trips_through_nt_continue() {
     faulted.set_rsp(old_rsp);
     faulted.set_reg(Reg::Rbx, 0xB16B_00B5);
     faulted.rflags = flags::RESERVED_ONE | flags::CF;
-    os.deliver_hw_exception(&mut faulted, &mut mem, NTDLL_BASE, 0xC000_0005, landing, &[0, landing])
+    os.deliver_hw_exception(&mut faulted, &mut mem, NTDLL_BASE, 0xC000_0005, landing, &[0, landing], TrapMode::Long)
         .unwrap();
     let new_rsp = (old_rsp - 0x5C0) & !0xF;
     assert_eq!(faulted.rsp(), new_rsp);
