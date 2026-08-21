@@ -107,9 +107,19 @@ ok "binary present: $BIN"
 # ---------------------------------------------------------------------------
 # Version, from the single source of truth (Cargo.toml's [workspace.package])
 # ---------------------------------------------------------------------------
-VERSION=$(sed -n '/^\[workspace\.package\]/,/^\[/{
-  /^version[[:space:]]*=/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }
-}' Cargo.toml | head -1)
+# NOTE: awk, not sed. The obvious `sed -n '/range/{/x/{s//y/p}}'` form is a GNU
+# extension; BSD sed (which is what macOS ships, and this is a macOS-only
+# script) rejects the nested block with "bad flag in substitute command".
+VERSION=$(awk '
+  /^\[workspace\.package\]/ { in_section = 1; next }
+  /^\[/                     { in_section = 0 }
+  in_section && /^version[[:space:]]*=/ {
+    if (match($0, /"[^"]*"/)) {
+      print substr($0, RSTART + 1, RLENGTH - 2)
+      exit
+    }
+  }
+' Cargo.toml)
 if [ -z "$VERSION" ]; then
   bad "could not read the workspace version out of Cargo.toml"
   exit 1
