@@ -85,14 +85,14 @@ impl Mode {
 
 const R_STATE: u32 = 19; // *mut CpuState
 const R_CTX: u32 = 20; // *mut BlockCtx
-const R_FLAGS: u32 = 21; // live rflags
+const R_FLAGS: u32 = 21; // rflags — as of *before* any pending flag operation
 const R_PARITY: u32 = 22; // parity table base
-const R_MASK: u32 = 23; // 0x8D5 = CF|PF|AF|ZF|SF|OF
-const R_NEWF: u32 = 24; // rflags being computed for the current instruction
-const R_VAL: u32 = 25; // result of the current instruction
-const R_A: u32 = 26; // first operand (survives helper calls)
-const R_B: u32 = 27; // second operand (survives helper calls)
-const R_ADDR: u32 = 28; // effective address (survives helper calls)
+const R_FA: u32 = 23; // pending flag operand a (survives helper calls)
+const R_FB: u32 = 24; // pending flag operand b (survives helper calls)
+const R_FR: u32 = 25; // pending flag result — also the ALU result
+const R_VAL: u32 = 26; // value to store / commit (survives helper calls)
+const R_ADDR: u32 = 27; // effective address (survives helper calls)
+const R_MASK: u32 = 28; // 0x8D5 = CF|PF|AF|ZF|SF|OF
 
 /// Scratch registers, dead across any helper call.
 const T0: u32 = 9;
@@ -306,8 +306,38 @@ impl Alu {
 #[derive(Clone, Copy)]
 enum Commit {
     None,
+    /// `rflags = R_FA` — the eagerly-computed flags of a shift, which have to
+    /// survive the store call before they may be committed.
     Flags,
     Gpr { idx: u8, size: u8, has_rex: bool },
+}
+
+/// The flag state at a point in the emitted code (roadmap W8.4).
+///
+/// Computing x86's six status flags eagerly costs ~16 ARM64 instructions per ALU
+/// operation, and the overwhelming majority of those results are dead: pointer
+/// arithmetic, index updates and the `add`/`sub` inside an addressing sequence
+/// have their flags overwritten by the *next* flag-writing instruction without
+/// anything ever reading them. So an ALU instruction emits only its **result**
+/// and records here how its flags could be derived; the derivation is emitted at
+/// the first point that can observe them, and never at all when a later
+/// instruction supersedes it first.
+///
+/// The invariant that makes this exact: while a state other than [`Flags::Live`]
+/// is outstanding, `R_FLAGS` holds the architectural `rflags` from *before* that
+/// operation, and `R_FA`/`R_FB`/`R_FR` hold its masked operands and result. So
+/// materialising is always `R_FLAGS = (R_FLAGS & !defined) | computed` — which
+/// is also why the flags an operation leaves *undefined* (INC/DEC's CF) come out
+/// right for free.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Flags {
+    /// `R_FLAGS` is the architectural `rflags`; nothing is pending.
+    Live,
+    /// An ADD/SUB-shaped result is pending. `keep_cf` marks INC/DEC, which
+    /// define every status flag except CF.
+    Arith { size: u8, sub: bool, keep_cf: bool },
+    /// AND/OR/XOR/TEST: CF, OF and AF are cleared, SF/ZF/PF come from `R_FR`.
+    Logic { size: u8 },
 }
 
 /// A deferred fault exit (rewind to the start of instruction `retired`).
@@ -315,6 +345,9 @@ struct FaultStub {
     label: Label,
     retired: u32,
     rip: u64,
+    /// The flag state as of the *start* of the faulting instruction — what the
+    /// rewound state must show.
+    flags: Flags,
 }
 
 /// A deferred "the store completed but landed in code" exit.
@@ -324,6 +357,10 @@ struct StoreStub {
     rip: u64,
     next_rip: u64,
     commit: Commit,
+    /// Flag state as of the start of this instruction (the rewind path) …
+    before: Flags,
+    /// … and as of after it (the "committed, now stop" path).
+    after: Flags,
 }
 
 /// The block being built.
@@ -334,6 +371,15 @@ pub struct Compiler {
     insns: u32,
     /// Guest address of the instruction being compiled.
     rip: u64,
+    /// Flag state right here in the emitted stream.
+    flags: Flags,
+    /// Flag state as of the start of the instruction being lowered. A faulting
+    /// access rewinds to exactly that point, so its stub must restore this one
+    /// rather than whatever the instruction has computed so far.
+    insn_flags: Flags,
+    /// Whether the instruction being lowered should leave its flags pending.
+    /// Purely a cost decision — either answer is correct.
+    defer: bool,
     fault_stubs: Vec<FaultStub>,
     store_stubs: Vec<StoreStub>,
     /// Branches to the shared epilogue.
@@ -354,6 +400,9 @@ impl Compiler {
             mode,
             insns: 0,
             rip: start,
+            flags: Flags::Live,
+            insn_flags: Flags::Live,
+            defer: false,
             fault_stubs: Vec::new(),
             store_stubs: Vec::new(),
             exits: Vec::new(),
@@ -389,6 +438,10 @@ impl Compiler {
                 }
             };
             let next = rip.wrapping_add(insn.len as u64) & mode.addr_mask();
+            // Deferring this instruction's flags only pays when a later one
+            // overwrites them first (roadmap W8.4); either answer is correct.
+            c.defer = flag_effect(&insn) != FlagEffect::Neutral
+                && defer_pays(mem, mode, next, DEFER_SCAN);
             match c.lower(&insn, next) {
                 Lowered::Ok => {
                     c.insns += 1;
@@ -410,7 +463,7 @@ impl Compiler {
         let insns = c.insns;
         // Fallthrough exit: rip = end of the block, no fault.
         if stop != StopReason::Terminator {
-            c.exit_to(end_rip, insns as u64);
+            c.exit_to(c.flags, end_rip, insns as u64);
         }
         c.emit_stubs();
         c.epilogue();
@@ -458,8 +511,12 @@ impl Compiler {
         a.ret();
     }
 
-    /// Leave the block: store `rip`, set the return value, jump to the epilogue.
-    fn exit_to(&mut self, rip: u64, ret: u64) {
+    /// Leave the block: settle `flags`, store `rip`, set the return value, jump
+    /// to the epilogue. The flag state is passed in rather than taken from
+    /// `self` because a stub exits with the state of the point it rewinds to,
+    /// not the state of the emission cursor.
+    fn exit_to(&mut self, flags: Flags, rip: u64, ret: u64) {
+        self.emit_flags(flags);
         self.asm.mov_imm64(T0, rip);
         self.asm.str(8, T0, R_STATE, st::RIP);
         self.asm.mov_imm64(0, ret);
@@ -475,14 +532,14 @@ impl Compiler {
             self.asm.subs_imm(true, ZR, 0, status::FAULT as u32, false);
             let is_fault = self.asm.b_cond_forward(Cond::Eq);
             self.emit_commit(s.commit);
-            self.exit_to(s.next_rip, (s.retired + 1) as u64);
+            self.exit_to(s.after, s.next_rip, (s.retired + 1) as u64);
             self.asm.bind(is_fault);
-            self.exit_to(s.rip, s.retired as u64 | RET_FAULT);
+            self.exit_to(s.before, s.rip, s.retired as u64 | RET_FAULT);
         }
         let faults = std::mem::take(&mut self.fault_stubs);
         for f in faults {
             self.asm.bind(f.label);
-            self.exit_to(f.rip, f.retired as u64 | RET_FAULT);
+            self.exit_to(f.flags, f.rip, f.retired as u64 | RET_FAULT);
         }
     }
 
@@ -580,7 +637,14 @@ impl Compiler {
         self.asm.ldr(8, T0, R_CTX, ctx_off::READ);
         self.asm.blr(T0);
         let l = self.asm.cbnz_forward(true, 1);
-        self.fault_stubs.push(FaultStub { label: l, retired: self.insns, rip: self.rip });
+        self.fault_stubs.push(FaultStub {
+            label: l,
+            retired: self.insns,
+            rip: self.rip,
+            flags: self.insn_flags,
+        });
+        // The fault branch is taken *before* this write, so `dst` may be one of
+        // the pending flag registers without disturbing the rewind path.
         self.asm.mov_reg(true, dst, 0);
     }
 
@@ -600,6 +664,8 @@ impl Compiler {
             rip: self.rip,
             next_rip,
             commit,
+            before: self.insn_flags,
+            after: self.flags,
         });
         self.emit_commit(commit);
     }
@@ -607,7 +673,7 @@ impl Compiler {
     fn emit_commit(&mut self, c: Commit) {
         match c {
             Commit::None => {}
-            Commit::Flags => self.asm.mov_reg(true, R_FLAGS, R_NEWF),
+            Commit::Flags => self.asm.mov_reg(true, R_FLAGS, R_FA),
             Commit::Gpr { idx, size, has_rex } => self.store_gpr(R_VAL, idx, size, has_rex),
         }
     }
@@ -623,86 +689,211 @@ impl Compiler {
 
     // ---- flags ------------------------------------------------------------
 
-    /// SF/ZF/PF from the masked result in `res`, ORed into [`R_NEWF`].
-    fn flags_szp(&mut self, res: u32, size: u8) {
+    /// SF/ZF/PF from the masked result in `res`, ORed into `dst`.
+    fn flags_szp_into(&mut self, dst: u32, res: u32, size: u8) {
         let bits = size as u32 * 8;
         self.asm.subs_imm(true, ZR, res, 0, false); // cmp res, #0
         self.asm.cset(true, T3, Cond::Eq);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_ZF);
+        self.asm.orr_reg(true, dst, dst, T3, F_ZF);
         self.asm.ubfx(true, T3, res, bits - 1, 1);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_SF);
+        self.asm.orr_reg(true, dst, dst, T3, F_SF);
         let ok = self.asm.and_imm(true, T3, res, 0xff);
         debug_assert!(ok);
         self.asm.ldrb_reg(T3, R_PARITY, T3);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_PF);
+        self.asm.orr_reg(true, dst, dst, T3, F_PF);
     }
 
-    /// `a op b` for ADD/SUB, with the full x86 flag set into [`R_NEWF`] and the
-    /// masked result into [`R_VAL`].
-    ///
-    /// Sub-64-bit widths are handled by shifting both operands up so the sign
-    /// bit lands in bit 63: then ARM's N/Z/C/V are exactly x86's SF/ZF/CF/OF for
-    /// that width, with no extra masking.
-    fn emit_addsub(&mut self, a: u32, b: u32, size: u8, is_sub: bool) {
-        let bits = size as u32 * 8;
-        match size {
-            8 => {
-                if is_sub {
-                    self.asm.subs_reg(true, R_VAL, a, b, 0);
-                } else {
-                    self.asm.adds_reg(true, R_VAL, a, b, 0);
-                }
+    /// Fold `flags` into [`R_FLAGS`], leaving it architecturally correct.
+    /// Emits nothing for [`Flags::Live`] — which is the whole point: most
+    /// pending states are superseded before any of this is ever reached.
+    fn emit_flags(&mut self, flags: Flags) {
+        match flags {
+            Flags::Live => {}
+            Flags::Logic { size } => {
+                // CF, OF and AF are all cleared by a logic operation.
+                self.asm.bic_reg(true, R_FLAGS, R_FLAGS, R_MASK, 0);
+                self.flags_szp_into(R_FLAGS, R_FR, size);
             }
-            4 => {
-                if is_sub {
-                    self.asm.subs_reg(false, R_VAL, a, b, 0);
+            Flags::Arith { size, sub, keep_cf } => {
+                // Re-derive NZCV with one compare of the saved operands: then
+                // ARM's C and V *are* x86's CF and OF for this width. Widths
+                // below 32 bits are shifted up so the sign bit lands in bit 63.
+                match size {
+                    8 => {
+                        if sub {
+                            self.asm.subs_reg(true, ZR, R_FA, R_FB, 0);
+                        } else {
+                            self.asm.adds_reg(true, ZR, R_FA, R_FB, 0);
+                        }
+                    }
+                    4 => {
+                        if sub {
+                            self.asm.subs_reg(false, ZR, R_FA, R_FB, 0);
+                        } else {
+                            self.asm.adds_reg(false, ZR, R_FA, R_FB, 0);
+                        }
+                    }
+                    _ => {
+                        let sh = 64 - size as u32 * 8;
+                        self.asm.lsl_imm(true, T0, R_FA, sh);
+                        self.asm.lsl_imm(true, T1, R_FB, sh);
+                        if sub {
+                            self.asm.subs_reg(true, ZR, T0, T1, 0);
+                        } else {
+                            self.asm.adds_reg(true, ZR, T0, T1, 0);
+                        }
+                    }
+                }
+                // NZCV is live from here to the last `cset`; `mov`, `bic`,
+                // `orr`, `eor` and `ubfx` do not disturb it.
+                if keep_cf {
+                    self.asm.mov_imm64(T2, ARITH_MASK & !(1 << F_CF));
+                    self.asm.bic_reg(true, R_FLAGS, R_FLAGS, T2, 0);
                 } else {
-                    self.asm.adds_reg(false, R_VAL, a, b, 0);
+                    self.asm.bic_reg(true, R_FLAGS, R_FLAGS, R_MASK, 0);
+                    self.asm.cset(true, T3, if sub { Cond::Cc } else { Cond::Cs });
+                    self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_CF);
+                }
+                self.asm.cset(true, T3, Cond::Vs);
+                self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_OF);
+                // AF = (a ^ b ^ result) bit 4, from the masked operands.
+                self.asm.eor_reg(true, T3, R_FA, R_FB, 0);
+                self.asm.eor_reg(true, T3, T3, R_FR, 0);
+                self.asm.ubfx(true, T3, T3, 4, 1);
+                self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_AF);
+                self.flags_szp_into(R_FLAGS, R_FR, size);
+            }
+        }
+    }
+
+    /// Settle whatever is pending, so `R_FLAGS` may be read (or the pending
+    /// registers reused).
+    ///
+    /// Only ever called **before** the current instruction's memory accesses —
+    /// which is what lets it also declare the instruction-start state settled,
+    /// and therefore what lets that instruction's fault stubs emit nothing.
+    fn materialize(&mut self) {
+        if self.flags != Flags::Live {
+            self.emit_flags(self.flags);
+            self.flags = Flags::Live;
+        }
+        self.insn_flags = Flags::Live;
+    }
+
+    /// `R_FR = R_FA ∓ R_FB`, masked to `size`. Flags are only *recorded*.
+    fn emit_arith_value(&mut self, size: u8, sub: bool) {
+        match size {
+            8 | 4 => {
+                let sf = size == 8;
+                if sub {
+                    self.asm.sub_reg(sf, R_FR, R_FA, R_FB, 0);
+                } else {
+                    self.asm.add_reg(sf, R_FR, R_FA, R_FB, 0);
                 }
             }
             _ => {
-                let sh = 64 - bits;
-                self.asm.lsl_imm(true, T0, a, sh);
-                self.asm.lsl_imm(true, T1, b, sh);
-                if is_sub {
-                    self.asm.subs_reg(true, R_VAL, T0, T1, 0);
+                if sub {
+                    self.asm.sub_reg(true, R_FR, R_FA, R_FB, 0);
                 } else {
-                    self.asm.adds_reg(true, R_VAL, T0, T1, 0);
+                    self.asm.add_reg(true, R_FR, R_FA, R_FB, 0);
                 }
-                self.asm.lsr_imm(true, R_VAL, R_VAL, sh);
+                self.mask_to(R_FR, size);
             }
         }
-        // NZCV is live here; `bic` and `cset` do not disturb it.
-        self.asm.bic_reg(true, R_NEWF, R_FLAGS, R_MASK, 0);
-        self.asm.cset(true, T3, if is_sub { Cond::Cc } else { Cond::Cs });
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_CF);
-        self.asm.cset(true, T3, Cond::Vs);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_OF);
-        // AF = (a ^ b ^ result) bit 4, from the *unshifted* masked operands.
-        self.asm.eor_reg(true, T3, a, b, 0);
-        self.asm.eor_reg(true, T3, T3, R_VAL, 0);
-        self.asm.ubfx(true, T3, T3, 4, 1);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_AF);
-        self.flags_szp(R_VAL, size);
     }
 
-    /// AND/OR/XOR: result into [`R_VAL`], flags into [`R_NEWF`] (CF/OF/AF cleared).
-    fn emit_logic(&mut self, a: u32, b: u32, size: u8, op: Alu) {
-        match op {
-            Alu::And => self.asm.and_reg(true, R_VAL, a, b, 0),
-            Alu::Or => self.asm.orr_reg(true, R_VAL, a, b, 0),
-            _ => self.asm.eor_reg(true, R_VAL, a, b, 0),
+    /// One of the six compiled ALU operations, `R_FA` op `R_FB` → `R_FR`.
+    ///
+    /// Deferring is only *free* when a later instruction in this block
+    /// overwrites the flags first — settling later costs one instruction more
+    /// than computing now, because the operation has to be repeated to get
+    /// NZCV back. `self.defer` carries that decision, taken by scanning
+    /// forward from the next instruction ([`defer_pays`]).
+    fn emit_alu(&mut self, op: Alu, size: u8) {
+        if self.defer {
+            match op {
+                Alu::Add => {
+                    self.emit_arith_value(size, false);
+                    self.flags = Flags::Arith { size, sub: false, keep_cf: false };
+                }
+                Alu::Sub | Alu::Cmp => {
+                    self.emit_arith_value(size, true);
+                    self.flags = Flags::Arith { size, sub: true, keep_cf: false };
+                }
+                _ => {
+                    self.emit_logic_value(op);
+                    self.flags = Flags::Logic { size };
+                }
+            }
+            return;
         }
-        self.asm.bic_reg(true, R_NEWF, R_FLAGS, R_MASK, 0);
-        self.flags_szp(R_VAL, size);
+        match op {
+            Alu::Add | Alu::Sub | Alu::Cmp => self.emit_arith_eager(size, op != Alu::Add, false),
+            _ => {
+                self.emit_logic_value(op);
+                self.asm.bic_reg(true, R_FLAGS, R_FLAGS, R_MASK, 0);
+                self.flags_szp_into(R_FLAGS, R_FR, size);
+                self.flags = Flags::Live;
+            }
+        }
     }
 
-    /// One of the six compiled ALU operations, `a` op `b`.
-    fn emit_alu(&mut self, op: Alu, a: u32, b: u32, size: u8) {
+    /// `R_FR = R_FA ∓ R_FB` **and** the flags it defines, straight into
+    /// `R_FLAGS` — NZCV comes from the operation itself rather than from a
+    /// repeat of it, which is what makes this one instruction cheaper than
+    /// deferring plus settling. `keep_cf` is INC/DEC.
+    fn emit_arith_eager(&mut self, size: u8, sub: bool, keep_cf: bool) {
+        // Sub-64-bit widths are handled by shifting both operands up so the
+        // sign bit lands in bit 63: then ARM's N/Z/C/V are exactly x86's
+        // SF/ZF/CF/OF for that width, with no extra masking.
+        match size {
+            8 | 4 => {
+                let sf = size == 8;
+                if sub {
+                    self.asm.subs_reg(sf, R_FR, R_FA, R_FB, 0);
+                } else {
+                    self.asm.adds_reg(sf, R_FR, R_FA, R_FB, 0);
+                }
+            }
+            _ => {
+                let sh = 64 - size as u32 * 8;
+                self.asm.lsl_imm(true, T0, R_FA, sh);
+                self.asm.lsl_imm(true, T1, R_FB, sh);
+                if sub {
+                    self.asm.subs_reg(true, R_FR, T0, T1, 0);
+                } else {
+                    self.asm.adds_reg(true, R_FR, T0, T1, 0);
+                }
+                self.asm.lsr_imm(true, R_FR, R_FR, sh);
+            }
+        }
+        // NZCV is live here; `mov`, `bic`, `orr`, `eor` and `ubfx` leave it be.
+        if keep_cf {
+            self.asm.mov_imm64(T2, ARITH_MASK & !(1 << F_CF));
+            self.asm.bic_reg(true, R_FLAGS, R_FLAGS, T2, 0);
+        } else {
+            self.asm.bic_reg(true, R_FLAGS, R_FLAGS, R_MASK, 0);
+            self.asm.cset(true, T3, if sub { Cond::Cc } else { Cond::Cs });
+            self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_CF);
+        }
+        self.asm.cset(true, T3, Cond::Vs);
+        self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_OF);
+        // AF = (a ^ b ^ result) bit 4, from the *unshifted* masked operands.
+        self.asm.eor_reg(true, T3, R_FA, R_FB, 0);
+        self.asm.eor_reg(true, T3, T3, R_FR, 0);
+        self.asm.ubfx(true, T3, T3, 4, 1);
+        self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_AF);
+        self.flags_szp_into(R_FLAGS, R_FR, size);
+        self.flags = Flags::Live;
+    }
+
+    /// `R_FR = R_FA op R_FB` for AND/OR/XOR. The operands are already masked,
+    /// so a 64-bit operation leaves a result that is masked too.
+    fn emit_logic_value(&mut self, op: Alu) {
         match op {
-            Alu::Add => self.emit_addsub(a, b, size, false),
-            Alu::Sub | Alu::Cmp => self.emit_addsub(a, b, size, true),
-            Alu::And | Alu::Or | Alu::Xor => self.emit_logic(a, b, size, op),
+            Alu::And => self.asm.and_reg(true, R_FR, R_FA, R_FB, 0),
+            Alu::Or => self.asm.orr_reg(true, R_FR, R_FA, R_FB, 0),
+            _ => self.asm.eor_reg(true, R_FR, R_FA, R_FB, 0),
         }
     }
 
@@ -986,6 +1177,107 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
     Some(Insn { pfx, opcode, esc, reg, rm, imm, len })
 }
 
+/// What an instruction does to the six status flags, as far as the deferral
+/// decision cares.
+///
+/// Only ever consulted to choose between two *equally correct* lowerings, so a
+/// misclassification costs instructions and never meaning. Everything the
+/// classifier does not recognise — including every instruction the compiler
+/// declines, which ends the block — answers [`FlagEffect::Reads`], the
+/// conservative side.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlagEffect {
+    /// Leaves every status flag alone, and reads none of them.
+    Neutral,
+    /// Defines all six from its own operands, reading none — this is what makes
+    /// an earlier flag computation dead.
+    Overwrites,
+    /// Reads them, or defines only some of them (which amounts to the same
+    /// thing: the bits it does not define have to be there already).
+    Reads,
+}
+
+fn flag_effect(insn: &Insn) -> FlagEffect {
+    if insn.esc {
+        return match insn.opcode {
+            0x1F | 0xB6 | 0xB7 | 0xBE | 0xBF => FlagEffect::Neutral,
+            _ => FlagEffect::Reads,
+        };
+    }
+    match insn.opcode {
+        // The regular ALU family; `adc`/`sbb` (forms 2 and 3) read CF.
+        0x00..=0x3D if insn.opcode & 7 < 6 => match Alu::from_op(insn.opcode >> 3) {
+            Some(_) => FlagEffect::Overwrites,
+            None => FlagEffect::Reads,
+        },
+        // 32-bit INC/DEC preserve CF (and in 64-bit mode these bytes are a REX
+        // prefix followed by something this compiler declines).
+        0x40..=0x4F => FlagEffect::Reads,
+        0x50..=0x5F | 0x63 | 0x88..=0x8B | 0x8D | 0x90 | 0xB0..=0xBF => FlagEffect::Neutral,
+        0xC6 | 0xC7 => FlagEffect::Neutral,
+        0x80 | 0x81 | 0x83 => match Alu::from_op(insn.reg & 7) {
+            Some(_) => FlagEffect::Overwrites,
+            None => FlagEffect::Reads,
+        },
+        0x84 | 0x85 | 0xA8 | 0xA9 => FlagEffect::Overwrites,
+        // group 3: /0,/1 test → overwrites; /2 not → neutral; /3 neg →
+        // overwrites; mul/div are not compiled at all.
+        0xF6 | 0xF7 => match insn.reg & 7 {
+            0 | 1 | 3 => FlagEffect::Overwrites,
+            2 => FlagEffect::Neutral,
+            _ => FlagEffect::Reads,
+        },
+        _ => FlagEffect::Reads,
+    }
+}
+
+/// Would an [`FlagEffect::Overwrites`] instruction have to settle a pending
+/// state before it could run? A memory *destination* would: by the time its
+/// store can fault, the pending registers hold its own operands.
+fn overwriter_settles(insn: &Insn) -> bool {
+    if insn.esc || !matches!(insn.rm, Rm::Mem(_)) {
+        return false;
+    }
+    match insn.opcode {
+        0x00..=0x3D if insn.opcode & 7 < 2 => {
+            Alu::from_op(insn.opcode >> 3).is_some_and(|o| o.writes_back())
+        }
+        0x80 | 0x81 | 0x83 => Alu::from_op(insn.reg & 7).is_some_and(|o| o.writes_back()),
+        0xF6 | 0xF7 => insn.reg & 7 == 3, // neg
+        _ => false,
+    }
+}
+
+/// How far ahead the deferral scan looks. Long enough to see across an
+/// addressing sequence, short enough that compiling stays cheap.
+const DEFER_SCAN: u32 = 12;
+
+/// Does leaving this instruction's flags pending actually pay?
+///
+/// It does exactly when some later instruction in this block overwrites all six
+/// status flags before anything can read them — then the computation is skipped
+/// outright. Otherwise settling later costs one instruction *more* than
+/// computing now (the operation has to be repeated to recover NZCV), so the
+/// answer is no.
+fn defer_pays(mem: &dyn Memory, mode: Mode, mut rip: u64, budget: u32) -> bool {
+    for _ in 0..budget {
+        let mut window = [0u8; 16];
+        if mem.fetch(rip, &mut window).is_err() {
+            return false;
+        }
+        let Some(insn) = decode(&window, mode, rip) else {
+            return false;
+        };
+        match flag_effect(&insn) {
+            FlagEffect::Overwrites => return !overwriter_settles(&insn),
+            FlagEffect::Reads => return false,
+            FlagEffect::Neutral => {}
+        }
+        rip = rip.wrapping_add(insn.len as u64) & mode.addr_mask();
+    }
+    false
+}
+
 impl Compiler {
     fn opsize(&self, p: &Pfx) -> u8 {
         if self.mode.is64() && p.w() {
@@ -1001,6 +1293,9 @@ impl Compiler {
     fn lower(&mut self, insn: &Insn, next: u64) -> Lowered {
         let p = insn.pfx;
         let has_rex = p.has_rex;
+        // A faulting access rewinds to here, so this is the flag state every
+        // stub of this instruction has to restore.
+        self.insn_flags = self.flags;
         if insn.esc {
             return self.lower_0f(insn, next);
         }
@@ -1015,12 +1310,13 @@ impl Compiler {
                 match form {
                     0 | 1 => {
                         // dst = r/m, src = reg
+                        self.settle_for_rm_dest(&insn.rm, op);
                         if let Rm::Mem(m) = insn.rm {
                             self.emit_addr(&m);
                         }
-                        self.read_rm(&insn.rm, R_A, size, has_rex);
-                        self.load_gpr(R_B, insn.reg, size, has_rex);
-                        self.emit_alu(op, R_A, R_B, size);
+                        self.read_rm(&insn.rm, R_FA, size, has_rex);
+                        self.load_gpr(R_FB, insn.reg, size, has_rex);
+                        self.emit_alu(op, size);
                         self.finish_rm_dest(insn, op, size, has_rex, next)
                     }
                     2 | 3 => {
@@ -1028,23 +1324,21 @@ impl Compiler {
                         if let Rm::Mem(m) = insn.rm {
                             self.emit_addr(&m);
                         }
-                        self.read_rm(&insn.rm, R_B, size, has_rex);
-                        self.load_gpr(R_A, insn.reg, size, has_rex);
-                        self.emit_alu(op, R_A, R_B, size);
-                        self.asm.mov_reg(true, R_FLAGS, R_NEWF);
+                        self.read_rm(&insn.rm, R_FB, size, has_rex);
+                        self.load_gpr(R_FA, insn.reg, size, has_rex);
+                        self.emit_alu(op, size);
                         if op.writes_back() {
-                            self.store_gpr(R_VAL, insn.reg, size, has_rex);
+                            self.store_gpr(R_FR, insn.reg, size, has_rex);
                         }
                         Lowered::Ok
                     }
                     _ => {
                         // dst = al/eax, src = imm
-                        self.load_gpr(R_A, 0, size, has_rex);
-                        self.asm.mov_imm64(R_B, insn.imm & mask_of(size));
-                        self.emit_alu(op, R_A, R_B, size);
-                        self.asm.mov_reg(true, R_FLAGS, R_NEWF);
+                        self.load_gpr(R_FA, 0, size, has_rex);
+                        self.asm.mov_imm64(R_FB, insn.imm & mask_of(size));
+                        self.emit_alu(op, size);
                         if op.writes_back() {
-                            self.store_gpr(R_VAL, 0, size, has_rex);
+                            self.store_gpr(R_FR, 0, size, has_rex);
                         }
                         Lowered::Ok
                     }
@@ -1055,10 +1349,10 @@ impl Compiler {
             0x40..=0x4F if !self.mode.is64() => {
                 let r = insn.opcode & 7;
                 let size = self.opsize(&p);
-                self.load_gpr(R_A, r, size, has_rex);
+                self.materialize();
+                self.load_gpr(R_FA, r, size, has_rex);
                 self.emit_incdec(size, insn.opcode < 0x48);
-                self.asm.mov_reg(true, R_FLAGS, R_NEWF);
-                self.store_gpr(R_VAL, r, size, has_rex);
+                self.store_gpr(R_FR, r, size, has_rex);
                 Lowered::Ok
             }
 
@@ -1069,13 +1363,12 @@ impl Compiler {
                 // Value first (a `push rsp` pushes the *old* rsp), then the new
                 // stack pointer; rsp is only committed once the store succeeds.
                 self.asm.ldr(8, R_VAL, R_STATE, gpr_off(r));
-                self.asm.ldr(8, R_A, R_STATE, gpr_off(4));
-                self.asm.sub_imm(true, R_ADDR, R_A, w as u32, false);
+                self.asm.ldr(8, T0, R_STATE, gpr_off(4));
+                self.asm.sub_imm(true, R_ADDR, T0, w as u32, false);
                 if !self.mode.is64() {
                     let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
                     debug_assert!(ok);
                 }
-                self.asm.mov_reg(true, R_A, R_ADDR); // keep the new rsp
                 self.emit_store_push(w, next);
                 Lowered::Ok
             }
@@ -1108,8 +1401,8 @@ impl Compiler {
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                self.read_rm(&insn.rm, R_A, 4, has_rex);
-                self.asm.sbfx(true, R_VAL, R_A, 0, 32);
+                self.read_rm(&insn.rm, R_VAL, 4, has_rex);
+                self.asm.sbfx(true, R_VAL, R_VAL, 0, 32);
                 self.mask_to(R_VAL, size);
                 self.store_gpr(R_VAL, insn.reg, size, has_rex);
                 Lowered::Ok
@@ -1118,13 +1411,13 @@ impl Compiler {
             // ---- IMUL r, r/m, imm ---------------------------------------
             0x69 | 0x6B => {
                 let size = self.opsize(&p);
+                self.materialize();
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                self.read_rm(&insn.rm, R_A, size, has_rex);
-                self.asm.mov_imm64(R_B, insn.imm & mask_of(size));
+                self.read_rm(&insn.rm, R_FA, size, has_rex);
+                self.asm.mov_imm64(R_FB, insn.imm & mask_of(size));
                 self.emit_imul(size);
-                self.asm.mov_reg(true, R_FLAGS, R_NEWF);
                 self.store_gpr(R_VAL, insn.reg, size, has_rex);
                 Lowered::Ok
             }
@@ -1141,12 +1434,13 @@ impl Compiler {
                 let Some(op) = Alu::from_op(insn.reg & 7) else {
                     return Lowered::Unsupported;
                 };
+                self.settle_for_rm_dest(&insn.rm, op);
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                self.read_rm(&insn.rm, R_A, size, has_rex);
-                self.asm.mov_imm64(R_B, insn.imm & mask_of(size));
-                self.emit_alu(op, R_A, R_B, size);
+                self.read_rm(&insn.rm, R_FA, size, has_rex);
+                self.asm.mov_imm64(R_FB, insn.imm & mask_of(size));
+                self.emit_alu(op, size);
                 self.finish_rm_dest(insn, op, size, has_rex, next)
             }
 
@@ -1156,10 +1450,9 @@ impl Compiler {
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                self.read_rm(&insn.rm, R_A, size, has_rex);
-                self.load_gpr(R_B, insn.reg, size, has_rex);
-                self.emit_logic(R_A, R_B, size, Alu::And);
-                self.asm.mov_reg(true, R_FLAGS, R_NEWF);
+                self.read_rm(&insn.rm, R_FA, size, has_rex);
+                self.load_gpr(R_FB, insn.reg, size, has_rex);
+                self.emit_alu(Alu::And, size);
                 Lowered::Ok
             }
 
@@ -1210,10 +1503,9 @@ impl Compiler {
             // ---- TEST al/eax, imm ---------------------------------------
             0xA8 | 0xA9 => {
                 let size = if insn.opcode == 0xA8 { 1 } else { self.opsize(&p) };
-                self.load_gpr(R_A, 0, size, has_rex);
-                self.asm.mov_imm64(R_B, insn.imm & mask_of(size));
-                self.emit_logic(R_A, R_B, size, Alu::And);
-                self.asm.mov_reg(true, R_FLAGS, R_NEWF);
+                self.load_gpr(R_FA, 0, size, has_rex);
+                self.asm.mov_imm64(R_FB, insn.imm & mask_of(size));
+                self.emit_alu(Alu::And, size);
                 Lowered::Ok
             }
 
@@ -1264,7 +1556,8 @@ impl Compiler {
             // ---- JMP rel -------------------------------------------------
             0xE9 | 0xEB => {
                 let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
-                self.exit_to(target, (self.insns + 1) as u64);
+                let f = self.flags;
+                self.exit_to(f, target, (self.insns + 1) as u64);
                 Lowered::Terminated
             }
 
@@ -1277,8 +1570,8 @@ impl Compiler {
                         if let Rm::Mem(m) = insn.rm {
                             self.emit_addr(&m);
                         }
-                        self.read_rm(&insn.rm, R_A, size, has_rex);
-                        self.asm.mvn(true, R_VAL, R_A);
+                        self.read_rm(&insn.rm, R_VAL, size, has_rex);
+                        self.asm.mvn(true, R_VAL, R_VAL);
                         self.mask_to(R_VAL, size);
                         match insn.rm {
                             Rm::Reg(i) => {
@@ -1293,12 +1586,13 @@ impl Compiler {
                     }
                     3 => {
                         // NEG — 0 - v, full arithmetic flags.
+                        self.settle_for_rm_dest(&insn.rm, Alu::Sub);
                         if let Rm::Mem(m) = insn.rm {
                             self.emit_addr(&m);
                         }
-                        self.read_rm(&insn.rm, R_B, size, has_rex);
-                        self.asm.mov_imm64(R_A, 0);
-                        self.emit_addsub(R_A, R_B, size, true);
+                        self.read_rm(&insn.rm, R_FB, size, has_rex);
+                        self.asm.mov_imm64(R_FA, 0);
+                        self.emit_alu(Alu::Sub, size);
                         self.finish_rm_dest(insn, Alu::Sub, size, has_rex, next)
                     }
                     _ => Lowered::Unsupported,
@@ -1312,19 +1606,19 @@ impl Compiler {
                     return Lowered::Unsupported; // call/jmp/push r/m
                 }
                 let size = if insn.opcode == 0xFE { 1 } else { self.opsize(&p) };
+                self.materialize();
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                self.read_rm(&insn.rm, R_A, size, has_rex);
+                self.read_rm(&insn.rm, R_FA, size, has_rex);
                 self.emit_incdec(size, sub == 0);
                 match insn.rm {
                     Rm::Reg(i) => {
-                        self.asm.mov_reg(true, R_FLAGS, R_NEWF);
-                        self.store_gpr(R_VAL, i, size, has_rex);
+                        self.store_gpr(R_FR, i, size, has_rex);
                         Lowered::Ok
                     }
                     Rm::Mem(_) => {
-                        self.emit_store(R_VAL, size, Commit::Flags, next);
+                        self.emit_store(R_FR, size, Commit::None, next);
                         Lowered::Ok
                     }
                 }
@@ -1343,16 +1637,18 @@ impl Compiler {
             // CMOVcc
             0x40..=0x4F => {
                 let size = self.opsize(&p);
+                self.materialize();
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                self.read_rm(&insn.rm, R_A, size, has_rex);
-                self.load_gpr(R_B, insn.reg, size, has_rex);
+                // `R_FA` is free once the pending state is settled above.
+                self.read_rm(&insn.rm, R_FA, size, has_rex);
+                self.load_gpr(R_VAL, insn.reg, size, has_rex);
                 self.emit_cond_value(insn.opcode & 0xF, T0);
                 self.asm.subs_imm(true, ZR, T0, 0, false);
                 // The destination is written unconditionally — that is what
                 // zero-extends a 32-bit CMOV even when the condition is false.
-                self.asm.csel(true, R_VAL, R_A, R_B, Cond::Ne);
+                self.asm.csel(true, R_VAL, R_FA, R_VAL, Cond::Ne);
                 self.store_gpr(R_VAL, insn.reg, size, has_rex);
                 Lowered::Ok
             }
@@ -1364,13 +1660,13 @@ impl Compiler {
             // IMUL r, r/m
             0xAF => {
                 let size = self.opsize(&p);
+                self.materialize();
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                self.read_rm(&insn.rm, R_B, size, has_rex);
-                self.load_gpr(R_A, insn.reg, size, has_rex);
+                self.read_rm(&insn.rm, R_FB, size, has_rex);
+                self.load_gpr(R_FA, insn.reg, size, has_rex);
                 self.emit_imul(size);
-                self.asm.mov_reg(true, R_FLAGS, R_NEWF);
                 self.store_gpr(R_VAL, insn.reg, size, has_rex);
                 Lowered::Ok
             }
@@ -1381,12 +1677,10 @@ impl Compiler {
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                self.read_rm(&insn.rm, R_A, src, has_rex);
+                self.read_rm(&insn.rm, R_VAL, src, has_rex);
                 if insn.opcode >= 0xBE {
-                    self.asm.sbfx(true, R_VAL, R_A, 0, src as u32 * 8);
+                    self.asm.sbfx(true, R_VAL, R_VAL, 0, src as u32 * 8);
                     self.mask_to(R_VAL, size);
-                } else {
-                    self.asm.mov_reg(true, R_VAL, R_A);
                 }
                 self.store_gpr(R_VAL, insn.reg, size, has_rex);
                 Lowered::Ok
@@ -1404,7 +1698,21 @@ impl Compiler {
         debug_assert!(ok);
     }
 
-    /// Commit an instruction whose destination is the r/m operand.
+    /// An instruction whose destination is a **memory** operand and which also
+    /// defines flags has to settle anything pending before it starts: by the
+    /// time its store can fault, the pending registers hold *this*
+    /// instruction's operands, so the rewind path could no longer reconstruct
+    /// the previous instruction's flags. (A `cmp`/`test` against memory writes
+    /// nothing back, so it keeps the deferral.)
+    fn settle_for_rm_dest(&mut self, rm: &Rm, op: Alu) {
+        if matches!(rm, Rm::Mem(_)) && op.writes_back() {
+            self.materialize();
+        }
+    }
+
+    /// Commit an instruction whose destination is the r/m operand. The flags
+    /// stay pending: on the store's rewind path `R_FLAGS` is still the
+    /// pre-instruction value, which is exactly what a rewind wants.
     fn finish_rm_dest(
         &mut self,
         insn: &Insn,
@@ -1415,49 +1723,48 @@ impl Compiler {
     ) -> Lowered {
         match insn.rm {
             Rm::Reg(i) => {
-                self.asm.mov_reg(true, R_FLAGS, R_NEWF);
                 if op.writes_back() {
-                    self.store_gpr(R_VAL, i, size, has_rex);
+                    self.store_gpr(R_FR, i, size, has_rex);
                 }
                 Lowered::Ok
             }
             Rm::Mem(_) => {
                 if op.writes_back() {
-                    self.emit_store(R_VAL, size, Commit::Flags, next);
-                } else {
-                    self.asm.mov_reg(true, R_FLAGS, R_NEWF);
+                    self.emit_store(R_FR, size, Commit::None, next);
                 }
                 Lowered::Ok
             }
         }
     }
 
-    /// INC/DEC: add/sub 1 with CF preserved.
+    /// INC/DEC: add/sub 1 with CF preserved. The operand is in [`R_FA`], and
+    /// the caller has already settled any pending flags — so `R_FLAGS` holds
+    /// the incoming CF that materialising will keep.
     fn emit_incdec(&mut self, size: u8, is_inc: bool) {
-        self.asm.mov_imm64(R_B, 1);
-        self.emit_addsub(R_A, R_B, size, !is_inc);
-        // Restore the incoming CF: INC/DEC leave it alone.
-        let ok = self.asm.and_imm(true, T3, R_FLAGS, 1);
-        debug_assert!(ok);
-        let ok = self.asm.and_imm(true, R_NEWF, R_NEWF, !1u64);
-        debug_assert!(ok);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, 0);
+        self.asm.mov_imm64(R_FB, 1);
+        if self.defer {
+            self.emit_arith_value(size, !is_inc);
+            self.flags = Flags::Arith { size, sub: !is_inc, keep_cf: true };
+        } else {
+            self.emit_arith_eager(size, !is_inc, true);
+        }
     }
 
     /// Two-operand signed multiply truncated to `size`; CF = OF = "the full
     /// product did not fit", every other flag untouched (exactly the
-    /// interpreter's `imul_trunc`).
+    /// interpreter's `imul_trunc`). Operands in [`R_FA`]/[`R_FB`], result in
+    /// [`R_VAL`]; the caller has settled the flags, so this writes them directly.
     fn emit_imul(&mut self, size: u8) {
         let bits = size as u32 * 8;
         if size == 8 {
-            self.asm.mul(true, R_VAL, R_A, R_B);
-            self.asm.smulh(T1, R_A, R_B);
+            self.asm.mul(true, R_VAL, R_FA, R_FB);
+            self.asm.smulh(T1, R_FA, R_FB);
             // Overflow iff the high half is not the sign extension of the low.
             self.asm.cmp_reg_asr(true, T1, R_VAL, 63);
             self.asm.cset(true, T3, Cond::Ne);
         } else {
-            self.asm.sbfx(true, T0, R_A, 0, bits);
-            self.asm.sbfx(true, T1, R_B, 0, bits);
+            self.asm.sbfx(true, T0, R_FA, 0, bits);
+            self.asm.sbfx(true, T1, R_FB, 0, bits);
             self.asm.mul(true, T2, T0, T1);
             self.asm.mov_reg(true, R_VAL, T2);
             self.mask_to(R_VAL, size);
@@ -1466,13 +1773,18 @@ impl Compiler {
             self.asm.cset(true, T3, Cond::Ne);
         }
         self.asm.mov_imm64(T0, (1 << F_CF) | (1 << F_OF));
-        self.asm.bic_reg(true, R_NEWF, R_FLAGS, T0, 0);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_CF);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_OF);
+        self.asm.bic_reg(true, R_FLAGS, R_FLAGS, T0, 0);
+        self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_CF);
+        self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_OF);
     }
 
-    /// SHL/SHR/SAR with a compile-time count. The rotates and the CL-count forms
-    /// are not compiled.
+    /// SHL/SHR/SAR with a compile-time count. The rotates and the CL-count
+    /// forms are not compiled.
+    ///
+    /// A shift *preserves* AF (and OF unless the count is 1), so it reads the
+    /// incoming flags and computes eagerly rather than deferring — into
+    /// [`R_FA`], which is free once the pending state is settled and which
+    /// survives the store of a memory destination.
     fn emit_shift(&mut self, insn: &Insn, size: u8, count: u64, next: u64, has_rex: bool) -> Lowered {
         let kind = insn.reg & 7;
         // 0=rol 1=ror 2=rcl 3=rcr 4=shl 5=shr 6=shl(alias) 7=sar
@@ -1484,13 +1796,13 @@ impl Compiler {
         };
         let bits = size as u32 * 8;
         let count = (count & if size == 8 { 0x3f } else { 0x1f }) as u32;
-        if let Rm::Mem(m) = insn.rm {
-            self.emit_addr(&m);
-        }
-        self.read_rm(&insn.rm, R_A, size, has_rex);
         if count == 0 {
-            // Identity, and — crucially — flags are left completely untouched.
-            self.asm.mov_reg(true, R_VAL, R_A);
+            // Identity, and — crucially — flags are left completely untouched,
+            // including anything still pending, so nothing is settled here.
+            if let Rm::Mem(m) = insn.rm {
+                self.emit_addr(&m);
+            }
+            self.read_rm(&insn.rm, R_VAL, size, has_rex);
             return match insn.rm {
                 Rm::Reg(i) => {
                     self.store_gpr(R_VAL, i, size, has_rex);
@@ -1502,47 +1814,54 @@ impl Compiler {
                 }
             };
         }
+        self.materialize();
+        if let Rm::Mem(m) = insn.rm {
+            self.emit_addr(&m);
+        }
+        // `R_FB` is free once the pending state is settled, and it survives the
+        // store of a memory destination.
+        self.read_rm(&insn.rm, R_FB, size, has_rex);
         // CF, then the result; both from the pre-shift value.
         if is_shl {
             if count <= bits {
-                self.asm.ubfx(true, T3, R_A, bits - count, 1);
+                self.asm.ubfx(true, T3, R_FB, bits - count, 1);
             } else {
                 self.asm.mov_imm64(T3, 0);
             }
-            self.asm.lsl_imm(true, R_VAL, R_A, count.min(63));
+            self.asm.lsl_imm(true, R_VAL, R_FB, count.min(63));
             self.mask_to(R_VAL, size);
         } else if is_sar {
-            self.asm.sbfx(true, T0, R_A, 0, bits);
+            self.asm.sbfx(true, T0, R_FB, 0, bits);
             self.asm.ubfx(true, T3, T0, count - 1, 1);
             self.asm.asr_imm(true, R_VAL, T0, count.min(63));
             self.mask_to(R_VAL, size);
         } else {
-            self.asm.ubfx(true, T3, R_A, count - 1, 1);
-            self.asm.lsr_imm(true, R_VAL, R_A, count.min(63));
+            self.asm.ubfx(true, T3, R_FB, count - 1, 1);
+            self.asm.lsr_imm(true, R_VAL, R_FB, count.min(63));
         }
         // Clear CF/SF/ZF/PF (plus OF when the count is 1, the only case in which
         // the architecture defines it), then rebuild them.
         let clear = (1u64 << F_CF) | (1 << F_SF) | (1 << F_ZF) | (1 << F_PF) | if count == 1 { 1 << F_OF } else { 0 };
         self.asm.mov_imm64(T0, clear);
-        self.asm.bic_reg(true, R_NEWF, R_FLAGS, T0, 0);
-        self.asm.orr_reg(true, R_NEWF, R_NEWF, T3, F_CF);
+        self.asm.bic_reg(true, R_FA, R_FLAGS, T0, 0);
+        self.asm.orr_reg(true, R_FA, R_FA, T3, F_CF);
         if count == 1 {
             if is_shl {
                 // OF = MSB(result) XOR CF
                 self.asm.ubfx(true, T0, R_VAL, bits - 1, 1);
                 self.asm.eor_reg(true, T0, T0, T3, 0);
-                self.asm.orr_reg(true, R_NEWF, R_NEWF, T0, F_OF);
+                self.asm.orr_reg(true, R_FA, R_FA, T0, F_OF);
             } else if !is_sar {
                 // SHR: OF = MSB(original)
-                self.asm.ubfx(true, T0, R_A, bits - 1, 1);
-                self.asm.orr_reg(true, R_NEWF, R_NEWF, T0, F_OF);
+                self.asm.ubfx(true, T0, R_FB, bits - 1, 1);
+                self.asm.orr_reg(true, R_FA, R_FA, T0, F_OF);
             }
             // SAR: OF = 0, already cleared.
         }
-        self.flags_szp(R_VAL, size);
+        self.flags_szp_into(R_FA, R_VAL, size);
         match insn.rm {
             Rm::Reg(i) => {
-                self.asm.mov_reg(true, R_FLAGS, R_NEWF);
+                self.asm.mov_reg(true, R_FLAGS, R_FA);
                 self.store_gpr(R_VAL, i, size, has_rex);
                 Lowered::Ok
             }
@@ -1553,8 +1872,9 @@ impl Compiler {
         }
     }
 
-    /// The store half of `push`: the new rsp is in [`R_A`] and the value in
-    /// [`R_VAL`]; rsp is committed only after the store succeeds.
+    /// The store half of `push`: the address in [`R_ADDR`] *is* the new rsp and
+    /// the value is in [`R_VAL`]; rsp is committed only after the store
+    /// succeeds.
     fn emit_store_push(&mut self, w: u8, next: u64) {
         self.asm.mov_reg(true, 0, R_CTX);
         self.asm.mov_reg(true, 1, R_ADDR);
@@ -1563,7 +1883,7 @@ impl Compiler {
         // The pending commit is the *new rsp*, so move it into R_VAL now that
         // the pushed value is safely in an argument register — both the hot path
         // and the "store hit code" stub then commit the same register.
-        self.asm.mov_reg(true, R_VAL, R_A);
+        self.asm.mov_reg(true, R_VAL, R_ADDR);
         self.asm.ldr(8, T0, R_CTX, ctx_off::WRITE);
         self.asm.blr(T0);
         let l = self.asm.cbnz_forward(true, 0);
@@ -1573,6 +1893,8 @@ impl Compiler {
             rip: self.rip,
             next_rip: next,
             commit: Commit::Gpr { idx: 4, size: 8, has_rex: true },
+            before: self.insn_flags,
+            after: self.flags,
         });
         self.store_gpr(R_VAL, 4, 8, true);
     }
@@ -1580,10 +1902,12 @@ impl Compiler {
     /// A conditional branch: both edges are compiled, so the block leaves with
     /// `rip` already correct and never returns to the interpreter for the jump.
     fn emit_jcc(&mut self, cc: u8, target: u64, fallthrough: u64) -> Lowered {
+        // The condition reads `R_FLAGS`, and both edges leave the block.
+        self.materialize();
         let taken = self.branch_if_cond(cc);
-        self.exit_to(fallthrough, (self.insns + 1) as u64);
+        self.exit_to(Flags::Live, fallthrough, (self.insns + 1) as u64);
         self.asm.bind(taken);
-        self.exit_to(target, (self.insns + 1) as u64);
+        self.exit_to(Flags::Live, target, (self.insns + 1) as u64);
         Lowered::Terminated
     }
 }
