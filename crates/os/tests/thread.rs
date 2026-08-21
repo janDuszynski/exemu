@@ -316,7 +316,15 @@ fn a_jitted_spin_loop_is_still_preempted() {
     while budget > 0 {
         // The app's run loop in miniature: try a block, account for it, then
         // fall back to the interpreter for anything the JIT declined.
-        match jit.run(cpu.state_mut(), &mut mem, exemu_jit::Mode::Protected) {
+        // The budget is what makes this test mean anything: chained blocks run
+        // back to back without returning here, so an unbounded run would let the
+        // compiled spin loop below hold the CPU forever and the worker thread
+        // would never be scheduled. `retire_budget()` is the OS layer's
+        // remaining timeslice — passing it is exactly what the app's run loop
+        // does, so this exercises the real preemption path rather than a
+        // test-only approximation.
+        let chunk = os.retire_budget().min(budget as u64);
+        match jit.run(cpu.state_mut(), &mut mem, exemu_jit::Mode::Protected, chunk) {
             exemu_jit::Run::Executed { insns } if insns > 0 => {
                 budget -= insns as i64;
                 Hooks::retire(&mut os, insns as u64, cpu.state_mut(), &mut mem).unwrap();
