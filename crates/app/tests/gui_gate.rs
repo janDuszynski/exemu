@@ -287,7 +287,7 @@ fn gui_sample_drives_windows_across_the_thread_split_on_wine() {
 fn gui_sample_window_stays_live_until_close_on_wine() {
     use exemu_core::InputEvent;
     use exemu_gui::{CocoaPresenter, WindowCommand};
-    use std::sync::mpsc::TryRecvError;
+    use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
 
     if !Path::new(WINE_DLLS).join("win32u.dll").exists() {
@@ -315,17 +315,40 @@ fn gui_sample_window_stays_live_until_close_on_wine() {
     // Wait until the window has been shown (a Present crossed the channel).
     // Do NOT drain-to-completion: the guest will not exit on its own — it parks
     // in GetMessage waiting for input.
-    let mut saw_present = false;
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !saw_present && Instant::now() < deadline {
-        match cmd_rx.try_recv() {
-            Ok(WindowCommand::Present { .. }) => saw_present = true,
-            Ok(_) => {}
-            Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
-            Err(TryRecvError::Disconnected) => break,
+    // Block on the channel rather than spinning on `try_recv` + sleep: a busy
+    // poll makes the wait itself compete for the CPU the guest needs, which is
+    // how this became load-sensitive. The budget is generous because the whole
+    // Wine boot runs first, and a machine under parallel load has taken well
+    // over 20 s to get here.
+    //
+    // The two ways to fail are distinguished, because they mean opposite things
+    // and the previous single message ("the guest presented its window before we
+    // intervened") described neither: a **disconnect** means the interpreter
+    // thread ended, so join it and surface *its* error, which is the real
+    // diagnosis; a **timeout** means the guest is alive but never presented.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let saw_present = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break false;
         }
-    }
-    assert!(saw_present, "the guest presented its window before we intervened");
+        match cmd_rx.recv_timeout(left) {
+            Ok(WindowCommand::Present { .. }) => break true,
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => break false,
+            Err(RecvTimeoutError::Disconnected) => {
+                let why = interp
+                    .join()
+                    .map(|r| match r {
+                        Ok(run) => format!("it exited with code {}", run.exit_code),
+                        Err(e) => format!("it failed: {e}"),
+                    })
+                    .unwrap_or_else(|_| "the interpreter thread panicked".to_string());
+                panic!("the guest never presented a window — {why}");
+            }
+        }
+    };
+    assert!(saw_present, "the guest did not present a window within 90 s (it is still running)");
 
     // The window stays live: the guest is parked in NtUserGetMessage, not exited.
     std::thread::sleep(Duration::from_millis(200));

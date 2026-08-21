@@ -180,3 +180,52 @@ fn moffs_mov_uses_the_live_segment_bases() {
     cpu.step(&mut mem, &mut NoHooks).expect("moffs load executes");
     assert_eq!(cpu.state().reg(Reg::Rax), 0xB16B_00B5, "gs:[0x30] read through the live GS base");
 }
+
+/// **A near branch wraps at 2³² in 32-bit mode, because the instruction pointer
+/// there is EIP.**
+///
+/// Every *non-branch* instruction already lands through `ctx.cur & addr_mask()`,
+/// but the relative-branch arms assigned `rip` directly and skipped it — so a
+/// backward branch from a low address left `rip = 0xFFFF_FFFF_FFFF_xxxx`
+/// instead of `0xFFFF_xxxx`, and the CPU was internally inconsistent about its
+/// own address width.
+///
+/// This was found by *reading* rather than by the differential oracle, which
+/// structurally cannot reach it: the oracle assembles every trial at the base of
+/// a page, so a branch's arithmetic never wraps. The block JIT masked all along;
+/// the interpreter is what changed, because masking is what the hardware does.
+#[test]
+fn a_backward_branch_from_a_low_address_wraps_to_32_bits() {
+    // `jmp rel32` at 0x100 with rel = -0x200: 0x105 + (-0x200) is negative, so
+    // EIP wraps to just below 4 GiB.
+    let base = 0x100u64;
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", 0, 0x1000, Perm::RX)).unwrap();
+    mem.poke(base, &[0xE9, 0x00, 0xFE, 0xFF, 0xFF]).unwrap(); // jmp -0x200
+
+    let mut cpu = Interpreter::with_bits(Bits::B32);
+    cpu.state_mut().rip = base;
+    let mut hooks = NoHooks;
+    cpu.step(&mut mem, &mut hooks).unwrap();
+
+    // 0x105 - 0x200 = -0xFB → 0xFFFF_FF05 as a 32-bit EIP.
+    assert_eq!(
+        cpu.state().rip,
+        0xFFFF_FF05,
+        "a wrapping near branch must leave a 32-bit EIP, not a sign-extended 64-bit value"
+    );
+
+    // The same encoding in 64-bit mode keeps the full 64-bit result: RIP is
+    // 64 bits there, so nothing is truncated.
+    let mut mem64 = VirtualMemory::new();
+    mem64.map(Region::new("code", 0, 0x1000, Perm::RX)).unwrap();
+    mem64.poke(base, &[0xE9, 0x00, 0xFE, 0xFF, 0xFF]).unwrap();
+    let mut cpu64 = Interpreter::with_bits(Bits::B64);
+    cpu64.state_mut().rip = base;
+    cpu64.step(&mut mem64, &mut hooks).unwrap();
+    assert_eq!(
+        cpu64.state().rip,
+        0xFFFF_FFFF_FFFF_FF05,
+        "64-bit mode must NOT truncate — RIP is 64 bits wide"
+    );
+}

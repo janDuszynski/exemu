@@ -203,7 +203,12 @@ impl Interpreter {
             0x70..=0x7F => {
                 let rel = ctx.u8(mem)? as i8 as i64;
                 let taken = self.cond(opcode & 0xF);
-                self.state.rip = if taken { ctx.cur.wrapping_add(rel as u64) } else { ctx.cur };
+                // Mask: in 32-bit mode the instruction pointer is EIP, so a near
+                // branch wraps at 2^32. Every non-branch instruction already
+                // lands through `ctx.cur & addr_mask()`; these paths assigned
+                // rip directly and skipped it.
+                let target = if taken { ctx.cur.wrapping_add(rel as u64) } else { ctx.cur };
+                self.state.rip = target & self.addr_mask();
                 return Ok(Exit::Continue);
             }
 
@@ -441,7 +446,9 @@ impl Interpreter {
             0xC2 => {
                 let extra = ctx.u16(mem)? as u64;
                 let ret = self.pop_stack(mem)?;
-                self.state.set_rsp(self.state.rsp().wrapping_add(extra));
+                // The stack pointer is ESP in 32-bit mode, so releasing the
+                // callee's arguments wraps at 2^32 just as the pop did.
+                self.state.set_rsp(self.state.rsp().wrapping_add(extra) & self.addr_mask());
                 self.state.rip = ret;
                 return Ok(Exit::Continue);
             }
@@ -536,17 +543,17 @@ impl Interpreter {
                 let rel = ctx.u32(mem)? as i32 as i64;
                 let ret = ctx.cur;
                 self.push_stack(mem, ret)?;
-                self.state.rip = ret.wrapping_add(rel as u64);
+                self.state.rip = ret.wrapping_add(rel as u64) & self.addr_mask();
                 return Ok(Exit::Continue);
             }
             0xE9 => {
                 let rel = ctx.u32(mem)? as i32 as i64;
-                self.state.rip = ctx.cur.wrapping_add(rel as u64);
+                self.state.rip = ctx.cur.wrapping_add(rel as u64) & self.addr_mask();
                 return Ok(Exit::Continue);
             }
             0xEB => {
                 let rel = ctx.u8(mem)? as i8 as i64;
-                self.state.rip = ctx.cur.wrapping_add(rel as u64);
+                self.state.rip = ctx.cur.wrapping_add(rel as u64) & self.addr_mask();
                 return Ok(Exit::Continue);
             }
 
@@ -1640,7 +1647,8 @@ impl Interpreter {
             0x80..=0x8F => {
                 let rel = ctx.u32(mem)? as i32 as i64;
                 let taken = self.cond(op2 & 0xF);
-                self.state.rip = if taken { ctx.cur.wrapping_add(rel as u64) } else { ctx.cur };
+                let target = if taken { ctx.cur.wrapping_add(rel as u64) } else { ctx.cur };
+                self.state.rip = target & self.addr_mask();
                 return Ok(Some(Exit::Continue));
             }
 
