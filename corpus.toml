@@ -195,7 +195,7 @@ artifacts = 108
 [[binary]]
 name      = "SteamSetup.exe (jit)"
 path      = "example_exe/SteamSetup.exe"
-note      = "The 32-bit NSIS installer through the block JIT. Pinned to the interpreter twin's numbers, including the fault SITE and TEXT: a fault is where the JIT's rewind path is exercised for real — the block returns rip to the faulting instruction having changed nothing, and the interpreter re-executes it to raise the error. 90.7% native."
+note      = "The 32-bit NSIS installer through the block JIT. Pinned to the interpreter twin's numbers, including the fault SITE and TEXT: a fault is where the JIT's rewind path is exercised for real — the block returns rip to the faulting instruction having changed nothing, and the interpreter re-executes it to raise the error. 91.7% native (was 90.7% before `push imm`/`leave`/moffs were compiled, roadmap W8.4)."
 quick     = false
 virtual_clock = true
 jit       = true

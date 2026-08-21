@@ -411,7 +411,8 @@ the instruction set:
 * integer ALU (`add`/`or`/`and`/`sub`/`xor`/`cmp`) in every operand form,
   group 1, `test`, `mov`, `lea`, `movzx`/`movsx`/`movsxd`, `imul`,
   constant-count `shl`/`shr`/`sar`, `inc`/`dec`, `neg`, `not`, `cmov<cc>`,
-  `push`/`pop`, and `j<cc>`/`jmp` as compiled block terminators;
+  `push`/`pop`, `push imm`, `leave`, the `moffs` `mov`s, and `j<cc>`/`jmp` as
+  compiled block terminators;
 * **everything else side-exits to the interpreter** — every SSE/x87/AVX
   instruction, `syscall`, `call`/`ret`, indirect jumps, the string ops,
   `adc`/`sbb`, the rotates, CL-count shifts, `mul`/`div`, the `LOCK`/`REP`
@@ -429,14 +430,35 @@ that is enforced two ways. A differential oracle
 ([below](#differential-cpu-oracle)) runs generated blocks through both engines
 and compares the entire architectural state — every GPR, every `rflags` bit
 including the ones x86 leaves undefined, `rip`, the vector file and every byte
-of memory — at **0 divergences in 8.3M trials per bitness**. And every corpus
+of memory — at **0 divergences in 9.3M trials per bitness**. And every corpus
 binary is run both ways: same exit code, same fault site, same artifacts, and
 the same exact instruction count, with only the wall time different.
+
+**Flags are computed only where they can be seen.** Building x86's six status
+flags eagerly costs ~19 ARM64 instructions per ALU operation, and most of those
+results are dead — the `add` in an addressing sequence has its flags overwritten
+by the next comparison without anything reading them. So an ALU instruction
+emits only its result and records how the flags *could* be derived; the
+derivation is emitted at the first point that can observe them, and not at all
+when a later instruction supersedes it. Whether to defer is decided per
+instruction by scanning forward from the next one, because settling later costs
+one instruction *more* than computing now — deferring unconditionally measured
+**slower**, since blocks average six instructions and most flag results are read
+by the very next one. On 7-Zip the version that decides per instruction is 4.5%
+faster than eager; on SteamSetup it is a wash, because that run is only 90.7%
+native and the interpreted remainder dominates.
 
 Two rules keep faults exact without any error plumbing in compiled code:
 nothing is committed to guest state before a faulting access, and a faulting
 access **rewinds** — `rip` goes back to the faulting instruction and the
-*interpreter* re-executes it, raising the real error. Self-modifying code is
+*interpreter* re-executes it, raising the real error. Deferred flags have to
+obey the same rules, and that is where the traps are: a rewind exposes the flag
+state as of the *start* of the faulting instruction, so every load and store
+stub carries the state it rewinds to; a store that lands in the running block's
+own bytes commits and stops, so that exit settles the state as of *after* the
+instruction; and an instruction that writes flags *and* stores to memory settles
+first, because by the time its store can fault the pending registers hold its
+own operands. Self-modifying code is
 handled from the other side: a store into the running block's own bytes stops
 the block, and between blocks the cache is validated against the per-page
 code-generation counters, so an ordinary store into a PE section's data (which
@@ -747,9 +769,10 @@ but means an address is being computed wrongly).
 cargo run -p exemu-oracle --release -- jit --bits both --count 1M --chain 8
 ```
 
-Current result: **0 divergences in 8.3M trials per bitness**, across ten
+Current result: **0 divergences in 9.3M trials per bitness**, across eleven
 configurations (1, 8, 24 and 32 instructions per block; ten seeds), of which
-2.5M per bitness were re-run against the final tree.
+800k per bitness were re-run against the deferred-flag lowering (roadmap W8.4)
+and 500k per bitness against the final tree.
 
 ## Contributing
 
