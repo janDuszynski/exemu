@@ -2809,7 +2809,11 @@ fn arm_hit_test(
     let hwnd = pending.hwnd;
     let wndproc = os.win32k_state.wndproc_for(hwnd);
     let (x, y) = input_point(pending.ev).unwrap_or((0, 0));
-    if wndproc == 0 || pending.skipped.len() >= HIT_TEST_ROUNDS_MAX {
+    // `!can_call_client()` (a WoW64 process) is handled here rather than at the
+    // callback itself because `pending` is consumed by the install: a window
+    // that *cannot* be asked is indistinguishable from one that has no WndProc,
+    // and both take the kernel's own answer.
+    if wndproc == 0 || !os.can_call_client() || pending.skipped.len() >= HIT_TEST_ROUNDS_MAX {
         let code =
             if os.win32k_state.contains_point(hwnd, x, y) { hit::CLIENT } else { hit::NOWHERE };
         deliver_hit(os, mem, pending.lp, pending.ev, pending.msg, pending.wparam, hwnd, code)?;
@@ -3084,7 +3088,12 @@ fn dispatch_to_wndproc(
         return Ok(result.unwrap_or(0) as u32);
     }
     let m = crate::msg::PostedMsg { hwnd, message: msg, wparam, lparam };
-    os.call_wndprocs_from_syscall(cpu, mem, vec![(wndproc, m.into_args())], result, 0)?;
+    if !os.call_wndprocs_from_syscall(cpu, mem, vec![(wndproc, m.into_args())], result, 0)? {
+        // No frame was installed (a WoW64 process — see `can_call_client`), so
+        // nothing will supply rax on resume: answer here instead of returning
+        // a 0 the handler never meant.
+        return Ok(result.unwrap_or(0) as u32);
+    }
     Ok(0) // ignored: the callback frame supplies rax on resume
 }
 
@@ -4567,6 +4576,51 @@ mod tests {
         };
         assert!(!dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap());
         assert_eq!(cpu.rip, 0, "nothing was seated");
+    }
+
+    /// **A WoW64 process gets no creation pair either — the pinned W5.10 gap.**
+    ///
+    /// The WndProc is 32-bit guest code but the win32k syscall arrives in long
+    /// mode, so seating it directly would run 32-bit bytes as 64-bit ones (see
+    /// `WinOs::can_call_client` for the measured `SteamSetup` failure). The
+    /// window is still created; it simply never hears `WM_NCCREATE`/`WM_CREATE`.
+    ///
+    /// This test fails the day exemu routes client callbacks through
+    /// `ntdll64!KiUserCallbackDispatcher` → `wow64!Wow64KiUserCallbackDispatcher`,
+    /// which is exactly when the claim above must be rewritten.
+    #[test]
+    fn a_wow64_process_gets_no_creation_pair() {
+        const WNDPROC: u64 = 0x1_4000_1000;
+        let (mut os, mut mem, hwnd) = window_for_create(WNDPROC);
+        os.set_syscall_guest_rsp_for_test(0x10_8000);
+        let mut cpu = CpuState::default();
+        let info = CreateInfo {
+            create_params: 0,
+            instance: 0,
+            menu: 0,
+            parent: 0,
+            rect: [0, 0, 1, 1],
+            style: 0,
+            ex_style: 0,
+            title: "",
+            class_name: "TestClass",
+        };
+        // The same window, same registered WndProc: only the process changes.
+        assert!(
+            dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap(),
+            "control: a 64-bit process does get the creation pair",
+        );
+
+        let (mut os, mut mem, hwnd) = window_for_create(WNDPROC);
+        os.set_syscall_guest_rsp_for_test(0x10_8000);
+        os.set_wow64_peb32(0x7f00_8000); // this process is now WoW64
+        let mut cpu = CpuState::default();
+        assert!(!os.can_call_client(), "a WoW64 process takes no direct client callback");
+        assert!(
+            !dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap(),
+            "no creation pair is seated in a WoW64 process",
+        );
+        assert_eq!(cpu.rip, 0, "nothing was seated, so no 32-bit code runs in long mode");
     }
 
     /// A second copy of ntdll is recognised structurally (export-directory name
