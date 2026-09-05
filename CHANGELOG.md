@@ -104,6 +104,28 @@ end-to-end on the default path.
   It also proves that a declined block changes nothing, and that a block which
   faults rewound onto an instruction that really does fault. The harness was
   validated by injecting a one-bit AF bug, which it caught in 2,000 trials.
+- **Two JIT bugs at the edge of the address space (W8.7).** Both were found by
+  auditing the JIT's address masking against the interpreter's, and neither was
+  a masking bug: the masking turned out to be right everywhere, and is now
+  pinned in both directions (32-bit must truncate, 64-bit must not) by
+  `crates/jit/tests/address_width.rs`.
+  - **The compiler decoded its own padding.** Where a 16-byte instruction fetch
+    overruns the region, the window is refilled byte by byte — but `decode` was
+    handed the whole window, zeros included. At the tail of an executable region
+    that *fabricates* an instruction the guest does not have: `8B 05` plus four
+    bytes of padding compiled as `mov eax, [0]` and succeeded, where the
+    interpreter faults fetching the third byte. `decode` now sees only the bytes
+    that were really fetched, so an over-long encoding is simply declined.
+  - **A block ending on the 4 GiB boundary reported an empty byte range.** The
+    store helper decides "this store rewrote an instruction I have not run yet"
+    by comparing against the block's `code_lo..code_hi`, and `hi` came from the
+    address the block *ends* at — which for such a block has wrapped round below
+    its own start. Clamped, the range collapsed to nothing, no store could ever
+    hit it, and the block carried on executing instructions the guest had just
+    overwritten. The range is now derived from the block's *length*, and the
+    compiler stops a block at the wrap (`StopReason::Wrapped`) so a block stays
+    one contiguous range — which is what both that check and the two-page code
+    generation check assume.
 - Two rules make faults exact with no error plumbing in compiled code: nothing
   is committed to guest state before a faulting access, and a fault **rewinds**
   — `rip` returns to the faulting instruction and the *interpreter* re-executes

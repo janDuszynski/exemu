@@ -141,6 +141,12 @@ pub enum StopReason {
     Full,
     /// The block ended on a compiled branch; `rip` is left correct by the code.
     Terminator,
+    /// The last instruction ended on the top of the address space, so the next
+    /// one is at a *lower* address than the block's first. A block is a
+    /// contiguous byte range — that is what the store helper's two-compare
+    /// self-modification check and the engine's two-page generation check are
+    /// built on — so the block stops here rather than becoming two ranges.
+    Wrapped,
 }
 
 /// A compiled block, before it is written into the code buffer.
@@ -413,13 +419,21 @@ impl Compiler {
         while c.insns < max_insns {
             c.rip = rip;
             let mut window = [0u8; 16];
+            // How many bytes of `window` are really guest memory. The rest are
+            // zeros this function put there, and **decoding them would fabricate
+            // an instruction**: at the tail of an executable region the
+            // interpreter faults fetching the byte after the last mapped one,
+            // so a compiler that read its own padding would run something the
+            // reference CPU never reaches. `decode` is therefore handed only the
+            // prefix that was fetched, and refuses anything longer.
+            let mut valid = window.len();
             if mem.fetch(rip, &mut window).is_err() {
                 // Short window near a region's tail: fetch what we can, byte by
                 // byte, so an instruction that fits still compiles.
                 let mut n = 0;
                 while n < 16 {
                     let mut b = [0u8; 1];
-                    if mem.fetch(rip + n as u64, &mut b).is_err() {
+                    if mem.fetch(rip.wrapping_add(n as u64), &mut b).is_err() {
                         break;
                     }
                     window[n] = b[0];
@@ -429,8 +443,9 @@ impl Compiler {
                     stop = StopReason::FetchFailed { rip };
                     break;
                 }
+                valid = n;
             }
-            let insn = match decode(&window, mode, rip) {
+            let insn = match decode(&window[..valid], mode, rip) {
                 Some(i) => i,
                 None => {
                     stop = StopReason::Unsupported { rip, opcode: window[0], esc: false };
@@ -446,6 +461,17 @@ impl Compiler {
                 Lowered::Ok => {
                     c.insns += 1;
                     rip = next;
+                    // Addresses only ever rise from `start`, so `next < start`
+                    // can only mean this instruction ended on the top of the
+                    // address space and the next one is back at the bottom.
+                    // Carrying on would make the block two disjoint byte
+                    // ranges, and everything downstream — the store helper's
+                    // `code_lo..code_hi` self-modification test, the engine's
+                    // two-page generation check — assumes exactly one.
+                    if next < start {
+                        stop = StopReason::Wrapped;
+                        break;
+                    }
                 }
                 Lowered::Terminated => {
                     c.insns += 1;
@@ -471,7 +497,11 @@ impl Compiler {
             start,
             insns,
             end_rip,
-            bytes: end_rip.wrapping_sub(start),
+            // Masked, because `end_rip` is: a 32-bit block that ends on the
+            // 4 GiB boundary has `end_rip == 0`, and a plain 64-bit subtraction
+            // would call that a 2^64-sized block instead of the handful of
+            // bytes it is.
+            bytes: end_rip.wrapping_sub(start) & mode.addr_mask(),
             code: c.asm.into_words(),
             stop,
         }
