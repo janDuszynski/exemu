@@ -378,11 +378,19 @@ than approximate: the gate pins them with zero tolerance.
 | Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; the inner program runs CRT init + setup + SEH frame build + thread/sync init for **4,665,426** instructions, then calls through a NULL function pointer (`rip=0`) |
 | SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for **92,865,377** instructions, then writes through a NULL pointer at `0x20001c2c` |
 | tcc.exe | 32-bit console | dies after **728** instructions calling through a NULL returned by the `VerifyVersionInfoW`/`VerSetConditionMask` stub |
+| SteamSetup, **`--wine-boot`** | 32-bit NSIS as a WoW64 process | **no faults at all** — Wine's i386 loader binds its whole 30-module import graph, and it terminates with its *own* exit code 2 after **7,363,620** instructions. Does not reach its nsDialogs installer |
+| Firefox Installer, **`--wine-boot`** | 32-bit UPX as a WoW64 process | **no faults at all** — unpacks `C:\Temp\7zS00004040` against Wine's `msvcrt`/`kernel32` and exits **1** after **12,467,176** instructions (2.7x the emulated path) |
 
-The last three are the *same* defect class, not three bugs: a stubbed Win32 API
-returns NULL, the guest stores it as a pointer, and it faults far downstream —
-728, 4.7M and 93M instructions later. They are pinned as **known-bad** so the
-day the Wine path fixes them, the gate is what notices.
+The first three of those are the *same* defect class, not three bugs: a stubbed
+Win32 API returns NULL, the guest stores it as a pointer, and it faults far
+downstream — 728, 4.7M and 93M instructions later. They are pinned as
+**known-bad** so the day the Wine path fixes them, the gate is what notices.
+
+The last two are the *same binaries on the Wine path*, pinned separately
+because they are not the same program: there NSIS calls Wine's Win32 through
+Wine's own 32-bit loader instead of exemu's hand-written one. Neither installs
+yet, but neither faults either — both stop by asking to, at a **named** wall
+(the 32-bit client-callback protocol and 32-bit thread creation; see below).
 
 7-Zip is only an example — the same generic path drives any dialog-based
 installer. With `--gui` you click Install in a real window (progress bar and
@@ -533,7 +541,7 @@ What is verified today:
 | A console `.exe` runs to completion on Wine's real PE `kernel32`/`kernelbase`/`ucrtbase` | **works** — correct stdout, file-I/O round-trip, propagated exit code, none of exemu's emulated thunks used |
 | A Win32 GUI app on Wine's `user32`/`gdi32`/`win32u` opens a **native macOS window** | **works** — real mouse/keyboard reach the guest `WndProc`; first frame pinned by a golden-PNG CI gate |
 | Guest faults delivered as Windows exceptions | **works** — via `KiUserExceptionDispatcher`, resumed through `NtContinue` |
-| **WoW64** (32-bit guests on the 64-bit Wine set) | **a 32-bit PE boots on Wine's own i386 loader and reaches the NT layer through Wine's own thunks** — `exemu run --wine-boot <dir>` on a **PE32** builds a real WoW64 process (Wine's 32-bit `ntdll` + the 64-bit `ntdll`/`wow64`/`wow64cpu`/`wow64win`, dual PEB32/PEB64 and a TEB pair linked by `TEB64.WowTebOffset`), then hands control to Wine's **`Wow64LdrpInitialize`**: it registers the win32k service table by copying `wow64win!sdwhwin32` itself, publishes the BOP into the 32-bit ntdll's own cells, and starts the 32-bit thread inside **`ntdll32!LdrInitializeThunk`** — so Wine's i386 `loader_init` maps the guest's 32-bit DLLs off disk and binds its whole import graph. A 32-bit `NtAllocateVirtualMemory` then travels Wine's own chain — the i386 ntdll's syscall stub → `__wine_syscall_dispatcher` → the `wow64cpu` BOP → `Wow64SystemServiceEx` → `wow64.dll`'s marshalling thunk → the 64-bit ntdll's `syscall` → exemu's SSDT — and the guest writes through the pointer it gets back. **exemu marshals nothing and binds nothing.** Gate: 841,235 instructions, exit code from the guest itself (1,292 on the shorter `Bringup::Direct` path, which skips the 32-bit loader). Per-exe probes: `SteamSetup.exe` is still running at 60M instructions, `Firefox Installer.exe` gets 11.5M in and past its UPX stub. **Not yet:** neither corpus binary completes, a 32-bit guest exception is not routed to `ntdll32!KiUserExceptionDispatcher`, and the process is single-threaded. Each gap is pinned as a test |
+| **WoW64** (32-bit guests on the 64-bit Wine set) | **a 32-bit PE boots on Wine's own i386 loader and reaches the NT layer through Wine's own thunks** — `exemu run --wine-boot <dir>` on a **PE32** builds a real WoW64 process (Wine's 32-bit `ntdll` + the 64-bit `ntdll`/`wow64`/`wow64cpu`/`wow64win`, dual PEB32/PEB64 and a TEB pair linked by `TEB64.WowTebOffset`), then hands control to Wine's **`Wow64LdrpInitialize`**: it registers the win32k service table by copying `wow64win!sdwhwin32` itself, publishes the BOP into the 32-bit ntdll's own cells, and starts the 32-bit thread inside **`ntdll32!LdrInitializeThunk`** — so Wine's i386 `loader_init` maps the guest's 32-bit DLLs off disk and binds its whole import graph. A 32-bit `NtAllocateVirtualMemory` then travels Wine's own chain — the i386 ntdll's syscall stub → `__wine_syscall_dispatcher` → the `wow64cpu` BOP → `Wow64SystemServiceEx` → `wow64.dll`'s marshalling thunk → the 64-bit ntdll's `syscall` → exemu's SSDT — and the guest writes through the pointer it gets back. **exemu marshals nothing and binds nothing.** Gate: 841,235 instructions, exit code from the guest itself (1,292 on the shorter `Bringup::Direct` path, which skips the 32-bit loader). **Per-exe pins** (`corpus.toml`, zero tolerance, 3 identical virtual-clock runs each): `SteamSetup.exe` runs **7,363,620** instructions and terminates with its own exit code 2, and `Firefox Installer.exe` **12,467,176** with its own exit code 1 — **neither faults**, and the earlier “still running at 60M” reading was a livelock, not progress. **Not yet:** neither installs. Both walls are named and pinned as tests rather than papered over. (1) A **32-bit client callback** — `WM_NCCREATE`/`WM_CREATE` and every WndProc dispatch — must travel `ntdll64!KiUserCallbackDispatcher` → `wow64!Wow64KiUserCallbackDispatcher` → `ntdll32!KiUserCallbackDispatcher`, which exemu's win32k does not speak; calling the 32-bit WndProc directly ran 32-bit bytes in long mode, so it is now declined and the window hears nothing. (2) A **32-bit thread** is a 64-bit thread entering `wow64!Wow64LdrpInitialize` with its own CPU-reserved area, not a thread with a smaller stack, so `NtCreateThreadEx` answers `STATUS_NOT_IMPLEMENTED` instead of handing the guest a stack it can only see the low 32 bits of |
 | **comctl32 / uxtheme / comdlg32** | **arrive as guest code** — a sample that statically imports `comctl32!InitCommonControlsEx` runs to completion on the Wine boot, and Wine's own comctl32 registers `msctls_progress32` as a real window class. exemu implements no progress bar. user32's **built-in control classes** (`BUTTON`/`EDIT`/`STATIC`/…) are registered too: win32k recovers their WndProcs by following the `jmp qword [rip+disp32]` thunks in the client-PFN arrays user32 publishes at boot, so `CreateWindowExW(L"BUTTON", …)` reaches `NtUserCreateWindowEx`. Those controls **paint themselves** into the top-level window's surface (child windows get no surface of their own — origin and clip are the kernel side's job, exactly as Wine's gdi32 expects) and they are **clickable**: a synthesized click at the button's coordinates is hit-tested onto the child, and Wine's own `ButtonWndProc` takes the capture, repaints itself pressed and sends the parent a real `WM_COMMAND`/`BN_CLICKED` |
 | **COM** (`ole32` / `combase` / `oleaut32`) | **works** — `CoCreateInstance` genuinely succeeds: the CLSID resolves through exemu's registry to an `InprocServer32`, the in-proc server loads, and the guest calls a method through the returned vtable. No native COM in exemu; the emulated path is the control that proves it |
 | **CAB extraction** (`cabinet`) | **works** — a guest extracts a real `.cab` through Wine's `FDICreate`/`FDICopy`, driven entirely by the guest's own FDI callbacks, and the bytes come back identical. exemu contributes a cabinet *writer* and no decoder, retiring the planned clean-room FDI |
@@ -623,13 +631,21 @@ fault site — is a JIT bug, and catching it is the reason the pair exists. The
 current table:
 
 ```
-  PASS   7z2602-x64.exe                      exit 0            496,505,572     108   19.8s
-  PASS   SteamSetup.exe                      fault @ 0x20001c2c 92,865,377       3    3.2s
+  PASS   7z2602-x64.exe                      exit 0            496,505,572     108    8.2s
+  PASS   SteamSetup.exe                      fault @ 0x20001c2c 92,865,377       3    1.6s
   PASS   Firefox Installer.exe               fault @ 0x0         4,665,426       1    0.1s
-  PASS   7z2602-x64.exe (jit)                exit 0            496,505,572     108    2.2s
-  PASS   SteamSetup.exe (jit)                fault @ 0x20001c2c 92,865,377       3    1.4s
+  PASS   7z2602-x64.exe (jit)                exit 0            496,505,572     108    1.0s
+  PASS   SteamSetup.exe (jit)                fault @ 0x20001c2c 92,865,377       3    0.7s
   PASS   Firefox Installer.exe (jit)         fault @ 0x0         4,665,426       1    0.1s
+  PASS   SteamSetup.exe (wine wow64)         exit 2              7,363,620       4    0.2s
+  PASS   Firefox Installer.exe (wine wow64)  exit 1             12,467,176       3    0.2s
 ```
+
+**Wine-path twins.** The last two entries (`wine_boot = "<prefix>"`) run the two
+32-bit binaries as WoW64 processes on Wine's PE set. They are separate entries
+rather than a flag on the ones above, because the same `.exe` on the two paths
+is not the same program — and keeping both is what stops a Wine-path
+improvement from masking an emulated-path regression, or the reverse.
 
 ### Deterministic guest clock
 

@@ -3123,6 +3123,63 @@ impl WinOs {
         }
     }
 
+    /// Whether exemu may seat a **client (user-mode) callback** on the guest
+    /// the direct way this module does it — `false` in a **WoW64** process
+    /// (roadmap W5.10).
+    ///
+    /// The direct path is sound only when the callee runs in the same mode, on
+    /// the same stack and under the same ABI as the syscall that interrupted
+    /// it. In a WoW64 process none of the three holds, and each failure is
+    /// independently fatal:
+    ///
+    /// * **Mode.** The win32k syscall arrives from `win32u.dll` in *long* mode,
+    ///   but the WndProc is 32-bit guest code. Measured on `SteamSetup.exe`:
+    ///   `NtUserCreateWindowEx` (`win32u+0x12680`, reached through
+    ///   `wow64win!wow64_NtUserCreateWindowEx+0x131`) seated combase's
+    ///   `OleMainThreadWndClass` procedure at `combase+0x1a630`, whose
+    ///   `ff 25 fc d4 e4 02` is `jmp dword ptr [0x2e4d4fc]` — an ordinary
+    ///   32-bit indirect jump through its own IAT — but decodes in 64-bit mode
+    ///   as `jmp qword ptr [rip+0x2e4d4fc]`, i.e. `0x5c67b73`. Unmapped, so
+    ///   `0xC0000005` at 6,460,140 instructions, followed by a cascade of
+    ///   `KiUserExceptionDispatcher` breakpoints.
+    /// * **ABI.** [`setup_call_args`](Self::setup_call_args) keys off
+    ///   `cfg.is_64bit`, which is `true` here because the *process* is 64-bit
+    ///   (that is the whole point of new-WoW64) — so it would pass the four
+    ///   arguments in `RCX/RDX/R8/R9` over a Win64 shadow area to a `stdcall`
+    ///   procedure that expects them pushed, and write an 8-byte return address
+    ///   a 32-bit `ret` cannot pop. The return thunk itself is unreachable:
+    ///   the thunk arena is at `0x7EFF_0000_0000`, not representable in 32 bits.
+    /// * **State.** Even a mode- and ABI-correct direct call would be unsound,
+    ///   because the callee's *own* syscalls leave through the BOP into
+    ///   `wow64cpu+0x1110`, which `xchg rsp,r14` against register state only
+    ///   `BTCpuSimulate` establishes. Entering 32-bit code from the middle of a
+    ///   64-bit syscall leaves `r13`/`r14` holding 64-bit callee-saved values.
+    ///
+    /// The faithful path is the kernel's: return to user mode at
+    /// `ntdll64!KiUserCallbackDispatcher`, which in a WoW64 process reaches
+    /// `wow64!Wow64KiUserCallbackDispatcher` (a real export of the pinned
+    /// `wow64.dll`), which marshals the call down to the 32-bit
+    /// `ntdll32!KiUserCallbackDispatcher` through `BTCpuSimulate` and comes back
+    /// through `NtCallbackReturn`. exemu's win32k does not speak that protocol
+    /// yet, so until it does the honest answer is to **not make the call** —
+    /// a window is still created, it simply never receives its `WM_NCCREATE`/
+    /// `WM_CREATE` (the same shape of gap `NtUserCreateWindowEx` had before
+    /// roadmap W6.2b, and pinned as a test the same way).
+    pub(crate) fn can_call_client(&self) -> bool {
+        !self.is_wow64()
+    }
+
+    /// Is this process a **WoW64** process — a 32-bit guest running on the
+    /// 64-bit Wine PE set (roadmap W5.4)? True once `wow64_boot` has published
+    /// the 32-bit PEB, which is the one field only that boot sets.
+    ///
+    /// `cfg.is_64bit` deliberately cannot answer this: a WoW64 process *is* a
+    /// 64-bit NT process, and every kernel-facing structure in it is 64-bit.
+    /// Anything that needs to know the **guest code's** bitness has to ask here.
+    pub(crate) fn is_wow64(&self) -> bool {
+        self.wow64_peb32 != 0
+    }
+
     /// The general form of [`call_wndproc_from_syscall`](Self::call_wndproc_from_syscall):
     /// run a **sequence** of guest callbacks from inside a win32k syscall
     /// handler, then resume that syscall's caller with `result` in rax
@@ -3139,8 +3196,9 @@ impl WinOs {
     /// `stack_reserve` bytes below the interrupted syscall's guest rsp are left
     /// untouched by the callback frames — room for a struct the callbacks are
     /// handed by pointer (`CREATESTRUCTW`). Returns whether a callback was
-    /// installed; `false` (an empty queue) means the caller should return its
-    /// status normally.
+    /// installed; `false` (an empty queue, or a process this mechanism cannot
+    /// call back into — see [`can_call_client`](Self::can_call_client)) means
+    /// the caller should return its status normally.
     pub(crate) fn call_wndprocs_from_syscall(
         &mut self,
         cpu: &mut CpuState,
@@ -3149,6 +3207,9 @@ impl WinOs {
         result: Option<u64>,
         stack_reserve: u64,
     ) -> Result<bool> {
+        if !self.can_call_client() {
+            return Ok(false);
+        }
         let mut remaining: VecDeque<(u64, Vec<u64>)> = calls.into();
         let Some((func, args)) = remaining.pop_front() else {
             return Ok(false);

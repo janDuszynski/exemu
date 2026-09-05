@@ -23,8 +23,7 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 635, clippy clean at `-D warnings`; 7-Zip still installs
-Tests grew 199 → 670, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 804, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
 ### Per-exe profiles (W9.4)
@@ -296,6 +295,49 @@ end-to-end on the default path.
 - An **`NSEvent` tap** feeding real mouse/keyboard into the guest's own `WndProc`,
   and a **CoreText glyph rasterizer** (real fonts in the DIB, not a bitmap font).
 - **PNG golden-image CI gate**: pixel drift in the sample's first frame fails CI.
+
+### Both 32-bit installers stop asking, not crashing (W5.10 / W5.11)
+
+Two WoW64 defects of the same shape — code that decided a guest's *bitness*
+from `cfg.is_64bit`, which is `true` in a WoW64 process because the process
+genuinely is 64-bit. Neither is fixed by making it 32-bit; both need machinery
+that is Wine's, so both are now honest refusals with the faithful path named.
+
+- **A 32-bit client callback is no longer made in long mode.** A 32-bit guest's
+  `CreateWindowEx` reaches exemu's win32k correctly, and exemu then seated the
+  class WndProc — 32-bit code — with the CPU still in 64-bit mode. On
+  `SteamSetup.exe` that was combase's `OleMainThreadWndClass` procedure, whose
+  `ff 25 fc d4 e4 02` is `jmp dword ptr [<its own IAT>]` in 32-bit mode and
+  `jmp qword ptr [rip+0x2e4d4fc]` in 64-bit: an access violation at `0x5c67b73`
+  and a 145-deep exception cascade. Two more defects sit in the same call — the
+  Win64 register ABI handed to a `stdcall` procedure, and a return thunk at
+  `0x7EFF_0000_0000` that a 32-bit `ret` cannot reach. The faithful route is
+  `ntdll64!KiUserCallbackDispatcher` → `wow64!Wow64KiUserCallbackDispatcher` →
+  `ntdll32!KiUserCallbackDispatcher`; until exemu speaks that protocol the
+  callback is **declined**, so a window is created but hears no `WM_NCCREATE`/
+  `WM_CREATE`. **SteamSetup goes from a fault at 6,605,667 instructions to a
+  clean exit 2 at 7,363,620, with zero exceptions delivered.**
+- **A 32-bit thread is refused rather than mis-spawned.** `Firefox Installer.exe`
+  died on `msvcrt!__beginthreadex_trampoline`'s own `push ebp`: the spawned
+  thread's stack came from the **64-bit** `VirtualAlloc` arena at
+  `0x40_0000_0000`, and 32-bit code sees only its low half (`0x0012_fef8`),
+  where nothing is mapped. A 32-bit thread is a 64-bit thread entering
+  `wow64!Wow64LdrpInitialize` with its own CPU-reserved area, so
+  `NtCreateThreadEx` now answers `STATUS_NOT_IMPLEMENTED` in a WoW64 process
+  and the guest's `_beginthreadex` takes its error path. **Firefox goes from a
+  fault at 10,950,022 to a clean exit 1 at 12,467,176** — 2.7× the emulated
+  path, with all the extra work being Wine's own code.
+- **Both are pinned in `corpus.toml`** via a new per-entry `wine_boot = "<Wine
+  prefix>"`, which runs an entry with `--wine-boot`. They are separate entries
+  from the emulated ones on the same binaries, because the two paths are not the
+  same program — and keeping both is what stops an improvement on one from
+  masking a regression on the other. Zero tolerance, three identical
+  virtual-clock runs each. The corpus is now **10 of 10**, 7-Zip unchanged at
+  exactly 496,505,572.
+- Both walls are also pinned as unit tests with a passing **control** in the
+  same test (`a_wow64_process_gets_no_creation_pair`,
+  `a_wow64_process_refuses_to_create_a_thread`), so each fails the day the real
+  protocol lands — which is when these claims have to be rewritten.
 
 ### WoW64 — 32-bit guests on the 64-bit Wine set (W5, in progress)
 - The **CS-selector mode switch**: far indirect `jmp m16:32/m16:64` and `iretq`

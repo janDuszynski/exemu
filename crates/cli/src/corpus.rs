@@ -195,6 +195,23 @@ pub struct Entry {
     /// Per-entry for the same reason `virtual_clock` is — it selects which
     /// engine the pin describes.
     pub jit: bool,
+    /// Boot this entry on the **Wine PE DLL set** in this directory
+    /// (`--wine-boot <dir>`, the `x86_64-windows` half of the pinned prefix),
+    /// resolved relative to the manifest like `path`. `None` keeps the
+    /// emulated path.
+    ///
+    /// Per-entry for the same reason `virtual_clock` and `jit` are: it selects
+    /// *which program* the pin describes. The same `.exe` on the emulated path
+    /// and on the Wine path are not the same run — on one it calls exemu's
+    /// hand-written Win32, on the other it calls Wine's, through Wine's own
+    /// loader — so the two are pinned as separate entries rather than one
+    /// number that changes meaning with a flag.
+    ///
+    /// The directory lives under the git-ignored `example_exe/`, so
+    /// [`Manifest::corpus_present`] requires it exactly as it requires the
+    /// binaries: a checkout without the prefix skips the whole manifest
+    /// instead of failing.
+    pub wine_boot: Option<String>,
     /// Free prose kept verbatim across `--update` rewrites.
     pub note: Option<String>,
 }
@@ -369,6 +386,9 @@ impl Manifest {
             if e.jit {
                 let _ = writeln!(o, "jit       = {}", e.jit);
             }
+            if let Some(dir) = &e.wine_boot {
+                let _ = writeln!(o, "wine_boot = {}", quote(dir));
+            }
             let _ = writeln!(o, "max_steps = {}", e.max_steps);
             let _ = writeln!(o, "outcome   = {}", quote(e.outcome.as_str()));
             if e.outcome == Outcome::Exit {
@@ -405,11 +425,31 @@ impl Manifest {
         }
     }
 
-    /// Are all the manifest's binaries present? The corpus lives in the
-    /// git-ignored `example_exe/`, so a fresh checkout has none and every
-    /// consumer must skip rather than fail.
+    /// Absolute (or manifest-relative) path of an entry's Wine prefix
+    /// directory, if it declares one.
+    pub fn wine_boot_path(&self, e: &Entry) -> Option<PathBuf> {
+        e.wine_boot.as_ref().map(|d| {
+            let p = Path::new(d);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.dir.join(p)
+            }
+        })
+    }
+
+    /// Are all the manifest's binaries — and the Wine prefixes its entries
+    /// name — present? Both live in the git-ignored `example_exe/`, so a fresh
+    /// checkout has neither and every consumer must skip rather than fail.
     pub fn corpus_present(&self) -> bool {
-        self.entries.iter().all(|e| self.exe_path(e).exists())
+        self.entries.iter().all(|e| {
+            // `rust-version = 1.80`, so no `is_none_or` here.
+            let prefix_ok = match self.wine_boot_path(e) {
+                Some(d) => d.is_dir(),
+                None => true,
+            };
+            self.exe_path(e).exists() && prefix_ok
+        })
     }
 }
 
@@ -461,6 +501,10 @@ impl Entry {
             quick: matches!(get("quick"), Some(Value::Bool(true))),
             virtual_clock: matches!(get("virtual_clock"), Some(Value::Bool(true))),
             jit: matches!(get("jit"), Some(Value::Bool(true))),
+            wine_boot: match get("wine_boot") {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            },
             note: match get("note") {
                 Some(Value::Str(s)) => Some(s.clone()),
                 _ => None,
@@ -554,6 +598,12 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
     }
     if e.jit {
         cmd.arg("--jit");
+    }
+    // The prefix is passed as an ABSOLUTE path: the child runs with its working
+    // directory set to the binary's own folder (see the bare-`argv[0]` note
+    // above), so a manifest-relative one would not resolve there.
+    if let Some(dir) = m.wine_boot_path(e) {
+        cmd.arg("--wine-boot").arg(absolute(dir));
     }
     let out = cmd
         .output()
@@ -977,6 +1027,50 @@ tolerance = 92883
 rip       = "0x20001c2c"
 stop      = "unmapped memory access at 0x0000000000001010"
 "#;
+
+    /// **A `wine_boot` entry survives `--update`** (roadmap W5).
+    ///
+    /// `--update` re-emits the whole manifest from the parsed `Entry`s, so a
+    /// field that parses but is never written back would be silently deleted
+    /// the first time anyone re-blessed a count — and the WoW64 entries would
+    /// quietly become emulated-path duplicates of the entries above them,
+    /// pinned to numbers from a different program. That failure is invisible in
+    /// the pass/fail table, so it is pinned here instead.
+    #[test]
+    fn a_wine_boot_entry_round_trips_and_resolves_against_the_manifest() {
+        const SRC: &str = r#"[[binary]]
+name      = "demo.exe (wine wow64)"
+path      = "example_exe/demo.exe"
+quick     = true
+virtual_clock = true
+wine_boot = "example_exe/wine-dlls/x86_64-windows"
+max_steps = 300000000
+outcome   = "exit"
+exit_code = 2
+steps     = 7363620
+tolerance = 0
+artifacts = 4
+"#;
+        let m = Manifest::parse(SRC, PathBuf::from("/repo")).expect("parse");
+        let e = &m.entries[0];
+        assert_eq!(e.wine_boot.as_deref(), Some("example_exe/wine-dlls/x86_64-windows"));
+        assert_eq!(
+            m.wine_boot_path(e),
+            Some(PathBuf::from("/repo/example_exe/wine-dlls/x86_64-windows")),
+            "the prefix resolves against the manifest's directory, like `path`",
+        );
+
+        let back = Manifest::parse(&m.to_toml(), PathBuf::from("/repo")).expect("reparse");
+        assert_eq!(back.entries[0].wine_boot, e.wine_boot, "`--update` keeps the prefix");
+        assert_eq!(back.entries[0].steps, e.steps);
+        assert_eq!(back.entries[0].exit_code, e.exit_code);
+
+        // An entry without one is unaffected, and emits no key.
+        let plain = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
+        assert_eq!(plain.entries[0].wine_boot, None);
+        assert_eq!(plain.wine_boot_path(&plain.entries[0]), None);
+        assert!(!plain.to_toml().contains("wine_boot"));
+    }
 
     #[test]
     fn parses_the_manifest_subset() {
