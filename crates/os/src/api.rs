@@ -3166,7 +3166,18 @@ impl WinOs {
     /// `WM_CREATE` (the same shape of gap `NtUserCreateWindowEx` had before
     /// roadmap W6.2b, and pinned as a test the same way).
     pub(crate) fn can_call_client(&self) -> bool {
-        self.wow64_peb32 == 0
+        !self.is_wow64()
+    }
+
+    /// Is this process a **WoW64** process — a 32-bit guest running on the
+    /// 64-bit Wine PE set (roadmap W5.4)? True once `wow64_boot` has published
+    /// the 32-bit PEB, which is the one field only that boot sets.
+    ///
+    /// `cfg.is_64bit` deliberately cannot answer this: a WoW64 process *is* a
+    /// 64-bit NT process, and every kernel-facing structure in it is 64-bit.
+    /// Anything that needs to know the **guest code's** bitness has to ask here.
+    pub(crate) fn is_wow64(&self) -> bool {
+        self.wow64_peb32 != 0
     }
 
     /// The general form of [`call_wndproc_from_syscall`](Self::call_wndproc_from_syscall):

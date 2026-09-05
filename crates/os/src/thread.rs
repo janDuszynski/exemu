@@ -806,6 +806,32 @@ impl WinOs {
     /// arg8=StackSize. The desired-access mask, object attributes, target
     /// process (self only), zero-bits and attribute list are accepted and
     /// ignored — exemu hosts a single process.
+    ///
+    /// **A WoW64 process is refused outright** (roadmap W5.11). A 32-bit thread
+    /// is not a thread with a smaller stack: it is a *64-bit* thread that enters
+    /// `wow64!Wow64LdrpInitialize`, which builds that thread's own WoW64
+    /// CPU-reserved area and runs `for(;;) BTCpuSimulate()` — the same
+    /// hand-off `wow64_boot::seat_wine_loader` performs for the initial thread,
+    /// per thread. [`spawn_thread`](Self::spawn_thread) below does none of that,
+    /// and every part of what it *does* do is wrong here:
+    ///
+    /// * the start frame is chosen by `cfg.is_64bit`, which is `true` because
+    ///   the process is 64-bit — so a `stdcall` start routine would be handed
+    ///   its argument in `RCX` with an 8-byte return address;
+    /// * `map_anywhere` places the stack in the 64-bit `VirtualAlloc` arena at
+    ///   `0x40_0000_0000`, and 32-bit code sees only the low half of that
+    ///   pointer. Measured on `Firefox Installer.exe`: the new thread's
+    ///   `msvcrt!__beginthreadex_trampoline` ran with `esp = 0x12fef8` — the low
+    ///   32 bits of its real stack top — and faulted on its own `push ebp`;
+    /// * and the thread's syscalls would leave through the BOP into
+    ///   `wow64cpu+0x1110`, whose `xchg rsp,r14` needs the register state only
+    ///   `BTCpuSimulate` sets up.
+    ///
+    /// `STATUS_NOT_IMPLEMENTED` is the honest answer: the guest's own
+    /// `_beginthreadex` reports the failure and takes its error path, which is
+    /// what moved Firefox Installer from a wild fault at 10,950,022 instructions
+    /// to a clean exit at 12,467,176. Single-threadedness is a listed W5 gap;
+    /// this makes it a refusal instead of a corruption.
     pub(crate) fn nt_create_thread_ex(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle_out = self.syscall_arg(cpu, mem, 0)?;
         let entry = self.syscall_arg(cpu, mem, 4)?;
@@ -814,6 +840,9 @@ impl WinOs {
         let stack_size = self.syscall_arg(cpu, mem, 8)?;
         if handle_out == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
+        }
+        if self.is_wow64() {
+            return Ok(STATUS_NOT_IMPLEMENTED);
         }
         let suspended = create_flags & (CREATE_SUSPENDED_NT as u64) != 0;
         match self.spawn_thread(mem, stack_size, entry, param, suspended)? {
@@ -1269,4 +1298,67 @@ pub(crate) fn ssdt_nt_query_system_information_ex(
     mem: &mut dyn Memory,
 ) -> Result<u32> {
     os.nt_query_system_information_ex(cpu, mem)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{WinConfig, WinOs};
+    use exemu_core::Region;
+    use exemu_memory::VirtualMemory;
+
+    /// `NtCreateThreadEx(&h, …, StartRoutine, Arg, flags, 0, stack, …)` with the
+    /// out-handle in the arg0 register and the rest on the syscall stack.
+    fn create_thread_ex(os: &mut WinOs, mem: &mut VirtualMemory, handle_out: u64) -> u32 {
+        const GUEST_RSP: u64 = 0x2_0800;
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, handle_out); // arg0 = &ThreadHandle
+        os.set_syscall_guest_rsp_for_test(GUEST_RSP);
+        for (i, v) in [(4u64, 0x40_1000u64), (5, 0), (6, 0), (7, 0), (8, 0x1000)] {
+            mem.write_u64(GUEST_RSP + 0x28 + (i - 4) * 8, v).unwrap();
+        }
+        os.nt_create_thread_ex(&mut cpu, mem).unwrap()
+    }
+
+    fn os_and_mem() -> (WinOs, VirtualMemory) {
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("stack", 0x2_0000, 0x1_0000, Perm::RW)).unwrap();
+        let os = WinOs::new(WinConfig {
+            is_64bit: true,
+            api_base: 0x7EFF_0000_0000,
+            heap_base: 0x2_0000_0000,
+            heap_size: 0x10_0000,
+            valloc_base: 0x40_0000_0000,
+            echo: false,
+            ..WinConfig::default()
+        });
+        (os, mem)
+    }
+
+    /// **A WoW64 process refuses to create a thread — the pinned W5.11 gap.**
+    ///
+    /// The control matters as much as the assertion: the *same* call in a plain
+    /// 64-bit process succeeds, so the refusal is a property of the process
+    /// model and not of the arguments. See `nt_create_thread_ex`'s doc comment
+    /// for why a 32-bit thread cannot be spawned by `spawn_thread` at all — it
+    /// would get the 64-bit start frame and a stack above 4 GiB that 32-bit
+    /// code sees only the low half of.
+    #[test]
+    fn a_wow64_process_refuses_to_create_a_thread() {
+        const OUT: u64 = 0x2_0100;
+
+        let (mut os, mut mem) = os_and_mem();
+        assert_eq!(create_thread_ex(&mut os, &mut mem, OUT), STATUS_SUCCESS, "control: 64-bit");
+        assert_ne!(mem.read_u64(OUT).unwrap(), 0, "the control really produced a handle");
+
+        let (mut os, mut mem) = os_and_mem();
+        os.set_wow64_peb32(0x7f00_8000); // this process is now WoW64
+        assert!(os.is_wow64());
+        assert_eq!(
+            create_thread_ex(&mut os, &mut mem, OUT),
+            STATUS_NOT_IMPLEMENTED,
+            "a WoW64 thread is Wine's Wow64LdrpInitialize to start, not spawn_thread's",
+        );
+        assert_eq!(mem.read_u64(OUT).unwrap(), 0, "no handle was written");
+    }
 }
