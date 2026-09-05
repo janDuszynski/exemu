@@ -103,6 +103,24 @@
 # it as a pointer, and faults far downstream. They are pinned as *known-bad*
 # so the day the Wine path (W5 WoW64) fixes them, this gate is what notices.
 #
+# THE WINE PATH IS NOW PINNED TOO (`wine_boot`, roadmap W5). The last two
+# entries run the two 32-bit binaries the way a real 32-bit application has to
+# run — as a WoW64 process on Wine's 64-bit PE set, with Wine's own i386 ntdll
+# doing the loading, so kernel32/user32/msvcrt/comctl32/ole32/… are Wine's
+# guest code and exemu binds none of their imports.
+#
+# They are SEPARATE entries, not a mode switch on the existing ones, because
+# they are not the same program: on the emulated path NSIS calls exemu's
+# hand-written Win32 and dies writing through a NULL at 0x20001c2c, while on
+# the Wine path it calls Wine's and exits cleanly. Keeping both is what makes
+# the comparison meaningful — and what stops a Wine-path improvement from
+# silently masking an emulated-path regression, or the reverse.
+#
+# Neither completes its install, and the pins say so in the only currency this
+# gate has: an exact instruction count and the guest's OWN exit code. Both are
+# reproducible to the instruction (3 virtual-clock runs each, Δ0, identical
+# artifact counts), so `tolerance = 0` applies here exactly as it does above.
+#
 # The counts here are LOWER than the ad-hoc numbers in knowledge/known-issues.know
 # (7-Zip 496,505,572 vs 496,505,788; SteamSetup 92,865,377 vs 92,883,812): those
 # were measured through a long absolute path and against a shared sandbox — see
@@ -221,3 +239,31 @@ tolerance = 0
 artifacts = 1
 rip       = "0x0"
 stop      = "unmapped memory access at 0x0000000000000000 (1 bytes)"
+
+[[binary]]
+name      = "SteamSetup.exe (wine wow64)"
+path      = "example_exe/SteamSetup.exe"
+note      = "The 32-bit NSIS installer as a real WoW64 process on Wine's 64-bit PE set (roadmap W5). Wine's i386 loader_init maps and binds its whole import graph off the pinned prefix — 30 modules, advapi32 through shfolder — and the guest reaches exemu's win32k through wow64win's thunks into the 64-bit win32u. It runs 7,363,620 instructions with ZERO exceptions delivered and terminates with its own exit code 2; the emulated twin above faults at 92,865,377. That the Wine number is smaller is not a regression: it is a different program that stops for a different reason. What moves this count: the pinned Wine prefix (BOTH halves — a refresh changes the loader itself, not just the libraries), the WoW64 file-system redirector's view of \\windows\\system32, which decides which DLLs the 32-bit loader is handed, and the sandbox contents, since a self-extractor's own file I/O is part of the count. It does NOT reach its nsDialogs installer; the remaining wall is that a 32-bit client callback (WM_NCCREATE/WM_CREATE, and every WndProc dispatch) has to travel ntdll64!KiUserCallbackDispatcher -> wow64!Wow64KiUserCallbackDispatcher -> ntdll32!KiUserCallbackDispatcher, which exemu's win32k does not speak yet (roadmap W5.10). Until it does, the window is created and hears nothing."
+quick     = false
+virtual_clock = true
+wine_boot = "example_exe/wine-dlls/x86_64-windows"
+max_steps = 300000000
+outcome   = "exit"
+exit_code = 2
+steps     = 7363620
+tolerance = 0
+artifacts = 4
+
+[[binary]]
+name      = "Firefox Installer.exe (wine wow64)"
+path      = "example_exe/Firefox Installer.exe"
+note      = "The 32-bit UPX-packed installer on the same WoW64 path. The UPX stub self-decompresses, the inner 7-Zip SFX runs against Wine's kernel32/kernelbase/msvcrt/user32 and unpacks C:\\Temp\\7zS00004040, then exits 1 after 12,467,176 instructions — 2.7x the emulated twin's 4,665,426, with all of the extra work being Wine's own code. The wall it stops at is named and pinned: it calls _beginthreadex, and exemu refuses NtCreateThreadEx in a WoW64 process (STATUS_NOT_IMPLEMENTED, roadmap W5.11) because a 32-bit thread is a 64-bit thread entering wow64!Wow64LdrpInitialize with its own CPU-reserved area, not a thread with a smaller stack. Before that refusal the spawned thread got a stack in the 64-bit VirtualAlloc arena at 0x40_0000_0000, whose low 32 bits (0x12fef8) address nothing, and died on its own push ebp. Same inputs move this count as the entry above."
+quick     = true
+virtual_clock = true
+wine_boot = "example_exe/wine-dlls/x86_64-windows"
+max_steps = 300000000
+outcome   = "exit"
+exit_code = 1
+steps     = 12467176
+tolerance = 0
+artifacts = 3

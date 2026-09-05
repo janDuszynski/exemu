@@ -109,29 +109,24 @@ fn probe(path: &str, tag: &str, max_steps: u64) -> Option<Probe> {
 
 /// **`SteamSetup.exe` (32-bit NSIS) on the WoW64 path.**
 ///
-/// Measured 2026-08-21: **~6.6M instructions**, then a fault inside the 64-bit
-/// `ntdll` with `rsp` off the bottom of the 32-bit stack.
+/// Measured 2026-09-06: **7,371,260 instructions, exit code 2 — the guest's
+/// own, with zero exceptions delivered.** Wine's i386 `loader_init` binds its
+/// whole import graph off the pinned prefix (30 modules, `advapi32` through
+/// `shfolder`) and the guest reaches exemu's win32k through `wow64win`'s
+/// thunks into the 64-bit `win32u`.
 ///
-/// **The previous "still running at 60M" reading was not progress.** With
-/// `EXEMU_DBG=1` the run showed one real fault at ~5.0M followed by 82
-/// `0x80000003` breakpoints, all at the identical address
-/// `ntdll!KiUserExceptionDispatcher+0x2a` — the `int3` Wine puts *after* its
-/// unreachable `call dispatch_exception`. The remaining 595M instructions were
-/// that livelock, not the installer.
+/// **It used to fault** at 6,605,667 with a 145-deep exception cascade: exemu
+/// seated combase's `OleMainThreadWndClass` procedure — 32-bit code — with the
+/// CPU still in long mode (roadmap W5.10). It now declines that callback
+/// instead, so the window is created and simply hears no `WM_NCCREATE`/
+/// `WM_CREATE`.
 ///
-/// What moved it forward: `wow64win.dll`'s 477 `win32u.dll` imports are now
-/// bound (roadmap W5.8). Before that, the first win32k call a GUI guest makes —
-/// `NtUserInitializeClientPfnArrays`, from user32's own `DllMain` — jumped
-/// through an unbound IAT slot into the ASCII of its own name. The visible
-/// effect is the module count: the 32-bit loader now gets **30** modules in,
-/// including `imm32`, `uxtheme`, `oleaut32`, `propsys` and `setupapi`, where it
-/// used to stop at 20.
-///
-/// For scale, the same binary on the **emulated** path is pinned at 92,865,377
-/// instructions and faults (`corpus.toml`) — but that is a different program:
-/// there NSIS runs against exemu's hand-written Win32, here it runs against
-/// Wine's. It does **not** reach its nsDialogs installer; that is the W5 gate,
-/// still open.
+/// It does **not** reach its nsDialogs installer; that is the W5 GUI gate,
+/// still open. The exact count lives in `corpus.toml`
+/// (`SteamSetup.exe (wine wow64)`, tolerance 0) measured through the corpus
+/// runner's bare `argv[0]`; this probe passes the test's own long relative
+/// path, which is worth ~7.6k more instructions of command-line parsing, so it
+/// asserts a range rather than a second, conflicting exact number.
 #[test]
 fn steamsetup_wow64_probe() {
     let Some(p) = probe("../../example_exe/SteamSetup.exe", "steam", 60_000_000) else {
@@ -139,7 +134,7 @@ fn steamsetup_wow64_probe() {
         return;
     };
     eprintln!(
-        "W5.8 probe — SteamSetup.exe (WoW64): {} instructions, PEB32.Ldr={:#x}, {}",
+        "W5 probe — SteamSetup.exe (WoW64): {} instructions, PEB32.Ldr={:#x}, {}",
         p.steps, p.peb32_ldr, p.outcome,
     );
     assert_ne!(
@@ -147,8 +142,15 @@ fn steamsetup_wow64_probe() {
         "Wine's i386 loader_init published PEB32.Ldr (it really ran) — {}",
         p.outcome,
     );
+    // The identity assertion, and the one that regressed for months: the run
+    // ends because the guest asked it to, not because it walked off a cliff.
+    assert_eq!(
+        p.outcome, "exit 2",
+        "SteamSetup terminates itself on the WoW64 path; a fault here means the \
+         32-bit callback/thread refusals (W5.10/W5.11) stopped holding",
+    );
     assert!(
-        p.steps > 5_000_000,
+        (5_000_000..20_000_000).contains(&p.steps),
         "SteamSetup should run millions of instructions on the WoW64 path; ran {} ({})",
         p.steps,
         p.outcome,
@@ -157,15 +159,22 @@ fn steamsetup_wow64_probe() {
 
 /// **`Firefox Installer.exe` (32-bit UPX) on the WoW64 path.**
 ///
-/// Measured: **11,462,340 instructions**, then an unmapped read at `0x12fef4`
-/// with `rip` at `0xcc1c70` — an address that is neither in the 32-bit `ntdll`
-/// (mapped at 0x6000_0000) nor in the packed stub's own image, i.e. the UPX
-/// stub has already unpacked and the *inner* program is running against
-/// Wine's 32-bit DLLs.
+/// Measured 2026-09-06: **12,475,885 instructions, exit code 1 — the guest's
+/// own.** The UPX stub self-decompresses, and the inner 7-Zip SFX runs against
+/// Wine's `kernel32`/`kernelbase`/`msvcrt`/`user32` far enough to unpack
+/// `C:\Temp\7zS00004040`.
+///
+/// **It used to fault** at 10,950,022 inside `msvcrt!__beginthreadex_trampoline`
+/// on its own `push ebp`: a thread exemu spawned with a stack in the *64-bit*
+/// `VirtualAlloc` arena at `0x40_0000_0000`, of which 32-bit code sees only
+/// `0x0012_fef8` — unmapped. `NtCreateThreadEx` now refuses in a WoW64 process
+/// (roadmap W5.11) and `_beginthreadex` takes its error path.
 ///
 /// For scale, the same binary on the **emulated** path is pinned at 4,665,426
-/// instructions (`corpus.toml`) — so the WoW64 path currently gets it ~2.5×
-/// further, with all of the extra work being Wine's own code.
+/// instructions and faults, so the WoW64 path gets it ~2.7x further with all of
+/// the extra work being Wine's own code. Exact count: `corpus.toml`
+/// (`Firefox Installer.exe (wine wow64)`, tolerance 0); see the note on the
+/// SteamSetup probe above for why this one asserts a range.
 #[test]
 fn firefox_installer_wow64_probe() {
     let Some(p) = probe("../../example_exe/Firefox Installer.exe", "firefox", 60_000_000) else {
@@ -173,7 +182,7 @@ fn firefox_installer_wow64_probe() {
         return;
     };
     eprintln!(
-        "W5.8 probe — Firefox Installer.exe (WoW64): {} instructions, PEB32.Ldr={:#x}, {}",
+        "W5 probe — Firefox Installer.exe (WoW64): {} instructions, PEB32.Ldr={:#x}, {}",
         p.steps, p.peb32_ldr, p.outcome,
     );
     assert_ne!(
@@ -181,8 +190,13 @@ fn firefox_installer_wow64_probe() {
         "Wine's i386 loader_init published PEB32.Ldr (it really ran) — {}",
         p.outcome,
     );
+    assert_eq!(
+        p.outcome, "exit 1",
+        "Firefox Installer terminates itself on the WoW64 path; a fault here means the \
+         32-bit callback/thread refusals (W5.10/W5.11) stopped holding",
+    );
     assert!(
-        p.steps > 4_000_000,
+        (8_000_000..25_000_000).contains(&p.steps),
         "Firefox Installer should get past its UPX stub on the WoW64 path; ran {} ({})",
         p.steps,
         p.outcome,
