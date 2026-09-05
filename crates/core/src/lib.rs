@@ -14,6 +14,7 @@
 pub mod clock;
 pub mod audio;
 pub mod cpu;
+pub mod debug;
 pub mod driver;
 pub mod error;
 pub mod gui;
@@ -30,6 +31,11 @@ pub use clock::{
 };
 pub use audio::{AudioFormat, AudioSink, NoAudio};
 pub use cpu::{Cpu, CpuState, Exit, Reg, X87, flags};
+pub use debug::{
+    DebugCommand, DebugControl, DebugEvent, DebugFrontEnd, DebugSession, DebugSnapshot,
+    DisasmLine, HandleInfo, ModuleInfo, NoTrace, StopReason, StopRequest, SyscallTable,
+    ThreadInfo, TraceSink, WatchKind, Watchpoint, BREAK_AT_STEP_DISABLED,
+};
 pub use driver::{
     DisplayMode, InputEvent, MouseButton, NoDriver, TextBitmap, UserDriver, WindowParams,
 };
