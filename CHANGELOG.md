@@ -126,6 +126,32 @@ end-to-end on the default path.
     compiler stops a block at the wrap (`StopReason::Wrapped`) so a block stays
     one contiguous range — which is what both that check and the two-page code
     generation check assume.
+- **Where a trial is assembled is now part of the trial (W8.7).** Every trial
+  used to be built at the base of a low page, which made the differential
+  *structurally* blind to the address-width rule: in 32-bit mode every
+  architectural address is masked to 32 bits (`rip` after any instruction, a
+  branch target, an effective address, `esp` across a push or pop) and in
+  64-bit mode none of them is, so a trial that never computes an address near
+  2^32 cannot tell a CPU that masks from one that does not. A trial now also
+  picks a **layout** — `edge-code` (32-bit code flush against 2^32 with page
+  zero mapped, or 64-bit code above 4 GiB where the rule is the opposite),
+  `edge-data` (low code, but `esp` and the base pointer on the boundary), or
+  the historical `low` — selected by `--layout low|edge|mixed`. The generator
+  also emits **push/pop/leave, `push imm`, near branches and `[rbp+disp]`
+  accesses**, none of which the single-instruction stream shared with the
+  Unicorn oracle contains: it has no control flow and never touches the stack.
+  This is what surfaced the two JIT bugs above; neither was reachable before.
+- **The trials were not as independent as their count suggested.** They were
+  seeded `Rng::new(base ^ index * GOLDEN)`, and `Rng` is itself counter-based,
+  so trial *i*'s draw sequence was trial *i+1*'s **shifted by one** — a whole
+  run sampled one shared sequence at different offsets, and nearby indices could
+  assemble byte-for-byte identical trials. `Rng::for_trial` runs the mixing
+  finalizer over the counter first; pinned by a test that asserts the old
+  derivation really was a shift and the new one shares no draw.
+- Volume after the fixes: **0 divergences in 1.25M trials per bitness** — 500k
+  mixed-layout, 500k boundary-layouts-only, and 250k single-instruction blocks,
+  across three seeds (2.5M trials in all) — and 7-Zip still retires exactly
+  496,505,572 instructions under `--jit`, so neither fix moved the pin.
 - Two rules make faults exact with no error plumbing in compiled code: nothing
   is committed to guest state before a faulting access, and a fault **rewinds**
   — `rip` returns to the faulting instruction and the *interpreter* re-executes

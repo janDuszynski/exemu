@@ -12,19 +12,19 @@
 //! recorded in the roadmap notes.
 
 use exemu_cpu::Bits;
-use exemu_oracle::jitdiff::{fuzz, render, JitFuzzConfig};
+use exemu_oracle::jitdiff::{fuzz, render, JitFuzzConfig, LayoutMix};
 
 /// `Jit::new` fails on any platform without the macOS/AArch64 W^X backend.
 fn jit_available() -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64"))
 }
 
-fn run(bits: Bits, count: u64, seed: u64, chain: u32) {
+fn run_mix(bits: Bits, count: u64, seed: u64, chain: u32, layouts: LayoutMix) {
     if !jit_available() {
         eprintln!("skipping: no JIT backend on this platform");
         return;
     }
-    let s = fuzz(&JitFuzzConfig { bits, count, seed, max_report: 8, chain })
+    let s = fuzz(&JitFuzzConfig { bits, count, seed, max_report: 8, chain, layouts })
         .expect("the JIT backend should be available here");
     for d in &s.first {
         eprintln!("{}", render(d));
@@ -39,6 +39,10 @@ fn run(bits: Bits, count: u64, seed: u64, chain: u32) {
     );
     // A run that compiles nothing would pass vacuously; require real work.
     assert!(s.insns > count / 2, "only {} instructions compiled in {} trials", s.insns, s.trials);
+}
+
+fn run(bits: Bits, count: u64, seed: u64, chain: u32) {
+    run_mix(bits, count, seed, chain, LayoutMix::Mixed);
 }
 
 #[test]
@@ -65,4 +69,23 @@ fn jit_matches_the_interpreter_one_instruction_at_a_time() {
 fn jit_matches_the_interpreter_second_seed() {
     run(Bits::B64, 4_000, 0xC0FFEE, 16);
     run(Bits::B32, 4_000, 0xC0FFEE, 16);
+}
+
+/// Only the boundary layouts (roadmap W8.7): every trial computes an address
+/// across 2^32 (32-bit) or above 4 GiB (64-bit), which is where the JIT and the
+/// interpreter can disagree about the width of an address without either
+/// looking wrong on its own. The low-layout runs above cannot reach this at all.
+#[test]
+fn jit_matches_the_interpreter_at_the_address_boundary() {
+    run_mix(Bits::B64, 4_000, 3, 8, LayoutMix::Edge);
+    run_mix(Bits::B32, 4_000, 3, 8, LayoutMix::Edge);
+    run_mix(Bits::B64, 4_000, 11, 1, LayoutMix::Edge);
+    run_mix(Bits::B32, 4_000, 11, 1, LayoutMix::Edge);
+}
+
+/// The pre-W8.7 shape, kept so an old run can still be reproduced exactly.
+#[test]
+fn jit_matches_the_interpreter_in_the_low_layout_only() {
+    run_mix(Bits::B64, 4_000, 5, 8, LayoutMix::Low);
+    run_mix(Bits::B32, 4_000, 5, 8, LayoutMix::Low);
 }

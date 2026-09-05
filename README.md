@@ -442,9 +442,11 @@ that is enforced two ways. A differential oracle
 ([below](#differential-cpu-oracle)) runs generated blocks through both engines
 and compares the entire architectural state — every GPR, every `rflags` bit
 including the ones x86 leaves undefined, `rip`, the vector file and every byte
-of memory — at **0 divergences in 9.3M trials per bitness**. And every corpus
-binary is run both ways: same exit code, same fault site, same artifacts, and
-the same exact instruction count, with only the wall time different.
+of memory — at **0 divergences in 10.5M trials per bitness**, a twelfth of them
+assembled at the top of the address space, where a 32-bit address wraps and a
+64-bit one must not. And every corpus binary is run both ways: same exit code,
+same fault site, same artifacts, and the same exact instruction count, with only
+the wall time different.
 
 **Flags are computed only where they can be seen.** Building x86's six status
 flags eagerly costs ~19 ARM64 instructions per ALU operation, and most of those
@@ -781,10 +783,26 @@ but means an address is being computed wrongly).
 cargo run -p exemu-oracle --release -- jit --bits both --count 1M --chain 8
 ```
 
-Current result: **0 divergences in 9.3M trials per bitness**, across eleven
-configurations (1, 8, 24 and 32 instructions per block; ten seeds), of which
+**Where a trial is assembled is part of the trial.** In 32-bit mode every
+address the CPU produces is masked to 32 bits — `rip` after any instruction, a
+branch target, an effective address, `esp` across a push or pop — and in 64-bit
+mode none of them is, so a trial built at the base of a low page (as all of them
+once were) cannot tell a CPU that masks from one that does not. Each trial
+therefore picks a *layout*: code flush against the top of the 32-bit address
+space, or above 4 GiB in long mode where the rule is the opposite, or low code
+with the stack and base pointer on the boundary. `--layout low|edge|mixed`
+chooses the mix. It also generates push/pop/leave, near branches and
+`[rbp+disp]` accesses, which the single-instruction Unicorn stream has no reason
+to contain. This found two real JIT bugs no other harness could reach — a
+compiler that decoded the zero padding of its own short instruction-fetch window
+at the end of an executable region, and a block ending exactly on the 4 GiB
+boundary whose self-modification range collapsed to nothing.
+
+Current result: **0 divergences in 10.5M trials per bitness**, across fourteen
+configurations (1, 8, 24 and 32 instructions per block; twelve seeds), of which
 800k per bitness were re-run against the deferred-flag lowering (roadmap W8.4)
-and 500k per bitness against the final tree.
+and **1.25M per bitness against the final tree, ~875k of that in the boundary
+layouts** (roadmap W8.7).
 
 ## Contributing
 
