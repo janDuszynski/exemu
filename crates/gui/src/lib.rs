@@ -19,6 +19,11 @@
 
 mod render;
 
+/// The OpenGL / Vulkan host backends behind Wine's `opengl32` and
+/// `winevulkan` (W7.3), plus the unixlib ABI recovered from the pinned Wine
+/// 11.0 binaries that says how a guest reaches them.
+pub mod graphics;
+
 /// The live macOS AppKit/Metal display path (W4.4). macOS-only; the rest of the
 /// crate (the minifb/offscreen dialog backends and the `Presenter` trait) is
 /// cross-platform.
