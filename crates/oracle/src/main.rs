@@ -12,16 +12,18 @@ fn main() {
     unicorn_main(&argv);
 }
 
-/// `exemu-oracle jit [--bits 32|64|both] [--count N] [--seed S] [--chain K]`
+/// `exemu-oracle jit [--bits 32|64|both] [--count N] [--seed S] [--chain K]
+///  [--layout low|edge|mixed]`
 fn jit_main(argv: &[String]) {
     use exemu_cpu::Bits;
-    use exemu_oracle::jitdiff::{fuzz, render, JitFuzzConfig};
+    use exemu_oracle::jitdiff::{fuzz, render, JitFuzzConfig, Layout, LayoutMix};
 
     let mut bits_list = vec![Bits::B32, Bits::B64];
     let mut count: u64 = 200_000;
     let mut seed: u64 = 1;
     let mut report: usize = 25;
     let mut chain: u32 = 8;
+    let mut layouts = LayoutMix::Mixed;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -46,6 +48,18 @@ fn jit_main(argv: &[String]) {
                 i += 1;
                 chain = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(chain);
             }
+            "--layout" => {
+                i += 1;
+                layouts = match argv.get(i).map(|s| s.as_str()) {
+                    Some("low") => LayoutMix::Low,
+                    Some("edge") => LayoutMix::Edge,
+                    Some("mixed") => LayoutMix::Mixed,
+                    other => {
+                        eprintln!("--layout expects low|edge|mixed, got {other:?}");
+                        std::process::exit(2);
+                    }
+                };
+            }
             "--report" => {
                 i += 1;
                 report = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(report);
@@ -64,8 +78,8 @@ fn jit_main(argv: &[String]) {
             Bits::B32 => "32-bit",
             Bits::B64 => "64-bit",
         };
-        println!("== JIT-vs-interpreter differential ({name}): {count} trials × {chain} instructions, seed {seed} ==");
-        let s = match fuzz(&JitFuzzConfig { bits, count, seed, max_report: report, chain }) {
+        println!("== JIT-vs-interpreter differential ({name}): {count} trials × {chain} instructions, seed {seed}, layout {layouts:?} ==");
+        let s = match fuzz(&JitFuzzConfig { bits, count, seed, max_report: report, chain, layouts }) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("  {e}");
@@ -86,6 +100,14 @@ fn jit_main(argv: &[String]) {
             s.faults,
             s.divergences
         );
+        let per_layout: Vec<String> = Layout::ALL
+            .iter()
+            .map(|l| {
+                let i = l.index();
+                format!("{}={} ({} div)", l.name(), s.by_layout[i], s.div_by_layout[i])
+            })
+            .collect();
+        println!("     layouts: {}", per_layout.join("  "));
         let declined: Vec<String> = s
             .declined_ops
             .iter()

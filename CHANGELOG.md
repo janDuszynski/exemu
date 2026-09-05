@@ -103,6 +103,54 @@ end-to-end on the default path.
   It also proves that a declined block changes nothing, and that a block which
   faults rewound onto an instruction that really does fault. The harness was
   validated by injecting a one-bit AF bug, which it caught in 2,000 trials.
+- **Two JIT bugs at the edge of the address space (W8.7).** Both were found by
+  auditing the JIT's address masking against the interpreter's, and neither was
+  a masking bug: the masking turned out to be right everywhere, and is now
+  pinned in both directions (32-bit must truncate, 64-bit must not) by
+  `crates/jit/tests/address_width.rs`.
+  - **The compiler decoded its own padding.** Where a 16-byte instruction fetch
+    overruns the region, the window is refilled byte by byte — but `decode` was
+    handed the whole window, zeros included. At the tail of an executable region
+    that *fabricates* an instruction the guest does not have: `8B 05` plus four
+    bytes of padding compiled as `mov eax, [0]` and succeeded, where the
+    interpreter faults fetching the third byte. `decode` now sees only the bytes
+    that were really fetched, so an over-long encoding is simply declined.
+  - **A block ending on the 4 GiB boundary reported an empty byte range.** The
+    store helper decides "this store rewrote an instruction I have not run yet"
+    by comparing against the block's `code_lo..code_hi`, and `hi` came from the
+    address the block *ends* at — which for such a block has wrapped round below
+    its own start. Clamped, the range collapsed to nothing, no store could ever
+    hit it, and the block carried on executing instructions the guest had just
+    overwritten. The range is now derived from the block's *length*, and the
+    compiler stops a block at the wrap (`StopReason::Wrapped`) so a block stays
+    one contiguous range — which is what both that check and the two-page code
+    generation check assume.
+- **Where a trial is assembled is now part of the trial (W8.7).** Every trial
+  used to be built at the base of a low page, which made the differential
+  *structurally* blind to the address-width rule: in 32-bit mode every
+  architectural address is masked to 32 bits (`rip` after any instruction, a
+  branch target, an effective address, `esp` across a push or pop) and in
+  64-bit mode none of them is, so a trial that never computes an address near
+  2^32 cannot tell a CPU that masks from one that does not. A trial now also
+  picks a **layout** — `edge-code` (32-bit code flush against 2^32 with page
+  zero mapped, or 64-bit code above 4 GiB where the rule is the opposite),
+  `edge-data` (low code, but `esp` and the base pointer on the boundary), or
+  the historical `low` — selected by `--layout low|edge|mixed`. The generator
+  also emits **push/pop/leave, `push imm`, near branches and `[rbp+disp]`
+  accesses**, none of which the single-instruction stream shared with the
+  Unicorn oracle contains: it has no control flow and never touches the stack.
+  This is what surfaced the two JIT bugs above; neither was reachable before.
+- **The trials were not as independent as their count suggested.** They were
+  seeded `Rng::new(base ^ index * GOLDEN)`, and `Rng` is itself counter-based,
+  so trial *i*'s draw sequence was trial *i+1*'s **shifted by one** — a whole
+  run sampled one shared sequence at different offsets, and nearby indices could
+  assemble byte-for-byte identical trials. `Rng::for_trial` runs the mixing
+  finalizer over the counter first; pinned by a test that asserts the old
+  derivation really was a shift and the new one shares no draw.
+- Volume after the fixes: **0 divergences in 1.25M trials per bitness** — 500k
+  mixed-layout, 500k boundary-layouts-only, and 250k single-instruction blocks,
+  across three seeds (2.5M trials in all) — and 7-Zip still retires exactly
+  496,505,572 instructions under `--jit`, so neither fix moved the pin.
 - Two rules make faults exact with no error plumbing in compiled code: nothing
   is committed to guest state before a faulting access, and a fault **rewinds**
   — `rip` returns to the faulting instruction and the *interpreter* re-executes

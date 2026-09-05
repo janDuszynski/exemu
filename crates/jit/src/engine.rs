@@ -225,7 +225,18 @@ impl Jit {
         }
         let plan = Compiler::compile(mem, mode, rip, self.max_insns);
         let lo = plan.start;
-        let hi = plan.end_rip.max(plan.start);
+        // The end of the block's guest **byte range**, which is not always
+        // `end_rip`: a block whose last instruction ends on the top of the
+        // address space leaves `end_rip` wrapped round to a *lower* value than
+        // `start`, and clamping that to `start` collapsed the range to nothing.
+        // The store helper then saw no store as hitting the block's own code,
+        // so a `mov [ebp+d], ebp` into the middle of the running block went
+        // undetected and the block carried on executing instructions the guest
+        // had just overwritten. `plan.bytes` is the length rather than the
+        // endpoint, so it is right either way; the compiler stops a block at
+        // the wrap (`StopReason::Wrapped`) so this can never exceed 2^64 in
+        // practice, and saturating keeps that a fact rather than a hope.
+        let hi = lo.saturating_add(plan.bytes);
         let page0 = lo & !(exemu_core::CODE_PAGE_SIZE - 1);
         let page1 = hi.saturating_sub(1).max(lo) & !(exemu_core::CODE_PAGE_SIZE - 1);
         let meta = (
