@@ -734,10 +734,14 @@ impl Win32kState {
 
     fn window_from_point(&self, x: i32, y: i32, skip: &[u32]) -> u32 {
         let Some(top) = self.shown_window() else { return 0 };
-        if skip.contains(&top) || !self.contains_point(top, x, y) {
+        self.window_from_point_in(top, x, y, skip)
+    }
+
+    fn window_from_point_in(&self, root: u32, x: i32, y: i32, skip: &[u32]) -> u32 {
+        if skip.contains(&root) || !self.contains_point(root, x, y) {
             return 0;
         }
-        let mut cur = top;
+        let mut cur = root;
         for _ in 0..WINDOW_ANCESTRY_MAX {
             let next = self
                 .windows
@@ -2233,7 +2237,7 @@ impl WinOs {
     pub(crate) fn post_input_event(&mut self, ev: exemu_core::InputEvent) {
         use exemu_core::InputEvent;
         match ev {
-            InputEvent::MouseMove { x, y } | InputEvent::MouseButton { x, y, .. } => {
+            InputEvent::MouseMove { x, y, .. } | InputEvent::MouseButton { x, y, .. } => {
                 self.win32k_state.cursor_pos = (x, y)
             }
             InputEvent::Close => return,
@@ -2262,8 +2266,8 @@ fn input_message(ev: exemu_core::InputEvent) -> Option<(u32, u64)> {
         InputEvent::MouseButton { button: MouseButton::Right, down: false, .. } => {
             (WM_RBUTTONUP, 0)
         }
-        InputEvent::Key { vk, down: true } => (WM_KEYDOWN, vk as u64),
-        InputEvent::Key { vk, down: false } => (WM_KEYUP, vk as u64),
+        InputEvent::Key { vk, down: true, .. } => (WM_KEYDOWN, vk as u64),
+        InputEvent::Key { vk, down: false, .. } => (WM_KEYUP, vk as u64),
     };
     Some((msg as u32, wparam))
 }
@@ -2271,7 +2275,7 @@ fn input_message(ev: exemu_core::InputEvent) -> Option<(u32, u64)> {
 fn input_point(ev: exemu_core::InputEvent) -> Option<(i32, i32)> {
     use exemu_core::InputEvent;
     match ev {
-        InputEvent::MouseMove { x, y } | InputEvent::MouseButton { x, y, .. } => Some((x, y)),
+        InputEvent::MouseMove { x, y, .. } | InputEvent::MouseButton { x, y, .. } => Some((x, y)),
         _ => None,
     }
 }
@@ -2289,7 +2293,7 @@ fn route_raw_input(
 ) -> Result<bool> {
     let Some((msg, wparam)) = input_message(ev) else { return Ok(false) };
     let Some((x, y)) = input_point(ev) else {
-        let target = keyboard_target(os);
+        let target = keyboard_target(os, ev.hwnd());
         if target != 0 {
             os.post_internal(target as u64, msg, wparam, 0);
         }
@@ -2303,21 +2307,39 @@ fn route_raw_input(
         return Ok(false);
     }
 
-    let target = os.win32k_state.window_from_point(x, y, &[]);
+    let Some(root) = input_root(&os.win32k_state, ev.hwnd()) else { return Ok(false) };
+    let target = os.win32k_state.window_from_point_in(root, x, y, &[]);
     if target == 0 {
         return Ok(false);
     }
     begin_hit_test(os, cpu, mem, lp, ev, msg, wparam, target, Vec::new())
 }
 
-fn keyboard_target(os: &WinOs) -> u32 {
+fn input_root(st: &Win32kState, hwnd: u32) -> Option<u32> {
+    if hwnd == 0 {
+        return st.shown_window();
+    }
+    let root = st.surface_owner(hwnd);
+    st.window(root).filter(|w| w.shown).map(|_| root)
+}
+
+fn keyboard_target(os: &WinOs, hwnd: u32) -> u32 {
     let st = &os.win32k_state;
+    if hwnd == 0 {
+        for h in [st.focus, st.active] {
+            if h != 0 && st.window(h).is_some() {
+                return h;
+            }
+        }
+        return st.shown_window().unwrap_or(0);
+    }
+    let Some(root) = input_root(st, hwnd) else { return 0 };
     for h in [st.focus, st.active] {
-        if h != 0 && st.window(h).is_some() {
+        if h != 0 && st.window(h).is_some() && st.surface_owner(h) == root {
             return h;
         }
     }
-    st.shown_window().unwrap_or(0)
+    root
 }
 
 pub(crate) struct PendingHitTest {
@@ -2380,7 +2402,10 @@ pub(crate) fn finish_hit_test(
     if code == hit::TRANSPARENT {
         pending.skipped.push(pending.hwnd);
         let (x, y) = input_point(pending.ev).unwrap_or((0, 0));
-        let next = os.win32k_state.window_from_point(x, y, &pending.skipped);
+        let next = match input_root(&os.win32k_state, pending.ev.hwnd()) {
+            Some(root) => os.win32k_state.window_from_point_in(root, x, y, &pending.skipped),
+            None => 0,
+        };
         if next != 0 && next != pending.hwnd {
             pending.hwnd = next;
             if let Some((wndproc, args)) = arm_hit_test(os, mem, &pending)? {
@@ -4383,6 +4408,7 @@ mod tests {
         let mut mem = VirtualMemory::new();
         let mut cpu = CpuState::default();
         let ev = exemu_core::InputEvent::MouseButton {
+            hwnd: 0,
             button: exemu_core::MouseButton::Left,
             down: false,
             x: 300,
@@ -4401,12 +4427,78 @@ mod tests {
     }
 
     #[test]
+    fn an_event_reaches_the_top_level_window_it_names() {
+        let mut mem = VirtualMemory::new();
+        let mut cpu = CpuState::default();
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let first = child(&mut os, 0, [0, 0, 400, 300]);
+        let first_button = child(&mut os, first, [10, 10, 100, 40]);
+        let second = child(&mut os, 0, [0, 0, 400, 300]);
+        let second_button = child(&mut os, second, [10, 10, 100, 40]);
+
+        let click = |hwnd| exemu_core::InputEvent::MouseButton {
+            hwnd,
+            button: exemu_core::MouseButton::Left,
+            down: true,
+            x: 50,
+            y: 30,
+        };
+        let mut route = |os: &mut WinOs, hwnd| {
+            route_raw_input(os, &mut cpu, &mut mem, 0, click(hwnd)).expect("routes");
+            os.msg_next()
+        };
+
+        let m = route(&mut os, second).expect("the click was posted");
+        assert_eq!(m.hwnd, second_button as u64, "the second window's control, not the first's");
+        assert_eq!(m.message, crate::gdi::WM_LBUTTONDOWN as u32);
+        assert_eq!(
+            (lo_word_i32(m.lparam), hi_word_i32(m.lparam)),
+            (40, 20),
+            "in that control's own client coordinates"
+        );
+
+        let m = route(&mut os, first).expect("the click was posted");
+        assert_eq!(m.hwnd, first_button as u64, "naming the first window still reaches it");
+
+        let m = route(&mut os, 0).expect("the click was posted");
+        assert_eq!(m.hwnd, first_button as u64, "an unnamed event keeps the old first-shown rule");
+
+        assert!(route(&mut os, 0xDEAD_BEEF).is_none(), "a window win32k never made takes nothing");
+
+        os.win32k_state.window_mut(second).unwrap().shown = false;
+        assert!(route(&mut os, second).is_none(), "a hidden window is not a fallback for the first");
+    }
+
+    #[test]
+    fn keys_stay_inside_the_window_the_event_names() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let first = child(&mut os, 0, [0, 0, 400, 300]);
+        let first_edit = child(&mut os, first, [10, 10, 100, 20]);
+        let second = child(&mut os, 0, [0, 0, 400, 300]);
+        let second_edit = child(&mut os, second, [10, 10, 100, 20]);
+
+        os.win32k_state.focus = first_edit;
+        assert_eq!(keyboard_target(&os, 0), first_edit, "an unnamed key follows the focus");
+        assert_eq!(keyboard_target(&os, first), first_edit);
+        assert_eq!(
+            keyboard_target(&os, second),
+            second,
+            "a key typed into the second window never lands in the first window's focus"
+        );
+
+        os.win32k_state.focus = second_edit;
+        assert_eq!(keyboard_target(&os, second), second_edit);
+        assert_eq!(keyboard_target(&os, first), first);
+        assert_eq!(keyboard_target(&os, 0xDEAD_BEEF), 0, "a window win32k never made takes nothing");
+    }
+
+    #[test]
     fn a_window_with_a_wndproc_is_asked_where_the_point_landed() {
         let mut mem = VirtualMemory::new();
         let mut cpu = CpuState::default();
         let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
         let top = child(&mut os, 0, [0, 0, 400, 300]);
-        let ev = exemu_core::InputEvent::MouseMove { x: 40, y: 40 };
+        let ev = exemu_core::InputEvent::MouseMove { hwnd: 0, x: 40, y: 40 };
 
         assert!(!route_raw_input(&mut os, &mut cpu, &mut mem, 0, ev).expect("routes"));
         let m = os.msg_next().expect("the move was posted");
@@ -4438,14 +4530,14 @@ mod tests {
         let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
         let top = child(&mut os, 0, [0, 0, 400, 300]);
         let edit = child(&mut os, top, [10, 10, 100, 20]);
-        assert_eq!(keyboard_target(&os), top, "no focus, no active → the shown top-level");
+        assert_eq!(keyboard_target(&os, 0), top, "no focus, no active → the shown top-level");
         os.win32k_state.active = top;
-        assert_eq!(keyboard_target(&os), top);
+        assert_eq!(keyboard_target(&os, 0), top);
         os.win32k_state.focus = edit;
-        assert_eq!(keyboard_target(&os), edit, "the focus window wins");
+        assert_eq!(keyboard_target(&os, 0), edit, "the focus window wins");
         destroy_window(&mut os, edit);
         assert_eq!(os.win32k_state.focus, 0, "destroying the focus window clears it");
-        assert_eq!(keyboard_target(&os), top);
+        assert_eq!(keyboard_target(&os, 0), top);
     }
 
     #[test]

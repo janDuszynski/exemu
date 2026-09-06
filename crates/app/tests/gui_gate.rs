@@ -397,7 +397,7 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
                 presents += 1;
                 if presents >= 2 && !clicked {
                     input_tx
-                        .send(InputEvent::MouseButton { button: MouseButton::Left, down: true, x: CLICK_X, y: CLICK_Y })
+                        .send(InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: true, x: CLICK_X, y: CLICK_Y })
                         .expect("the interpreter is still listening for input");
                     clicked = true;
                 }

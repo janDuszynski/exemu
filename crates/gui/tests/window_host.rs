@@ -104,19 +104,25 @@ fn hiding_a_window_orders_it_out_and_keeps_it_alive() {
 }
 
 #[test]
-fn input_follows_the_first_visible_top_level() {
+fn every_visible_top_level_takes_its_own_input() {
     let mut m = WindowModel::new();
     let second = TOP + 0x100;
     m.plan(&create(TOP, 0, 480, 260, true));
     m.plan(&create(second, 0, 300, 200, true));
+    m.plan(&create(BUTTON, second, 60, 24, true));
     assert_eq!(m.visible_windows(), vec![TOP, second], "creation order, as win32k walks it");
-    assert_eq!(m.primary(), Some(TOP));
+    assert!(m.visible(TOP) && m.visible(second), "both windows are routable, not just the first");
+    assert!(!m.visible(BUTTON), "a control has no window of its own to take input from");
+    assert_eq!(m.primary(), Some(TOP), "the first visible window is where a synthetic click goes");
 
     m.plan(&WindowCommand::Show { hwnd: TOP, cmd: SW_HIDE });
-    assert_eq!(m.primary(), Some(second), "hiding the first hands input to the next one");
+    assert!(!m.visible(TOP), "a hidden window stops taking input");
+    assert!(m.visible(second), "…and its sibling keeps taking its own");
+    assert_eq!(m.primary(), Some(second));
 
     m.plan(&WindowCommand::Destroy { hwnd: second });
     assert_eq!(m.primary(), None, "with nothing visible there is no window to route input to");
+    assert!(!m.visible(second));
 }
 
 #[test]

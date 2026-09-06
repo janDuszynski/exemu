@@ -590,8 +590,8 @@ fn clicking_the_button_reaches_wine_button_wndproc_on_wine() {
                 Box::new(FrameCapture { frames: Arc::clone(&frames) }),
             )),
             vec![
-                InputEvent::MouseButton { button: MouseButton::Left, down: true, x: cx, y: cy },
-                InputEvent::MouseButton { button: MouseButton::Left, down: false, x: cx, y: cy },
+                InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: true, x: cx, y: cy },
+                InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: false, x: cx, y: cy },
             ],
         ),
     )
@@ -697,12 +697,12 @@ fn space_activates_the_focused_button_on_wine() {
     };
 
     let click = vec![
-        InputEvent::MouseButton { button: MouseButton::Left, down: true, x: cx, y: cy },
-        InputEvent::MouseButton { button: MouseButton::Left, down: false, x: cx, y: cy },
+        InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: true, x: cx, y: cy },
+        InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: false, x: cx, y: cy },
     ];
     let mut click_then_space = click.clone();
-    click_then_space.push(InputEvent::Key { vk: VK_SPACE, down: true });
-    click_then_space.push(InputEvent::Key { vk: VK_SPACE, down: false });
+    click_then_space.push(InputEvent::Key { hwnd: 0, vk: VK_SPACE, down: true });
+    click_then_space.push(InputEvent::Key { hwnd: 0, vk: VK_SPACE, down: false });
 
     assert_eq!(notifications(click), 1, "the click alone notifies once");
     assert_eq!(
@@ -739,8 +739,8 @@ fn the_pressed_button_matches_golden_on_wine() {
         input_run_config(
             Box::new(PresenterDriver::new(OffscreenPresenter::with_dir(Some(shot_dir.clone())))),
             vec![
-                InputEvent::MouseButton { button: MouseButton::Left, down: true, x: cx, y: cy },
-                InputEvent::MouseButton { button: MouseButton::Left, down: false, x: cx, y: cy },
+                InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: true, x: cx, y: cy },
+                InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: false, x: cx, y: cy },
             ],
         ),
     )
@@ -811,8 +811,8 @@ fn a_click_that_misses_the_button_notifies_nobody_on_wine() {
         input_run_config(
             Box::new(RecordingDriver::new(Arc::clone(&log))),
             vec![
-                InputEvent::MouseButton { button: MouseButton::Left, down: true, x: cx, y: cy },
-                InputEvent::MouseButton { button: MouseButton::Left, down: false, x: cx, y: cy },
+                InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: true, x: cx, y: cy },
+                InputEvent::MouseButton { hwnd: 0, button: MouseButton::Left, down: false, x: cx, y: cy },
             ],
         ),
     )
