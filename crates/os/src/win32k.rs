@@ -40,6 +40,7 @@ const WIN32K_LAST: u32 = 0x1601;
 const NT_USER_INITIALIZE_CLIENT_PFN_ARRAYS: u32 = 0x147a;
 const NT_USER_GET_SYSTEM_DPI_FOR_PROCESS: u32 = 0x144b;
 const NT_USER_SET_PROCESS_DPI_AWARENESS_CONTEXT: u32 = 0x1577;
+const NT_USER_GET_ATOM_NAME: u32 = 0x13d1;
 const NT_USER_GET_CLASS_INFO_EX: u32 = 0x13d8;
 const NT_USER_REGISTER_CLASS_EX_WOW: u32 = 0x14eb;
 const NT_USER_CREATE_WINDOW_EX: u32 = 0x136b;
@@ -1176,6 +1177,7 @@ pub(crate) fn register(os: &mut WinOs) {
         NT_USER_SET_PROCESS_DPI_AWARENESS_CONTEXT,
         nt_user_set_process_dpi_awareness_context,
     );
+    os.set_win32k_handler(NT_USER_GET_ATOM_NAME, nt_user_get_atom_name);
     os.set_win32k_handler(NT_USER_GET_CLASS_INFO_EX, nt_user_get_class_info_ex);
     os.set_win32k_handler(NT_USER_REGISTER_CLASS_EX_WOW, nt_user_register_class_ex_wow);
     os.set_win32k_handler(NT_USER_CREATE_WINDOW_EX, nt_user_create_window_ex);
@@ -1527,6 +1529,50 @@ fn nt_user_set_process_dpi_awareness_context(
 ///
 /// arg2 is a UNICODE_STRING* for the class name (same marshalling user32 uses
 /// for RegisterClass/CreateWindow — recovered `init_class_name`).
+/// `NtUserGetAtomName(ATOM atom, UNICODE_STRING* out)` → the name's length in
+/// WCHARs, 0 on failure.
+///
+/// user32's dialog manager names the dialog class by its well-known *integer*
+/// atom — `MAKEINTATOM(32770)` = 0x8002 — not by string, so `DialogBoxIndirect`
+/// asks for the name here and then feeds it straight back to
+/// `NtUserGetClassInfoEx`. Without this handler the name came back empty, the
+/// class lookup failed client-side, and every dialog died before
+/// `NtUserCreateWindowEx` — which is exactly what stopped Wine's comdlg32 from
+/// ever building its file dialog (roadmap W6.2).
+///
+/// Two atom spaces meet here. A **registered class atom** (exemu allocates
+/// those from [`CLASS_ATOM_BASE`]) names its class. Anything else is an
+/// **integer atom**, which `GlobalGetAtomName` documents as naming *itself* in
+/// the form `#<decimal value>` — the form `#32770` the built-in table already
+/// registers, so the round trip closes.
+fn nt_user_get_atom_name(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let atom = os.syscall_arg(cpu, mem, 0)? as u16;
+    let out = os.syscall_arg(cpu, mem, 1)?;
+    if out == 0 {
+        return Ok(0);
+    }
+    let name = match os.win32k_state.class_by_atom(atom) {
+        Some(class) => class.name.clone(),
+        None => format!("#{atom}"),
+    };
+
+    // UNICODE_STRING: Length@0, MaximumLength@2, Buffer@8. MaximumLength counts
+    // bytes and must leave room for the terminator user32 expects.
+    let max_bytes = mem.read_u16(out + 2)? as usize;
+    let buffer = mem.read_u64(out + 8)?;
+    if buffer == 0 {
+        return Ok(0);
+    }
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let n = units.len().min(max_bytes.saturating_sub(2) / 2);
+    for (i, unit) in units.iter().take(n).enumerate() {
+        mem.write_u16(buffer + (i as u64) * 2, *unit)?;
+    }
+    mem.write_u16(buffer + (n as u64) * 2, 0)?;
+    mem.write_u16(out, (n * 2) as u16)?;
+    Ok(n as u32)
+}
+
 fn nt_user_get_class_info_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let name_ptr = os.syscall_arg(cpu, mem, 1)?;
     let name = read_unicode_string(mem, name_ptr)?;

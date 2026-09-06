@@ -267,28 +267,35 @@ fn wine_get_open_file_name_w_accepts_exactly_two_struct_sizes() {
 // The gap, pinned.
 // ==========================================================================
 
-/// **The W6.2 gap, as it stands today.** Wine's file dialog does not open under
-/// exemu, and this test pins exactly how far it gets.
+/// **W6.2 as it stands now: Wine builds its whole file dialog, and then nobody
+/// clicks it.** `NtUserGetAtomName` (roadmap W6.2, win32u index 0x13d1) closed
+/// the creation gap this test used to pin — user32's dialog manager names the
+/// dialog class by its integer atom `MAKEINTATOM(32770)`, and with the name
+/// answered, `DialogBoxIndirectParamW` gets all the way through the template.
 ///
-/// * `GetOpenFileNameW` returns `FALSE` and leaves `lpstrFile` empty, so the
-///   guest has no path and its `CreateFileW` fails.
-/// * `CommDlgExtendedError()` is **0**, not 1/6/7 — so the call passed struct
-///   validation *and* found, loaded and locked its own dialog-template resource.
-///   The only `FALSE` exit left in `GetFileName95` that leaves the error at 0 is
-///   the one taken when `DialogBoxIndirectParamW` fails.
-/// * **Not one window reached the driver.** That is what says the failure is in
-///   dialog *creation* rather than anywhere later — see the module docs for the
-///   `NtUserGetAtomName` diagnosis.
+/// What that buys, and this test pins:
 ///
-/// The save leg shows the same thing from the other side, plus a detail worth
-/// keeping: because `GetSaveFileNameW` returns `FALSE` without touching the
-/// buffer, the guest still holds the file name it *proposed*, opens that
-/// relative name, and writes to it — landing in the sandbox root. So "a file was
-/// written" is emphatically **not** evidence that the save dialog worked, which
-/// is precisely why the open leg (whose buffer starts empty) is the one that
-/// carries the claim.
+/// * **Every control of comdlg32's own template reaches the driver** — the
+///   `#32770` dialog itself plus the `Static`/`ComboBox`/`ToolbarWindow32`/
+///   `ListBox`/`Edit`/`ComboBoxEx32`/`Button` set, from comdlg32's own
+///   resources, as guest code, on both the open and the save leg.
+/// * `CommDlgExtendedError()` stays **0** — no struct, find-resource or
+///   load-resource failure.
+///
+/// What is still missing, and is the remaining W6.2 work: **the dialog is modal
+/// and headless, so its message loop ends with no selection** and
+/// `GetOpenFileNameW` still returns `FALSE` with `lpstrFile` empty. Driving it
+/// (synthesizing the selection + `IDOK`, or bridging to a native panel) is the
+/// next step.
+///
+/// A detail worth keeping: because `GetSaveFileNameW` returns `FALSE` without
+/// touching the buffer, the guest still holds the file name it *proposed*,
+/// opens that relative name, and writes to it — landing in the sandbox root. So
+/// "a file was written" is emphatically **not** evidence that the save dialog
+/// worked, which is why the open leg (whose buffer starts empty) carries the
+/// claim.
 #[test]
-fn wine_file_dialog_stops_before_it_creates_a_window() {
+fn wine_file_dialog_is_built_but_never_completes() {
     if !wine_dlls_present() {
         eprintln!("SKIP: {WINE_DLLS} not present (the Wine DLL set is git-ignored)");
         return;
@@ -297,6 +304,8 @@ fn wine_file_dialog_stops_before_it_creates_a_window() {
     let r = report(&res.stdout);
     eprintln!("comdlg wine gap: exit={} steps={} {r:?}", res.exit_code, res.steps);
 
+    // Still FALSE — but now for a *later* reason: the modal loop ran and ended
+    // with no selection, rather than the dialog never existing.
     assert_eq!(tag(&r, comdlg_sample::TAG_OPEN), "", "GetOpenFileNameW returned no path");
     assert_eq!(tag(&r, comdlg_sample::TAG_READ), "", "so nothing could be opened and read");
     assert_ne!(
@@ -314,7 +323,7 @@ fn wine_file_dialog_stops_before_it_creates_a_window() {
          'comdlg32 arrives as guest code' still holds"
     );
     assert_ne!(err, comdlg_sample::CDERR_LOADRESFAILURE, "…and loaded and locked it");
-    assert_eq!(err, 0, "the remaining FALSE exit: DialogBoxIndirectParamW failed");
+    assert_eq!(err, 0, "no struct/find-resource/load-resource failure: the dialog ran");
     assert_eq!(num(&r, comdlg_sample::TAG_SAVE_ERR), 0, "the save side fails the same way");
 
     let created: Vec<&str> = calls
@@ -324,11 +333,28 @@ fn wine_file_dialog_stops_before_it_creates_a_window() {
             _ => None,
         })
         .collect();
+
+    // The dialog itself, twice: comdlg32 runs the same template for the open
+    // and the save leg. Asserting the count (not just "contains") is what keeps
+    // this honest — one dialog would mean a leg silently stopped failing early.
+    assert_eq!(
+        created.iter().filter(|c| **c == "#32770").count(),
+        2,
+        "both legs build comdlg32's own dialog template. Got {created:?}"
+    );
+
+    // Controls that can only come from comdlg32's own resources: the file list,
+    // the look-in combo and the shell toolbar are not classes exemu's guest
+    // sample ever registers, so their presence is proof the real template ran.
+    for control in ["Static", "ComboBox", "ComboBoxEx32", "ToolbarWindow32", "ListBox", "Edit"] {
+        assert!(
+            created.contains(&control),
+            "comdlg32's template creates a {control}. Got {created:?}"
+        );
+    }
     assert!(
-        created.is_empty(),
-        "no window reaches the driver today — the dialog dies in creation. Got {created:?}; \
-         if this fires, `NtUserGetAtomName` (or an equivalent) has landed and Wine is \
-         building its dialog: re-baseline this gate and the README table."
+        created.iter().filter(|c| **c == "Button").count() >= 2,
+        "the template's Open/Cancel buttons reach the driver. Got {created:?}"
     );
 
     // The failure count the sample reports: dialog FALSE + empty path + failed
