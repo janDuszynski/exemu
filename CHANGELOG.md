@@ -67,8 +67,9 @@ end-to-end on the default path.
   told where to go next: when the target is a compile-time constant (a
   fallthrough, a `jmp rel`, either edge of a `j<cc>`, or a `call rel32`) it reads
   a cached pointer to the successor's body and branches straight into it, so a
-  run of blocks executes as one straight line of native code. Measured
-  interleaved — both binaries built, alternated in one session, min user+sys over
+  run of blocks executes as one straight line of native code — **95.8% of block
+  entries (78.0 M of 81.4 M) on that run**, out of only 1,501 distinct filled
+  slots. Measured interleaved — both binaries built, alternated in one session, min user+sys over
   five runs each — because the same binary spans a wide range depending on what
   else the machine is doing.
 - **Indirect branches get an inline cache.** `call r/m` and `jmp r/m` — every
@@ -98,8 +99,8 @@ end-to-end on the default path.
   down its own links and then execute the stale copy.
 - **The differential learned to run round a loop** (`exemu-oracle jit --laps K`),
   because every trial it had ever generated walked each of its blocks exactly
-  once — the one case in which a link is never *taken*. 0 divergences in 600 k
-  lapped trials with 1.05 M block entries reached by a native link, plus 2 M
+  once — the one case in which a link is never *taken*. 0 divergences in 800 k
+  lapped trials with 1.42 M block entries reached by a native link, plus 2 M
   straight trials across both bitnesses and both layout mixes.
 
 ### The block JIT (W8.2 / W8.3 / W8.7)

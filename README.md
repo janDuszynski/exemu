@@ -450,7 +450,7 @@ that is enforced two ways. A differential oracle
 ([below](#differential-cpu-oracle)) runs generated blocks through both engines
 and compares the entire architectural state — every GPR, every `rflags` bit
 including the ones x86 leaves undefined, `rip`, the vector file and every byte
-of memory — at **0 divergences in 11.8M trials per bitness**, a tenth of them
+of memory — at **0 divergences in 11.9M trials per bitness**, a tenth of them
 assembled at the top of the address space, where a 32-bit address wraps and a
 64-bit one must not. And every corpus binary is run both ways: same exit code,
 same fault site, same artifacts, and the same exact instruction count, with only
@@ -507,12 +507,14 @@ code-cache flush does, what a store into a page a compiled block was built from
 does — checked on every store against a page-hash table, because a linked chain
 has no Rust between blocks to notice — and what attaching a debugger will do.
 
+On the 7-Zip install, **95.8% of block entries (78.0 M of 81.4 M) are reached by
+a branch from the previous block**, out of only 1,501 distinct filled slots.
 Measured interleaved (both binaries built, alternated in one session, min
-user+sys over five runs each), the 7-Zip install goes from **0.95 s to 0.76 s**,
-28.5 G to 21.7 G retired host instructions. The remaining per-block cost is now
-about a fifteen-instruction exit sequence, and the emitted code is 60% larger
-than it was, so the trade is code size for speed — which is a loss on a run too
-short to amortise compiling it.
+user+sys over five runs each), the run goes from **0.95 s to 0.76 s**, 28.5 G to
+21.7 G retired host instructions. The remaining per-block cost is now about a
+fifteen-instruction exit sequence, and the emitted code is 60% larger than it
+was, so the trade is code size for speed — which is a loss on a run too short to
+amortise compiling it.
 
 `crates/jit` is the **only** crate in the workspace that is not
 `#![forbid(unsafe_code)]`, because a JIT cannot be. The relaxation is bounded:
@@ -856,11 +858,11 @@ exit with no Rust in between; the JIT side is driven the way the real run loop
 drives it, handing each declined opcode to an interpreter running against its own
 memory. What is compared is then what a *linked chain* computed.
 
-Current result: **0 divergences in 11.8M trials per bitness**, across sixteen
+Current result: **0 divergences in 11.9M trials per bitness**, across sixteen
 configurations (1, 8, 24 and 32 instructions per block; fourteen seeds), of which
 800k per bitness were re-run against the deferred-flag lowering (roadmap W8.4),
 **1.25M per bitness against the boundary-aware tree** (roadmap W8.7), and
-**1.3M per bitness against native linking — 300k of it lapped**, with 1.05M block
+**1.4M per bitness against native linking — 400k of it lapped**, with 1.42M block
 entries reached by a native link (roadmap W8.5).
 
 ## Contributing
