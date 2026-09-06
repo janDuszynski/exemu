@@ -26,6 +26,27 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 931, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### Window properties, and the handle every window procedure is given (W6.2)
+- **`SetProp`/`GetProp`/`RemoveProp` had no implementation at all.** `GetProp`
+  answered NULL for something that had just been set — and window properties are
+  where a large part of Wine's own USER layer keeps per-window state. The visible
+  symptom was `err:commctrl:COMCTL32_SubclassProc Our sub classing stack got
+  erased` on *every* control comctl32 subclasses; it is gone. Properties are
+  keyed by name, with the documented integer-atom overload, and the stored value
+  comes back at full 64-bit width because what callers park there is a pointer to
+  their own allocation, not a BOOL.
+- **Every dialog procedure in the process was being called with `hwnd = 0`.**
+  `user32!WIN_GetFullHandle` — the handle widener each user32 entry point runs
+  its `HWND` through — is one `NtUserCallHwnd` selector, and exemu answered it
+  with 0. `user32!call_dialog_proc` widens the handle and passes the result to
+  the dialog procedure *as its window*, so a dialog procedure could not name its
+  own window: comdlg32's file-dialog procedure could not even store its own
+  state. exemu's handles are already full, so the answer is the validated
+  identity.
+- Both are re-derived from the pinned binaries on every test run
+  (`crates/os/tests/user_abi.rs`), so a Wine-prefix refresh that renumbers the
+  SSDT fails a test instead of silently bringing the bug back.
+
 ### A real codepage table, and an honest codepage surface (W6.x)
 - **msvcrt was running with empty multibyte tables on every Wine-booted guest.**
   `NtGetNlsSectionPtr(type 0xb, id)` answered *every* codepage with the same

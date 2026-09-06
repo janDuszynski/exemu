@@ -303,6 +303,15 @@ const NT_GDI_INTERSECT_CLIP_RECT: u32 = 0x1238;
 const NT_GDI_GET_TEXT_METRICS_W: u32 = 0x1229;
 const NT_GDI_GET_TEXT_EXTENT_EX_W: u32 = 0x1227;
 
+// --- W6.2: two USER primitives that were answering nothing ------------------
+/// `NtUserSetProp(hwnd, str, handle)` — `user32!SetPropW` is a bare tail-jump
+/// into it (@ RVA 0x46c30), so its arguments arrive untouched.
+const NT_USER_SET_PROP: u32 = 0x157f;
+/// `NtUserGetProp(hwnd, str)` — likewise `GetPropW` (@ RVA 0x30ec0).
+const NT_USER_GET_PROP: u32 = 0x1438;
+/// `NtUserRemoveProp(hwnd, str)` — likewise `RemovePropW`.
+const NT_USER_REMOVE_PROP: u32 = 0x151e;
+
 // --- TEXTMETRICW field offsets (documented Win32 layout; all LONG/WCHAR/BYTE,
 //     so identical on 32- and 64-bit). `gdi32!GetTextMetricsW` (RVA 0x26290) is
 //     `xor r8d,r8d; jmp NtGdiGetTextMetricsW`, so the caller's buffer arrives
@@ -571,6 +580,16 @@ mod call_hwnd {
     pub const IS_WINDOW_UNICODE: u64 = 0x0c;
     /// `IsWindowVisible`.
     pub const IS_WINDOW_VISIBLE: u64 = 0x0d;
+    /// **`GetFullWindowHandle`** — the 16-bit-era handle widener every user32
+    /// entry point runs its `HWND` argument through first. Recovered from
+    /// `user32!WIN_GetFullHandle` (@ RVA 0x55790), which is literally
+    /// `mov edx,0xf; jmp NtUserCallHwnd` followed by `mov eax,eax`. exemu's
+    /// window handles are already full, so this is the identity — but answering
+    /// **0** meant `user32!call_dialog_proc` (@ RVA 0x58170), which widens the
+    /// handle before invoking a dialog procedure, handed every dialog procedure
+    /// `hwnd = 0`; a window procedure that cannot name its own window can do
+    /// nothing at all.
+    pub const GET_FULL_WINDOW_HANDLE: u64 = 0x0f;
     /// The "does this window belong to the calling thread" probe every
     /// `GetWindowText` / `SetWindowText` / `GetWindowModuleFileName` makes first
     /// (recovered from `user32!SetWindowTextW` @ RVA 0x47590, which sends the
@@ -944,6 +963,16 @@ struct Window {
     id: u64,
     /// `GWLP_HINSTANCE`.
     instance: u64,
+    /// **Window properties** — `SetPropW`/`GetPropW`/`RemovePropW`
+    /// (roadmap W6.2), keyed by the normalised property name. This is where a
+    /// large part of Wine's own USER layer keeps its per-window state:
+    /// comctl32's subclassing chain, comdlg32's `FileOpenDlgInfos`, the IME
+    /// context. With no store behind them `GetProp` answered NULL for something
+    /// that had just been set, and every one of those subsystems silently lost
+    /// its state — visibly, as
+    /// `err:commctrl:COMCTL32_SubclassProc Our sub classing stack got erased`
+    /// on every control comctl32 subclasses.
+    props: Vec<(String, u64)>,
 }
 
 /// A per-window backing surface (W4.3): a guest-mapped top-down BGRA32 DIB the
@@ -1344,6 +1373,9 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_GDI_INTERSECT_CLIP_RECT, nt_gdi_intersect_clip_rect);
     os.set_win32k_handler(NT_GDI_GET_TEXT_METRICS_W, nt_gdi_get_text_metrics_w);
     os.set_win32k_handler(NT_GDI_GET_TEXT_EXTENT_EX_W, nt_gdi_get_text_extent_ex_w);
+    os.set_win32k_handler(NT_USER_SET_PROP, nt_user_set_prop);
+    os.set_win32k_handler(NT_USER_GET_PROP, nt_user_get_prop);
+    os.set_win32k_handler(NT_USER_REMOVE_PROP, nt_user_remove_prop);
 }
 
 /// Allocate a fresh nonzero handle (HWND/HDC) from the shared handle space. The
@@ -1803,6 +1835,7 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
             // real menu handle and has no id.
             id: if style & WS_CHILD != 0 { menu } else { 0 },
             instance,
+            props: Vec::new(),
         },
     ));
 
@@ -2381,6 +2414,8 @@ fn nt_user_call_hwnd(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
         // `DefWindowProc` in the process to window number 1. Single-threaded
         // guest, so a live window always belongs to the caller.
         call_hwnd::IS_SELF_THREAD => st.window(hwnd).map(|_| hwnd).unwrap_or(0),
+        // Also the validated handle, not a boolean — see the constant.
+        call_hwnd::GET_FULL_WINDOW_HANDLE => st.window(hwnd).map(|_| hwnd).unwrap_or(0),
         _ => 0,
     })
 }
@@ -3988,6 +4023,63 @@ fn nt_gdi_select_pen(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
     Ok(os.syscall_arg(cpu, mem, 1)? as u32)
 }
 
+/// Normalise a `SetProp`/`GetProp`/`RemoveProp` name argument into a comparison
+/// key (roadmap W6.2).
+///
+/// The argument is the same overloaded `LPCWSTR` an atom API takes: a value
+/// below 0x10000 is `MAKEINTATOM(n)`, anything else a string pointer. Atom names
+/// are case-insensitive, so the key is folded.
+fn prop_key(mem: &dyn Memory, name: u64) -> Result<String> {
+    if name < 0x1_0000 {
+        return Ok(format!("#{name}"));
+    }
+    Ok(read_wstr(mem, name)?.to_ascii_lowercase())
+}
+
+/// `NtUserSetProp(hwnd, str, handle)` → TRUE.
+fn nt_user_set_prop(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let key = prop_key(mem, os.syscall_arg(cpu, mem, 1)?)?;
+    let handle = os.syscall_arg(cpu, mem, 2)?;
+    let Some(w) = os.win32k_state.window_mut(hwnd) else { return Ok(0) };
+    match w.props.iter_mut().find(|(k, _)| *k == key) {
+        Some(slot) => slot.1 = handle,
+        None => w.props.push((key, handle)),
+    }
+    Ok(1)
+}
+
+/// `NtUserGetProp(hwnd, str)` → the stored handle, or 0.
+///
+/// **A pointer, not a BOOL**: what callers keep here is an allocation of their
+/// own (comctl32's subclass chain, comdlg32's `FileOpenDlgInfos`), so it has to
+/// come back through RAX at full width.
+fn nt_user_get_prop(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let key = prop_key(mem, os.syscall_arg(cpu, mem, 1)?)?;
+    let value = os
+        .win32k_state
+        .window(hwnd)
+        .and_then(|w| w.props.iter().find(|(k, _)| *k == key).map(|(_, v)| *v))
+        .unwrap_or(0);
+    os.return_u64_from_syscall(value);
+    Ok(0) // ignored: the 64-bit value above is what reaches rax
+}
+
+/// `NtUserRemoveProp(hwnd, str)` → the handle that was there, and forget it.
+fn nt_user_remove_prop(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    let key = prop_key(mem, os.syscall_arg(cpu, mem, 1)?)?;
+    let mut value = 0;
+    if let Some(w) = os.win32k_state.window_mut(hwnd) {
+        if let Some(i) = w.props.iter().position(|(k, _)| *k == key) {
+            value = w.props.remove(i).1;
+        }
+    }
+    os.return_u64_from_syscall(value);
+    Ok(0)
+}
+
 /// `NtGdiSelectFont(hdc, hfont)` → the previous font. The CoreText path picks
 /// its own metrics (design §5), so an HFONT is only a handle that must
 /// round-trip; selecting one must not fail or a control abandons its text.
@@ -4418,9 +4510,91 @@ mod tests {
                 user_data: 0,
                 id: 0,
                 instance: 0,
+                props: Vec::new(),
             },
         ));
         hwnd
+    }
+
+    /// **Window properties round-trip**, by string name and by integer atom,
+    /// per window (roadmap W6.2). This is the store comctl32's subclassing and
+    /// comdlg32's dialog state live in; with no store behind it `GetProp`
+    /// answered NULL for something that had just been set.
+    #[test]
+    fn window_properties_round_trip_per_window() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        // Two windows and two property names, one string, one integer atom.
+        let a = child(&mut os, 0, [0, 0, 100, 100]);
+        let b = child(&mut os, 0, [0, 0, 100, 100]);
+        let name = 0x2_0100u64;
+        for (i, u) in "FileOpenDlgInfos".encode_utf16().enumerate() {
+            mem.write_u16(name + i as u64 * 2, u).unwrap();
+        }
+        mem.write_u16(name + 32, 0).unwrap();
+
+        let set = |os: &mut WinOs, mem: &mut VirtualMemory, h: u32, n: u64, v: u64| {
+            let mut cpu = CpuState::default();
+            cpu.set_rsp(0x2_0800);
+            cpu.set_reg(exemu_core::Reg::R10, h as u64);
+            cpu.set_reg(exemu_core::Reg::Rdx, n);
+            cpu.set_reg(exemu_core::Reg::R8, v);
+            nt_user_set_prop(os, &mut cpu, mem).unwrap()
+        };
+        let get = |os: &mut WinOs, mem: &mut VirtualMemory, h: u32, n: u64| -> u64 {
+            let mut cpu = CpuState::default();
+            cpu.set_rsp(0x2_0800);
+            cpu.set_reg(exemu_core::Reg::R10, h as u64);
+            cpu.set_reg(exemu_core::Reg::Rdx, n);
+            nt_user_get_prop(os, &mut cpu, mem).unwrap();
+            // The handler seats a full 64-bit value for the dispatcher rather
+            // than returning a u32 — read it from there, as the dispatcher does.
+            os.syscall_result64.take().unwrap_or(0)
+        };
+
+        assert_eq!(set(&mut os, &mut mem, a, name, 0xDEAD_BEEF_1234), 1, "SetProp reports TRUE");
+        // **The full 64 bits survive** — the value is a heap pointer, not a BOOL.
+        assert_eq!(get(&mut os, &mut mem, a, name), 0xDEAD_BEEF_1234, "GetProp reads it back");
+        assert_eq!(get(&mut os, &mut mem, b, name), 0, "…and it is per window");
+        // An integer atom is a distinct key from any string.
+        set(&mut os, &mut mem, a, 0xC123, 7);
+        assert_eq!(get(&mut os, &mut mem, a, 0xC123), 7, "MAKEINTATOM keys work");
+        assert_eq!(get(&mut os, &mut mem, a, name), 0xDEAD_BEEF_1234, "…without colliding");
+        // Re-setting replaces rather than appending a shadowed second entry.
+        set(&mut os, &mut mem, a, name, 9);
+        assert_eq!(get(&mut os, &mut mem, a, name), 9, "SetProp replaces");
+        // Removing returns the value and forgets it.
+        let mut cpu = CpuState::default();
+        cpu.set_rsp(0x2_0800);
+        cpu.set_reg(exemu_core::Reg::R10, a as u64);
+        cpu.set_reg(exemu_core::Reg::Rdx, name);
+        nt_user_remove_prop(&mut os, &mut cpu, &mut mem).unwrap();
+        assert_eq!(os.syscall_result64.take(), Some(9), "RemoveProp returns the value");
+        assert_eq!(get(&mut os, &mut mem, a, name), 0, "…and it is gone");
+    }
+
+    /// **`GetFullWindowHandle` is the identity for a live window and 0 for a
+    /// dead one** (roadmap W6.2). `user32!WIN_GetFullHandle` widens every `HWND`
+    /// through this selector before use — including
+    /// `user32!call_dialog_proc`, which passes the result to the dialog
+    /// procedure as its `hwnd`. Answering 0 gave every dialog procedure a null
+    /// window.
+    #[test]
+    fn get_full_window_handle_widens_a_live_window_to_itself() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        let hwnd = child(&mut os, 0, [0, 0, 100, 100]);
+        let call = |os: &mut WinOs, mem: &mut VirtualMemory, h: u64| -> u32 {
+            let mut cpu = CpuState::default();
+            cpu.set_rsp(0x2_0800);
+            cpu.set_reg(exemu_core::Reg::R10, h);
+            cpu.set_reg(exemu_core::Reg::Rdx, call_hwnd::GET_FULL_WINDOW_HANDLE);
+            nt_user_call_hwnd(os, &mut cpu, mem).unwrap()
+        };
+        assert_eq!(call(&mut os, &mut mem, hwnd as u64), hwnd, "a live handle widens to itself");
+        assert_eq!(call(&mut os, &mut mem, 0xDEAD), 0, "an unknown handle stays 0");
     }
 
     /// **The child-window model.** A child has no surface of its own: it renders
@@ -4744,6 +4918,7 @@ mod tests {
                 user_data: 0,
                 id: 0x65,
                 instance: 0x1_4000_0000,
+                props: Vec::new(),
             },
         ));
         let mut mem = VirtualMemory::new();
