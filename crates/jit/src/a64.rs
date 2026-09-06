@@ -188,6 +188,13 @@ impl Asm {
         self.emit(0x3860_6800 | rm << 16 | rn << 5 | rt);
     }
 
+    /// `str Xt, [Xn, Xm, LSL #3]` — 8-byte store to an indexed slot (the block
+    /// trail's ring, written from compiled code when a native link is taken).
+    pub fn str_reg_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
+        // size=11 V=0 opc=00, option=011 (LSL/UXTX), S=1 (scale by 8).
+        self.emit(0xF820_7800 | rm << 16 | rn << 5 | rt);
+    }
+
     /// `str{b,h,} Wt|Xt, [Xn, #off]`.
     pub fn str(&mut self, size: u8, rt: u32, rn: u32, off: u32) {
         let (base, scale) = match size {
@@ -482,6 +489,13 @@ impl Asm {
     pub fn blr(&mut self, rn: u32) {
         self.emit(0xD63F_0000 | rn << 5);
     }
+    /// `br Xn` — branch to an address held in a register, without linking. The
+    /// one instruction native block linking is built on: a compiled block jumps
+    /// straight into its successor's body instead of returning to Rust.
+    pub fn br(&mut self, rn: u32) {
+        self.emit(0xD61F_0000 | rn << 5);
+    }
+
     /// `nop`
     pub fn nop(&mut self) {
         self.emit(0xD503_201F);
@@ -637,6 +651,51 @@ mod tests {
         // and lives in `buf`, which outlives the call.
         let f: extern "C" fn(u64, u64) -> u64 = unsafe { code.as_fn() };
         f(a, b)
+    }
+
+    #[test]
+    fn br_jumps_to_the_address_in_a_register() {
+        // `br` is the whole of native block linking, so it is executed here
+        // rather than pattern-matched: assemble a second stream that returns 42,
+        // put its address in x1 and branch to it. If the encoding were wrong the
+        // test would not fail an assertion, it would crash — which is the point.
+        let mut tail = Asm::new();
+        tail.mov_imm64(0, 42);
+        tail.ret();
+        let mut buf = CodeBuffer::with_capacity(4096).unwrap();
+        let target = buf.push(tail.words()).unwrap();
+        let mut head = Asm::new();
+        head.mov_imm64(0, 7);
+        head.br(1);
+        let entry = buf.push(head.words()).unwrap();
+        // SAFETY: both streams were just assembled for this signature and the
+        // buffer is alive; `br x1` lands on `target`, which ends in `ret`.
+        let got = unsafe {
+            let f: extern "C" fn(u64, u64) -> u64 = entry.as_fn();
+            f(0, target.addr() as u64)
+        };
+        assert_eq!(got, 42, "br did not reach the second stream");
+    }
+
+    #[test]
+    fn str_reg_lsl3_indexes_a_slot_array() {
+        // `str x0, [x1, x2, lsl #3]` — the trail-ring write.
+        let mut slots = [0u64; 4];
+        let mut asm = Asm::new();
+        asm.mov_imm64(3, 0xABCD);
+        asm.mov_imm64(2, 2);
+        asm.str_reg_lsl3(3, 1, 2);
+        asm.mov_imm64(0, 0);
+        asm.ret();
+        let mut buf = CodeBuffer::with_capacity(4096).unwrap();
+        let code = buf.push(asm.words()).unwrap();
+        // SAFETY: as `run2` — the stream was just assembled for this signature,
+        // and `slots` is a live 4-element array the store indexes inside.
+        unsafe {
+            let f: extern "C" fn(u64, u64) -> u64 = code.as_fn();
+            f(0, slots.as_mut_ptr() as u64);
+        }
+        assert_eq!(slots, [0, 0, 0xABCD, 0], "the scaled index landed wrong");
     }
 
     #[test]
