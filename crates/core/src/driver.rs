@@ -96,9 +96,20 @@ impl UserDriver for NoDriver {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
     Close,
-    MouseMove { x: i32, y: i32 },
-    MouseButton { button: MouseButton, down: bool, x: i32, y: i32 },
-    Key { vk: u32, down: bool },
+    MouseMove { hwnd: u32, x: i32, y: i32 },
+    MouseButton { hwnd: u32, button: MouseButton, down: bool, x: i32, y: i32 },
+    Key { hwnd: u32, vk: u32, down: bool },
+}
+
+impl InputEvent {
+    pub fn hwnd(self) -> u32 {
+        match self {
+            InputEvent::Close => 0,
+            InputEvent::MouseMove { hwnd, .. }
+            | InputEvent::MouseButton { hwnd, .. }
+            | InputEvent::Key { hwnd, .. } => hwnd,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

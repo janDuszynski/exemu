@@ -802,10 +802,13 @@ client coordinate space, so a click inside a control is hit-tested by win32k
 window created without `WS_VISIBLE` stays off screen until `ShowWindow`;
 `SW_HIDE` orders it out without destroying it and a later `SW_SHOW` reuses the
 same window; a `SetWindowPos` that changes the client size resizes the host
-window and its drawable. Host input is forwarded only from the window win32k
-will route it to, so an event on another window is dropped rather than delivered
-to the wrong one — with more than one top-level window on screen that is still
-the first shown one, because the input channel carries no window identity yet.
+window and its drawable. Host input carries the identity of the window it came
+from: an `NSEvent`'s `windowNumber` resolves to the guest top-level whose
+`NSWindow` received it, `exemu_core::InputEvent` carries that hwnd, and win32k
+hit-tests down from there — so with several top-level windows on screen a click
+in the second one reaches the second one, and its keystrokes cannot land in the
+first one's focus. An event from a window the host does not recognise, or one
+the guest has since hidden, is dropped rather than delivered to the wrong one.
 The event pump also runs on a fixed interval while the guest is presenting, so
 an app that redraws continuously cannot starve its own window of mouse and
 keyboard events.
@@ -844,11 +847,12 @@ and tail-jump `NtUserWindowFromPoint`, and `SetCapture`/`ReleaseCapture`/
 target when the app asks for a message: the capture holder first (in its own
 client coordinates, hit test skipped — which is what lets a pushed button see
 the button-up after the pointer has left its rect), otherwise the deepest
-visible window under the point, which is then asked `WM_NCHITTEST` and gets to
-answer. `HTCLIENT` delivers the ordinary message with the point rebased into
-that window's client space; `HTTRANSPARENT` retries with it excluded (Wine's own
-`ButtonWndProc` answers exactly that for a `BS_GROUPBOX`); anything else
-delivers the `WM_NC*` twin. Keyboard input follows `SetFocus`, and
+visible window under the point **within the top-level window the event names**,
+which is then asked `WM_NCHITTEST` and gets to answer. `HTCLIENT` delivers the
+ordinary message with the point rebased into that window's client space;
+`HTTRANSPARENT` retries with it excluded (Wine's own `ButtonWndProc` answers
+exactly that for a `BS_GROUPBOX`); anything else delivers the `WM_NC*` twin.
+Keyboard input follows `SetFocus` inside the window the event names, and
 `TranslateMessage` produces the `WM_CHAR` that follows a key-down. The result is
 that Wine's real controls work: a click at a `BUTTON`'s coordinates makes
 user32's own `ButtonWndProc` take the capture, repaint itself pressed (the

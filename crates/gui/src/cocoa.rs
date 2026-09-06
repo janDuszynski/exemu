@@ -261,9 +261,10 @@ fn event_vk(event: &NSEvent) -> Option<u32> {
     typed.or_else(|| vk_from_key_code(event.keyCode()))
 }
 
-fn translate_event(event: &NSEvent, mtm: MainThreadMarker) -> Option<InputEvent> {
+fn translate_event(event: &NSEvent, mtm: MainThreadMarker, hwnd: u32) -> Option<InputEvent> {
     let mouse = |button, down| {
-        event_client_pos(event, mtm).map(|(x, y)| InputEvent::MouseButton { button, down, x, y })
+        event_client_pos(event, mtm)
+            .map(|(x, y)| InputEvent::MouseButton { hwnd, button, down, x, y })
     };
     match event.r#type() {
         NSEventType::LeftMouseDown => mouse(MouseButton::Left, true),
@@ -271,10 +272,10 @@ fn translate_event(event: &NSEvent, mtm: MainThreadMarker) -> Option<InputEvent>
         NSEventType::RightMouseDown => mouse(MouseButton::Right, true),
         NSEventType::RightMouseUp => mouse(MouseButton::Right, false),
         NSEventType::MouseMoved | NSEventType::LeftMouseDragged | NSEventType::RightMouseDragged => {
-            event_client_pos(event, mtm).map(|(x, y)| InputEvent::MouseMove { x, y })
+            event_client_pos(event, mtm).map(|(x, y)| InputEvent::MouseMove { hwnd, x, y })
         }
-        NSEventType::KeyDown => event_vk(event).map(|vk| InputEvent::Key { vk, down: true }),
-        NSEventType::KeyUp => event_vk(event).map(|vk| InputEvent::Key { vk, down: false }),
+        NSEventType::KeyDown => event_vk(event).map(|vk| InputEvent::Key { hwnd, vk, down: true }),
+        NSEventType::KeyUp => event_vk(event).map(|vk| InputEvent::Key { hwnd, vk, down: false }),
         _ => None,
     }
 }
@@ -286,11 +287,17 @@ fn parse_point(spec: &str) -> Option<(f64, f64)> {
     Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
 }
 
-fn forwards_event(target: Option<isize>, window_number: isize) -> bool {
-    target.is_some_and(|n| n == window_number)
+fn event_target(
+    mut windows: impl Iterator<Item = (u32, isize)>,
+    model: &WindowModel,
+    window_number: isize,
+) -> Option<u32> {
+    windows
+        .find(|(hwnd, number)| *number == window_number && model.visible(*hwnd))
+        .map(|(hwnd, _)| hwnd)
 }
 
-fn pump_events(target: Option<isize>, input_tx: &Sender<InputEvent>, seconds: f64) {
+fn pump_events(host: &WindowHost, input_tx: &Sender<InputEvent>, seconds: f64) {
     let Some(mtm) = MainThreadMarker::new() else {
         pump_runloop(seconds);
         return;
@@ -307,8 +314,8 @@ fn pump_events(target: Option<isize>, input_tx: &Sender<InputEvent>, seconds: f6
             )
         };
         let Some(event) = event else { break };
-        if forwards_event(target, event.windowNumber()) {
-            if let Some(ev) = translate_event(&event, mtm) {
+        if let Some(hwnd) = host.hwnd_for_window(event.windowNumber()) {
+            if let Some(ev) = translate_event(&event, mtm, hwnd) {
                 let _ = input_tx.send(ev);
             }
         }
@@ -332,8 +339,9 @@ impl WindowHost {
         self.windows.is_empty()
     }
 
-    pub fn input_target(&self) -> Option<isize> {
-        self.windows.get(&self.model.primary()?).map(|w| w.window_number())
+    pub fn hwnd_for_window(&self, window_number: isize) -> Option<u32> {
+        let numbered = self.windows.iter().map(|(hwnd, win)| (*hwnd, win.window_number()));
+        event_target(numbered, &self.model, window_number)
     }
 
     pub fn primary_window(&self) -> Option<&CocoaWindow> {
@@ -433,13 +441,13 @@ pub fn run_live(
             Ok(cmd) => {
                 host.apply(cmd);
                 if last_pump.elapsed() >= PUMP_INTERVAL {
-                    pump_events(host.input_target(), &input_tx, 0.0);
+                    pump_events(&host, &input_tx, 0.0);
                     host.reap_closed(&input_tx);
                     last_pump = std::time::Instant::now();
                 }
             }
             Err(TryRecvError::Empty) => {
-                pump_events(host.input_target(), &input_tx, 0.01);
+                pump_events(&host, &input_tx, 0.01);
                 host.reap_closed(&input_tx);
                 last_pump = std::time::Instant::now();
                 if let Some((x, y)) = synth_click {
@@ -711,11 +719,37 @@ mod tests {
     }
 
     #[test]
-    fn only_the_routing_targets_own_events_are_forwarded() {
-        assert!(forwards_event(Some(42), 42));
-        assert!(!forwards_event(Some(42), 43), "another window's event is dropped, not rerouted");
-        assert!(!forwards_event(Some(42), 0), "a windowless event carries no client point");
-        assert!(!forwards_event(None, 42), "with no window on screen nothing is forwarded");
+    fn an_event_carries_the_identity_of_the_window_it_came_from() {
+        const FIRST: u32 = 0x0001_0010;
+        const SECOND: u32 = 0x0001_0020;
+        let mut model = WindowModel::new();
+        for hwnd in [FIRST, SECOND] {
+            model.plan(&WindowCommand::Create {
+                hwnd,
+                parent: 0,
+                x: 0,
+                y: 0,
+                w: 480,
+                h: 260,
+                visible: true,
+                title: format!("window {hwnd:#x}"),
+            });
+        }
+        let numbers = [(FIRST, 41isize), (SECOND, 42isize)];
+        let target = |model: &WindowModel, n| event_target(numbers.iter().copied(), model, n);
+
+        assert_eq!(target(&model, 41), Some(FIRST));
+        assert_eq!(
+            target(&model, 42),
+            Some(SECOND),
+            "the second window names itself, not the first"
+        );
+        assert_eq!(target(&model, 43), None, "an unknown window's event is dropped, not rerouted");
+        assert_eq!(target(&model, 0), None, "a windowless event carries no client point");
+
+        model.plan(&WindowCommand::Show { hwnd: SECOND, cmd: crate::SW_HIDE });
+        assert_eq!(target(&model, 42), None, "a hidden window takes no input");
+        assert_eq!(target(&model, 41), Some(FIRST), "…and its sibling is unaffected");
     }
 
     #[test]
