@@ -255,6 +255,7 @@ fn driving_the_dialog_reaches_the_text_layout_path_and_stops_there() {
         }
         Err(e) => e.to_string(),
     };
+    eprintln!("comdlg wine drive: {err}");
     assert!(
         err.contains("0xc0000005"),
         "the wall is an access violation in gdi32's bundled Uniscribe, not something \

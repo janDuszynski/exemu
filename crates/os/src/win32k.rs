@@ -128,6 +128,47 @@ const NT_GDI_SELECT_BITMAP: u32 = 0x126b;
 const NT_GDI_GET_DEVICE_CAPS: u32 = 0x11f4;
 const NT_GDI_CREATE_DIB_SECTION: u32 = 0x10b0;
 const NT_GDI_EXT_GET_OBJECT_W: u32 = 0x11c7;
+const NT_GDI_HFONT_CREATE: u32 = 0x1233;
+const NT_GDI_GET_DC_OBJECT: u32 = 0x11f0;
+const NT_GDI_GET_FONT_DATA: u32 = 0x11fe;
+const NT_GDI_GET_TEXT_FACE_W: u32 = 0x1228;
+
+const LOGFONTW_SIZE: u32 = 0x5c;
+const LOGFONT_HEIGHT: usize = 0x00;
+const LOGFONT_WEIGHT: usize = 0x10;
+const LOGFONT_ITALIC: usize = 0x14;
+const LOGFONT_UNDERLINE: usize = 0x15;
+const LOGFONT_STRIKE_OUT: usize = 0x16;
+const LOGFONT_CHAR_SET: usize = 0x17;
+const LOGFONT_PITCH_AND_FAMILY: usize = 0x1b;
+const LOGFONT_FACE_NAME: usize = 0x1c;
+const LOGFONT_FACE_CHARS: usize = 32;
+
+const GDI_ERROR: u32 = 0xFFFF_FFFF;
+
+const STOCK_SYSTEM_FONT: u32 = 0x2d;
+const STOCK_DEFAULT_GUI_FONT: u32 = 0x31;
+const STOCK_WHITE_BRUSH: u32 = 0x20;
+const STOCK_BLACK_PEN: u32 = 0x27;
+const STOCK_DEFAULT_PALETTE: u32 = 0x2f;
+
+const NTGDI_OBJ_SURF: u32 = 0x05;
+const NTGDI_OBJ_EXTPEN: u32 = 0x50;
+
+const DEFAULT_CHARSET: u8 = 1;
+const FW_NORMAL: i32 = 400;
+const FW_BOLD: i32 = 700;
+const FIXED_PITCH_MODERN: u8 = 0x31;
+const VARIABLE_PITCH_SWISS: u8 = 0x22;
+
+const STOCK_FONTS: [(u32, i32, i32, u8, &str); 6] = [
+    (0x2a, 12, FW_NORMAL, FIXED_PITCH_MODERN, "Terminal"),
+    (0x2b, 13, FW_NORMAL, FIXED_PITCH_MODERN, "Courier"),
+    (0x2c, 12, FW_NORMAL, VARIABLE_PITCH_SWISS, "MS Sans Serif"),
+    (STOCK_SYSTEM_FONT, 16, FW_BOLD, VARIABLE_PITCH_SWISS, "System"),
+    (0x30, 15, FW_NORMAL, FIXED_PITCH_MODERN, "Fixedsys"),
+    (STOCK_DEFAULT_GUI_FONT, -11, FW_NORMAL, VARIABLE_PITCH_SWISS, "MS Shell Dlg"),
+];
 
 const BIH_WIDTH: u64 = 0x04;
 const BIH_HEIGHT: u64 = 0x08;
@@ -208,7 +249,6 @@ const TM_CHARSET: u64 = 0x38;
 
 const STUB_FONT_CELL_W: u32 = 8;
 const STUB_FONT_CELL_H: u32 = 16;
-const STUB_FONT_DESCENT: u32 = 3;
 
 const SIMPLEREGION: u32 = 2;
 
@@ -571,12 +611,117 @@ struct IconObject {
     mask: u32,
 }
 
+#[derive(Clone, Copy)]
+struct LogFont([u8; LOGFONTW_SIZE as usize]);
+
+impl LogFont {
+    fn from_bytes(src: &[u8]) -> LogFont {
+        let mut lf = [0u8; LOGFONTW_SIZE as usize];
+        let n = src.len().min(lf.len());
+        lf[..n].copy_from_slice(&src[..n]);
+        LogFont(lf)
+    }
+
+    fn stock(height: i32, weight: i32, pitch_and_family: u8, face: &str) -> LogFont {
+        let mut lf = [0u8; LOGFONTW_SIZE as usize];
+        lf[LOGFONT_HEIGHT..LOGFONT_HEIGHT + 4].copy_from_slice(&height.to_le_bytes());
+        lf[LOGFONT_WEIGHT..LOGFONT_WEIGHT + 4].copy_from_slice(&weight.to_le_bytes());
+        lf[LOGFONT_CHAR_SET] = DEFAULT_CHARSET;
+        lf[LOGFONT_PITCH_AND_FAMILY] = pitch_and_family;
+        for (i, unit) in face.encode_utf16().take(LOGFONT_FACE_CHARS - 1).enumerate() {
+            let at = LOGFONT_FACE_NAME + i * 2;
+            lf[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        LogFont(lf)
+    }
+
+    fn i32_at(&self, off: usize) -> i32 {
+        i32::from_le_bytes([self.0[off], self.0[off + 1], self.0[off + 2], self.0[off + 3]])
+    }
+
+    fn height(&self) -> i32 {
+        self.i32_at(LOGFONT_HEIGHT)
+    }
+
+    fn weight(&self) -> i32 {
+        match self.i32_at(LOGFONT_WEIGHT) {
+            0 => FW_NORMAL,
+            w => w,
+        }
+    }
+
+    fn face(&self) -> String {
+        let mut units = Vec::with_capacity(LOGFONT_FACE_CHARS);
+        for i in 0..LOGFONT_FACE_CHARS {
+            let at = LOGFONT_FACE_NAME + i * 2;
+            let unit = u16::from_le_bytes([self.0[at], self.0[at + 1]]);
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+        String::from_utf16_lossy(&units)
+    }
+
+    fn cell_height(&self) -> u32 {
+        match self.height() {
+            0 => STUB_FONT_CELL_H,
+            h if h > 0 => h as u32,
+            h => {
+                let em = h.unsigned_abs();
+                em + em.div_ceil(4)
+            }
+        }
+        .clamp(1, 512)
+    }
+
+    fn metrics(&self) -> TextMetrics {
+        let cell = self.cell_height();
+        let descent = (cell / 4).max(1);
+        let internal_leading = match self.height() {
+            h if h < 0 => cell - h.unsigned_abs(),
+            _ => cell / 8,
+        };
+        let ave = (cell * 3 / 8).max(1);
+        TextMetrics {
+            height: cell,
+            ascent: cell - descent,
+            descent,
+            internal_leading,
+            ave_char_width: ave,
+            max_char_width: ave * 2,
+            weight: self.weight() as u32,
+            italic: self.0[LOGFONT_ITALIC],
+            underlined: self.0[LOGFONT_UNDERLINE],
+            struck_out: self.0[LOGFONT_STRIKE_OUT],
+            char_set: self.0[LOGFONT_CHAR_SET],
+            pitch_and_family: self.0[LOGFONT_PITCH_AND_FAMILY],
+        }
+    }
+}
+
+struct TextMetrics {
+    height: u32,
+    ascent: u32,
+    descent: u32,
+    internal_leading: u32,
+    ave_char_width: u32,
+    max_char_width: u32,
+    weight: u32,
+    italic: u8,
+    underlined: u8,
+    struck_out: u8,
+    char_set: u8,
+    pitch_and_family: u8,
+}
+
 struct Dc {
     hwnd: u32,
     brush: u32,
     org: (i32, i32),
     clip: [i32; 4],
     bitmap: u32,
+    font: u32,
 }
 
 #[derive(Default)]
@@ -591,6 +736,7 @@ pub(crate) struct Win32kState {
     dcs: Vec<(u32, Dc)>,
     brushes: Vec<(u32, u32)>,
     bitmaps: Vec<(u32, Bitmap)>,
+    fonts: Vec<(u32, LogFont)>,
     icons: Vec<(u32, IconObject)>,
     win_procs: Vec<WinProc>,
     driven_dialogs: Vec<u32>,
@@ -725,6 +871,20 @@ impl Win32kState {
         self.bitmaps.iter().find(|(h, _)| *h == handle).map(|(_, b)| *b)
     }
 
+    fn font(&self, handle: u32) -> Option<LogFont> {
+        let ty = handle >> 16;
+        if ty != 0 && ty != gdi_type::FONT as u32 {
+            return None;
+        }
+        let slot = handle & 0xFFFF;
+        self.fonts.iter().find(|(s, _)| *s == slot).map(|(_, f)| *f)
+    }
+
+    fn dc_font(&self, hdc: u32) -> Option<LogFont> {
+        let handle = self.dc(hdc).map(|d| d.font).unwrap_or(STOCK_SYSTEM_FONT);
+        self.font(handle).or_else(|| self.font(STOCK_SYSTEM_FONT))
+    }
+
     fn contains_point(&self, hwnd: u32, x: i32, y: i32) -> bool {
         let (ox, oy) = self.client_origin(hwnd);
         let Some(w) = self.window(hwnd) else { return false };
@@ -852,6 +1012,10 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_GDI_SELECT_BITMAP, nt_gdi_select_bitmap);
     os.set_win32k_handler(NT_GDI_CREATE_DIB_SECTION, nt_gdi_create_dib_section);
     os.set_win32k_handler(NT_GDI_EXT_GET_OBJECT_W, nt_gdi_ext_get_object_w);
+    os.set_win32k_handler(NT_GDI_HFONT_CREATE, nt_gdi_hfont_create);
+    os.set_win32k_handler(NT_GDI_GET_DC_OBJECT, nt_gdi_get_dc_object);
+    os.set_win32k_handler(NT_GDI_GET_FONT_DATA, nt_gdi_get_font_data);
+    os.set_win32k_handler(NT_GDI_GET_TEXT_FACE_W, nt_gdi_get_text_face_w);
     os.set_win32k_handler(NT_USER_SET_CURSOR_ICON_DATA, nt_user_set_cursor_icon_data);
     os.set_win32k_handler(NT_USER_GET_ICON_INFO, nt_user_get_icon_info);
     os.set_win32k_handler(NT_USER_GET_ICON_SIZE, nt_user_get_icon_size);
@@ -1994,6 +2158,14 @@ fn publish_stock_objects(os: &mut WinOs, mem: &mut dyn Memory) -> Result<()> {
             let handle = ((ty as u32) << 16) | (slot as u32);
             os.win32k_state.brushes.push((handle, color));
         }
+        if ty == gdi_type::FONT {
+            let named = STOCK_FONTS.iter().find(|(s, ..)| *s == slot as u32);
+            let (_, height, weight, pitch, face) =
+                named.copied().unwrap_or((0, 16, FW_NORMAL, VARIABLE_PITCH_SWISS, "System"));
+            os.win32k_state
+                .fonts
+                .push((slot as u32, LogFont::stock(height, weight, pitch, face)));
+        }
     }
     Ok(())
 }
@@ -2007,7 +2179,7 @@ fn alloc_dc(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<u32> {
     let clip = os.win32k_state.window_visible_rect(hwnd);
     mem.write_u32(obj + DC_ATTR_ORG_X, org.0 as u32)?;
     mem.write_u32(obj + DC_ATTR_ORG_Y, org.1 as u32)?;
-    os.win32k_state.dcs.push((hdc, Dc { hwnd, brush: 0, org, clip, bitmap: 0 }));
+    os.win32k_state.dcs.push((hdc, Dc { hwnd, brush: 0, org, clip, bitmap: 0, font: STOCK_SYSTEM_FONT }));
     Ok(hdc)
 }
 
@@ -2805,18 +2977,18 @@ fn nt_gdi_ext_text_out_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
     }
     let text = String::from_utf16_lossy(&units);
 
-    const DEFAULT_TEXT_PX: u32 = 16;
+    let m = os.win32k_state.dc_font(hdc).map(|f| f.metrics()).unwrap_or_else(default_metrics);
     let color = gdi_client_object(os, mem, hdc)
         .and_then(|obj| mem.read_u32(obj + DC_ATTR_TEXT_COLOR).ok())
         .map(colorref_to_bgra)
         .unwrap_or(BGRA_BLACK);
-    if let Some(tb) = os.driver.rasterize_text(&text, DEFAULT_TEXT_PX) {
+    if let Some(tb) = os.driver.rasterize_text(&text, m.height) {
         composite_coverage(mem, &target, x, y, &tb, color)?;
     } else {
         let mut cx = x;
         for ch in text.chars() {
             draw_glyph(mem, &target, ch, cx, y, color)?;
-            cx += 8;
+            cx += STUB_FONT_CELL_W as i32;
         }
     }
     Ok(1)
@@ -3097,7 +3269,72 @@ fn nt_user_remove_prop(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
 }
 
 fn nt_gdi_select_font(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
-    Ok(os.syscall_arg(cpu, mem, 1)? as u32)
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let hfont = os.syscall_arg(cpu, mem, 1)? as u32;
+    if os.win32k_state.font(hfont).is_none() {
+        return Ok(0);
+    }
+    Ok(os
+        .win32k_state
+        .dcs
+        .iter_mut()
+        .find(|(h, _)| *h == hdc)
+        .map(|(_, dc)| std::mem::replace(&mut dc.font, hfont))
+        .unwrap_or(0))
+}
+
+fn nt_gdi_hfont_create(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let enumex = os.syscall_arg(cpu, mem, 0)?;
+    if enumex == 0 {
+        return Ok(0);
+    }
+    let mut bytes = [0u8; LOGFONTW_SIZE as usize];
+    mem.read(enumex, &mut bytes)?;
+    let Some((handle, _)) = alloc_gdi_object(os, mem, gdi_type::FONT)? else {
+        return Ok(0);
+    };
+    os.win32k_state.fonts.push((handle & 0xFFFF, LogFont::from_bytes(&bytes)));
+    Ok(handle)
+}
+
+fn nt_gdi_get_dc_object(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let ty = (os.syscall_arg_u32(cpu, mem, 1)? >> 16) & 0xFFFF;
+    let dc = os.win32k_state.dc(hdc);
+    Ok(match ty as u16 {
+        gdi_type::FONT => dc.map(|d| d.font).unwrap_or(STOCK_SYSTEM_FONT),
+        gdi_type::BRUSH => match dc.map(|d| d.brush).unwrap_or(0) {
+            0 => STOCK_WHITE_BRUSH,
+            h => h,
+        },
+        gdi_type::PEN => STOCK_BLACK_PEN,
+        gdi_type::PALETTE => STOCK_DEFAULT_PALETTE,
+        gdi_type::BITMAP => dc.map(|d| d.bitmap).unwrap_or(0),
+        _ if ty == NTGDI_OBJ_SURF => dc.map(|d| d.bitmap).unwrap_or(0),
+        _ if ty == NTGDI_OBJ_EXTPEN => STOCK_BLACK_PEN,
+        _ => 0,
+    })
+}
+
+fn nt_gdi_get_font_data(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
+    Ok(GDI_ERROR)
+}
+
+fn nt_gdi_get_text_face_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let count = os.syscall_arg_u32(cpu, mem, 1)?;
+    let buffer = os.syscall_arg(cpu, mem, 2)?;
+    let Some(lf) = os.win32k_state.dc_font(hdc) else { return Ok(0) };
+    let units: Vec<u16> = lf.face().encode_utf16().collect();
+    if buffer == 0 || count == 0 {
+        return Ok(units.len() as u32 + 1);
+    }
+    let n = (units.len() as u32 + 1).min(count);
+    for i in 0..n {
+        let unit = if i + 1 == n { 0 } else { units[i as usize] };
+        mem.write_u16(buffer + i as u64 * 2, unit)?;
+    }
+    Ok(n)
 }
 
 fn alloc_bitmap(
@@ -3140,7 +3377,14 @@ fn alloc_memory_dc(os: &mut WinOs, mem: &mut dyn Memory) -> Result<u32> {
     };
     mem.write_u32(obj + DC_ATTR_ORG_X, 0)?;
     mem.write_u32(obj + DC_ATTR_ORG_Y, 0)?;
-    let dc = Dc { hwnd: 0, brush: 0, org: (0, 0), clip: [0, 0, 0, 0], bitmap: 0 };
+    let dc = Dc {
+        hwnd: 0,
+        brush: 0,
+        org: (0, 0),
+        clip: [0, 0, 0, 0],
+        bitmap: 0,
+        font: STOCK_SYSTEM_FONT,
+    };
     os.win32k_state.dcs.push((hdc, dc));
     Ok(hdc)
 }
@@ -3235,6 +3479,16 @@ fn nt_gdi_ext_get_object_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
     let handle = os.syscall_arg(cpu, mem, 0)? as u32;
     let count = os.syscall_arg_u32(cpu, mem, 1)?;
     let buffer = os.syscall_arg(cpu, mem, 2)?;
+
+    if let Some(lf) = os.win32k_state.font(handle) {
+        if buffer == 0 {
+            return Ok(LOGFONTW_SIZE);
+        }
+        let n = count.min(LOGFONTW_SIZE);
+        mem.write(buffer, &lf.0[..n as usize])?;
+        return Ok(n);
+    }
+
     let Some(b) = os.win32k_state.bitmap(handle) else { return Ok(0) };
 
     if buffer == 0 || count == 0 {
@@ -3387,15 +3641,15 @@ fn nt_gdi_get_text_metrics_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn M
     if tm == 0 || os.win32k_state.dc(hdc).is_none() {
         return Ok(0);
     }
-    let (h, d) = (STUB_FONT_CELL_H, STUB_FONT_DESCENT);
-    mem.write_u32(tm + TM_HEIGHT, h)?;
-    mem.write_u32(tm + TM_ASCENT, h - d)?;
-    mem.write_u32(tm + TM_DESCENT, d)?;
-    mem.write_u32(tm + TM_INTERNAL_LEADING, 2)?;
+    let m = os.win32k_state.dc_font(hdc).map(|f| f.metrics()).unwrap_or_else(default_metrics);
+    mem.write_u32(tm + TM_HEIGHT, m.height)?;
+    mem.write_u32(tm + TM_ASCENT, m.ascent)?;
+    mem.write_u32(tm + TM_DESCENT, m.descent)?;
+    mem.write_u32(tm + TM_INTERNAL_LEADING, m.internal_leading)?;
     mem.write_u32(tm + TM_EXTERNAL_LEADING, 0)?;
-    mem.write_u32(tm + TM_AVE_CHAR_WIDTH, STUB_FONT_CELL_W)?;
-    mem.write_u32(tm + TM_MAX_CHAR_WIDTH, STUB_FONT_CELL_W)?;
-    mem.write_u32(tm + TM_WEIGHT, 400)?;
+    mem.write_u32(tm + TM_AVE_CHAR_WIDTH, m.ave_char_width)?;
+    mem.write_u32(tm + TM_MAX_CHAR_WIDTH, m.max_char_width)?;
+    mem.write_u32(tm + TM_WEIGHT, m.weight)?;
     mem.write_u32(tm + TM_OVERHANG, 0)?;
     mem.write_u32(tm + TM_DIGITIZED_ASPECT_X, 96)?;
     mem.write_u32(tm + TM_DIGITIZED_ASPECT_Y, 96)?;
@@ -3403,11 +3657,11 @@ fn nt_gdi_get_text_metrics_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn M
     mem.write_u16(tm + TM_LAST_CHAR, 0xFF)?;
     mem.write_u16(tm + TM_DEFAULT_CHAR, 0x1F)?;
     mem.write_u16(tm + TM_BREAK_CHAR, 0x20)?;
-    mem.write_u8(tm + TM_ITALIC, 0)?;
-    mem.write_u8(tm + TM_UNDERLINED, 0)?;
-    mem.write_u8(tm + TM_STRUCK_OUT, 0)?;
-    mem.write_u8(tm + TM_PITCH_AND_FAMILY, 0)?;
-    mem.write_u8(tm + TM_CHARSET, 0)?;
+    mem.write_u8(tm + TM_ITALIC, m.italic)?;
+    mem.write_u8(tm + TM_UNDERLINED, m.underlined)?;
+    mem.write_u8(tm + TM_STRUCK_OUT, m.struck_out)?;
+    mem.write_u8(tm + TM_PITCH_AND_FAMILY, m.pitch_and_family)?;
+    mem.write_u8(tm + TM_CHARSET, m.char_set)?;
     Ok(1)
 }
 
@@ -3425,24 +3679,28 @@ fn nt_gdi_get_text_extent_ex_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn
         units.push(mem.read_u16(str_ptr + i as u64 * 2)?);
     }
     let text = String::from_utf16_lossy(&units);
-    let (cx, cy) = measure_run(os, &text);
+    let m = os.win32k_state.dc_font(hdc).map(|f| f.metrics()).unwrap_or_else(default_metrics);
+    let (cx, cy) = measure_run(os, &text, &m);
     if size != 0 {
         mem.write_u32(size, cx)?;
         mem.write_u32(size + 4, cy)?;
     }
     if alp_dx != 0 {
         for i in 0..count {
-            mem.write_u32(alp_dx + i as u64 * 4, (i + 1) * STUB_FONT_CELL_W)?;
+            mem.write_u32(alp_dx + i as u64 * 4, (i + 1) * m.ave_char_width)?;
         }
     }
     Ok(1)
 }
 
-fn measure_run(os: &WinOs, text: &str) -> (u32, u32) {
-    const DEFAULT_TEXT_PX: u32 = 16;
-    match os.driver.rasterize_text(text, DEFAULT_TEXT_PX) {
+fn default_metrics() -> TextMetrics {
+    LogFont::stock(STUB_FONT_CELL_H as i32, FW_NORMAL, VARIABLE_PITCH_SWISS, "System").metrics()
+}
+
+fn measure_run(os: &WinOs, text: &str, m: &TextMetrics) -> (u32, u32) {
+    match os.driver.rasterize_text(text, m.height) {
         Some(tb) => (tb.width, tb.height),
-        None => (text.chars().count() as u32 * STUB_FONT_CELL_W, STUB_FONT_CELL_H),
+        None => (text.chars().count() as u32 * m.ave_char_width, m.height),
     }
 }
 
@@ -3479,6 +3737,7 @@ fn free_gdi_object(os: &mut WinOs, mem: &mut dyn Memory, handle: u32) -> Result<
     os.win32k_state.brushes.retain(|(h, _)| *h != handle);
     os.win32k_state.dcs.retain(|(h, _)| *h != handle);
     os.win32k_state.bitmaps.retain(|(h, _)| *h != handle);
+    os.win32k_state.fonts.retain(|(s, _)| *s != slot as u32);
     Ok(())
 }
 
