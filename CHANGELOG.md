@@ -23,8 +23,45 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 1052, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1059, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### The JIT compiles `ret`, and the reason to compile it was not the one on record (W8)
+- **`ret` and `ret imm16` now compile** — a stack pop reusing the software TLB
+  plus an exit through the indirect-branch inline cache that W8.5 built for
+  `jmp`/`call` through a register. `ret` was the last high-frequency opcode that
+  ended a block by handing control back to the interpreter.
+- **The measurement is a correction, and it is the point of the entry.** The
+  plan said 7-Zip's 3.42 M returns to the interpreter were dominated by `ret`.
+  They are not: 7-Zip executes **1,703** returns in its whole 496,505,572-instruction
+  run, so side exits fall 3,419,597 → 3,417,894 (−0.05%) and retired host
+  instructions do not move outside the run-to-run spread. The `c3×76` line in the
+  JIT's declined-opcode report counts **distinct block addresses**, not
+  executions; reading it as a frequency is what produced the wrong expectation.
+- **On the Wine path it pays properly.** SteamSetup as a WoW64 process on Wine's
+  PE builtins loses **40.9%** of its remaining side exits (206,174 → 121,869),
+  runs 98.5% instead of 97.5% of its stream as native code, goes from 9.8 to
+  **16.7** blocks per native chain, and retires **8.6% fewer host instructions**
+  (1.2026 G → 1.0989 G, min user+sys over 5 interleaved reps, non-overlapping
+  spreads). Every Win32 call on that path is a real `call` into a Wine DLL and a
+  real `ret` back, which is exactly why the same opcode is worth 0.05% on one
+  binary and 40.9% on the other.
+- A fault in a compiled `ret` still rewinds to the interpreter's exact state: the
+  return address is loaded before `rsp` moves, so a failed pop leaves `rsp`
+  untouched and `rip` on the `ret` itself. A `66`-prefixed `ret` is declined
+  rather than compiled, matching how the JIT already treats `66` on `call` and
+  `jmp`.
+- The JIT differential now **generates** returns — hostile-`esp` `ret` and
+  `ret imm16` shapes whose pop straddles or runs off the end of a region, and a
+  lapped `push <top> ; ret` shape that is the only way this harness can make a
+  return's inline cache fill and then be taken. 0 divergences in 4.4 M trials
+  across both bitnesses, both layouts, both debug modes and the lapped mode.
+- A dozen JIT tests had used `ret` as *the opcode the compiler declines*, to end
+  a block where they wanted it ended; they now use `hlt`, which the interpreter
+  answers with a defined halt, which `crates/jit/tests/debug.rs` already used for
+  the same purpose, and which is one byte with the same flag classification — so
+  every block length, byte offset and emitted instruction those tests were
+  exercising is unchanged.
 
 ### The file dialog tells the truth: an honest cancel instead of a hollow TRUE (W6.2)
 - **`GetOpenFileNameW` had started returning TRUE with an untouched `lpstrFile`**,
