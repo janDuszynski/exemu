@@ -23,8 +23,45 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 1031, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1037, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### A guest finally gets comctl32 **v6**: the WinSxS store is materialised (W6.1)
+- **Every Wine-path guest silently got comctl32 v5.** Wine ships two builds —
+  `comctl32.dll` (`__WINE_COMCTL32_VERSION=5`) and `comctl32_v6.dll` (`=6`) —
+  and only v6 compiles the themed replacements for the user32 built-ins
+  (`Button`, `ComboBox`, `Edit`, `ListBox`, `Static`) plus `SysLink` and
+  `TaskDialog`, and only it delay-imports `uxtheme`. Choosing v6 is not a flag:
+  the guest's manifest declares a dependency on the
+  `Microsoft.Windows.Common-Controls` 6.0.0.0 **side-by-side assembly**, and the
+  loader resolves it through the activation context.
+- **The assembly was in the prefix all along** — embedded in `comctl32_v6.dll`
+  as an `RT_MANIFEST` resource *named* `WINE_MANIFEST`. What was missing was
+  Wine's **prefix-creation** step, which turns those resources into a store:
+  `%WINDIR%\winsxs\manifests\<key>.manifest` plus a private copy of the DLL
+  under `%WINDIR%\winsxs\<key>\`, keyed
+  `<arch>_<name>_<publicKeyToken>_<version>_<lang>_deadbeef`. exemu had never run
+  it, so `ntdll!lookup_winsxs` opened an empty directory and Wine logged
+  `fixme:actctx:parse_depend_manifests Could not find dependent assembly`.
+- exemu now runs it (`crates/app/src/winsxs.rs`, staged from `Process::load`
+  next to the `winecoreaudio.drv` staging), for the architecture the process's
+  own loader will ask for — `x86` inside a WoW64 process, `amd64` for a native
+  64-bit one. It is idempotent and only ever writes into the run's sandbox.
+- **Proven guest-side, not by file existence.** The gate boots `SteamSetup.exe`
+  as a WoW64 process, walks its own `PEB32.Ldr`, and asserts (a) the
+  `LDR_DATA_TABLE_ENTRY` for `comctl32.dll` carries a `FullDllName` under
+  `C:\windows\winsxs\<key>\` and (b) the image at that entry's `DllBase`
+  exports `TaskDialogIndirect`, read out of the **mapped** export directory —
+  an export the v5 build does not have at all. Mutation-checked: with the
+  staging call removed the same run reports
+  `FullDllName = "C:\windows\system32\COMCTL32.dll"` and the test fails.
+- Corpus: both Wine WoW64 rows move, deterministic across three runs, and the
+  attribution is exact — reverting only the staging call reproduces the old pins
+  to the instruction. `SteamSetup.exe (wine wow64)` 7,683,013 → **8,169,827**
+  (+486,814), 4 → 6 artifacts (the two new files *are* the store);
+  `Firefox Installer.exe (wine wow64)` 14,466,773 → **14,775,399** (+308,626),
+  3 → 5. The Firefox delta is the activation-context work alone — its inner
+  7-Zip SFX declares the same dependency but exits before it loads comctl32.
 
 ### An exception nothing handles ends the process, instead of spinning (W5.12)
 - **An unhandled guest fault used to run for ever** — measured as one
