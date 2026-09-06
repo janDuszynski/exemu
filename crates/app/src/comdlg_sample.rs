@@ -105,6 +105,18 @@ pub const TAG_WROTE: &str = "WROTE";
 /// unconditionally so a failing run says *why* rather than only *that*.
 pub const TAG_OPEN_ERR: &str = "OPENERR";
 pub const TAG_SAVE_ERR: &str = "SAVEERR";
+/// The **raw `BOOL`** `GetOpenFileNameW` / `GetSaveFileNameW` returned, printed
+/// as its own line so the return value is *visible* rather than inferred from
+/// the exit code.
+///
+/// This exists because the tally once "improved" from 5 to 3 while every
+/// reported tag stayed byte-identical (roadmap W6.2): the dialog had begun
+/// answering **TRUE with an untouched `lpstrFile`**, and the only trace of it
+/// was two failures quietly going missing. `OPENRET=1` next to `OPEN=` says
+/// that in one glance.
+pub const TAG_OPEN_RET: &str = "OPENRET";
+/// The save leg's, likewise.
+pub const TAG_SAVE_RET: &str = "SAVERET";
 /// `CommDlgExtendedError()` after a **deliberately malformed** call — see
 /// [`BAD_STRUCT_SIZE`]. This leg does not affect the exit code; it exists so a
 /// gate can attribute the result to Wine's own validator rather than to exemu.
@@ -216,8 +228,17 @@ fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
 }
 
 /// The ASCII report tags, in `.rdata` order.
-const TAGS: [&str; 7] =
-    [TAG_OPEN, TAG_READ, TAG_SAVE, TAG_WROTE, TAG_OPEN_ERR, TAG_SAVE_ERR, TAG_BAD_SIZE];
+const TAGS: [&str; 9] = [
+    TAG_OPEN,
+    TAG_READ,
+    TAG_SAVE,
+    TAG_WROTE,
+    TAG_OPEN_ERR,
+    TAG_SAVE_ERR,
+    TAG_BAD_SIZE,
+    TAG_OPEN_RET,
+    TAG_SAVE_RET,
+];
 
 /// The wide strings the sample references, in `.rdata` order.
 const WIDE_STRINGS: [&str; 5] =
@@ -256,6 +277,9 @@ struct Rdata {
     counted_rva: u32,
     /// `WriteFile`'s `lpNumberOfBytesWritten` slot for the stdout reports.
     written_rva: u32,
+    /// The raw `BOOL` a dialog call returned, kept in its own slot so stashing
+    /// `CommDlgExtendedError()` in [`Rdata::counted_rva`] cannot overwrite it.
+    ret_rva: u32,
     data_len: u32,
 }
 
@@ -381,7 +405,8 @@ impl Rdata {
         let rbuf_rva = abuf_rva + MAX_PATH * 2 + 8;
         let counted_rva = align_up_u32(rbuf_rva + RBUF_LEN + 8, 8);
         let written_rva = counted_rva + 8;
-        let data_len = written_rva + 8 - DATA_RVA;
+        let ret_rva = written_rva + 8;
+        let data_len = ret_rva + 8 - DATA_RVA;
 
         Rdata {
             bytes: b,
@@ -403,6 +428,7 @@ impl Rdata {
             rbuf_rva,
             counted_rva,
             written_rva,
+            ret_rva,
             data_len,
         }
     }
@@ -513,10 +539,16 @@ fn emit_open_leg(c: &mut Vec<u8>, r: &Rdata) {
     c.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
     c.extend_from_slice(&[0x75, 0x03]); // jne +3
     c.extend_from_slice(&[0x41, 0xFF, 0xC5]); // inc r13d
+    rip(c, &[0x89, 0x05], r.ret_rva); // mov [rip+ret], eax — the raw BOOL
 
     // Stash `CommDlgExtendedError()` before anything else can disturb it.
     rip(c, &[0xFF, 0x15], r.slot("CommDlgExtendedError"));
     rip(c, &[0x89, 0x05], r.counted_rva); // mov [rip+counted], eax
+
+    let (tag, len) = r.tag(TAG_OPEN_RET);
+    emit_tag(c, r, tag, len);
+    emit_decimal(c, r.ret_rva);
+    emit_flush(c, r);
 
     let (tag, len) = r.tag(TAG_OPEN);
     emit_tag(c, r, tag, len);
@@ -590,9 +622,15 @@ fn emit_save_leg(c: &mut Vec<u8>, r: &Rdata) {
     c.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
     c.extend_from_slice(&[0x75, 0x03]); // jne +3
     c.extend_from_slice(&[0x41, 0xFF, 0xC5]); // inc r13d
+    rip(c, &[0x89, 0x05], r.ret_rva); // mov [rip+ret], eax — the raw BOOL
 
     rip(c, &[0xFF, 0x15], r.slot("CommDlgExtendedError"));
     rip(c, &[0x89, 0x05], r.counted_rva); // mov [rip+counted], eax
+
+    let (tag, len) = r.tag(TAG_SAVE_RET);
+    emit_tag(c, r, tag, len);
+    emit_decimal(c, r.ret_rva);
+    emit_flush(c, r);
 
     let (tag, len) = r.tag(TAG_SAVE);
     emit_tag(c, r, tag, len);

@@ -136,6 +136,41 @@ fn num(r: &HashMap<String, String>, k: &str) -> u32 {
     tag(r, k).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", tag(r, k)))
 }
 
+/// **A dialog that reported success must have produced something.** Assert this
+/// on every run, and never read the failure tally without it.
+///
+/// The sample's exit code is its failure count, and for a long time two of its
+/// failure sites were invisible in the printed tags: the `BOOL` each of
+/// `GetOpenFileNameW` and `GetSaveFileNameW` returned. That is exactly where a
+/// regression hid. The tally "improved" from **5 to 3** while all seven reported
+/// tags stayed *byte-identical* — because `DIALOG_DoDialogBox` had started
+/// breaking its modal loop on a manufactured `WM_QUIT` and returning
+/// `dlgInfo->idResult`, which user32 pre-initialises to `IDOK`. Both dialogs
+/// began answering **TRUE with an untouched `lpstrFile`**, and the only visible
+/// consequence was two failures quietly going missing.
+///
+/// **A smaller number is not progress.** A hollow TRUE is strictly *worse* than
+/// the FALSE it replaced: a real application takes an empty `lpstrFile` for a
+/// valid selection and opens whatever the empty path resolves to, where a FALSE
+/// makes it do nothing. So the sample now prints both return values
+/// (`OPENRET` / `SAVERET`) and this function ties each one to what came back —
+/// if a leg says TRUE, its path had better be there.
+fn assert_no_hollow_success(r: &HashMap<String, String>) {
+    for (ret, path, who) in [
+        (comdlg_sample::TAG_OPEN_RET, comdlg_sample::TAG_OPEN, "GetOpenFileNameW"),
+        (comdlg_sample::TAG_SAVE_RET, comdlg_sample::TAG_SAVE, "GetSaveFileNameW"),
+    ] {
+        if num(r, ret) != 0 {
+            assert!(
+                !tag(r, path).is_empty(),
+                "{who} returned TRUE with an empty buffer — a HOLLOW SUCCESS, and worse \
+                 than the FALSE it replaces, because a real app treats an empty path as a \
+                 valid selection. Got {r:?}"
+            );
+        }
+    }
+}
+
 /// Run the sample on the Wine boot with a recording driver and a headless,
 /// deterministic message pump (a channel whose sender is dropped at once, the
 /// same shape `comctl_gate` uses — no threads, no timing, no AppKit).
@@ -185,8 +220,22 @@ fn emulated_path_has_no_file_dialog_at_all() {
     eprintln!("comdlg emulated: exit={} steps={} {r:?}", res.exit_code, res.steps);
 
     assert_ne!(res.exit_code, 0, "no dialog exists on the emulated path");
+    assert_no_hollow_success(&r);
     assert_eq!(tag(&r, comdlg_sample::TAG_OPEN), "", "nothing filled lpstrFile");
+    assert_eq!(num(&r, comdlg_sample::TAG_OPEN_RET), 0, "…and the thunk said so, with FALSE");
+    assert_eq!(num(&r, comdlg_sample::TAG_SAVE_RET), 0, "…on the save leg too");
     assert_eq!(tag(&r, comdlg_sample::TAG_READ), "", "so there was no path to open");
+    // Four, not the Wine path's five. The arithmetic says why: the open leg
+    // counts a failure for the handle *and* one for the empty read, so a run
+    // that reports both an empty path and an empty read scores 5 only when
+    // `CreateFileW(L"")` fails. Here it does not — the emulated file layer opens
+    // the empty name and reads nothing from it — so this leg contributes one
+    // failure where the Wine path contributes two. Pinned so the difference
+    // stays a known one rather than a surprise.
+    assert_eq!(
+        res.exit_code, 4,
+        "open FALSE + empty path + empty read + save FALSE, and nothing else"
+    );
     // The attribution probe: with no validator anywhere, the deliberately
     // malformed call reports no error either.
     assert_eq!(
@@ -287,20 +336,32 @@ fn wine_get_open_file_name_w_accepts_exactly_two_struct_sizes() {
 ///   `DIALOGINFO` and pumps, where it used to give up before reaching
 ///   `NtUserGetMessage` even once.
 ///
-/// ## **THE HOLLOW TRUE — read this before believing any number here**
+/// * **And it is honestly cancelled.** A run with no window host has nobody who
+///   could complete a modal dialog, so exemu closes it rather than letting it
+///   report the `IDOK` it was born with (roadmap W6.2): `WM_CLOSE` first, and
+///   the window destroyed if the dialog does nothing with it. `DIALOG_DoDialogBox`
+///   then takes its "the dialog window is gone" exit and answers **0**, so
+///   `GetOpenFileNameW` returns FALSE with `CommDlgExtendedError() == 0` — a
+///   plain cancel, which is what actually happened.
 ///
-/// Running the modal loop makes `GetOpenFileNameW` return **TRUE**, and that
-/// TRUE means nothing. `DIALOG_DoDialogBox` breaks its loop on the pending
-/// `WM_QUIT` and returns `dlgInfo->idResult`, which user32 pre-initialises to
-/// `IDOK`. So the call succeeds with `lpstrFile` **untouched**.
+/// ## **THE HOLLOW TRUE — the regression this file now makes impossible**
 ///
-/// The visible consequence is that the sample's failure tally *improves* from 5
-/// to 3 — the two "the dialog returned FALSE" failures disappear — while the
-/// guest is no better off than before. **A smaller number here is not
-/// progress.** Everything this file asserts about the outcome is therefore
-/// asserted on the returned **path** and on the **bytes read back through it**,
-/// never on the return value; the tally is pinned only so that it cannot move
-/// silently.
+/// It is worth knowing what the assertions below are guarding against, because
+/// it already happened once. With the modal loop first running and no cancel,
+/// `GetOpenFileNameW` returned **TRUE and meant nothing**: `DIALOG_DoDialogBox`
+/// broke its loop on the `WM_QUIT` exemu manufactures for a hostless run and
+/// returned `dlgInfo->idResult`, which user32 pre-initialises to `IDOK`, so the
+/// call "succeeded" with `lpstrFile` untouched.
+///
+/// The only visible consequence was that the sample's failure tally *improved*
+/// from **5 to 3** while all seven reported tags stayed byte-identical — the two
+/// "the dialog returned FALSE" failures had simply gone missing. **A smaller
+/// number here is not progress**, and a hollow TRUE is worse than the FALSE it
+/// replaces, because a real application takes the empty path for a valid
+/// selection. So: every claim below is made on the returned **path** and the
+/// **bytes read back through it**, the two return values are now printed and
+/// checked against the path by [`assert_no_hollow_success`], and the tally is
+/// pinned *together with* the observables that explain it.
 ///
 /// What is still missing, and is the remaining W6.2 work: nobody types a file
 /// name or presses the default button, so the dialog closes with no selection.
@@ -320,9 +381,9 @@ fn wine_file_dialog_is_built_but_never_completes() {
     let r = report(&res.stdout);
     eprintln!("comdlg wine gap: exit={} steps={} {r:?}", res.exit_code, res.steps);
 
-    // **The load-bearing pair.** The call now answers TRUE (see the hollow-TRUE
-    // note above), so the only honest questions are "what path came back?" and
-    // "what did opening it read?" — and the answer to both is still nothing.
+    // **The load-bearing pair**: "what path came back?" and "what did opening it
+    // read?" — the answer to both is still nothing.
+    assert_no_hollow_success(&r);
     assert_eq!(tag(&r, comdlg_sample::TAG_OPEN), "", "GetOpenFileNameW returned no path");
     assert_eq!(tag(&r, comdlg_sample::TAG_READ), "", "so nothing could be opened and read");
     assert_ne!(
@@ -374,12 +435,27 @@ fn wine_file_dialog_is_built_but_never_completes() {
         "the template's Open/Cancel buttons reach the driver. Got {created:?}"
     );
 
-    // The failure count the sample reports: empty path + failed CreateFileW +
-    // empty read, all on the open leg. It was **5** before the modal loop ran,
-    // and the two that vanished are the two "the dialog returned FALSE" legs —
-    // replaced by a TRUE that proves nothing. Pinned so the tally cannot move
-    // silently, never as evidence of progress; see the hollow-TRUE note above.
-    assert_eq!(res.exit_code, 3, "the exact failure tally of the measured gap");
+    // **The tally, tied to the observables above.** With no path in `OPEN`, the
+    // honest failure count is exactly five, and each one is accounted for:
+    //
+    //   1. `GetOpenFileNameW` returned FALSE          → `OPENRET=0`
+    //   2. `lpstrFile` came back empty                → `OPEN=`
+    //   3. `CreateFileW("")` failed                   → (no tag of its own)
+    //   4. nothing was read back                      → `READ=`
+    //   5. `GetSaveFileNameW` returned FALSE          → `SAVERET=0`
+    //
+    // **Anything lower means a dialog reported success without producing
+    // anything** — a hollow TRUE (see the note in the doc comment above), which
+    // is what a 3 here meant the one time it happened. The two return-value
+    // assertions and this count are deliberately redundant: a future change that
+    // makes a dialog "succeed" has to defeat all three at once.
+    assert_eq!(num(&r, comdlg_sample::TAG_OPEN_RET), 0, "no path came back, so the answer is FALSE");
+    assert_eq!(num(&r, comdlg_sample::TAG_SAVE_RET), 0, "and the save leg cancels the same way");
+    assert_eq!(
+        res.exit_code, 5,
+        "the five honest failures of a dialog nobody completed — a LOWER number is not \
+         progress, it is a hollow success. Got {r:?}"
+    );
 }
 
 // ==========================================================================
