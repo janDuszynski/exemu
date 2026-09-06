@@ -23,7 +23,7 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 804, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 847, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
 ### Per-exe profiles (W9.4)
@@ -343,6 +343,64 @@ end-to-end on the default path.
 - An **`NSEvent` tap** feeding real mouse/keyboard into the guest's own `WndProc`,
   and a **CoreText glyph rasterizer** (real fonts in the DIB, not a bitmap font).
 - **PNG golden-image CI gate**: pixel drift in the sample's first frame fails CI.
+
+### A 32-bit guest's own window procedure runs (W5.10)
+
+The W5 GUI wall. exemu's win32k *is* the kernel, so every `WM_NCCREATE` it owes
+a window it has just created has to leave the kernel the way a kernel leaves it.
+In a WoW64 process it could not — it called the 32-bit procedure directly, in
+long mode, under the Win64 register ABI, through a return thunk a 32-bit `ret`
+cannot reach — so the callback was declined and the window heard nothing. It now
+takes the real route, and every hop below the first belongs to Wine:
+
+```
+exemu's win32k
+  → ntdll!KiUserCallbackDispatcher      (id = NtUserCallWinProc)
+  → wow64win!user_callbacks[4]          → wow64!Wow64KiUserCallbackDispatcher
+  → BTCpuSimulate                       → ntdll32!KiUserCallbackDispatcher
+  → user32(i386)!User32CallWinProc      → the guest's own 32-bit WndProc
+  → NtCallbackReturn (SSDT index 5)     → exemu resumes the interrupted syscall
+```
+
+exemu contributes exactly three things: `PEB.KernelCallbackTable`, which
+`wow64win!DllMain` would publish and this boot never runs (the array is decoded
+out of that `DllMain`'s own bytes, not hardcoded); the callback frame and the
+`win_proc_params` block; and `NtCallbackReturn`, which restores the non-volatile
+registers and `XMM6`–`XMM15` captured when the callback was seated — the chain
+unwinds by `longjmp`, so what is live at the return belongs to `wow64win`, not
+to the `win32u` frame the syscall must resume into.
+
+- **Gate**: a new PE32 sample registers a class whose `lpfnWndProc` is its own
+  32-bit code, creates the window, and checks that `WM_NCCREATE` **and**
+  `WM_CREATE` arrived, that the `CREATESTRUCTW` it was handed is 32-bit (its
+  `style` at offset `0x20`) and at an address a 32-bit pointer can hold, that a
+  `SendMessageW` returned what the procedure returned — the *return* half of the
+  round trip — and that `esp` came back unchanged. Exit 71, 3,312,593
+  instructions.
+- **Every constant is re-derived from the pinned Wine binaries on each run**
+  (`wow64_callback_abi.rs`, 8 tests): the dispatcher's frame layout and the
+  `PEB+0x58` table, the 25-entry `user_callbacks` array and its publish site,
+  `NtUserCallWinProc = 4` (named by `wow64win`'s own COFF symbol table, not
+  counted), the 32-bit frame `Wow64KiUserCallbackDispatcher` builds at
+  `(Esp − 0x1c − len) & ~15`, the frame `wow64.dll`'s slot 5 fills at
+  `TEB64+0x14a8`, and `struct win_proc_params`, whose layout three independent
+  consumers have to agree on.
+- **Two defects this surfaced.** A `CREATESTRUCTW` parked on the process's
+  *64-bit* stack (`0x10_0000_0000`) reached the 32-bit procedure as a truncated
+  pointer, and its handles are 4 bytes wide, not 8 — so it now goes in a
+  sub-4 GiB scratch in a 32-bit layout. And `NtUserMessageCall` type `0x3002` is
+  `SpyGetMsgName`, a *query* for a message's printable name that
+  `user32!DefWindowProcW` issues on every message; dispatching it as a send is a
+  self-feeding loop that went 461 callbacks deep and overflowed a 2 MiB stack.
+- **`SteamSetup.exe` on `--wine-boot` now unpacks its NSIS archive** —
+  `Temp/nsa1.tmp`, `nsa2.tmp` — running **30,803,716** instructions, up from
+  7,363,620. Its `corpus.toml` pin adds `--virtual-clock`, which sends NSIS down
+  a shorter path, and is re-blessed **7,363,620 → 7,692,851** (zero tolerance,
+  three identical runs). 7-Zip is unchanged at exactly 496,505,572; the corpus
+  stays 10 of 10.
+- The negative pin flips: `a_wow64_process_gets_no_creation_pair` becomes
+  `a_wow64_process_gets_its_creation_pair_through_a_client_callback`, keeping
+  the 64-bit control in the same test.
 
 ### Both 32-bit installers stop asking, not crashing (W5.10 / W5.11)
 
