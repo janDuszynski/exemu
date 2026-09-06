@@ -406,9 +406,11 @@ pub struct WinOs {
     /// `NtInitializeNlsFiles` and returned identically thereafter so the ntdll
     /// `RtlGetLocaleFileMappingAddress` cache stays consistent (roadmap W3.2).
     nls_locale_base: Option<(u64, u64)>,
-    /// Mapped `NtGetNlsSectionPtr` sections, keyed by section `type`:
-    /// `(type, base, size)`. Cached so a repeated query returns the same view.
-    nls_section_bases: Vec<(u32, u64, u64)>,
+    /// Mapped `NtGetNlsSectionPtr` sections, keyed by section **type and id**:
+    /// `(type, id, base, size)`. Cached so a repeated query returns the same
+    /// view — and keyed by the id too because a codepage section (type 0xb) is
+    /// one table *per codepage*, not one per type.
+    nls_section_bases: Vec<(u32, u32, u64, u64)>,
     /// Guest virtual address of the dedicated "unix stack" the dispatcher
     /// switches to while a native handler runs (roadmap W2.3), and its top
     /// (initial RSP). Lazily allocated on first syscall; zero until then.

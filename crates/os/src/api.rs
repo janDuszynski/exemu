@@ -1939,9 +1939,20 @@ impl WinOs {
             }
             Api::WideCharToMultiByte => {
                 // WideCharToMultiByte(cp, flags, wstr, cch, mbstr, cb, defChar,
-                //                     usedDefault). We treat the codepage as
-                //  UTF-8. cch<0 ⇒ NUL-terminated input, terminator included in
-                //  the output and count. cb==0 ⇒ return required byte count.
+                //                     usedDefault).
+                //
+                // Codepages exemu implements as real single-byte tables
+                // (`nls::sbcs_encode` — 20127/28591/1252) are encoded through
+                // them, so this thunk and the Wine boot's kernelbase agree.
+                // Everything else is UTF-8, which is the *right* answer for the
+                // ones that actually arrive: `GetACP` reports 65001 here, so
+                // `CP_ACP`/`CP_OEMCP`/`CP_UTF8` are all UTF-8 by construction.
+                // (Measured: on the emulated corpus this API is reached 11,311
+                // times, every one of them with `CP_ACP`.)
+                //
+                // cch<0 ⇒ NUL-terminated input, terminator included in the
+                // output and count. cb==0 ⇒ return required byte count.
+                let cp = self.arg(cpu, mem, 0)? as u32;
                 let wstr = self.arg(cpu, mem, 2)?;
                 let cch = self.arg(cpu, mem, 3)? as i32;
                 let mbstr = self.arg(cpu, mem, 4)?;
@@ -1957,12 +1968,17 @@ impl WinOs {
                     }
                     v
                 };
-                let mut bytes = String::from_utf16_lossy(&units).into_bytes();
+                let (mut bytes, lossy) = match crate::nls::sbcs_encode(cp, &units) {
+                    Some(pair) => pair,
+                    None => (String::from_utf16_lossy(&units).into_bytes(), false),
+                };
                 if cch < 0 {
                     bytes.push(0); // include the NUL terminator in the output
                 }
                 if used_default != 0 {
-                    mem.write_u8(used_default, 0)?; // no lossy substitution under UTF-8
+                    // UTF-8 never substitutes; a single-byte codepage does, for
+                    // any character outside it.
+                    mem.write_u8(used_default, u8::from(lossy))?;
                 }
                 if cb == 0 {
                     return ret(bytes.len() as u64); // size query
@@ -1977,7 +1993,10 @@ impl WinOs {
             Api::MultiByteToWideChar => {
                 // MultiByteToWideChar(cp, flags, mbstr, cb, wstr, cch). cb<0 ⇒
                 // NUL-terminated input (terminator included); cch==0 ⇒ return
-                // the required count in wide chars.
+                // the required count in wide chars. Codepage handling as in
+                // `WideCharToMultiByte` above: a real table where exemu has one,
+                // UTF-8 otherwise — which is what `CP_ACP` means here.
+                let cp = self.arg(cpu, mem, 0)? as u32;
                 let mbstr = self.arg(cpu, mem, 2)?;
                 let cb = self.arg(cpu, mem, 3)? as i32;
                 let wstr = self.arg(cpu, mem, 4)?;
@@ -1990,7 +2009,8 @@ impl WinOs {
                     mem.read(mbstr, &mut v)?;
                     v
                 };
-                let mut units: Vec<u16> = String::from_utf8_lossy(&bytes).encode_utf16().collect();
+                let mut units: Vec<u16> = crate::nls::sbcs_decode(cp, &bytes)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&bytes).encode_utf16().collect());
                 if cb < 0 {
                     units.push(0); // include the NUL terminator
                 }
