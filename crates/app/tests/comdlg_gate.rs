@@ -60,6 +60,13 @@ fn assert_no_hollow_success(r: &HashMap<String, String>) {
 }
 
 fn run_on_wine(tag: &str) -> (exemu_app::RunResult, Vec<DriverCall>) {
+    let (res, calls) = run_on_wine_picking(tag, None);
+    (res.expect("the comdlg sample runs to completion on the Wine boot"), calls)
+}
+
+type PickedRun = (exemu_core::Result<exemu_app::RunResult>, Vec<DriverCall>);
+
+fn run_on_wine_picking(tag: &str, pick: Option<&str>) -> PickedRun {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = std::sync::mpsc::channel::<exemu_core::InputEvent>();
     drop(tx);
@@ -72,10 +79,10 @@ fn run_on_wine(tag: &str) -> (exemu_app::RunResult, Vec<DriverCall>) {
             sandbox_root: Some(seeded_sandbox(tag)),
             input: Some(rx),
             driver: Some(Box::new(RecordingDriver::new(Arc::clone(&log)))),
+            file_dialog_pick: pick.map(str::to_string),
             ..RunConfig::default()
         },
-    )
-    .expect("the comdlg sample runs to completion on the Wine boot");
+    );
     let calls = log.lock().unwrap().clone();
     (res, calls)
 }
@@ -217,6 +224,41 @@ fn wine_file_dialog_is_built_but_never_completes() {
         res.exit_code, 5,
         "the five honest failures of a dialog nobody completed — a LOWER number is not \
          progress, it is a hollow success. Got {r:?}"
+    );
+}
+
+#[test]
+fn driving_the_dialog_reaches_the_text_layout_path_and_stops_there() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (the Wine DLL set is git-ignored)");
+        return;
+    }
+    let (undriven, _) = run_on_wine_picking("nopick", None);
+    let undriven = undriven.expect("with no pick configured the run completes");
+    assert_eq!(tag(&report(&undriven.stdout), comdlg_sample::TAG_OPEN), "");
+    assert!(
+        undriven.steps > 30_000_000,
+        "the undriven run builds and tears down the whole dialog (got {})",
+        undriven.steps
+    );
+
+    let (driven, _) = run_on_wine_picking("pick", Some(comdlg_sample::PICK_FILE_NAME));
+    let err = match driven {
+        Ok(res) => {
+            let r = report(&res.stdout);
+            panic!(
+                "the drive no longer faults — re-baseline this test to the positive \
+                 assertion: OPEN must be the path comdlg32 resolved and READ must be \
+                 {PICK_CONTENT:?}. Got exit={} {r:?}",
+                res.exit_code
+            )
+        }
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("0xc0000005"),
+        "the wall is an access violation in gdi32's bundled Uniscribe, not something \
+         else: {err}"
     );
 }
 

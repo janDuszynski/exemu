@@ -335,6 +335,10 @@ mod window_relative {
 }
 
 const HWND_LIST_MAX: usize = 4096;
+const DIALOG_CLASS: &str = "#32770";
+const IDC_FILENAME_COMBO: u64 = 0x47c;
+const IDOK: u64 = 1;
+const WM_COMMAND: u32 = 0x0111;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 
 mod call_two_param {
@@ -589,6 +593,8 @@ pub(crate) struct Win32kState {
     bitmaps: Vec<(u32, Bitmap)>,
     icons: Vec<(u32, IconObject)>,
     win_procs: Vec<WinProc>,
+    driven_dialogs: Vec<u32>,
+    pick_text: u64,
     sys_brushes: Vec<(u32, u32)>,
     gdi_table_base: u64,
     gdi_next_slot: u64,
@@ -1591,6 +1597,65 @@ fn nt_user_call_hwnd(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
     })
 }
 
+fn edit_within(st: &Win32kState, root: u32) -> Option<u32> {
+    let mut frontier = vec![root];
+    for _ in 0..WINDOW_ANCESTRY_MAX {
+        let mut next = Vec::new();
+        for (h, w) in &st.windows {
+            if !frontier.contains(&w.parent) {
+                continue;
+            }
+            if w.class_name.eq_ignore_ascii_case("Edit") {
+                return Some(*h);
+            }
+            next.push(*h);
+        }
+        if next.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
+}
+
+fn drive_file_dialog(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
+    let Some(pick) = os.cfg.file_dialog_pick.clone() else { return false };
+    let st = &os.win32k_state;
+    let Some((hwnd, target)) = st
+        .windows
+        .iter()
+        .filter(|(h, w)| w.class_name == DIALOG_CLASS && !st.driven_dialogs.contains(h))
+        .find_map(|(h, _)| {
+            let combo = st
+                .windows
+                .iter()
+                .find(|(_, w)| w.parent == *h && w.id == IDC_FILENAME_COMBO)
+                .map(|(c, _)| *c)?;
+            Some((*h, edit_within(st, combo).unwrap_or(combo)))
+        })
+    else {
+        return false;
+    };
+
+    if os.win32k_state.pick_text == 0 {
+        let bytes: Vec<u8> =
+            pick.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+        let Some(base) = os.map_anywhere(mem, bytes.len() as u64, Perm::RW, "dialog-pick") else {
+            return false;
+        };
+        if mem.write(base, &bytes).is_err() {
+            return false;
+        }
+        os.win32k_state.pick_text = base;
+    }
+
+    os.win32k_state.driven_dialogs.push(hwnd);
+    let text = os.win32k_state.pick_text;
+    os.post_internal(target as u64, WM_SETTEXT, 0, text);
+    os.post_internal(hwnd as u64, WM_COMMAND, IDOK, 0);
+    true
+}
+
 fn window_relative(st: &Win32kState, hwnd: u32, rel: u64) -> u32 {
     let Some(w) = st.window(hwnd) else { return 0 };
     let (parent, style) = (w.parent, w.style);
@@ -2130,6 +2195,7 @@ fn cancel_unattended_dialog(os: &mut WinOs) {
 fn nt_user_get_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let lp = os.syscall_arg(cpu, mem, 0)?;
     loop {
+        drive_file_dialog(os, mem);
         quit_when_headless(os);
         os.drain_input();
         synthesize_paint(os);
@@ -2504,6 +2570,7 @@ fn nt_user_peek_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
     const PM_REMOVE: u32 = 0x0001;
     let lp = os.syscall_arg(cpu, mem, 0)?;
     let remove = os.syscall_arg(cpu, mem, 4)? as u32 & PM_REMOVE != 0;
+    drive_file_dialog(os, mem);
     quit_when_headless(os);
     os.drain_input();
     synthesize_paint(os);

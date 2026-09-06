@@ -68,6 +68,7 @@ pub struct WinConfig {
     pub image_name: String,
     pub wine_dll_dir: Option<String>,
     pub dpi: u32,
+    pub file_dialog_pick: Option<String>,
 }
 
 impl Default for WinConfig {
@@ -96,6 +97,7 @@ impl Default for WinConfig {
             image_name: String::new(),
             wine_dll_dir: None,
             dpi: 96,
+            file_dialog_pick: None,
         }
     }
 }
