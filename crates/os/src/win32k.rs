@@ -396,7 +396,6 @@ const NT_USER_DESTROY_CURSOR: u32 = 0x137f;
 //     user32→win32k blocks `NtUserSetCursorIconData` carries. **Both layouts are
 //     read out of the pinned `user32.dll`'s DWARF**, where they are declared in
 //     full — not reconstructed from a call site, and not remembered.
-const DESC_NUM_FRAMES: u64 = 0x08;
 const DESC_FRAMES: u64 = 0x10;
 const FRAME_WIDTH: u64 = 0x00;
 const FRAME_HEIGHT: u64 = 0x04;
@@ -4983,6 +4982,29 @@ fn create_cursor_icon(os: &mut WinOs, is_icon: bool) -> u32 {
 /// them. exemu records the **first** frame — a static icon has exactly one, and
 /// an animated cursor's first frame is what a non-animating caller draws.
 ///
+/// **A static icon carries no counts at all, and refusing it is what made every
+/// icon in a Wine guest fail** (roadmap W6.2). `user32!create_icon_from_bitmapinfo`
+/// builds one `struct cursoricon_frame` on its stack and points a
+/// `struct cursoricon_desc` at it, leaving `num_steps` **and** `num_frames`
+/// zero — those two count an *animated* cursor's steps and frames, and a plain
+/// icon has neither. Dumped straight out of a live call, the whole descriptor is
+///
+/// ```text
+///   +0x00 flags      = 0x00008040
+///   +0x04 num_steps  = 0
+///   +0x08 num_frames = 0            <-- and it is *supposed* to be
+///   +0x10 frames     = 0x10001fe638 --> { width 32, height 32,
+///                                         color/alpha/mask: three real HBITMAPs }
+/// ```
+///
+/// so treating `num_frames == 0` as "nothing to record" rejected a perfectly
+/// good icon. user32 answers a FALSE here by destroying the object it just
+/// allocated and returning NULL (`NtUserDestroyCursor` follows immediately in
+/// the trace), which is why the earlier evidence — `NtUserSetCursorIconData`
+/// being *reached* at all, and `+cursor` logging `CURSORICON_Load` instead of
+/// failing before it — did not mean the icon had been created. The one
+/// requirement that is real is a non-NULL `frames`.
+///
 /// `module` and `res_name` name where the icon came from, for the shared-icon
 /// cache; exemu keeps no cache (see [`nt_user_find_existing_cursor_icon`]) and
 /// so ignores them.
@@ -4996,8 +5018,11 @@ fn nt_user_set_cursor_icon_data(
     if desc == 0 || !os.win32k_state.icons.iter().any(|(h, _)| *h == hicon) {
         return Ok(0);
     }
+    // The frame array is the only thing that must be there: a static icon leaves
+    // both counts zero and supplies exactly one frame. An *animated* cursor is
+    // the case that fills them in, and even then frame 0 is what exemu records.
     let frames = mem.read_u64(desc + DESC_FRAMES)?;
-    if frames == 0 || mem.read_u32(desc + DESC_NUM_FRAMES)? == 0 {
+    if frames == 0 {
         return Ok(0);
     }
     let f = frames; // frame 0 — see the doc comment above.
@@ -5589,8 +5614,12 @@ mod tests {
         //    layout read out of the pinned user32's DWARF.
         let color = alloc_bitmap(&mut os, &mut mem, 32, 32, 1, 32, true).unwrap();
         let mask = alloc_bitmap(&mut os, &mut mem, 32, 64, 1, 1, true).unwrap();
+        // **A static icon, described exactly as user32 describes one**: both
+        // `num_steps` and `num_frames` left ZERO — they count an animated
+        // cursor's steps and frames, and a plain icon has neither — with a
+        // single frame hung off `frames`. Reading those zeros as "nothing to
+        // record" is what made every icon in a Wine guest fail.
         let (desc, frame) = (0x10_4000u64, 0x10_5000u64);
-        mem.write_u32(desc + DESC_NUM_FRAMES, 1).unwrap();
         mem.write_u64(desc + DESC_FRAMES, frame).unwrap();
         mem.write_u32(frame + FRAME_WIDTH, 32).unwrap();
         mem.write_u32(frame + FRAME_HEIGHT, 32).unwrap();
