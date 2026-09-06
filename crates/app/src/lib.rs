@@ -24,6 +24,7 @@ pub mod shell_link_sample;
 pub mod shell_sample;
 pub mod socket_sample;
 pub mod wow64_boot;
+pub mod wow64_gui_sample;
 pub mod wow64_sample;
 pub mod spawn;
 pub mod spawn_sample;
@@ -1099,6 +1100,11 @@ impl Process {
     /// Read a little-endian `u32` of guest memory (for tests/tools).
     pub fn peek_u32(&self, addr: u64) -> Result<u32> {
         self.mem.read_u32(addr)
+    }
+
+    /// Read a little-endian `u64` of guest memory (for tests/tools).
+    pub fn peek_u64(&self, addr: u64) -> Result<u64> {
+        self.mem.read_u64(addr)
     }
 
     /// Read-only view of the process address space (for tests/tools inspecting

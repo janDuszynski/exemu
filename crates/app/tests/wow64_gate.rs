@@ -487,3 +487,98 @@ fn wow64_wine_loader_boots_the_i386_ntdll_loader() {
         r.steps,
     );
 }
+
+/// **W5.10 — a 32-bit guest's own window procedure receives its creation
+/// messages, and its answer reaches the kernel.**
+///
+/// The gate the whole client-callback protocol exists for. A PE32 guest
+/// registers a class whose `lpfnWndProc` is its own 32-bit code, creates the
+/// window, and checks three things the direct call could never have delivered:
+///
+/// * `WM_NCCREATE` **and** `WM_CREATE` both arrive (before this, exemu declined
+///   the callback rather than run 32-bit bytes in long mode);
+/// * the `WM_NCCREATE` `lParam` is a **32-bit-addressable** `CREATESTRUCTW`
+///   whose `style` reads back at the 32-bit offset `0x20`;
+/// * a `SendMessageW` returns the value the procedure returned — so the answer
+///   travelled WndProc → `NtCallbackReturn` → exemu's kernel → back out through
+///   `wow64win`.
+///
+/// Nothing in the chain between the guest's `call [IAT]` and its own procedure
+/// is exemu's: it is Wine's i386 `user32`/`win32u`, `wow64cpu`'s BOP,
+/// `wow64.dll`, `wow64win.dll`, and the 64-bit `ntdll` — with exemu supplying
+/// only the kernel side of the win32k syscall and the callback frame.
+#[test]
+fn a_32bit_guest_wndproc_gets_its_creation_messages() {
+    if !have_wow64_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    use exemu_app::wow64_gui_sample as s;
+
+    let exe = s::build();
+    let mut cfg = wine_loader_config("wndproc");
+    cfg.max_steps = 80_000_000;
+    let mut proc = Process::load(&exe, &mut cfg).expect("WoW64 boot");
+
+    // `PEB64.KernelCallbackTable` is `wow64win!user_callbacks`, published from
+    // that DLL's own `DllMain` bytes — without it the dispatcher would
+    // `call [0 + id*8]`.
+    let (peb64, wow64win_base, wow64win_size) = {
+        let b = proc.wow64().expect("WoW64 boot");
+        (b.peb64, b.wow64win.base, b.wow64win.size)
+    };
+    let table = proc.peek_u64(peb64 + exemu_os::wow64::PEB64_KERNEL_CALLBACK_TABLE).unwrap();
+    assert!(
+        table > wow64win_base && table < wow64win_base + wow64win_size,
+        "PEB.KernelCallbackTable {table:#x} points into the mapped wow64win image",
+    );
+    let win_proc_cb = proc
+        .peek_u64(table + 8 * u64::from(exemu_os::wow64::NT_USER_CALL_WIN_PROC))
+        .unwrap();
+    assert!(
+        win_proc_cb > wow64win_base && win_proc_cb < wow64win_base + wow64win_size,
+        "…and its NtUserCallWinProc entry is real code in that image",
+    );
+
+    let r = proc.run_borrowed().expect("the WoW64 GUI guest ran");
+    let seen = proc.peek_u32(s::data_va(s::data::SEEN)).unwrap();
+    eprintln!(
+        "W5.10 — the 32-bit guest exited {} after {} instructions (seen={seen:#x})",
+        r.exit_code, r.steps,
+    );
+    assert_eq!(
+        r.exit_code,
+        s::GUI_OK_EXIT,
+        "the guest's own checks all held; seen={seen:#x} style={:#x} lresult={:#x}",
+        proc.peek_u32(s::data_va(s::data::CS_STYLE)).unwrap(),
+        proc.peek_u32(s::data_va(s::data::SEND_RESULT)).unwrap(),
+    );
+
+    // The same facts, read out of guest memory rather than inferred from the
+    // exit code — so a failure names which half broke.
+    assert_eq!(seen, s::seen::ALL, "WM_NCCREATE, WM_CREATE and the private probe all arrived");
+    let hwnd = proc.peek_u32(s::data_va(s::data::HWND)).unwrap();
+    assert_ne!(hwnd, 0, "CreateWindowExW returned a window");
+    assert_eq!(
+        proc.peek_u32(s::data_va(s::data::PROC_HWND)).unwrap(),
+        hwnd,
+        "the procedure was called with the window it was creating",
+    );
+    let cs = proc.peek_u32(s::data_va(s::data::CS_PTR)).unwrap();
+    assert_ne!(cs, 0, "WM_NCCREATE carried a CREATESTRUCTW");
+    assert_eq!(
+        proc.peek_u32(s::data_va(s::data::CS_STYLE)).unwrap(),
+        s::WINDOW_STYLE,
+        "…in the 32-bit layout, at an address a 32-bit pointer can hold ({cs:#x})",
+    );
+    assert_eq!(
+        proc.peek_u32(s::data_va(s::data::SEND_RESULT)).unwrap(),
+        s::PROBE_LRESULT,
+        "the procedure's LRESULT made the whole round trip back to SendMessageW",
+    );
+    assert_eq!(
+        proc.peek_u32(s::data_va(s::data::ESP_AFTER)).unwrap(),
+        proc.peek_u32(s::data_va(s::data::ESP_BEFORE)).unwrap(),
+        "every stdcall frame the kernel built was popped by the callee it was handed to",
+    );
+}
