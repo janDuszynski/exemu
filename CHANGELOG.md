@@ -96,38 +96,47 @@ end-to-end on the default path.
   executable — now dispatches as `exemu run <path>` instead of erroring
   "unknown command".
 
-### The JIT's guest memory path, profiled (W8.6)
-- **Profiled rather than guessed.** Sampling the 7-Zip `--jit` run put 249 of
-  614 main-thread samples — **40% of the whole process** — in the two guest
-  memory helpers and the `Memory` methods they call. That is where the JIT's
-  time is now, and every instruction on that path is paid ~500M times.
-- **The single biggest win was in the compiler, not the compiled code.** The
-  ARM64 logical-immediate encoder brute-forced all 8192 `(N, immr, imms)`
-  triples through the architecture's decoder. `and #0xff` — which nearly every
-  compiled arithmetic instruction emits — needs ~4100 of them, so this alone was
-  **4.6% of the run**. It is now the closed form, with the derived triple still
-  verified against the decoder before it is used, and a test that walks the whole
-  triple space proves no encodable value was lost.
-- **The guest memory path no longer dispatches through a vtable.** `BlockCtx`
-  held `&mut dyn Memory`, so every guest load and store was two indirect calls.
-  It now carries the backend as a type parameter and `Jit::run` is generic over
-  it; no call site changed. Semantics are untouched — same implementation, same
-  order, same bounds, permission, watchpoint and fault behaviour.
-- **A store hashes one address into the compiled-code page table, not two.** The
-  second probe is made only when the store really spans two pages.
-- **Measured, four-way interleaved in one session, 5 reps, min user+sys:**
-  22.030 G → 21.108 G → 20.889 G → **20.782 G** retired host instructions,
-  **−5.7%** overall, 0.78 s → 0.73 s. The same binary spans 0.73–1.15 s across
-  reps depending on machine load, so the instruction count is the number that
-  means anything; it varies by under 0.3%. 7-Zip still retires exactly
-  496,505,572 guest instructions and emits the same 771 KiB of native code.
-- **What is still on the table, and what it needs.** The remaining ~35% is a
-  software TLB in emitted code — about seven instructions and no call in place
-  of a helper call and a region lookup. It cannot be built inside the JIT: the
-  emitted code needs a host pointer to a region's bytes, which neither the
-  `Memory` trait nor its implementation exposes. Zero divergences in 2.4M
-  JIT-vs-interpreter differential trials across both address-space layouts and
-  both bitnesses; corpus 10/10 at drift 0.
+### The JIT's guest memory path, inlined (W8.6)
+- **7-Zip `--jit` goes from 22.0 G to 10.4 G retired host instructions — −53% —
+  and from 0.79 s to 0.44 s of CPU**, on exactly the same 496,505,572 guest
+  instructions. Measured interleaved in one session, 5 reps, min user+sys, with
+  every binary built and alternated; the same binary spans 0.79–0.84 s (and one
+  arm 0.76–0.98 s) depending on machine load, while the instruction count varies
+  by under 0.15%, which is why that is the number quoted.
+- **Profiled rather than guessed.** Sampling put 249 of 614 main-thread samples —
+  **40% of the whole process** — in the guest memory helpers. Afterwards it is
+  2–3 of 126, with the bulk of the run in emitted code.
+- **A guest load or store no longer calls into Rust.** Emitted code carries a
+  direct-mapped cache of host addresses and does the access itself in seven
+  instructions with no call, no spill and no `Result` returned through memory. A
+  miss falls into exactly the helper sequence that was there before.
+- **The seam that made it possible did not weaken anything.** `exemu-core` and
+  `exemu-memory` both keep `#![forbid(unsafe_code)]`, untouched: the new
+  `Memory::host_span` / `host_span_mut` return **safe slices**, so the backend
+  writes no `unsafe` and the compiler checks the bounds of what it exposes.
+  Turning one into a pointer that outlives the borrow is the JIT's explicit
+  `unsafe`, in the one crate that has ever been allowed it.
+- **Four invariants, each enforced where it cannot be forgotten.** A span is
+  refused for anything that would fault, so a fault still lands on exactly the
+  instruction it did before; a *writable* span is never handed out over
+  executable memory, so every store that could rewrite compiled code keeps going
+  through the self-modification checks; nothing is handed out at all while a data
+  watchpoint is armed, so an armed watchpoint still sees every access; and
+  `Memory::layout_generation` moves for every map, unmap and re-protect, so a
+  cached host address cannot outlive the bytes it points at. The JIT checks all
+  of that **once per `Jit::run`, never per access** — detached, that is a field
+  load and a null test per chain.
+- **The differential could not execute the new fast path at all, and now can.**
+  Every region the JIT-vs-interpreter harness mapped was exactly one page, and a
+  page is only cached when its whole page plus seven bytes is inside one region —
+  so 3,000 trials filled **zero** cache entries. The "zero divergences" that
+  first accompanied the fast path was true and worth nothing. Region roominess is
+  now drawn per trial, so half the trials keep the tight one-page regions the
+  fault shapes depend on and half have the slack the fast path needs: 1,203
+  entries filled in the same 3,000 trials.
+- 0 divergences in 2M differential trials across both address-space layouts and
+  both bitnesses with the fast path engaged; corpus 11/11 at drift 0; workspace
+  tests 940 → 960, clippy clean at `-D warnings`.
 
 ### Native block linking and indirect-branch inline caches (W8.5)
 - **7-Zip `--jit` goes from 0.95 s to 0.76 s of CPU — 28.5 G to 21.7 G retired
