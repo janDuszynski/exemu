@@ -24,6 +24,7 @@ pub mod sample;
 pub mod shell_link_sample;
 pub mod shell_sample;
 pub mod socket_sample;
+pub mod winsxs;
 pub mod wow64_boot;
 pub mod wow64_gui_sample;
 pub mod wow64_sample;
@@ -786,6 +787,28 @@ impl Process {
                 .join("system32")
                 .join(exemu_os::audio::DRIVER_MODULE);
             let _ = std::fs::write(drv, exemu_os::audio::driver_stub_pe());
+        }
+
+        // The WinSxS store (roadmap W6.1). A real Wine prefix is *created* with
+        // one: `wineboot --update` turns every builtin's `WINE_MANIFEST`
+        // resource into `%WINDIR%\winsxs\manifests\<key>.manifest` plus a
+        // private copy of the DLL under `%WINDIR%\winsxs\<key>\`. exemu booted
+        // Wine against a prefix that had never had that step run, so
+        // `ntdll!lookup_winsxs` found no assembly for
+        // `Microsoft.Windows.Common-Controls` 6.0.0.0 and every guest silently
+        // got **comctl32 v5** — the build with no themed control replacements
+        // and no `uxtheme`. Staged here, next to the audio driver above and for
+        // the same reason: it is prefix creation, not emulation. See
+        // `crates/app/src/winsxs.rs`.
+        if let Some(dir) = &wine_dll_dir {
+            // The 32-bit half of a WoW64 process asks for the `x86` assembly and
+            // loads the 32-bit DLL, so the payload has to come from the prefix
+            // the WoW64 file-system redirector points its loader at.
+            let prefix = match (image.is_64bit, &wow64_dir32) {
+                (false, Some(d32)) => d32.clone(),
+                _ => std::path::PathBuf::from(dir),
+            };
+            let _ = winsxs::stage_comctl6(&sandbox, &prefix, winsxs::arch_for(image.is_64bit));
         }
 
         // --- The OS layer and import resolution ---------------------------

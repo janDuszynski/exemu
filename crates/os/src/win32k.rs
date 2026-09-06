@@ -1298,7 +1298,11 @@ impl Win32kState {
 /// which the emulated corpus never issues.
 pub(crate) fn register(os: &mut WinOs) {
     for idx in WIN32K_FIRST..=WIN32K_LAST {
-        os.set_win32k_handler(idx, honest_stub);
+        // Deliberately [`WinOs::set_win32k_stub`], not
+        // [`WinOs::set_win32k_handler`]: the blanket fill must not make an index
+        // look *serviced*, or the `EXEMU_W32K_TRACE` transcript loses the one
+        // signal that finds the next missing primitive (roadmap W6.2).
+        os.set_win32k_stub(idx, honest_stub);
     }
     os.set_win32k_handler(
         NT_USER_INITIALIZE_CLIENT_PFN_ARRAYS,
