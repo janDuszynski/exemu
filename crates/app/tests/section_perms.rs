@@ -104,7 +104,7 @@ fn the_section_carrying_the_iat_stays_writable() {
 /// real third-party binary.
 #[test]
 fn a_upx_packed_guest_still_gets_rwx_because_it_asked_for_it() {
-    let path = std::path::Path::new("example_exe/Firefox Installer.exe");
+    let path = std::path::Path::new("../../example_exe/Firefox Installer.exe");
     let Ok(bytes) = std::fs::read(path) else {
         eprintln!("skipping: {} not present", path.display());
         return;
@@ -125,7 +125,7 @@ fn a_upx_packed_guest_still_gets_rwx_because_it_asked_for_it() {
 /// the read-only sections that do **not** carry the IAT stay read-only.
 #[test]
 fn a_real_msvc_image_maps_pdata_and_rsrc_read_only() {
-    let path = std::path::Path::new("example_exe/7z2602-x64.exe");
+    let path = std::path::Path::new("../../example_exe/7z2602-x64.exe");
     let Ok(bytes) = std::fs::read(path) else {
         eprintln!("skipping: {} not present", path.display());
         return;
