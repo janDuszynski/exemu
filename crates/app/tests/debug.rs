@@ -625,6 +625,44 @@ fn detach_disarms_and_runs_to_completion() {
     assert_eq!(d.ok().exit_code, plain.exit_code);
 }
 
+/// A fault parks the debugger before the error is returned, so a front-end gets
+/// one look at the register file, the trail and the backtrace at the point the
+/// run died — the stop no front-end can ask for and the most useful one it can
+/// be handed. The error is returned either way: nothing can un-fault a guest.
+#[test]
+fn a_fault_parks_the_debugger_before_it_is_reported() {
+    let control = DebugControl::attached();
+    let (session, front) = DebugSession::pair(control);
+    front.commands.send(DebugCommand::Resume).unwrap();
+    drop(front.commands);
+
+    // A tiny step cap dies at a known instruction without needing a guest that
+    // faults, and takes the same `Process::fault` path a real fault does.
+    let mut c = cfg(false);
+    c.max_steps = 10;
+    c.debug = Some(session);
+    let err = load_and_run(&long_image(), c).err().expect("the step cap should have been hit");
+
+    let mut stops = Vec::new();
+    while let Ok(e) = front.events.try_recv() {
+        if let DebugEvent::Stopped(s) = e {
+            stops.push(*s);
+        }
+    }
+    assert_eq!(stops.len(), 1, "a fault should park exactly once");
+    assert_eq!(stops[0].steps, 10, "parked at the instruction the run died on");
+    match &stops[0].stop {
+        StopReason::Faulted { report } => {
+            assert!(
+                report.contains("instruction budget exhausted"),
+                "the snapshot carries the fault reporter's own text: {report}"
+            );
+        }
+        other => panic!("expected a fault stop, got {other:?}"),
+    }
+    assert!(err.to_string().contains("instruction budget exhausted"));
+}
+
 /// `Kill` abandons the run, and says so rather than pretending the guest exited.
 #[test]
 fn kill_abandons_the_run() {

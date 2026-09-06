@@ -1280,11 +1280,8 @@ impl Process {
         let exit_code = loop {
             if self.max_steps != 0 && steps >= self.max_steps {
                 let tail = self.rip_trail(&recent);
-                return Err(self.fault(
-                    EmuError::Os(format!("instruction budget exhausted after {steps} steps")),
-                    steps,
-                    &tail,
-                ));
+                let e = EmuError::Os(format!("instruction budget exhausted after {steps} steps"));
+                return Err(self.fault_debugged(debugging, e, steps, &tail));
             }
             recent.push_back(self.cpu.state().rip);
             if recent.len() > TAIL {
@@ -1490,24 +1487,23 @@ impl Process {
                     if self.try_deliver_hw_exception(ExcSource::Interrupt(n), steps, &t)? {
                         continue;
                     }
-                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &t));
+                    let e = EmuError::Os(format!("unhandled interrupt {n:#x}"));
+                    return Err(self.fault_debugged(debugging, e, steps, &t));
                 }
                 // A native SYSCALL is serviced inside `Cpu::step` (the OS layer's
                 // syscall seam, roadmap W2.2); an unserviced one surfaces here as
                 // `Interrupt(0x80)` from the default hook, not as `Syscall`.
                 Ok(Exit::Syscall(index)) => {
-                    return Err(self.fault(
-                        EmuError::Os(format!("SYSCALL {index:#x} escaped the dispatcher")),
-                        steps,
-                        &tail(),
-                    ));
+                    let t = tail();
+                    let e = EmuError::Os(format!("SYSCALL {index:#x} escaped the dispatcher"));
+                    return Err(self.fault_debugged(debugging, e, steps, &t));
                 }
                 Err(e) => {
                     let t = tail();
                     if self.try_deliver_hw_exception(ExcSource::Error(&e), steps, &t)? {
                         continue;
                     }
-                    return Err(self.fault(e, steps, &t));
+                    return Err(self.fault_debugged(debugging, e, steps, &t));
                 }
             }
         };
@@ -1755,6 +1751,32 @@ impl Process {
             buf.push(b[0]);
         }
         buf
+    }
+
+    /// Build the fault the run is about to die of and, when a debugger is
+    /// attached, park on it first.
+    ///
+    /// A fault is the one stop the front-end cannot ask for and the most useful
+    /// one it can be handed: it is where the register file, the rip trail and
+    /// the backtrace are worth reading. The resume action is deliberately
+    /// ignored — nothing can un-fault the guest — so the front-end gets one look
+    /// at the state and the error is returned either way. `Kill` is honoured
+    /// only in the sense that the run was ending regardless.
+    fn fault_debugged(
+        &mut self,
+        debugging: bool,
+        err: EmuError,
+        steps: u64,
+        recent: &[u64],
+    ) -> EmuError {
+        let err = self.fault(err, steps, recent);
+        if debugging {
+            if let EmuError::Fault { report, .. } = &err {
+                let report = report.clone();
+                self.debug_stop(StopReason::Faulted { report }, steps, recent);
+            }
+        }
+        err
     }
 
     /// Disarm everything, so a detached run costs the attached-but-unarmed
