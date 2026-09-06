@@ -39,8 +39,8 @@ use exemu_core::Memory;
 use crate::buffer::{BlockCode, BufferError, CodeBuffer};
 use crate::compile::{Compiler, StopReason, MAX_INSNS, MAX_LINKS, RET_FAULT};
 use crate::rt::{
-    jit_read, jit_write, BlockCtx, LinkSlot, CODE_PAGE_WORDS, LINK_EPOCH_DEAD, NO_SLOT, NO_SMC,
-    PARITY, TRAIL,
+    jit_read, jit_write, BlockCtx, LinkSlot, TlbEntry, CODE_PAGE_WORDS, LINK_EPOCH_DEAD, NO_SLOT,
+    NO_SMC, PARITY, TLB_SLOTS, TRAIL,
 };
 
 pub use crate::compile::Mode;
@@ -116,6 +116,14 @@ pub struct JitStats {
     pub smc_false_hits: u64,
     /// Times the whole cache was thrown away because guest code changed.
     pub flushes: u64,
+    /// Guest-memory TLB entries filled, and fills the backend refused (roadmap
+    /// W8.6). A refusal is a store into executable memory, or a page whose
+    /// region ends inside the span an entry has to cover; both stay on the
+    /// helper. `tlb_resets` counts the times the whole table was thrown away
+    /// because the address space changed under it.
+    pub tlb_fills: u64,
+    pub tlb_denied: u64,
+    pub tlb_resets: u64,
     /// High-water mark of emitted native code, in bytes. (`Jit::code_bytes`
     /// reports what is live *now*, which a flush resets.)
     pub peak_code_bytes: usize,
@@ -223,6 +231,25 @@ pub struct Jit {
     /// the hash table [`crate::rt::jit_write`] tests every store against.
     code_page_set: HashSet<u64>,
     code_pages: Box<[u64]>,
+    /// The guest-memory TLB compiled code reads on every access (roadmap W8.6),
+    /// and the three facts it is only valid against.
+    ///
+    /// `tlb_gen` is `Memory::layout_generation` at the moment it was last
+    /// filled: it moves for every map, unmap and re-protect, i.e. for everything
+    /// that can move or free the bytes an entry points at. `tlb_watch` is
+    /// whether a data watchpoint was armed, because an armed one must observe
+    /// every access and an entry is how an access becomes unobservable.
+    /// `tlb_mem` is the address of the backend itself — a second net under the
+    /// generation, for a caller that swaps address spaces under one engine, for
+    /// which the contract is [`Jit::invalidate`].
+    tlb: Box<[TlbEntry]>,
+    tlb_live: bool,
+    tlb_gen: u64,
+    tlb_watch: bool,
+    tlb_mem: usize,
+    /// Whether the helpers may fill the table at all. On by default; a test (or
+    /// a bisect) turns it off to put every access back on the helper.
+    tlb_on: bool,
 }
 
 impl Jit {
@@ -250,11 +277,38 @@ impl Jit {
             pending_long: false,
             code_page_set: HashSet::new(),
             code_pages: vec![0u64; CODE_PAGE_WORDS].into_boxed_slice(),
+            tlb: vec![TlbEntry::EMPTY; TLB_SLOTS].into_boxed_slice(),
+            tlb_live: false,
+            tlb_gen: 0,
+            tlb_watch: false,
+            tlb_mem: 0,
+            tlb_on: true,
         })
     }
 
     pub fn stats(&self) -> &JitStats {
         &self.stats
+    }
+
+    /// Turn the guest-memory TLB off (or back on).
+    ///
+    /// Correctness never depends on it: with it off every access goes through
+    /// [`crate::rt::jit_read`] / [`crate::rt::jit_write`], which is what the JIT
+    /// did before roadmap W8.6. It exists so a test can require the two to agree
+    /// instruction for instruction, which is the cheap way to ask whether a
+    /// divergence is about the fast path.
+    pub fn set_tlb(&mut self, on: bool) {
+        self.tlb_on = on;
+        self.tlb_reset();
+    }
+
+    /// Throw every cached host address away. Cheap and rare: it happens when the
+    /// address space changed under the table, not when compiled code did.
+    fn tlb_reset(&mut self) {
+        self.dump_tlb_stats("reset");
+        self.tlb.fill(TlbEntry::EMPTY);
+        self.tlb_live = false;
+        self.stats.tlb_resets += 1;
     }
 
     /// Cap the number of guest instructions per block (the differential uses
@@ -336,6 +390,10 @@ impl Jit {
     pub fn invalidate(&mut self) {
         self.flush();
         self.code_gen = 0;
+        // A different address space's regions are somewhere else entirely, and
+        // its `layout_generation` starts again from its own zero — so this, not
+        // the generation, is what a caller swapping guest images relies on.
+        self.tlb_reset();
     }
 
     /// Compile (or find) the block at `rip` in `mode` and return its index.
@@ -527,6 +585,35 @@ impl Jit {
     ) -> Run {
         self.stats.chains += 1;
         let long = mode == Mode::Long;
+        // --- the guest-memory TLB's validity, decided once per chain --------
+        //
+        // Not once per access: that is the whole point. `layout_generation`
+        // moves for every map, unmap and re-protect — everything that can move
+        // or free the bytes a cached entry points at — and `watchpoints_armed`
+        // is one null test on an `Option` niche when nothing is attached, which
+        // is every ordinary run. A debugger arms a watchpoint while parked at an
+        // instruction boundary, which is between calls to this function, so this
+        // is exactly the right granularity: an entry filled before the arming
+        // cannot survive it, and an entry cannot be filled after it (the backend
+        // refuses).
+        let mem_id = std::ptr::from_mut(mem).cast::<u8>() as usize;
+        let layout_gen = mem.layout_generation();
+        let watching = mem.watchpoints_armed();
+        if !self.tlb_live
+            || layout_gen != self.tlb_gen
+            || watching != self.tlb_watch
+            || mem_id != self.tlb_mem
+        {
+            self.tlb_reset();
+            self.tlb_gen = layout_gen;
+            self.tlb_watch = watching;
+            self.tlb_mem = mem_id;
+            self.tlb_live = true;
+        }
+        // Filling while a watchpoint is armed would only ever be refused; not
+        // asking is how that costs nothing rather than a region lookup per
+        // access.
+        let tlb_on = u64::from(self.tlb_on && !watching);
         // The running total is reported in a `u32` and a block adds at most
         // `MAX_INSNS` to it, so cap the budget well clear of the edge rather
         // than trusting every caller to. `u64::MAX` — the default budget of a
@@ -608,6 +695,10 @@ impl Jit {
                     smc: NO_SMC,
                     smc_hits: 0,
                     code_pages: self.code_pages.as_ptr(),
+                    tlb: self.tlb.as_mut_ptr(),
+                    tlb_on,
+                    tlb_fills: 0,
+                    tlb_denied: 0,
                 };
                 // SAFETY: `code` was produced by this crate's emitter for exactly
                 // this signature and written into `self.buffer`, which is still
@@ -624,6 +715,8 @@ impl Jit {
                     let f: BlockFn = code.as_fn();
                     f(state as *mut CpuState, (&mut ctx as *mut BlockCtx<'_, M>).cast::<u8>())
                 };
+                self.stats.tlb_fills += ctx.tlb_fills;
+                self.stats.tlb_denied += ctx.tlb_denied;
                 (ret, ctx.retired, ctx.pending, (ctx.smc, ctx.smc_hits), ctx.trail_at)
             };
             // Every link the chain took wrote one trail entry, which is also how
@@ -661,6 +754,24 @@ impl Jit {
         }
     }
 
+    /// Dump the guest-memory TLB's counters, if `EXEMU_JIT_TLB_STATS` is set.
+    ///
+    /// `JitReport` lives in `crates/app` and the corpus's attach-is-free entry
+    /// asserts it field by field, so the numbers that answer "how much of the
+    /// memory path actually got inlined, and what still falls back" are exposed
+    /// here instead — the same shape as the other `EXEMU_*` diagnostics, off
+    /// unless asked for.
+    pub fn dump_tlb_stats(&self, tag: &str) {
+        if std::env::var("EXEMU_JIT_TLB_STATS").is_err() {
+            return;
+        }
+        let s = &self.stats;
+        eprintln!(
+            "[jit/tlb] {tag}: {} fills, {} denied, {} resets; {} chains, {} blocks, {} insns",
+            s.tlb_fills, s.tlb_denied, s.tlb_resets, s.chains, s.blocks_executed, s.insns_executed
+        );
+    }
+
     /// The most recent block entry addresses, oldest first — the rip trail the
     /// fault reporter prints. Chaining moves this bookkeeping in here, because
     /// the caller's loop no longer sees every block.
@@ -669,6 +780,16 @@ impl Jit {
         (0..n)
             .map(|i| self.trail[(self.trail_at as usize + TRAIL - n + i) & (TRAIL - 1)])
             .collect()
+    }
+}
+
+/// The final tally, for the same `EXEMU_JIT_TLB_STATS` diagnostic. A `Jit`
+/// belongs to one guest thread and is dropped when that thread ends, so this is
+/// one line per thread at the end of a run — and nothing at all otherwise, since
+/// the only work it does is read an environment variable.
+impl Drop for Jit {
+    fn drop(&mut self) {
+        self.dump_tlb_stats("final");
     }
 }
 
@@ -860,6 +981,211 @@ mod tests {
         }
         assert_eq!(jit.stats().flushes, 0, "a data store must not invalidate the cache");
         assert_eq!(jit.stats().blocks_compiled, 1, "and the block is compiled once");
+    }
+
+    // -----------------------------------------------------------------------
+    // The guest-memory TLB (roadmap W8.6)
+    // -----------------------------------------------------------------------
+    //
+    // Compiled code reads host addresses out of a table the helpers fill. What
+    // can go wrong is not the reading — that is a tag compare — but the table
+    // outliving the memory it describes. These are that.
+
+    /// `mov eax, [DATA]` then `ret`: one compiled load, then a side exit.
+    const LOAD_DATA: [u8; 8] = [0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0xC3];
+
+    /// Data regions here are **two** pages, not one.
+    ///
+    /// An entry has to cover its whole page plus the seven bytes an 8-byte
+    /// access at the last byte reaches, so the final page of a region is never
+    /// cached — and a one-page region is all final page. That is a real property
+    /// worth knowing (`a_page_at_the_tail_of_its_region_is_not_cached` pins it
+    /// directly); it just makes the workspace's usual one-page fixture the wrong
+    /// shape for testing the table.
+    fn mem_two_page_data(code: &[u8], perm: Perm) -> VirtualMemory {
+        let mut m = VirtualMemory::new();
+        m.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
+        m.map(Region::new("data", DATA, 0x2000, perm)).unwrap();
+        m.poke(CODE, code).unwrap();
+        m
+    }
+
+    /// Run `LOAD_DATA` once from the top and return what it loaded.
+    fn load_once(jit: &mut Jit, mem: &mut VirtualMemory) -> u64 {
+        let mut st = CpuState::new();
+        st.rip = CODE;
+        jit.run(&mut st, mem, Mode::Long, 1000);
+        st.gpr[0]
+    }
+
+    /// **The use-after-free test.** Unmapping a region frees its buffer; mapping
+    /// another at the same guest address gives a different host buffer. A cached
+    /// entry that survived that would read the freed one — so `layout_generation`
+    /// moving, and the engine noticing, is the whole of what stands between this
+    /// design and a dangling pointer.
+    #[test]
+    fn remapping_a_region_at_the_same_address_does_not_reuse_its_host_pointer() {
+        let mut mem = mem_two_page_data(&LOAD_DATA, Perm::RW);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+
+        mem.write_u32(DATA, 0x1111_1111).unwrap();
+        assert_eq!(load_once(&mut jit, &mut mem), 0x1111_1111);
+        assert!(jit.stats().tlb_fills > 0, "the page must actually be cached");
+        let resets = jit.stats().tlb_resets;
+
+        // Free it and put a *different* buffer at the same guest address, with
+        // different contents. Several times, so a lucky allocator reuse is not
+        // what the test rests on.
+        for i in 0..8u32 {
+            mem.unmap(DATA, 0).unwrap();
+            mem.map(Region::new("data", DATA, 0x2000, Perm::RW)).unwrap();
+            let v = 0x2222_0000 + i;
+            mem.write_u32(DATA, v).unwrap();
+            assert_eq!(load_once(&mut jit, &mut mem), v as u64, "round {i} read a stale page");
+        }
+        assert!(jit.stats().tlb_resets > resets, "the table was never thrown away");
+    }
+
+    /// Re-protecting is the other half: the bytes stay, what may be done with
+    /// them does not. A region turned executable must put its stores back on the
+    /// helper, or a guest could rewrite compiled code invisibly.
+    #[test]
+    fn making_a_region_executable_puts_its_stores_back_on_the_helper() {
+        // mov byte [DATA], 1 ; ret
+        let mut mem = mem_two_page_data(
+            &[0xC6, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x01, 0xC3],
+            Perm::RW,
+        );
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+
+        // While it is plain data, the store is cached and the SMC seam is never
+        // reached — there is nothing there to protect. (The baseline is not zero:
+        // poking the code region in is itself a write into executable memory.)
+        let quiet = mem.code_generation();
+        for _ in 0..4 {
+            st.rip = CODE;
+            jit.run(&mut st, &mut mem, Mode::Long, 1000);
+        }
+        assert!(jit.stats().tlb_fills > 0);
+        assert_eq!(mem.code_generation(), quiet, "not executable, so not a code write");
+
+        // Now it is executable. Every store must reach `jit_write` again.
+        mem.protect(DATA, 0x2000, Perm::RWX).unwrap();
+        let before = mem.code_generation();
+        for _ in 0..4 {
+            st.rip = CODE;
+            jit.run(&mut st, &mut mem, Mode::Long, 1000);
+        }
+        assert_eq!(
+            mem.code_generation(),
+            before + 4,
+            "every store into executable memory must reach the seam"
+        );
+    }
+
+    /// A watchpoint armed between two calls throws the table away, so an access
+    /// that was being served from a cached page goes back through the backend
+    /// that reports it. (The run loop also takes an armed process off the JIT
+    /// entirely — this is the guarantee that does not depend on it.)
+    #[test]
+    fn arming_a_watchpoint_throws_the_cached_pages_away() {
+        use exemu_core::debug::{DebugControl, WatchKind};
+        let mut mem = mem_two_page_data(&LOAD_DATA, Perm::RW);
+        let d = DebugControl::attached();
+        mem.set_debug(d.clone());
+        let mut jit = Jit::new(64 * 1024).unwrap();
+
+        mem.write_u32(DATA, 0x33).unwrap();
+        assert_eq!(load_once(&mut jit, &mut mem), 0x33);
+        assert!(jit.stats().tlb_fills > 0, "unarmed, the page is cached");
+
+        d.arm_watch(DATA, 4, WatchKind::Read);
+        let fills = jit.stats().tlb_fills;
+        let resets = jit.stats().tlb_resets;
+        assert_eq!(load_once(&mut jit, &mut mem), 0x33, "still the right value");
+        assert!(jit.stats().tlb_resets > resets, "arming must throw the table away");
+        assert_eq!(jit.stats().tlb_fills, fills, "and nothing may be cached while armed");
+        assert!(d.take_watch_hit().is_some(), "the read must have been seen");
+
+        // Disarming lets it cache again.
+        d.disarm_watch(DATA);
+        assert_eq!(load_once(&mut jit, &mut mem), 0x33);
+        assert!(jit.stats().tlb_fills > fills);
+    }
+
+    /// **Forcing the feature off is the cheap way to ask whether a difference is
+    /// about the feature** (the method lesson from W8.5). With the table off,
+    /// every access goes through the helper — the pre-W8.6 path — and the two
+    /// must agree on registers, memory and the instruction count, block by
+    /// block, for reads, writes, push/pop and a read-modify-write.
+    #[test]
+    fn the_table_changes_nothing_a_run_can_observe() {
+        // mov eax,[DATA] ; add dword [DATA+4], eax ; mov [DATA+8], eax ;
+        // push rax ; pop rbx ; mov cl,[DATA+1] ; ret
+        let code: [u8; 26] = [
+            0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, // mov eax, [0x2000]
+            0x01, 0x04, 0x25, 0x04, 0x20, 0x00, 0x00, // add [0x2004], eax
+            0x89, 0x04, 0x25, 0x08, 0x20, 0x00, 0x00, // mov [0x2008], eax
+            0x50, // push rax
+            0x5B, // pop rbx
+            0x8A, 0x0D, // (mov cl, [rip+..]) truncated below by `ret`
+            0xC3,
+        ];
+        let run = |tlb_on: bool| {
+            let mut mem = mem_two_page_data(&code, Perm::RW);
+            mem.write_u64(DATA, 0x0000_0007_0000_0005).unwrap();
+            // A stack, so push/pop have somewhere to go.
+            mem.map(Region::new("stack", 0x8000, 0x4000, Perm::RW)).unwrap();
+            let mut jit = Jit::new(64 * 1024).unwrap();
+            jit.set_tlb(tlb_on);
+            let mut st = CpuState::new();
+            st.rip = CODE;
+            st.gpr[4] = 0x9000;
+            let mut insns = 0u64;
+            // Several passes, so the second and later ones run entirely off
+            // cached pages when the table is on.
+            for _ in 0..4 {
+                st.rip = CODE;
+                insns += jit.run(&mut st, &mut mem, Mode::Long, 1000).insns() as u64;
+            }
+            let mut data = [0u8; 32];
+            mem.read(DATA, &mut data).unwrap();
+            (st.gpr, st.rflags, insns, data, jit.stats().tlb_fills > 0)
+        };
+        let (off_gpr, off_flags, off_insns, off_data, off_cached) = run(false);
+        let (on_gpr, on_flags, on_insns, on_data, on_cached) = run(true);
+        assert!(!off_cached, "switched off means switched off");
+        assert!(on_cached, "switched on, the pages really were cached");
+        assert_eq!(on_gpr, off_gpr, "registers");
+        assert_eq!(on_flags, off_flags, "flags");
+        assert_eq!(on_insns, off_insns, "instructions retired");
+        assert_eq!(on_data, off_data, "guest memory");
+    }
+
+    /// An access that faults must still fault, at the same instruction, whether
+    /// or not neighbouring pages are cached: an entry is only ever filled for a
+    /// page the backend confirmed whole, so a fault can never be served from one.
+    #[test]
+    fn a_faulting_access_still_faults_with_a_warm_table() {
+        // mov eax, [DATA] ; mov ebx, [DATA+0x4000] (unmapped) ; ret
+        let code: [u8; 15] = [
+            0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, // mov eax, [0x2000]
+            0x8B, 0x1C, 0x25, 0x00, 0x60, 0x00, 0x00, // mov ebx, [0x6000]
+            0xC3,
+        ];
+        let mut mem = mem_two_page_data(&code, Perm::RW);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        for round in 0..4 {
+            st.rip = CODE;
+            st.gpr[3] = 0xdead;
+            let r = jit.run(&mut st, &mut mem, Mode::Long, 1000);
+            assert_eq!(r, Run::Faulted { insns: 1 }, "round {round}");
+            assert_eq!(st.rip, CODE + 7, "rewound to the faulting instruction");
+            assert_eq!(st.gpr[3], 0xdead, "nothing of it was committed");
+        }
+        assert!(jit.stats().tlb_fills > 0, "the mapped page was cached all along");
     }
 
     // -----------------------------------------------------------------------

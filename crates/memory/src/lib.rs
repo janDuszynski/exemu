@@ -70,6 +70,14 @@ pub struct VirtualMemory {
     /// `Vec::get`, so a stale index (after a map/unmap shifts the vector) can
     /// only cause a miss, never a mis-resolution.
     hints: [Cell<usize>; HINT_SLOTS],
+    /// Bumped by every change that can move or free a region's backing bytes,
+    /// or change the permission under them (roadmap W8.6). The JIT's host-span
+    /// cache is valid exactly as long as this does not move, so **a missed bump
+    /// is a use-after-free** — which is why it lives on the three mutation
+    /// funnels (`insert`, `protect`, `unmap`) rather than at each public entry
+    /// point, and why `layout_generation_moves_for_every_mutation_that_can_
+    /// invalidate_a_span` enumerates them.
+    layout_gen: u64,
     /// The process's shared debug handle, or `None` when no debugger is
     /// attached — which is every ordinary run, every corpus entry and almost
     /// every test (roadmap W9.3).
@@ -244,6 +252,10 @@ impl VirtualMemory {
         }
         let pos = self.regions.partition_point(|m| m.region.base < region.base);
         self.regions.insert(pos, Mapped { region, bytes });
+        // The single funnel every mapping call reaches (`map`, `map_with_data`,
+        // `map_fixed`): the `regions` vector may reallocate and every `Mapped`
+        // after `pos` shifts, so any cached host address is now suspect.
+        self.layout_gen = self.layout_gen.wrapping_add(1);
         Ok(())
     }
 
@@ -425,10 +437,19 @@ impl Memory for VirtualMemory {
         let m = self.find_mut(base).ok_or(EmuError::Unmapped { addr: base, len: size as usize })?;
         let old = m.region.perm;
         m.region.perm = perm;
+        // The bytes have not moved, but what may be done with them has: a span
+        // handed out under the old permission — or withheld under it, as a
+        // writable span is for executable memory — must not survive this.
+        self.layout_gen = self.layout_gen.wrapping_add(1);
         Ok(old)
     }
 
     fn unmap(&mut self, base: u64, size: u64) -> Result<()> {
+        // Unconditional, and before the work: unmapping *frees* backing buffers,
+        // so this is the one mutation where a missed bump is a dangling pointer
+        // rather than a stale permission. A no-op unmap bumping too is a cache
+        // flush that costs nothing and cannot be wrong.
+        self.layout_gen = self.layout_gen.wrapping_add(1);
         if size == 0 {
             if let Some(pos) = self.regions.iter().position(|m| m.region.base == base) {
                 self.regions.remove(pos);
@@ -448,6 +469,57 @@ impl Memory for VirtualMemory {
             .iter()
             .find(|m| m.end() > addr)
             .map(|m| (m.region.base, m.region.size, m.region.perm))
+    }
+
+    // ---- host spans (the W8.6 JIT software-TLB seam) ----------------------
+
+    /// See [`Memory::host_span`]. Three refusals, and each one is a property the
+    /// JIT would otherwise have to remember:
+    ///
+    /// * a **watchpoint is armed** — every guest access must stay observable, so
+    ///   while a debugger is watching, nothing is handed out and every access
+    ///   goes back through [`note_watched_access`](Self::note_watched_access).
+    ///   Detached (the ordinary case) this is one null test on the `Option`'s
+    ///   niche, and it is paid once per *fill*, not once per access.
+    /// * the range is not wholly inside one region carrying `needed` — the same
+    ///   [`locate`](Self::locate) every ordinary access uses, so an access that
+    ///   would fault can never be served from a span and still faults at exactly
+    ///   the instruction it did before.
+    /// * (for the `_mut` form) the region is **executable**.
+    fn host_span(&self, addr: u64, len: usize, needed: Perm) -> Option<&[u8]> {
+        if len == 0 || self.watchpoints_armed() {
+            return None;
+        }
+        let (idx, start, end) = self.locate(addr, len, needed, "read").ok()?;
+        Some(&self.regions[idx].bytes[start..end])
+    }
+
+    /// See [`Memory::host_span_mut`]. Everything [`host_span`](Self::host_span)
+    /// refuses, plus **executable memory**: a write through the returned bytes
+    /// cannot reach [`note_code_write`](Self::note_code_write), so a guest that
+    /// rewrote its own code through one would be invisible to the JIT's
+    /// invalidation. PE sections are mapped RWX here, so this is what keeps
+    /// every store into an image out of the fast path and on the helper that
+    /// does the self-modification test.
+    fn host_span_mut(&mut self, addr: u64, len: usize, needed: Perm) -> Option<&mut [u8]> {
+        if len == 0 || self.watchpoints_armed() {
+            return None;
+        }
+        let (idx, start, end) = self.locate(addr, len, needed, "write").ok()?;
+        if self.regions[idx].region.perm.contains(Perm::EXEC) {
+            return None;
+        }
+        Some(&mut self.regions[idx].bytes[start..end])
+    }
+
+    #[inline]
+    fn layout_generation(&self) -> u64 {
+        self.layout_gen
+    }
+
+    #[inline]
+    fn watchpoints_armed(&self) -> bool {
+        self.debug.as_ref().is_some_and(|d| d.any_watchpoints())
     }
 
     #[inline]

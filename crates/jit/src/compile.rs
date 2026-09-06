@@ -44,7 +44,7 @@
 //! rather than running instructions that may have just been rewritten.
 
 use crate::a64::{Asm, Cond, Label, ZR};
-use crate::rt::{ctx_off, status};
+use crate::rt::{ctx_off, status, tlb_off, TLB_PAGE_BITS, TLB_SLOT_BITS};
 use exemu_core::cpu::CpuState;
 use exemu_core::Memory;
 
@@ -93,6 +93,10 @@ const R_FR: u32 = 25; // pending flag result — also the ALU result
 const R_VAL: u32 = 26; // value to store / commit (survives helper calls)
 const R_ADDR: u32 = 27; // effective address (survives helper calls)
 const R_MASK: u32 = 28; // 0x8D5 = CF|PF|AF|ZF|SF|OF
+
+/// `log2` of a [`crate::rt::TlbEntry`]'s size, as the shift folded into the
+/// address of a slot. Checked against the real layout in `emit_tlb_probe`.
+const TLB_ENTRY_SHIFT: u32 = 5;
 
 /// Scratch registers, dead across any helper call.
 const T0: u32 = 9;
@@ -881,9 +885,45 @@ impl Compiler {
         }
     }
 
+    /// Probe the guest-memory TLB for [`R_ADDR`] (roadmap W8.6) and return the
+    /// label a **miss** branches to. On a hit the page's host base is left in
+    /// [`T3`], so the access itself is one `ldr`/`str` with `T3` as the base and
+    /// `R_ADDR` as the (unscaled) offset.
+    ///
+    /// Seven instructions, no call, and nothing spilled — against a call into
+    /// the helper, a region lookup, a permission test and a 40-byte `Result`
+    /// returned through memory. `off` selects the read or the write half of the
+    /// entry; they are separate so a store can never take an entry a load
+    /// filled.
+    ///
+    /// **A hit cannot be wrong, and that is a property of what filled it, not
+    /// of this sequence.** An entry exists only where the backend handed out a
+    /// span covering the whole page *plus seven bytes* — so an access of any
+    /// width up to 8 starting anywhere on the page is inside one region with the
+    /// right permission, and can neither fault nor run off the end. Nothing is
+    /// ever filled for a store into executable memory, so the self-modification
+    /// checks in `jit_write` stay in the path of every store that could reach
+    /// compiled code; and nothing at all is filled while a data watchpoint is
+    /// armed, so an armed watchpoint still sees every access.
+    fn emit_tlb_probe(&mut self, off: u32) -> Label {
+        debug_assert_eq!(tlb_off::SIZE, 1 << TLB_ENTRY_SHIFT);
+        self.asm.ldr(8, T0, R_CTX, ctx_off::TLB);
+        self.asm.lsr_imm(true, T1, R_ADDR, TLB_PAGE_BITS); // tag: the guest page
+        self.asm.ubfx(true, T2, R_ADDR, TLB_PAGE_BITS, TLB_SLOT_BITS); // slot
+        self.asm.add_reg(true, T0, T0, T2, TLB_ENTRY_SHIFT); // &tlb[slot]
+        self.asm.ldp(T2, T3, T0, off as i32); // tag, host base
+        self.asm.cmp_reg(true, T2, T1);
+        self.asm.b_cond_forward(Cond::Ne)
+    }
+
     /// Emit a guest load of `size` bytes from [`R_ADDR`] into `dst`.
-    /// Clobbers x0..x8; `dst` must be a callee-saved role register.
+    /// Clobbers x0..x8 and the scratch registers; `dst` must be a callee-saved
+    /// role register.
     fn emit_load(&mut self, dst: u32, size: u8) {
+        let miss = self.emit_tlb_probe(tlb_off::READ);
+        self.asm.ldr_reg(size, dst, T3, R_ADDR);
+        let done = self.asm.b_forward();
+        self.asm.bind(miss);
         self.asm.mov_reg(true, 0, R_CTX);
         self.asm.mov_reg(true, 1, R_ADDR);
         self.asm.mov_imm64(2, size as u64);
@@ -899,11 +939,22 @@ impl Compiler {
         // The fault branch is taken *before* this write, so `dst` may be one of
         // the pending flag registers without disturbing the rewind path.
         self.asm.mov_reg(true, dst, 0);
+        self.asm.bind(done);
     }
 
     /// Emit a guest store of `size` bytes from `src` to [`R_ADDR`], then the
-    /// instruction's commit. Clobbers x0..x8.
+    /// instruction's commit. Clobbers x0..x8 and the scratch registers.
+    ///
+    /// The commit is emitted **after** the two paths join, so it happens exactly
+    /// once and identically either way. The store stub — the rewind, and the
+    /// "this store rewrote compiled code" exit — hangs off the helper path
+    /// alone, which is sound because the fast path is only ever taken for a
+    /// store that can neither fault nor land in executable memory.
     fn emit_store(&mut self, src: u32, size: u8, commit: Commit, next_rip: u64) {
+        let miss = self.emit_tlb_probe(tlb_off::WRITE);
+        self.asm.str_reg(size, src, T3, R_ADDR);
+        let done = self.asm.b_forward();
+        self.asm.bind(miss);
         self.asm.mov_reg(true, 0, R_CTX);
         self.asm.mov_reg(true, 1, R_ADDR);
         self.asm.mov_imm64(2, size as u64);
@@ -921,6 +972,7 @@ impl Compiler {
             before: self.insn_flags,
             after: self.flags,
         });
+        self.asm.bind(done);
         self.emit_commit(commit);
     }
 
@@ -2287,6 +2339,13 @@ impl Compiler {
     /// the value is in [`R_VAL`]; rsp is committed only after the store
     /// succeeds.
     fn emit_store_push(&mut self, w: u8, next: u64, next_reg: Option<u32>) {
+        let miss = self.emit_tlb_probe(tlb_off::WRITE);
+        self.asm.str_reg(w, R_VAL, T3, R_ADDR);
+        // Same handover as the helper path below, so both arrive at the commit
+        // with the new rsp in R_VAL.
+        self.asm.mov_reg(true, R_VAL, R_ADDR);
+        let done = self.asm.b_forward();
+        self.asm.bind(miss);
         self.asm.mov_reg(true, 0, R_CTX);
         self.asm.mov_reg(true, 1, R_ADDR);
         self.asm.mov_imm64(2, w as u64);
@@ -2308,6 +2367,7 @@ impl Compiler {
             before: self.insn_flags,
             after: self.flags,
         });
+        self.asm.bind(done);
         self.store_gpr(R_VAL, 4, 8, true);
     }
 

@@ -197,6 +197,36 @@ impl Asm {
         self.emit(0x3860_6800 | rm << 16 | rn << 5 | rt);
     }
 
+    /// `ldr{b,h,} Wt|Xt, [Xn, Xm]` for `size` in {1,2,4,8} — zero-extending,
+    /// little-endian, **unscaled** register offset, so the address is exactly
+    /// `Xn + Xm`. The guest-memory fast path's load (roadmap W8.6): `Xn` is the
+    /// host base cached for the page and `Xm` is the guest address, so the sum
+    /// is the host address of the guest byte.
+    ///
+    /// Unaligned is fine — these are ordinary loads, and x86 operands are not
+    /// required to be aligned.
+    pub fn ldr_reg(&mut self, size: u8, rt: u32, rn: u32, rm: u32) {
+        // size<<30 | 111000011 | Rm | option=011 (LSL/UXTX) | S=0 | 10 | Rn | Rt
+        let base: u32 = match size {
+            1 => 0x3860_6800,
+            2 => 0x7860_6800,
+            4 => 0xB860_6800,
+            _ => 0xF860_6800,
+        };
+        self.emit(base | rm << 16 | rn << 5 | rt);
+    }
+
+    /// `str{b,h,} Wt|Xt, [Xn, Xm]` — the store half of [`ldr_reg`](Self::ldr_reg).
+    pub fn str_reg(&mut self, size: u8, rt: u32, rn: u32, rm: u32) {
+        let base: u32 = match size {
+            1 => 0x3820_6800,
+            2 => 0x7820_6800,
+            4 => 0xB820_6800,
+            _ => 0xF820_6800,
+        };
+        self.emit(base | rm << 16 | rn << 5 | rt);
+    }
+
     /// `str Xt, [Xn, Xm, LSL #3]` — 8-byte store to an indexed slot (the block
     /// trail's ring, written from compiled code when a native link is taken).
     pub fn str_reg_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
@@ -864,6 +894,42 @@ mod tests {
         assert_eq!(run2(|a| a.rorv(true, 0, 0, 1), 1, 1), 0x8000_0000_0000_0000);
         // bfi replaces a field and leaves the rest alone.
         assert_eq!(run2(|a| a.bfi(true, 0, 1, 8, 8), 0xffff, 0), 0x00ff);
+    }
+
+    /// The guest-memory fast path is `ldr dst, [base, addr]` with the host base
+    /// and the *guest* address in registers, so the encoding has to be the
+    /// unscaled register-offset form at every width — a scaled one would
+    /// multiply the guest address by the access size. Executed, not inspected.
+    #[test]
+    fn register_offset_loads_and_stores_address_base_plus_offset() {
+        let mut buf = [0u8; 32];
+        let base = buf.as_mut_ptr() as u64;
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        // x0 = base, x1 = offset; every width reads at exactly base+offset.
+        assert_eq!(run2(|a| a.ldr_reg(1, 0, 0, 1), base, 5), 5);
+        assert_eq!(run2(|a| a.ldr_reg(2, 0, 0, 1), base, 5), 0x0605);
+        assert_eq!(run2(|a| a.ldr_reg(4, 0, 0, 1), base, 5), 0x0807_0605);
+        assert_eq!(run2(|a| a.ldr_reg(8, 0, 0, 1), base, 5), 0x0c0b_0a09_0807_0605);
+        // Unaligned is allowed and little-endian.
+        assert_eq!(run2(|a| a.ldr_reg(4, 0, 0, 1), base, 3), 0x0605_0403);
+
+        let mut out = [0u8; 16];
+        let ob = out.as_mut_ptr() as u64;
+        // x2 = the value; store it at ob+offset, then read the whole word back.
+        run2(
+            |a| {
+                a.mov_imm64(2, 0xdead_beef_cafe_1122);
+                a.str_reg(1, 2, 0, 1);
+                a.str_reg(2, 2, 0, 1); // overwrites with the low half
+            },
+            ob,
+            3,
+        );
+        assert_eq!(u16::from_le_bytes([out[3], out[4]]), 0x1122);
+        run2(|a| a.str_reg(8, 1, 0, 1), ob, 0);
+        assert_eq!(u64::from_le_bytes(out[..8].try_into().unwrap()), 0);
     }
 
     #[test]

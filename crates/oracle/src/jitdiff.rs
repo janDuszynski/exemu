@@ -159,19 +159,47 @@ struct Space {
     pop_sp: u64,
 }
 
-fn space(layout: Layout, bits: Bits) -> Space {
+/// Extra bytes appended to the data and stack regions in a **roomy** trial.
+///
+/// The JIT's guest-memory TLB (roadmap W8.6) caches a page only when the whole
+/// page *plus the seven bytes an 8-byte access at its last byte reaches* is
+/// inside one region — so a region exactly one page long is never cached, and
+/// every region in this harness was exactly one page long. The differential was
+/// therefore **structurally unable to execute the fast path at all**: 2 M trials
+/// of "zero divergences" said nothing whatever about it.
+///
+/// Rather than grow every region — which would quietly delete the fault
+/// coverage the one-page regions exist for, since a push that used to run off
+/// the end would now succeed — roominess is drawn per trial like the layout is.
+/// Half the trials are exactly what they always were; half have the slack that
+/// lets the fast path engage. Both halves are compared the same way.
+const ROOM: u64 = PAGE;
+
+fn space(layout: Layout, bits: Bits, roomy: bool) -> Space {
+    let room = if roomy { ROOM } else { 0 };
     let data = (
         "data",
         gen::DATA_BASE,
-        gen::DATA_LEN as u64,
+        gen::DATA_LEN as u64 + room,
         Perm::RW,
     );
+    // The stack grows *upward* for slack, which is fine everywhere except where
+    // the region is deliberately flush against the top of the address space —
+    // `EdgeData`'s, whose whole point is that a push carries past the boundary.
+    // Those stay one page and stay on the helper, which is itself the right
+    // answer: a fast path must not serve an access there.
+    let stack_room = match (layout, bits) {
+        // The only stack that cannot grow: 32-bit `EdgeData` puts it flush
+        // against 2^32, which is the entire point of that layout.
+        (Layout::EdgeData, Bits::B32) => 0,
+        _ => room,
+    };
     match (layout, bits) {
         (Layout::Low, _) => Space {
             regions: vec![
                 ("code", LOW_CODE, PAGE, Perm::RWX),
                 data,
-                ("stack", LOW_STACK, PAGE, Perm::RW),
+                ("stack", LOW_STACK, PAGE + stack_room, Perm::RW),
             ],
             code_base: LOW_CODE,
             code_len: PAGE,
@@ -189,7 +217,7 @@ fn space(layout: Layout, bits: Bits) -> Space {
                 ("code", TOP32, PAGE, Perm::RWX),
                 ("zero", 0, PAGE, Perm::RW),
                 data,
-                ("stack", LOW_STACK, PAGE, Perm::RW),
+                ("stack", LOW_STACK, PAGE + stack_room, Perm::RW),
             ],
             code_base: TOP32,
             code_len: PAGE,
@@ -206,7 +234,7 @@ fn space(layout: Layout, bits: Bits) -> Space {
             regions: vec![
                 ("code", HIGH64, PAGE, Perm::RWX),
                 data,
-                ("stack", HIGH64 + PAGE, PAGE, Perm::RW),
+                ("stack", HIGH64 + PAGE, PAGE + stack_room, Perm::RW),
             ],
             code_base: HIGH64,
             code_len: PAGE,
@@ -237,7 +265,7 @@ fn space(layout: Layout, bits: Bits) -> Space {
             regions: vec![
                 ("code", LOW_CODE, PAGE, Perm::RWX),
                 data,
-                ("stack", HIGH64, PAGE, Perm::RW),
+                ("stack", HIGH64, PAGE + stack_room, Perm::RW),
             ],
             code_base: LOW_CODE,
             code_len: PAGE,
@@ -518,7 +546,10 @@ fn trial_at(cfg: &JitFuzzConfig, index: u64) -> TrialPlan {
     let bits = cfg.bits;
     let mut rng = Rng::for_trial(cfg.seed, index);
     let layout = cfg.layouts.pick(&mut rng);
-    let sp = space(layout, bits);
+    // Half the trials get the slack the JIT's guest-memory TLB needs before it
+    // will cache a page, so the fast path is exercised; half keep the tight
+    // one-page regions the fault shapes depend on. See `ROOM`.
+    let sp = space(layout, bits, rng.below(2) == 0);
     let mut seed = gen::seed(&mut rng);
     let mut bytes = Vec::new();
     let mut labels: Vec<String> = Vec::new();
