@@ -2617,6 +2617,10 @@ impl WinOs {
         self.wow64_peb32 != 0
     }
 
+    pub(crate) fn wow64_peb32(&self) -> u64 {
+        self.wow64_peb32
+    }
+
     pub(crate) fn call_wndprocs_from_syscall(
         &mut self,
         cpu: &mut CpuState,
