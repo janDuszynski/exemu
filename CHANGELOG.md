@@ -23,7 +23,7 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 847, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 848, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
 ### Per-exe profiles (W9.4)
@@ -343,6 +343,34 @@ end-to-end on the default path.
 - An **`NSEvent` tap** feeding real mouse/keyboard into the guest's own `WndProc`,
   and a **CoreText glyph rasterizer** (real fonts in the DIB, not a bitmap font).
 - **PNG golden-image CI gate**: pixel drift in the sample's first frame fails CI.
+
+### A WoW64 process creates real 32-bit threads (W5.11)
+
+`NtCreateThreadEx` used to answer `STATUS_NOT_IMPLEMENTED` in a WoW64 process,
+because a 32-bit thread is not a thread with a smaller stack: it is a *64-bit*
+thread that enters `wow64!Wow64LdrpInitialize`, which builds that thread's own
+BOP and `WOW64INFO` links and then runs `for(;;) BTCpuSimulate()`. exemu now does
+that per thread and supplies what a kernel owes each one — a **sub-4 GiB** 32-bit
+stack (one from the 64-bit `VirtualAlloc` arena reaches the guest as its low half,
+which is how `Firefox Installer.exe`'s worker died on its own `push ebp` at
+`0x12fef8`), a TEB64/TEB32 pair in one low block so the signed 32-bit
+`WowTebOffset` spans it, and its own CPU-reserved area seeded with the i386
+start convention (`Eax` = entry, `Ebx` = argument).
+
+- **The scheduler now carries the CPU mode across a switch.** `CpuState` has no
+  `bits` field — the mode lives in the interpreter — so a context switch swapped
+  registers and left the incoming thread running the *outgoing* one's mode. In a
+  WoW64 process that is fatal in one instruction: a fresh thread's entry is
+  `Wow64LdrpInitialize` at `0x7_0000_2ce0`, which a 32-bit CPU truncates to
+  `0x2ce0`. This was latent for any multithreaded WoW64 process.
+- **`Firefox Installer.exe` on `--wine-boot`: 12,467,176 → 14,466,116**
+  instructions, still a clean exit 1 with zero exceptions delivered. Corpus pin
+  re-blessed at zero tolerance over three identical runs; 7-Zip unchanged at
+  exactly 496,505,572, corpus 10 of 10.
+- The negative pin flips with its control kept:
+  `a_wow64_process_refuses_to_create_a_thread` becomes
+  `a_wow64_process_creates_a_real_32bit_thread`, plus
+  `a_thread_switch_carries_the_cpu_mode` for the scheduler half.
 
 ### A 32-bit guest's own window procedure runs (W5.10)
 
