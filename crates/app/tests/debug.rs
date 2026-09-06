@@ -162,7 +162,17 @@ fn assert_jit_reports_identical(a: &Option<JitReport>, b: &Option<JitReport>, wh
             assert_eq!(a.not_compiled, b.not_compiled, "{what}: not_compiled");
             assert_eq!(a.flushes, b.flushes, "{what}: flushes");
             assert_eq!(a.code_bytes, b.code_bytes, "{what}: code_bytes");
-            assert_eq!(a.declined, b.declined, "{what}: declined");
+            // Compared as a multiset: `declined` is ranked by count, and opcodes
+            // with equal counts have no defined order between them — an
+            // order-sensitive compare would be flaky rather than strict. (Seen
+            // for real: the A/B on SteamSetup and Firefox agrees on every count
+            // and shuffles two entries that tie at 3 and at 2.)
+            let sorted = |r: &JitReport| {
+                let mut v = r.declined.clone();
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(sorted(a), sorted(b), "{what}: declined");
             assert!(a.insns_executed > 0, "{what}: the JIT executed nothing at all");
         }
         (None, None) => {}

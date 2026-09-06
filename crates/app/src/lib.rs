@@ -1154,6 +1154,24 @@ impl Process {
         // backend records watched accesses onto it. `None` installs a *detached*
         // handle, whose every accessor short-circuits on a plain `bool`, so the
         // undebugged run is the one the corpus pins were measured against.
+        //
+        // `EXEMU_DEBUG_IDLE` attaches a handle with **nothing armed and no
+        // front-end**, which is the whole "attaching is free" claim made
+        // executable against real binaries: the same installer, the same flags,
+        // one env var apart, must produce the same instruction count and the
+        // same `JitReport`. It takes the same shape as the `EXEMU_JIT` /
+        // `EXEMU_VIRTUAL_CLOCK` opt-ins, and an explicit `RunConfig::debug` wins
+        // over it. (A `--debug-idle` flag and the matching corpus entry are the
+        // CLI's half of the same gate; this is the hook they will use.)
+        let idle = cfg.debug.is_none()
+            && std::env::var("EXEMU_DEBUG_IDLE").is_ok_and(|v| !v.is_empty() && v != "0");
+        if idle {
+            // The front-end half is dropped immediately: nothing is armed, so
+            // nothing ever parks, and if something somehow did it would see a
+            // disconnected channel and detach rather than hang.
+            let (session, _front) = exemu_core::DebugSession::pair(DebugControl::attached());
+            cfg.debug = Some(session);
+        }
         let (dbg, dbg_cmds, dbg_events) = match cfg.debug.take() {
             Some(s) => (s.control, Some(s.commands), Some(s.events)),
             None => (DebugControl::detached(), None, None),
