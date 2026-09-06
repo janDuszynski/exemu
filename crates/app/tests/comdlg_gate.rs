@@ -27,8 +27,11 @@
 //!    and locking its own dialog-template resource — proven by
 //!    `CommDlgExtendedError() == 0`, because `CDERR_FINDRESFAILURE (6)` and
 //!    `CDERR_LOADRESFAILURE (7)` are the codes those two failures set — and then
-//!    `DialogBoxIndirectParamW` fails **without a single window reaching the
-//!    driver**. Zero `CreateWindow` calls is the load-bearing observation.
+//!    `DialogBoxIndirectParamW` does not return TRUE, **without a single window
+//!    reaching the driver**. Those two facts together are the load-bearing
+//!    observation: an extended error of 0 alone would also be consistent with
+//!    "the dialog ran and the user cancelled", and it is the *zero*
+//!    `CreateWindow` calls that says the dialog was never built at all.
 //! 5. [`win32u_publishes_the_indices_the_diagnosis_names`] — the three
 //!    `NtUser*` syscall indices the diagnosis below rests on, recovered from the
 //!    pinned `win32u.dll`'s own export stubs rather than asserted.
