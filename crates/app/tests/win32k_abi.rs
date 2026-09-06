@@ -379,7 +379,10 @@ fn rip_indirect(code: &[u8], i: usize, text_rva: u32, at: u32) -> Option<u32> {
 /// `ecx`(1) for `NtUserCallNoParam`, `edx`(2) for the one-argument families,
 /// `r8d`(8) for the two-argument ones.
 fn selector_at_call(dll: &Dll, export: &str, iat_slot: u32, reg: u8) -> Option<u32> {
-    let rva = dll.export(export);
+    // `code_rva`, not `export`: the dialog selectors are only ever passed by
+    // internal routines (`DIALOG_get_info`), which the COFF symbol table names
+    // but the export table does not.
+    let rva = dll.code_rva(export);
     let (begin, end) = dll.func_at(rva);
     let body = dll.slice(begin, end);
     let mut last: BTreeMap<u8, u32> = BTreeMap::new();
@@ -397,6 +400,46 @@ fn selector_at_call(dll: &Dll, export: &str, iat_slot: u32, reg: u8) -> Option<u
         i += 1;
     }
     None
+}
+
+/// The selector immediates at every `call *%rdi` in a routine that has parked an
+/// import slot in `rdi` (`mov rdi, [rip+disp32]`), in order.
+///
+/// `selector_at_call` only recognises a direct `call [rip+disp32]`, which is
+/// what a one-call wrapper emits. `user32!SetWindowLongPtrA` makes **two**
+/// `NtUserCallTwoParam` calls in a row and so loads the slot once and calls
+/// through the register — and it is the only routine in the binary that uses
+/// `GetDialogProc` at all, so reading it needs this shape.
+fn selectors_via_parked_rdi(dll: &Dll, sym: &str, iat_slot: u32) -> Vec<u32> {
+    let (begin, end) = dll.func_at(dll.code_rva(sym));
+    let body = dll.slice(begin, end);
+    let mut last: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut parked = false;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < body.len() {
+        let at = begin + i as u32;
+        // `mov rdi, [rip+disp32]` — 48 8b 3d disp32.
+        if body[i..].starts_with(&[0x48, 0x8B, 0x3D]) && i + 7 <= body.len() {
+            let disp = i32::from_le_bytes(body[i + 3..i + 7].try_into().unwrap());
+            parked = u32::try_from(at as i64 + 7 + disp as i64) == Ok(iat_slot);
+            i += 7;
+            continue;
+        }
+        if let Some((r, imm, len)) = mov_reg_imm32(body, i) {
+            last.insert(r, imm);
+            i += len;
+            continue;
+        }
+        // `call *%rdi` — ff d7. The trailing argument of a two-param call is r8d.
+        if parked && body[i] == 0xFF && body[i + 1] == 0xD7 {
+            out.push(last.get(&8).copied().unwrap_or(u32::MAX));
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Whether `needle` occurs anywhere in `[begin, end)`.
@@ -522,6 +565,51 @@ fn nt_user_call_selectors_match_the_pinned_user32_wrappers() {
         sorted.dedup();
         assert_eq!(sorted.len(), set.len(), "{label}: two operations share a selector");
     }
+}
+
+/// **`GetDialogProc` is selector 0 of `NtUserCallTwoParam`** (roadmap W6.2), and
+/// zero is exactly the value a mistake would also produce — so it is pinned from
+/// the only routine in the pinned user32 that uses it,
+/// `user32!SetWindowLongPtrA`. Setting `DWLP_DLGPROC` on a dialog makes three
+/// calls back to back:
+///
+/// ```text
+///   mov  edx, 1              ; NtUserCallHwnd_GetDialogInfo — is it a dialog?
+///   call NtUserCallHwnd
+///   mov  rdi, [rip+…]        ; park __imp_NtUserCallTwoParam
+///   mov  r8d, 9              ; NtUserAllocWinProc(newproc, ansi)
+///   call *rdi
+///   call NtUserSetWindowLongPtr(hwnd, DWLP_DLGPROC, winproc, ansi)
+///   xor  r8d, r8d            ; NtUserCallTwoParam_GetDialogProc(oldproc, ansi)
+///   call *rdi
+///   test rax, rax
+///   cmovne rbx, rax          ; …falling back to the raw value on 0
+/// ```
+///
+/// Asserting the **pair** `[AllocWinProc = 9, GetDialogProc = 0]` is what makes
+/// the zero meaningful: a scan that had found the wrong function, or decoded
+/// nothing, could not also produce the 9 in front of it. The two values agree
+/// with the pinned user32's own DWARF enumeration
+/// (`NtUserCallTwoParam_GetDialogProc = 0`, `NtUserAllocWinProc = 9`).
+///
+/// The `cmovne` is also why answering the procedure itself is safe: user32
+/// treats a zero as "not one of the kernel side's A/W pairs" and keeps what it
+/// had.
+#[test]
+fn get_dialog_proc_is_selector_zero_of_nt_user_call_two_param() {
+    if !wine_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let user32 = Dll::load("user32.dll");
+    let two = user32.iat("NtUserCallTwoParam");
+    let got = selectors_via_parked_rdi(&user32, "SetWindowLongPtrA", two);
+    let want: Vec<u32> =
+        abi::CALL_TWO_PARAM_VIA_SET_WINDOW_LONG_PTR_A.iter().map(|(_, c)| *c as u32).collect();
+    assert_eq!(
+        got, want,
+        "user32!SetWindowLongPtrA's NtUserCallTwoParam selectors are {got:?}, exemu maps {want:?}"
+    );
 }
 
 /// `GetWindowLong` and `GetWindowLongPtr{A,W}` are three *different* selectors of
