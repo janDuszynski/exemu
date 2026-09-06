@@ -23,8 +23,39 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 1038, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1047, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### Icons exist: the object every `LoadIcon` in a Wine guest was failing on (W6.2)
+- **Every `LoadIcon`/`LoadCursor`/`CreateIconFromResourceEx` in a Wine-path guest
+  returned NULL**, and the cause was a single unserviced multiplexer arm.
+  `user32!create_cursoricon_object` allocates the icon object *first* —
+  `NtUserCallOneParam(is_icon, NtUserCallOneParam_CreateCursorIcon)` — and gives
+  up the moment that answers 0. It always did. The enumeration is recovered from
+  the pinned `user32.dll`'s own DWARF (`CreateCursorIcon = 0`, `GetSysColor = 6`,
+  `GetSysColorBrush = 7`, `GetSystemMetrics = 9`), the last three of which exemu
+  had already recovered by disassembly — so the numbering is cross-checked, not
+  taken on faith.
+- **The GDI bitmap object model** an icon frame is built out of: memory DCs
+  (`NtGdiCreateCompatibleDC`, whose surface *is* the bitmap selected into it),
+  `NtGdiCreateBitmap` / `CreateCompatibleBitmap` / `CreateDIBSection` /
+  `SelectBitmap` / `GetDeviceCaps`, and `GetObjectW` for bitmaps. Every bitmap
+  gets a real guest-mapped store at the depth asked for with the DWORD-aligned
+  DIB stride, because `CreateDIBSection` hands that address back to the caller.
+- **Icon/cursor objects**: `NtUserSetCursorIconData`, `NtUserGetIconInfo`,
+  `NtUserGetIconSize`, `NtUserFindExistingCursorIcon`, `NtUserDestroyCursor`.
+  Two constants a guess gets silently wrong, recovered and pinned against the
+  binaries: `NtUserGetIconSize` reports the height **doubled** (its only caller,
+  `user32!get_icon_size`, halves it back out), and `GetIconInfo` hands back
+  **copies** of `hbmMask`/`hbmColor` because its caller deletes them.
+- **The icon system metrics.** `shell32!SIC_Initialize` sizes the system image
+  list from `SM_CXICON`/`SM_CYICON` and `SM_CXSMICON`/`SM_CYSMICON`; exemu
+  answered 0 for all four, so the list came out 0×0, comctl32 destroyed it, and
+  comdlg32's file dialog dereferenced the resulting NULL `HIMAGELIST`.
+- `EXEMU_WINE_DBG=1` forces Wine's own `WINEDEBUG` channels to host stderr for a
+  run whose trace flag is off — which is every gate test, i.e. exactly the runs
+  whose diagnostics one needs while debugging.
+- Corpus unchanged, 11/11, to the instruction.
 
 ### The win32u trace says which index is *unserviced* (W6.2)
 - win32k fills its **whole** syscall-index range with an honest-zero stub before
