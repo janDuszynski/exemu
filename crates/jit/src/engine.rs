@@ -1170,18 +1170,23 @@ mod tests {
     /// `mov eax, [DATA]` then `ret`: one compiled load, then a side exit.
     const LOAD_DATA: [u8; 8] = [0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0xC3];
 
-    /// Data regions here are **two** pages, not one.
-    ///
-    /// An entry has to cover its whole page plus the seven bytes an 8-byte
-    /// access at the last byte reaches, so the final page of a region is never
-    /// cached — and a one-page region is all final page. That is a real property
-    /// worth knowing (`a_page_at_the_tail_of_its_region_is_not_cached` pins it
-    /// directly); it just makes the workspace's usual one-page fixture the wrong
-    /// shape for testing the table.
+    /// Data regions here are **two** pages, so that a test can put an access on
+    /// a page that is not the region's last one. Since the W8.6 fill-probe fix
+    /// the last page is cacheable too (`a_one_page_region_is_served_from_the_
+    /// fast_path`), so this is a convenience, not a requirement.
     fn mem_two_page_data(code: &[u8], perm: Perm) -> VirtualMemory {
         let mut m = VirtualMemory::new();
         m.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
         m.map(Region::new("data", DATA, 0x2000, perm)).unwrap();
+        m.poke(CODE, code).unwrap();
+        m
+    }
+
+    /// The same, with a data region of exactly `pages` pages.
+    fn mem_data_pages(code: &[u8], pages: u64) -> VirtualMemory {
+        let mut m = VirtualMemory::new();
+        m.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
+        m.map(Region::new("data", DATA, pages * 0x1000, Perm::RW)).unwrap();
         m.poke(CODE, code).unwrap();
         m
     }
@@ -1362,6 +1367,96 @@ mod tests {
             assert_eq!(st.gpr[3], 0xdead, "nothing of it was committed");
         }
         assert!(jit.stats().tlb_fills > 0, "the mapped page was cached all along");
+    }
+
+    /// **The W8.6 fill-probe fix, through compiled code.** A one-page region is
+    /// nothing *but* its final page, and the final page is the one the old
+    /// page-plus-seven probe could never cache — which is why 99.8% of 7-Zip's
+    /// refusals were a single region's last page, and why every region in the
+    /// JIT differential filled exactly zero entries. Both ends of the page are
+    /// read here, the last dword included.
+    #[test]
+    fn a_one_page_region_is_served_from_the_fast_path() {
+        // mov eax, [0x2000] ; mov ecx, [0x2ffc] ; ret
+        let code: [u8; 15] = [
+            0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, // mov eax, [DATA]
+            0x8B, 0x0C, 0x25, 0xFC, 0x2F, 0x00, 0x00, // mov ecx, [DATA+0xffc]
+            0xC3,
+        ];
+        let mut mem = mem_data_pages(&code, 1);
+        mem.write_u32(DATA, 0x4444_4444).unwrap();
+        mem.write_u32(DATA + 0xffc, 0x5555_5555).unwrap();
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        // Twice: the second pass runs entirely off the entry the first filled.
+        for _ in 0..2 {
+            st.rip = CODE;
+            jit.run(&mut st, &mut mem, Mode::Long, 1000);
+        }
+        assert_eq!(st.gpr[0], 0x4444_4444);
+        assert_eq!(st.gpr[1] as u32, 0x5555_5555, "the region's last dword");
+        assert_eq!(jit.stats().tlb_fills, 1, "one page, cached once and reused");
+        assert_eq!(jit.stats().tlb_denied, 0);
+    }
+
+    /// **What replaced the seven bytes of slack.** An 8-byte load whose first
+    /// byte is on a cached page and whose last byte is not must not be served
+    /// from that page's entry: here the next page is unmapped, so it has to
+    /// fault, and fault at its own instruction with nothing committed. The
+    /// preceding load is there to make sure the entry really is warm.
+    #[test]
+    fn an_access_running_off_a_cached_final_page_faults_at_its_own_instruction() {
+        // mov eax, [0x2000] ; mov rbx, [0x2ffc] ; ret
+        let code: [u8; 16] = [
+            0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, // mov eax, [DATA]
+            0x48, 0x8B, 0x1C, 0x25, 0xFC, 0x2F, 0x00, 0x00, // mov rbx, [DATA+0xffc]
+            0xC3,
+        ];
+        let mut mem = mem_data_pages(&code, 1);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        for round in 0..4 {
+            st.rip = CODE;
+            st.gpr[3] = 0xdead;
+            assert_eq!(
+                jit.run(&mut st, &mut mem, Mode::Long, 1000),
+                Run::Faulted { insns: 1 },
+                "round {round}"
+            );
+            assert_eq!(st.rip, CODE + 7, "rewound to the straddling load");
+            assert_eq!(st.gpr[3], 0xdead, "nothing of it was committed");
+        }
+        assert_eq!(jit.stats().tlb_fills, 1, "the page it starts on is cached");
+    }
+
+    /// The same shape where the next page *is* mapped and in the same region:
+    /// the probe still declines it — a straddling access can never match the
+    /// entry its own first page indexes — so the helper serves it, correctly and
+    /// without asking the backend for the span again each time round.
+    #[test]
+    fn a_straddling_access_is_served_by_the_helper_and_reads_both_pages() {
+        // mov eax, [0x2000] ; mov rbx, [0x2ffc] ; ret
+        let code: [u8; 16] = [
+            0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, // mov eax, [DATA]
+            0x48, 0x8B, 0x1C, 0x25, 0xFC, 0x2F, 0x00, 0x00, // mov rbx, [DATA+0xffc]
+            0xC3,
+        ];
+        let mut mem = mem_data_pages(&code, 2);
+        mem.write_u32(DATA + 0xffc, 0xAAAA_AAAA).unwrap();
+        mem.write_u32(DATA + 0x1000, 0xBBBB_BBBB).unwrap();
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        for _ in 0..4 {
+            st.rip = CODE;
+            st.gpr[3] = 0;
+            jit.run(&mut st, &mut mem, Mode::Long, 1000);
+            assert_eq!(st.gpr[3], 0xBBBB_BBBB_AAAA_AAAA, "both halves, little-endian");
+        }
+        // One entry for the page the straddling load starts on and one for the
+        // page the first load uses — they are the same page, so: one fill, and
+        // the three later passes add nothing.
+        assert_eq!(jit.stats().tlb_fills, 1);
+        assert_eq!(jit.stats().tlb_denied, 0);
     }
 
     // -----------------------------------------------------------------------

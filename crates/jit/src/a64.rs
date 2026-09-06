@@ -309,6 +309,15 @@ impl Asm {
                 | ZR,
         );
     }
+    /// `cmp Xn, Xm, LSR #sh` — the shift folded into the compare, so the
+    /// guest-memory TLB's page-number test costs no separate `lsr`
+    /// (roadmap W8.6).
+    pub fn cmp_reg_lsr(&mut self, sf64: bool, rn: u32, rm: u32, sh: u32) {
+        self.emit(
+            (sf64 as u32) << 31 | 0x6B00_0000 | 0b01 << 22 | rm << 16 | (sh & 0x3f) << 10 | rn << 5
+                | ZR,
+        );
+    }
     /// `adcs Xd, Xn, Xm` — add with the ARM carry flag, setting NZCV.
     pub fn adcs_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32) {
         self.emit((sf64 as u32) << 31 | 0x3A00_0000 | rm << 16 | rn << 5 | rd);
@@ -894,6 +903,31 @@ mod tests {
         assert_eq!(run2(|a| a.rorv(true, 0, 0, 1), 1, 1), 0x8000_0000_0000_0000);
         // bfi replaces a field and leaves the rest alone.
         assert_eq!(run2(|a| a.bfi(true, 0, 1, 8, 8), 0xffff, 0), 0x00ff);
+    }
+
+    /// `cmp Xn, Xm, LSR #sh`. The guest-memory TLB's probe compares a stored
+    /// page number against the page of the access's last byte, and folding the
+    /// shift into the compare is what makes that check cost nothing (roadmap
+    /// W8.6) — so the shift has to be *logical*, and applied to the second
+    /// operand only.
+    #[test]
+    fn cmp_folds_a_logical_shift_right_into_its_second_operand() {
+        let eq = |a: u64, b: u64| {
+            run2(
+                |asm| {
+                    asm.cmp_reg_lsr(true, 0, 1, 12);
+                    asm.cset(true, 0, Cond::Eq);
+                },
+                a,
+                b,
+            )
+        };
+        assert_eq!(eq(0x9, 0x9123), 1, "x0 == x1 >> 12");
+        assert_eq!(eq(0x9, 0xa123), 0);
+        assert_eq!(eq(0x9123, 0x9123), 0, "the shift is not optional");
+        // Logical, not arithmetic: the sign bit must not be replicated.
+        assert_eq!(eq(0x000f_ffff_ffff_ffff, u64::MAX), 1);
+        assert_eq!(eq(u64::MAX, u64::MAX), 0);
     }
 
     /// The guest-memory fast path is `ldr dst, [base, addr]` with the host base

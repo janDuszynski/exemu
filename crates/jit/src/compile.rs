@@ -977,34 +977,57 @@ impl Compiler {
         }
     }
 
-    /// Probe the guest-memory TLB for [`R_ADDR`] (roadmap W8.6) and return the
-    /// label a **miss** branches to. On a hit the page's host base is left in
-    /// [`T3`], so the access itself is one `ldr`/`str` with `T3` as the base and
-    /// `R_ADDR` as the (unscaled) offset.
+    /// Probe the guest-memory TLB for a `size`-byte access at [`R_ADDR`]
+    /// (roadmap W8.6) and return the label a **miss** branches to. On a hit the
+    /// page's host base is left in [`T3`], so the access itself is one
+    /// `ldr`/`str` with `T3` as the base and `R_ADDR` as the (unscaled) offset.
     ///
-    /// Seven instructions, no call, and nothing spilled — against a call into
-    /// the helper, a region lookup, a permission test and a 40-byte `Result`
-    /// returned through memory. `off` selects the read or the write half of the
-    /// entry; they are separate so a store can never take an entry a load
-    /// filled.
+    /// Seven instructions (six for a byte access), no call, and nothing spilled
+    /// — against a call into the helper, a region lookup, a permission test and
+    /// a 40-byte `Result` returned through memory. `off` selects the read or the
+    /// write half of the entry; they are separate so a store can never take an
+    /// entry a load filled.
     ///
-    /// **A hit cannot be wrong, and that is a property of what filled it, not
-    /// of this sequence.** An entry exists only where the backend handed out a
-    /// span covering the whole page *plus seven bytes* — so an access of any
-    /// width up to 8 starting anywhere on the page is inside one region with the
-    /// right permission, and can neither fault nor run off the end. Nothing is
-    /// ever filled for a store into executable memory, so the self-modification
-    /// checks in `jit_write` stay in the path of every store that could reach
-    /// compiled code; and nothing at all is filled while a data watchpoint is
-    /// armed, so an armed watchpoint still sees every access.
-    fn emit_tlb_probe(&mut self, off: u32) -> Label {
+    /// **A hit cannot be wrong, and that is a property of what filled it plus
+    /// one detail of this sequence.** An entry exists only where the backend
+    /// handed out a span covering the whole page, so any access that stays
+    /// *inside* the page is in one region with the right permission and can
+    /// neither fault nor run off the end. What keeps the access inside the page
+    /// is that the tag compared is the page of its **last** byte
+    /// (`(addr + size - 1) >> 12`) while the slot is indexed by the page of its
+    /// **first** (`addr >> 12`): a straddling access looks for a tag one page
+    /// above the one that indexed the slot, and only pages congruent modulo
+    /// [`TLB_SLOTS`] ever live in the same slot, so it can never match. It
+    /// misses and takes the helper — which is also what makes a wrap of the
+    /// 64-bit add (or of a masked 32-bit address) safe, for the same reason.
+    ///
+    /// *This is what replaced the seven bytes of slack an entry used to need.*
+    /// The slack made the probe a bare tag compare, but it also meant the
+    /// **last page of every region was uncacheable** — and a stack is used from
+    /// the top down, so that page is the hottest one in the process. Folding
+    /// `lsr` into the compare pays for the `add`, so the check is now free
+    /// rather than absent.
+    ///
+    /// Nothing is ever filled for a store into executable memory, so the
+    /// self-modification checks in `jit_write` stay in the path of every store
+    /// that could reach compiled code; and nothing at all is filled while a data
+    /// watchpoint is armed, so an armed watchpoint still sees every access.
+    fn emit_tlb_probe(&mut self, off: u32, size: u8) -> Label {
         debug_assert_eq!(tlb_off::SIZE, 1 << TLB_ENTRY_SHIFT);
+        debug_assert!(matches!(size, 1 | 2 | 4 | 8));
         self.asm.ldr(8, T0, R_CTX, ctx_off::TLB);
-        self.asm.lsr_imm(true, T1, R_ADDR, TLB_PAGE_BITS); // tag: the guest page
+        // The last byte the access touches. For a byte access that is `R_ADDR`
+        // itself, so the `add` disappears.
+        let last = if size == 1 {
+            R_ADDR
+        } else {
+            self.asm.add_imm(true, T1, R_ADDR, size as u32 - 1, false);
+            T1
+        };
         self.asm.ubfx(true, T2, R_ADDR, TLB_PAGE_BITS, TLB_SLOT_BITS); // slot
         self.asm.add_reg(true, T0, T0, T2, TLB_ENTRY_SHIFT); // &tlb[slot]
         self.asm.ldp(T2, T3, T0, off as i32); // tag, host base
-        self.asm.cmp_reg(true, T2, T1);
+        self.asm.cmp_reg_lsr(true, T2, last, TLB_PAGE_BITS);
         self.asm.b_cond_forward(Cond::Ne)
     }
 
@@ -1012,7 +1035,7 @@ impl Compiler {
     /// Clobbers x0..x8 and the scratch registers; `dst` must be a callee-saved
     /// role register.
     fn emit_load(&mut self, dst: u32, size: u8) {
-        let miss = self.emit_tlb_probe(tlb_off::READ);
+        let miss = self.emit_tlb_probe(tlb_off::READ, size);
         self.asm.ldr_reg(size, dst, T3, R_ADDR);
         let done = self.asm.b_forward();
         self.asm.bind(miss);
@@ -1043,7 +1066,7 @@ impl Compiler {
     /// alone, which is sound because the fast path is only ever taken for a
     /// store that can neither fault nor land in executable memory.
     fn emit_store(&mut self, src: u32, size: u8, commit: Commit, next_rip: u64) {
-        let miss = self.emit_tlb_probe(tlb_off::WRITE);
+        let miss = self.emit_tlb_probe(tlb_off::WRITE, size);
         self.asm.str_reg(size, src, T3, R_ADDR);
         let done = self.asm.b_forward();
         self.asm.bind(miss);
@@ -2432,7 +2455,7 @@ impl Compiler {
     /// the value is in [`R_VAL`]; rsp is committed only after the store
     /// succeeds.
     fn emit_store_push(&mut self, w: u8, next: u64, next_reg: Option<u32>) {
-        let miss = self.emit_tlb_probe(tlb_off::WRITE);
+        let miss = self.emit_tlb_probe(tlb_off::WRITE, w);
         self.asm.str_reg(w, R_VAL, T3, R_ADDR);
         // Same handover as the helper path below, so both arrive at the commit
         // with the new rsp in R_VAL.

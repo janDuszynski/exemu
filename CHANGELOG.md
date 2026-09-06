@@ -23,8 +23,50 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 1019, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1024, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### The JIT's memory cache stops skipping the last page of every region (W8.6)
+- **A guest access cache entry used to need its page *plus seven bytes*** — the
+  reach of an 8-byte access at the page's last byte — so that the emitted check
+  could be a bare tag compare with no end-of-access test. That bought a small
+  fast path and cost almost all of its coverage: the probe ran seven bytes past
+  the region's end, so **the last page of every region could never be cached**,
+  and a stack is used from the top down, which makes that page the hottest one in
+  the process. Attributed over the first 1,000,000 declined fills: **998,205 of
+  7-Zip's (99.8%) were one region's final page**, and **69% of the Wine WoW64
+  path's were the 32-bit stack's** — none of them permission refusals.
+- **The end-of-access check is now free rather than absent.** The probe compares
+  the cached page number against the page of the access's *last* byte, while
+  indexing the slot by the page of its *first*. An access that leaves the page
+  therefore looks for a tag one page above the one that chose the slot, and only
+  pages congruent modulo the slot count ever share a slot — so it cannot match,
+  and falls back to the helper. The same argument covers an address that wraps at
+  2^64 or at 2^32. Folding the shift into the compare pays for the add, so the
+  fast path is still seven instructions (six for a byte access).
+- **Measured on the same build, before and after** (`EXEMU_JIT_TLB_STATS`):
+  7-Zip `--jit` **1,141,330 declined fills → 0**; SteamSetup on the Wine WoW64
+  path **1,090,698 → 217,225 (−80%)**. What is left on the Wine path is the RWX
+  image and `VirtualAlloc` regions — the executable-memory rule doing its job.
+- **Retired host instructions, interleaved in one session, 5 reps, min user+sys:**
+  7-Zip **10.443 G → 10.176 G (−2.6%)**, spread 10.443–10.489 vs 10.176–10.189;
+  SteamSetup on Wine **1.3336 G → 1.1181 G (−16.2%)**, spread 1.334–1.375 vs
+  1.118–1.124, CPU 0.06 s → 0.05 s. The two differ by an order of magnitude
+  because the declined fills were 0.2% of 7-Zip's guest instructions and 14.5% of
+  the Wine path's.
+- **The blind spot this had created in the differential is gone the other way
+  too.** Every region that harness maps is one page — all of it final page — so
+  the fast path was reached only in the trials given deliberate extra slack. On
+  identical trials the harness now goes from **18,390 entries filled and 28,989
+  fills declined to 41,911 filled and 195 declined**, which is the region-final
+  page becoming reachable, measured where it can be seen.
+- Corpus 11/11 at drift 0 with every count unchanged to the instruction (7-Zip
+  496,505,572 interpreted, debug-attached and JIT-compiled alike); 0 divergences
+  in 4.0 M differential trials — 2 M across `mixed` and `edge` at both bitnesses,
+  1.6 M more with a breakpoint or a watchpoint armed, and 400 k lapped — with
+  **zero** cache entries filled in every watchpoint-armed run, which is the
+  invariant that keeps an armed watchpoint seeing every access. Workspace tests
+  1004 → 1009, clippy clean at `-D warnings`.
 
 ### Window properties, and the handle every window procedure is given (W6.2)
 - **`SetProp`/`GetProp`/`RemoveProp` had no implementation at all.** `GetProp`
@@ -381,8 +423,8 @@ end-to-end on the default path.
   load and a null test per chain.
 - **The differential could not execute the new fast path at all, and now can.**
   Every region the JIT-vs-interpreter harness mapped was exactly one page, and a
-  page is only cached when its whole page plus seven bytes is inside one region —
-  so 3,000 trials filled **zero** cache entries. The "zero divergences" that
+  page was then only cached when its whole page plus seven bytes was inside one
+  region — so 3,000 trials filled **zero** cache entries. The "zero divergences" that
   first accompanied the fast path was true and worth nothing. Region roominess is
   now drawn per trial, so half the trials keep the tight one-page regions the
   fault shapes depend on and half have the slack the fast path needs: 1,203
