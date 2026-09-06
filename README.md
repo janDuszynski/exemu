@@ -786,6 +786,17 @@ and `EnumDisplaySettings`/`ChangeDisplaySettings` present a single 1920×1080
 monitor. `exemu cocoa-demo` still opens the same presenter directly with a test
 frame.
 
+**`WINEDEBUG` works on the Wine path.** Wine's own `TRACE`/`WARN`/`ERR`/`FIXME`
+channels are resolved by `ntdll` against a per-process option array the unix
+side publishes, and the emulator is that unix side: it builds the array from the
+`WINEDEBUG` environment variable in the documented `[class][+|-]channel,…`
+syntax and writes it at the offsets each `ntdll` reads it from (`PEB+0x2000` for
+the 64-bit build, `PEB+0x1000` for the 32-bit one — a difference that had been
+putting the 32-bit half's flags on top of the WoW64 register save area). With
+`WINEDEBUG` unset the default is Wine's own, `err+all,fixme+all`, recovered from
+the pinned builtins rather than assumed; `exemu run --trace` surfaces those
+lines, and `WINEDEBUG=-all` silences them.
+
 Input is **routed**, not broadcast. Which window a click belongs to is the
 kernel side's decision, and the pinned binaries say so plainly:
 `user32!WindowFromPoint` is four instructions that unpack the by-value `POINT`
