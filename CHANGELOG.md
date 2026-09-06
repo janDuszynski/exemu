@@ -23,7 +23,7 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 804, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 876, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
 ### Per-exe profiles (W9.4)
@@ -59,6 +59,48 @@ end-to-end on the default path.
   Finder drag-onto-the-icon or double-click to a bundled, non-AppKit
   executable — now dispatches as `exemu run <path>` instead of erroring
   "unknown command".
+
+### Native block linking and indirect-branch inline caches (W8.5)
+- **7-Zip `--jit` goes from 0.95 s to 0.76 s of CPU — 28.5 G to 21.7 G retired
+  host instructions — on exactly the same 496,505,572 guest instructions and the
+  same 108 artifacts.** A compiled block's exit no longer returns to Rust to be
+  told where to go next: when the target is a compile-time constant (a
+  fallthrough, a `jmp rel`, either edge of a `j<cc>`, or a `call rel32`) it reads
+  a cached pointer to the successor's body and branches straight into it, so a
+  run of blocks executes as one straight line of native code. Measured
+  interleaved — both binaries built, alternated in one session, min user+sys over
+  five runs each — because the same binary spans a wide range depending on what
+  else the machine is doing.
+- **Indirect branches get an inline cache.** `call r/m` and `jmp r/m` — every
+  import-table call, every virtual call, every jump table — read the same slot,
+  which also records *which* guest address it cached a block for, and take the
+  link only if the address the guest just produced matches. On the Wine WoW64
+  path that removes **31%** of the returns to the interpreter (247,909 → 171,618)
+  and takes blocks-per-chain from 7.5 to 10.8. On 7-Zip, whose hot path is an
+  LZMA loop with almost no calls in it, it removes only 3,354 of 3.42 M and costs
+  ~1% in emitted-code size — recorded rather than buried, because the cost is
+  fixed per call site compiled and the benefit scales with how often that site
+  runs.
+- **The budget moved into the emitted exit, and that is a correctness property.**
+  A chain adds each block's instructions to a running total and stops at the
+  first block boundary at which the total has reached what the caller allowed —
+  the same boundary the block-at-a-time loop stopped at. Timeslice preemption,
+  the `KUSER_SHARED_DATA` clock refresh and the step cap therefore still fire at
+  the identical guest instruction, and the corpus stays **10 of 10 with zero
+  drift**, SteamSetup's exact fault address and count included.
+- **Unlinking is one increment.** Every slot carries the engine's link epoch and
+  is taken only while it still matches, so retiring every link at once is a
+  single `+= 1` — no walk over the array, no patching of emitted code, no
+  instruction-cache maintenance. A code-cache flush does it; so does a store the
+  guest makes into a page a compiled block was built from, which is checked on
+  every store against a page-hash table because a linked chain has no Rust
+  between blocks to notice. Without that a chain could store into a block further
+  down its own links and then execute the stale copy.
+- **The differential learned to run round a loop** (`exemu-oracle jit --laps K`),
+  because every trial it had ever generated walked each of its blocks exactly
+  once — the one case in which a link is never *taken*. 0 divergences in 600 k
+  lapped trials with 1.05 M block entries reached by a native link, plus 2 M
+  straight trials across both bitnesses and both layout mixes.
 
 ### The block JIT (W8.2 / W8.3 / W8.7)
 - **7-Zip installs in ~2.4 s instead of ~16.6 s — 7× faster — executing exactly
