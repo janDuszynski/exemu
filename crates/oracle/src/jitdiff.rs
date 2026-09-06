@@ -162,18 +162,24 @@ struct Space {
 
 /// Extra bytes appended to the data and stack regions in a **roomy** trial.
 ///
-/// The JIT's guest-memory TLB (roadmap W8.6) caches a page only when the whole
-/// page *plus the seven bytes an 8-byte access at its last byte reaches* is
-/// inside one region — so a region exactly one page long is never cached, and
-/// every region in this harness was exactly one page long. The differential was
-/// therefore **structurally unable to execute the fast path at all**: 2 M trials
-/// of "zero divergences" said nothing whatever about it.
+/// This exists because the JIT's guest-memory TLB (roadmap W8.6) originally
+/// cached a page only when the whole page *plus the seven bytes an 8-byte access
+/// at its last byte reaches* was inside one region — so a region exactly one
+/// page long was never cached, and every region in this harness was exactly one
+/// page long. The differential was **structurally unable to execute the fast
+/// path at all**: 2 M trials of "zero divergences" said nothing whatever about
+/// it. Roominess was drawn per trial rather than given to every region, because
+/// growing every region would have quietly deleted the fault coverage the
+/// one-page regions exist for — a push that used to run off the end would now
+/// succeed.
 ///
-/// Rather than grow every region — which would quietly delete the fault
-/// coverage the one-page regions exist for, since a push that used to run off
-/// the end would now succeed — roominess is drawn per trial like the layout is.
-/// Half the trials are exactly what they always were; half have the slack that
-/// lets the fast path engage. Both halves are compared the same way.
+/// The seven-byte tail is gone (the probe now compares the page of the access's
+/// *last* byte, so a page needs no slack past it), and a one-page region is
+/// cached like any other — which is the interesting half, since a one-page
+/// region is nothing but its final page and every access that leaves it faults.
+/// Roominess stays, and now buys the other half: a region with an **interior**
+/// page boundary, so a trial can put an access across a boundary that is not a
+/// region's end. Both halves are compared the same way.
 const ROOM: u64 = PAGE;
 
 fn space(layout: Layout, bits: Bits, roomy: bool) -> Space {
