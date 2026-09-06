@@ -342,6 +342,10 @@ mod call_two_param {
     pub const ALLOC_WIN_PROC: u64 = 0x09;
 }
 
+const WINPROC_HANDLE_TAG: u64 = 0xFFFF_0000;
+const WINPROC_HANDLE_MASK: u64 = 0xFFFF;
+const WINPROC_MAX: usize = 0x1000;
+
 mod call_one_param {
     pub const CREATE_CURSOR_ICON: u64 = super::CALL_ONE_CREATE_CURSOR_ICON;
     pub const GET_SYS_COLOR: u64 = 0x06;
@@ -547,6 +551,12 @@ struct Bitmap {
 }
 
 #[derive(Clone, Copy, Default)]
+struct WinProc {
+    proc_a: u64,
+    proc_w: u64,
+}
+
+#[derive(Clone, Copy, Default)]
 struct IconObject {
     is_icon: bool,
     width: i32,
@@ -578,6 +588,7 @@ pub(crate) struct Win32kState {
     brushes: Vec<(u32, u32)>,
     bitmaps: Vec<(u32, Bitmap)>,
     icons: Vec<(u32, IconObject)>,
+    win_procs: Vec<WinProc>,
     sys_brushes: Vec<(u32, u32)>,
     gdi_table_base: u64,
     gdi_next_slot: u64,
@@ -1656,14 +1667,58 @@ fn nt_user_build_hwnd_list(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
     Ok(0)
 }
 
+fn winproc_slot(value: u64) -> Option<usize> {
+    if value & !WINPROC_HANDLE_MASK != WINPROC_HANDLE_TAG {
+        return None;
+    }
+    Some((value & WINPROC_HANDLE_MASK) as usize)
+}
+
+fn alloc_win_proc(st: &mut Win32kState, func: u64, ansi: bool) -> u64 {
+    if func == 0 || winproc_slot(func).is_some() {
+        return func;
+    }
+    let existing = st
+        .win_procs
+        .iter()
+        .position(|p| if ansi { p.proc_a == func } else { p.proc_w == func });
+    if let Some(slot) = existing {
+        return WINPROC_HANDLE_TAG | slot as u64;
+    }
+    if st.win_procs.len() >= WINPROC_MAX {
+        return func;
+    }
+    let entry = if ansi {
+        WinProc { proc_a: func, proc_w: 0 }
+    } else {
+        WinProc { proc_a: 0, proc_w: func }
+    };
+    st.win_procs.push(entry);
+    WINPROC_HANDLE_TAG | (st.win_procs.len() - 1) as u64
+}
+
+fn get_dialog_proc(st: &Win32kState, value: u64, ansi: bool) -> u64 {
+    let Some(slot) = winproc_slot(value) else { return value };
+    st.win_procs.get(slot).map(|p| if ansi { p.proc_a } else { p.proc_w }).unwrap_or(0)
+}
+
 fn nt_user_call_two_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let a = os.syscall_arg(cpu, mem, 0)?;
+    let b = os.syscall_arg(cpu, mem, 1)?;
     let code = os.syscall_arg(cpu, mem, 2)?;
-    if code == call_two_param::GET_DIALOG_PROC {
-        os.return_u64_from_syscall(a);
-        return Ok(0);
+    match code {
+        call_two_param::GET_DIALOG_PROC => {
+            let proc = get_dialog_proc(&os.win32k_state, a, b != 0);
+            os.return_u64_from_syscall(proc);
+            Ok(0)
+        }
+        call_two_param::ALLOC_WIN_PROC => {
+            let handle = alloc_win_proc(&mut os.win32k_state, a, b != 0);
+            os.return_u64_from_syscall(handle);
+            Ok(0)
+        }
+        _ => Ok(0),
     }
-    Ok(0)
 }
 
 fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
@@ -3887,6 +3942,32 @@ mod tests {
             },
         ));
         hwnd
+    }
+
+    #[test]
+    fn a_winproc_handle_round_trips_only_through_the_flavour_it_was_allocated_for() {
+        let mut st = Win32kState::default();
+        const PROC_W: u64 = 0x4001_2345;
+        const PROC_A: u64 = 0x4009_9999;
+
+        assert_eq!(alloc_win_proc(&mut st, 0, false), 0, "a null procedure stays null");
+
+        let hw = alloc_win_proc(&mut st, PROC_W, false);
+        assert_ne!(hw, PROC_W, "a handle is not the procedure address");
+        assert!(hw >= 2, "GetWindowLongPtrW keeps the raw value for 0 and 1");
+        assert_eq!(get_dialog_proc(&st, hw, false), PROC_W, "SetWindowLongPtrW round-trips it");
+        assert_eq!(get_dialog_proc(&st, hw, true), 0, "…and the ANSI flavour is not this one");
+
+        assert_eq!(alloc_win_proc(&mut st, PROC_W, false), hw, "the same pair reuses its slot");
+        assert_eq!(alloc_win_proc(&mut st, hw, false), hw, "an existing handle is left alone");
+
+        let ha = alloc_win_proc(&mut st, PROC_A, true);
+        assert_ne!(ha, hw);
+        assert_eq!(get_dialog_proc(&st, ha, true), PROC_A);
+        assert_eq!(get_dialog_proc(&st, ha, false), 0);
+
+        assert_eq!(get_dialog_proc(&st, PROC_W, false), PROC_W, "a plain address is its own answer");
+        assert_eq!(get_dialog_proc(&st, WINPROC_HANDLE_TAG | 0x800, false), 0, "an unissued slot");
     }
 
     #[test]

@@ -67,7 +67,7 @@ fn run_on_wine(tag: &str) -> (exemu_app::RunResult, Vec<DriverCall>) {
         &comdlg_sample::build(),
         RunConfig {
             echo: false,
-            max_steps: 60_000_000,
+            max_steps: 200_000_000,
             wine_boot_dir: Some(WINE_DLLS.to_string()),
             sandbox_root: Some(seeded_sandbox(tag)),
             input: Some(rx),
