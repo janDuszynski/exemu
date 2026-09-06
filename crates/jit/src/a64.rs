@@ -85,6 +85,15 @@ impl Asm {
         self.words
     }
 
+    /// The stream, writable — for the one case that needs it: a word emitted
+    /// before its value is known (the block's own byte length, which is only
+    /// settled once the block has stopped growing) and patched in afterwards.
+    /// This is a plain `Vec<u32>` that has not been copied into the code buffer
+    /// yet, so nothing here touches executable memory.
+    pub fn words_mut(&mut self) -> &mut [u32] {
+        &mut self.words
+    }
+
     pub fn len(&self) -> usize {
         self.words.len()
     }

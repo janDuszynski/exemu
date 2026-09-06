@@ -337,7 +337,7 @@ fn an_instruction_running_past_executable_memory_is_not_compiled() {
     let s = seed(Bits::B32);
     let at = 0xFFFF_FFFE;
     let (mem, _) = build(Bits::B32, at, &code, &s);
-    let plan = exemu_jit::compile::Compiler::compile(&mem, Mode::Protected, at, 64);
+    let plan = exemu_jit::compile::Compiler::compile(&mem, Mode::Protected, at, 64, None);
     assert_eq!(
         plan.insns, 0,
         "an instruction whose encoding runs past executable memory must not compile"
@@ -385,7 +385,7 @@ fn a_block_that_ends_on_2_32_still_sees_a_store_into_its_own_code() {
     // The compiler must not run past the boundary either: a block is one
     // contiguous byte range, so it stops where the address space wraps.
     let (mem, _) = build(Bits::B32, at, &code, &s);
-    let plan = exemu_jit::compile::Compiler::compile(&mem, Mode::Protected, at, 64);
+    let plan = exemu_jit::compile::Compiler::compile(&mem, Mode::Protected, at, 64, None);
     assert_eq!(plan.stop, exemu_jit::StopReason::Wrapped);
     assert_eq!(plan.bytes, 0x10, "the block covers exactly the bytes it compiled");
 

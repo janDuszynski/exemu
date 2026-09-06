@@ -162,6 +162,15 @@ pub struct BlockPlan {
     /// The ARM64 words.
     pub code: Vec<u32>,
     pub stop: StopReason,
+    /// Word offset of the **chain entry**: the first instruction past the
+    /// prologue. A block reached by a native link jumps here rather than to word
+    /// 0, because the chain has already built the frame and loaded the pinned
+    /// registers, and doing it again would grow the stack without bound
+    /// (roadmap W8.5).
+    pub chain_off: u32,
+    /// Guest address each link slot this block took points at, in slot order.
+    /// Empty when the engine gave the block no slots.
+    pub links: Vec<u64>,
 }
 
 /// Maximum guest instructions in one block.
@@ -390,17 +399,56 @@ pub struct Compiler {
     store_stubs: Vec<StoreStub>,
     /// Branches to the shared epilogue.
     exits: Vec<Label>,
+    /// First link slot this block may use, if the engine gave it any
+    /// (roadmap W8.5). `None` compiles a block that always returns to Rust.
+    slot_base: Option<u32>,
+    /// Guest address each slot this block took points at, in slot order.
+    link_targets: Vec<u64>,
+}
+
+/// Outgoing native links one block may hold: a conditional branch has two edges,
+/// and no terminator this compiler accepts has more.
+pub const MAX_LINKS: u32 = 2;
+
+/// How a block leaves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitKind {
+    /// Return to the engine, which decides what runs next.
+    Return,
+    /// Return having rewound onto a faulting access.
+    Fault,
+    /// `rip` is a compile-time constant with a block of its own, so the exit may
+    /// jump straight into that block's code instead of returning (roadmap W8.5).
+    Link,
+}
+
+impl ExitKind {
+    fn of(linkable: bool) -> ExitKind {
+        if linkable {
+            ExitKind::Link
+        } else {
+            ExitKind::Return
+        }
+    }
 }
 
 /// Bit set in the block's return value when it exited by rewinding to a
-/// faulting instruction.
+/// faulting instruction. The instruction *count* is no longer in the return
+/// value: a natively linked chain accumulates it in `BlockCtx::retired`, so the
+/// engine reads it from there and a block returns only a status word.
 pub const RET_FAULT: u64 = 1 << 32;
 
 impl Compiler {
     /// Compile a straight-line block starting at `start`. A plan with
     /// `insns == 0` means nothing here could be compiled and the caller must
     /// interpret.
-    pub fn compile(mem: &dyn Memory, mode: Mode, start: u64, max_insns: u32) -> BlockPlan {
+    pub fn compile(
+        mem: &dyn Memory,
+        mode: Mode,
+        start: u64,
+        max_insns: u32,
+        slot_base: Option<u32>,
+    ) -> BlockPlan {
         let mut c = Compiler {
             asm: Asm::new(),
             mode,
@@ -412,8 +460,27 @@ impl Compiler {
             fault_stubs: Vec::new(),
             store_stubs: Vec::new(),
             exits: Vec::new(),
+            slot_base,
+            link_targets: Vec::new(),
         };
         c.prologue();
+        // --- the chain entry ---------------------------------------------
+        //
+        // Where a natively linked predecessor jumps in: past the frame the chain
+        // already built, but *before* the body — because the one thing a block
+        // must publish on every entry, however it was entered, is the guest byte
+        // range it was compiled from. The store helper tests every store against
+        // it, and with linking there is no Rust between blocks to set it.
+        //
+        // The block's length is not known until it has stopped growing, so the
+        // `add` that derives the end from the start is emitted as a placeholder
+        // and patched below. It is a plain `Vec<u32>` at this point; nothing here
+        // touches executable memory.
+        let chain_off = c.asm.len() as u32;
+        c.asm.mov_imm64(T0, start);
+        let bytes_at = c.asm.len();
+        c.asm.nop();
+        c.asm.stp(T0, T1, R_CTX, ctx_off::CODE_LO as i32);
         let mut stop = StopReason::Full;
         let mut rip = start;
         while c.insns < max_insns {
@@ -489,21 +556,41 @@ impl Compiler {
         let insns = c.insns;
         // Fallthrough exit: rip = end of the block, no fault.
         if stop != StopReason::Terminator {
-            c.exit_to(c.flags, end_rip, insns as u64);
+            // Only a block that stopped because it was *full* (or wrapped past
+            // the top of the address space) has a compiled successor to link to.
+            // The other two reasons — an opcode this compiler declines, and a
+            // fetch that failed — are precisely the addresses where nothing can
+            // be compiled, so the chain has to hand that instruction to the
+            // interpreter.
+            let linkable = matches!(stop, StopReason::Full | StopReason::Wrapped);
+            c.exit_to(c.flags, end_rip, insns, ExitKind::of(linkable));
         }
         c.emit_stubs();
         c.epilogue();
+        // Masked, because `end_rip` is: a 32-bit block that ends on the 4 GiB
+        // boundary has `end_rip == 0`, and a plain 64-bit subtraction would call
+        // that a 2^64-sized block instead of the handful of bytes it is.
+        let bytes = end_rip.wrapping_sub(start) & mode.addr_mask();
+        // Patch the chain entry's `add T1, T0, #bytes`. A block holds at most
+        // `MAX_INSNS` instructions of at most 15 bytes, so the length always
+        // fits the 12-bit immediate — asserted rather than assumed, because a
+        // silently truncated length would under-report the block's own range and
+        // let a store into it go unnoticed.
+        assert!(bytes < 4096, "block byte length {bytes} does not fit an add immediate");
+        {
+            let mut patch = Asm::new();
+            patch.add_imm(true, T1, T0, bytes as u32, false);
+            c.asm.words_mut()[bytes_at] = patch.words()[0];
+        }
         BlockPlan {
             start,
             insns,
             end_rip,
-            // Masked, because `end_rip` is: a 32-bit block that ends on the
-            // 4 GiB boundary has `end_rip == 0`, and a plain 64-bit subtraction
-            // would call that a 2^64-sized block instead of the handful of
-            // bytes it is.
-            bytes: end_rip.wrapping_sub(start) & mode.addr_mask(),
+            bytes,
             code: c.asm.into_words(),
             stop,
+            chain_off,
+            links: c.link_targets,
         }
     }
 
@@ -541,15 +628,93 @@ impl Compiler {
         a.ret();
     }
 
-    /// Leave the block: settle `flags`, store `rip`, set the return value, jump
-    /// to the epilogue. The flag state is passed in rather than taken from
+    /// Take the next link slot this block is allowed, for a jump to `target`.
+    /// `None` when the engine gave the block no slots, or when it has used them
+    /// all — either way the exit falls back to returning to Rust, which is
+    /// always correct and only slower.
+    fn take_slot(&mut self, target: u64) -> Option<u32> {
+        let base = self.slot_base?;
+        let n = self.link_targets.len() as u32;
+        if n >= MAX_LINKS {
+            return None;
+        }
+        self.link_targets.push(target);
+        Some(base + n)
+    }
+
+    /// Leave the block for guest address `rip`, having retired `retired`
+    /// instructions here. The flag state is passed in rather than taken from
     /// `self` because a stub exits with the state of the point it rewinds to,
     /// not the state of the emission cursor.
-    fn exit_to(&mut self, flags: Flags, rip: u64, ret: u64) {
+    ///
+    /// # What a linkable exit emits, and why in this order
+    ///
+    /// Every exit settles the flags, publishes `rip` and adds this block's
+    /// instructions to the chain's running total. An [`ExitKind::Link`] exit then
+    /// tries to continue **without returning to Rust** (roadmap W8.5):
+    ///
+    /// 1. **Budget first.** The chain stops at the first block boundary at which
+    ///    the running total has reached the budget — the same boundary the
+    ///    caller's block-at-a-time loop stopped at, which is what keeps
+    ///    preemption, the `KUSER_SHARED_DATA` refresh and the step cap firing at
+    ///    the *identical* guest instruction. This test is what makes native
+    ///    linking safe to do at all.
+    /// 2. **Then the slot.** A cached successor is taken only while the slot's
+    ///    epoch still matches the engine's, so invalidating every link in the
+    ///    process is one increment (see [`crate::rt::LinkSlot`]).
+    /// 3. **Then the trail.** The caller's loop cannot see a linked block, so
+    ///    compiled code records the entry address itself, and the fault reporter
+    ///    keeps printing a real history instead of one address per chain.
+    ///
+    /// If either test fails the exit records *which* slot it wanted in
+    /// `BlockCtx::pending` and returns; the engine fills that slot once it has
+    /// compiled and validated the block the chain landed on.
+    fn exit_to(&mut self, flags: Flags, rip: u64, retired: u32, kind: ExitKind) {
         self.emit_flags(flags);
-        self.asm.mov_imm64(T0, rip);
-        self.asm.str(8, T0, R_STATE, st::RIP);
-        self.asm.mov_imm64(0, ret);
+        self.asm.mov_imm64(T2, rip);
+        self.asm.str(8, T2, R_STATE, st::RIP);
+        self.asm.ldr(8, T0, R_CTX, ctx_off::RETIRED);
+        if retired != 0 {
+            self.asm.add_imm(true, T0, T0, retired, false);
+            self.asm.str(8, T0, R_CTX, ctx_off::RETIRED);
+        }
+        if kind == ExitKind::Link {
+            if let Some(slot) = self.take_slot(rip) {
+                self.asm.ldr(8, T1, R_CTX, ctx_off::BUDGET);
+                self.asm.cmp_reg(true, T0, T1);
+                let spent = self.asm.b_cond_forward(Cond::Cs);
+                // The slot pair, addressed off the array base in the context. An
+                // `ldr`'s scaled immediate reaches 32 760 bytes; past that, one
+                // page-granular `add` gets the base within range, which covers
+                // every slot the engine can hand out.
+                let off = slot * 16;
+                self.asm.ldr(8, T1, R_CTX, ctx_off::LINKS);
+                let bias = if off + 8 <= 32_760 { 0 } else { off & !0xFFF };
+                if bias != 0 {
+                    self.asm.add_imm(true, T1, T1, bias >> 12, true);
+                }
+                let at = off - bias;
+                self.asm.ldr(8, T3, T1, at);
+                self.asm.ldr(8, T1, T1, at + 8);
+                self.asm.ldr(8, T0, R_CTX, ctx_off::LINK_EPOCH);
+                self.asm.cmp_reg(true, T3, T0);
+                let stale = self.asm.b_cond_forward(Cond::Ne);
+                // The block trail, for the fault reporter.
+                self.asm.ldr(8, T3, R_CTX, ctx_off::TRAIL_AT);
+                self.asm.add_imm(true, T0, T3, 1, false);
+                self.asm.str(8, T0, R_CTX, ctx_off::TRAIL_AT);
+                let ok = self.asm.and_imm(true, T3, T3, crate::rt::TRAIL as u64 - 1);
+                debug_assert!(ok, "the trail ring size must be a logical immediate");
+                self.asm.ldr(8, T0, R_CTX, ctx_off::TRAIL);
+                self.asm.str_reg_lsl3(T2, T0, T3);
+                self.asm.br(T1);
+                self.asm.bind(stale);
+                self.asm.bind(spent);
+                self.asm.mov_imm64(T0, slot as u64);
+                self.asm.str(8, T0, R_CTX, ctx_off::PENDING);
+            }
+        }
+        self.asm.mov_imm64(0, if kind == ExitKind::Fault { RET_FAULT } else { 0 });
         let l = self.asm.b_forward();
         self.exits.push(l);
     }
@@ -562,14 +727,17 @@ impl Compiler {
             self.asm.subs_imm(true, ZR, 0, status::FAULT as u32, false);
             let is_fault = self.asm.b_cond_forward(Cond::Eq);
             self.emit_commit(s.commit);
-            self.exit_to(s.after, s.next_rip, (s.retired + 1) as u64);
+            // Never linked: the store landed on a page some compiled block was
+            // built from, so the engine has to look at it before anything else
+            // runs — including any block this one is linked to.
+            self.exit_to(s.after, s.next_rip, s.retired + 1, ExitKind::Return);
             self.asm.bind(is_fault);
-            self.exit_to(s.before, s.rip, s.retired as u64 | RET_FAULT);
+            self.exit_to(s.before, s.rip, s.retired, ExitKind::Fault);
         }
         let faults = std::mem::take(&mut self.fault_stubs);
         for f in faults {
             self.asm.bind(f.label);
-            self.exit_to(f.flags, f.rip, f.retired as u64 | RET_FAULT);
+            self.exit_to(f.flags, f.rip, f.retired, ExitKind::Fault);
         }
     }
 
@@ -1672,7 +1840,7 @@ impl Compiler {
             0xE9 | 0xEB => {
                 let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
                 let f = self.flags;
-                self.exit_to(f, target, (self.insns + 1) as u64);
+                self.exit_to(f, target, self.insns + 1, ExitKind::Link);
                 Lowered::Terminated
             }
 
@@ -2017,12 +2185,15 @@ impl Compiler {
     /// A conditional branch: both edges are compiled, so the block leaves with
     /// `rip` already correct and never returns to the interpreter for the jump.
     fn emit_jcc(&mut self, cc: u8, target: u64, fallthrough: u64) -> Lowered {
-        // The condition reads `R_FLAGS`, and both edges leave the block.
+        // The condition reads `R_FLAGS`, and both edges leave the block — and
+        // both are compile-time constants, so both get a link slot. A loop whose
+        // body and exit are each one block therefore runs entirely as native
+        // code once both slots are filled.
         self.materialize();
         let taken = self.branch_if_cond(cc);
-        self.exit_to(Flags::Live, fallthrough, (self.insns + 1) as u64);
+        self.exit_to(Flags::Live, fallthrough, self.insns + 1, ExitKind::Link);
         self.asm.bind(taken);
-        self.exit_to(Flags::Live, target, (self.insns + 1) as u64);
+        self.exit_to(Flags::Live, target, self.insns + 1, ExitKind::Link);
         Lowered::Terminated
     }
 }

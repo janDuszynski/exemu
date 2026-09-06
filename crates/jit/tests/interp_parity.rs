@@ -459,7 +459,7 @@ fn compile_len(code: &[u8]) -> usize {
     let mut mem = VirtualMemory::new();
     mem.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
     mem.poke(CODE, code).unwrap();
-    exemu_jit::compile::Compiler::compile(&mem, Mode::Long, CODE, 64).code.len()
+    exemu_jit::compile::Compiler::compile(&mem, Mode::Long, CODE, 64, None).code.len()
 }
 
 // ---------------------------------------------------------------------------
