@@ -58,6 +58,9 @@ const NT_USER_END_PAINT: u32 = 0x13bc;
 const NT_USER_GET_MESSAGE: u32 = 0x141b;
 const NT_USER_PEEK_MESSAGE: u32 = 0x14ca;
 const NT_USER_POST_QUIT_MESSAGE: u32 = 0x14d1;
+/// `NtUserPostMessage` — `user32!PostMessageW`/`A` are bare thunks into it, and
+/// so is every `PostMessage` Wine's own USER code makes internally.
+const NT_USER_POST_MESSAGE: u32 = 0x14d0;
 const NT_USER_TRANSLATE_MESSAGE: u32 = 0x15d8;
 const NT_USER_DISPATCH_MESSAGE: u32 = 0x138b;
 
@@ -1626,6 +1629,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_GET_MESSAGE, nt_user_get_message);
     os.set_win32k_handler(NT_USER_PEEK_MESSAGE, nt_user_peek_message);
     os.set_win32k_handler(NT_USER_POST_QUIT_MESSAGE, nt_user_post_quit_message);
+    os.set_win32k_handler(NT_USER_POST_MESSAGE, nt_user_post_message);
     os.set_win32k_handler(NT_USER_TRANSLATE_MESSAGE, nt_user_translate_message);
     os.set_win32k_handler(NT_USER_DISPATCH_MESSAGE, nt_user_dispatch_message);
     // Cursor / display driver members (W4.7).
@@ -3890,6 +3894,44 @@ fn nt_user_translate_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn M
     Ok(1)
 }
 
+/// `NtUserPostMessage(hwnd, msg, wParam, lParam)` — **put a message on a
+/// window's queue and return at once** (roadmap W6.2).
+///
+/// Unserviced, every `PostMessage` a Wine DLL made was silently dropped, and the
+/// loss is invisible: the caller gets 0 (which it usually ignores) and the
+/// message simply never arrives. The case that exposed it is
+/// `user32!DEFDLG_Proc`'s `WM_CLOSE` arm, which does **not** destroy the window
+/// the way `DefWindowProcW` would — it posts the Cancel button's command
+/// instead, visible in a win32u trace as
+/// `NtUserPostMessage(hwnd, 0x111, IDCANCEL) <UNSERVICED>` immediately after
+/// `GetDlgItem(hwnd, IDCANCEL)`. So closing any Wine dialog did nothing at all.
+///
+/// exemu is single-threaded on the guest side, so "the target window's thread"
+/// is the running one — the same assumption [`WinOs::post_internal`] already
+/// makes. Two documented cases are not a plain enqueue:
+///
+/// * `WM_QUIT` posted this way behaves as `PostQuitMessage`, so it stays the
+///   last message the queue ever delivers rather than being overtaken by
+///   whatever is queued behind it (the emulated path's `PostMessage` in
+///   [`crate::msg`] already reads it that way);
+/// * a non-zero `hwnd` that names no live window cannot receive anything, and
+///   answering TRUE for it would invent a delivery.
+fn nt_user_post_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)?;
+    let message = os.syscall_arg(cpu, mem, 1)? as u32;
+    let wparam = os.syscall_arg(cpu, mem, 2)?;
+    let lparam = os.syscall_arg(cpu, mem, 3)?;
+    if message == crate::msg::WM_QUIT {
+        os.threads[os.current].quit_code = Some(wparam as i32);
+        return Ok(1);
+    }
+    if hwnd != 0 && os.win32k_state.window(hwnd as u32).is_none() {
+        return Ok(0);
+    }
+    os.post_internal(hwnd, message, wparam, lparam);
+    Ok(1)
+}
+
 /// `NtUserPostQuitMessage(nExitCode)` — mark the running thread to receive
 /// `WM_QUIT` once its queue drains (roadmap W4.6), so a guest WndProc's
 /// `WM_DESTROY → PostQuitMessage` stops the message loop.
@@ -5766,6 +5808,45 @@ mod tests {
         // "nothing here" and leaving the guest to spin.
         assert_eq!(call(&mut os, &mut mem, true), 0);
         assert_eq!(mem.read_u32(lp + 8).unwrap(), WM_QUIT, "…on every later round too");
+    }
+
+    /// **`NtUserPostMessage` actually queues** (roadmap W6.2) — unserviced, it
+    /// answered 0 and dropped every `PostMessage` in the process, including the
+    /// `WM_COMMAND(IDCANCEL)` `user32!DEFDLG_Proc` posts to close a dialog.
+    ///
+    /// Also pins the two cases that are not a plain enqueue: a posted `WM_QUIT`
+    /// behaves as `PostQuitMessage` (so it stays *last*, behind anything already
+    /// queued), and an `hwnd` that names no window cannot receive anything.
+    #[test]
+    fn nt_user_post_message_queues_and_a_posted_quit_stays_last() {
+        const WM_QUIT: u32 = 0x0012;
+        const WM_COMMAND: u32 = 0x0111;
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        let hwnd = child(&mut os, 0, [0, 0, 100, 100]);
+
+        let post = |os: &mut WinOs, mem: &mut VirtualMemory, h: u64, m: u32, w: u64| -> u32 {
+            let mut cpu = CpuState::default();
+            cpu.set_rsp(0x2_0800);
+            cpu.set_reg(exemu_core::Reg::R10, h);
+            cpu.set_reg(exemu_core::Reg::Rdx, m as u64);
+            cpu.set_reg(exemu_core::Reg::R8, w);
+            cpu.set_reg(exemu_core::Reg::R9, 0);
+            nt_user_post_message(os, &mut cpu, mem).unwrap()
+        };
+
+        assert_eq!(post(&mut os, &mut mem, hwnd as u64, WM_COMMAND, 2), 1, "posted");
+        assert_eq!(post(&mut os, &mut mem, 0, WM_QUIT, 7), 1, "…and so is a quit");
+        assert_eq!(post(&mut os, &mut mem, 0xDEAD, WM_COMMAND, 0), 0, "…but not to a dead hwnd");
+
+        // The command comes out first even though the quit was posted after it:
+        // a quit is not queued, it is the answer once the queue runs dry.
+        let first = os.msg_next().expect("the queued command");
+        assert_eq!((first.hwnd, first.message, first.wparam), (hwnd as u64, WM_COMMAND, 2));
+        let last = os.msg_next().expect("then the quit");
+        assert_eq!((last.message, last.wparam), (WM_QUIT, 7), "with the posted exit code");
+        assert!(os.msg_next().is_none(), "and nothing after it");
     }
 
     /// **`IsChild`'s two arguments, pinned in the order `user32!IsChild`
