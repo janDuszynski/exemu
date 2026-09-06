@@ -1642,7 +1642,14 @@ impl Process {
         let Some(cmds) = self.dbg_cmds.take() else { return DebugAction::Continue };
         let events = self.dbg_events.take();
         let action = self.debug_serve(&cmds, events.as_ref(), reason, steps, trail);
-        if !matches!(action, DebugAction::Detach) {
+        if matches!(action, DebugAction::Detach) {
+            // Detaching drops both channel ends and disarms everything, so the
+            // memory backend goes back to the attached-but-unarmed cost — one
+            // relaxed load of a zero Bloom filter. This covers the front-end
+            // that *asked* to detach and the one that simply went away, which
+            // are the same situation from here.
+            self.debug_disarm_all();
+        } else {
             self.dbg_cmds = Some(cmds);
             self.dbg_events = events;
         }
@@ -1703,10 +1710,7 @@ impl Process {
                         )));
                     }
                 }
-                DebugCommand::Detach => {
-                    self.debug_disarm_all();
-                    return DebugAction::Detach;
-                }
+                DebugCommand::Detach => return DebugAction::Detach,
                 DebugCommand::Kill => return DebugAction::Kill,
             }
         }
