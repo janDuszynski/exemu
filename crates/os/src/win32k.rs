@@ -236,7 +236,7 @@ const GDI_ENTRY_SIZE: u64 = 24;
 const GDI_ENTRY_GENERATION_OFF: u64 = 0xC;
 const GDI_ENTRY_TYPE_OFF: u64 = 0xE;
 const GDI_ENTRY_OBJECT_OFF: u64 = 0x10;
-const GDI_TABLE_SLOTS: u64 = 128;
+const GDI_TABLE_SLOTS: u64 = 4096;
 const GDI_ENTRY_IN_USE: u8 = 0x01;
 const GDI_DC_OBJECT_SIZE: u64 = 0x100;
 
@@ -565,6 +565,7 @@ pub(crate) struct Win32kState {
     sys_brushes: Vec<(u32, u32)>,
     gdi_table_base: u64,
     gdi_next_slot: u64,
+    gdi_free_slots: Vec<u64>,
     gdi_dc_arena: u64,
     cursor_pos: (i32, i32),
     current_cursor: u64,
@@ -1798,11 +1799,17 @@ fn alloc_gdi_object(os: &mut WinOs, mem: &mut dyn Memory, ty: u16) -> Result<Opt
     if !ensure_gdi_table(os, mem) {
         return Ok(None);
     }
-    let slot = os.win32k_state.gdi_next_slot;
-    if slot >= GDI_TABLE_SLOTS {
-        return Ok(None);
-    }
-    os.win32k_state.gdi_next_slot += 1;
+    let slot = match os.win32k_state.gdi_free_slots.pop() {
+        Some(slot) => slot,
+        None => {
+            let slot = os.win32k_state.gdi_next_slot;
+            if slot >= GDI_TABLE_SLOTS {
+                return Ok(None);
+            }
+            os.win32k_state.gdi_next_slot += 1;
+            slot
+        }
+    };
 
     let entry = os.win32k_state.gdi_table_base + slot * GDI_ENTRY_SIZE;
     let obj = os.win32k_state.gdi_dc_arena + slot * GDI_DC_OBJECT_SIZE;
@@ -1897,7 +1904,7 @@ fn nt_user_release_dc(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) 
     if let Some(hwnd) = os.win32k_state.dc(hdc).map(|d| d.hwnd) {
         present_surface(os, mem, hwnd)?;
     }
-    os.win32k_state.dcs.retain(|(h, _)| *h != hdc);
+    free_gdi_object(os, mem, hdc)?;
     Ok(1)
 }
 
@@ -1931,7 +1938,7 @@ fn nt_user_end_paint(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
     }
     if ps != 0 {
         let hdc = mem.read_u64(ps)? as u32;
-        os.win32k_state.dcs.retain(|(h, _)| *h != hdc);
+        free_gdi_object(os, mem, hdc)?;
     }
     Ok(1)
 }
@@ -3219,14 +3226,27 @@ fn nt_gdi_delete_object_app(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     if (STOCK_SLOT_BASE..=STOCK_SLOT_LAST).contains(&slot) {
         return Ok(1);
     }
+    free_gdi_object(os, mem, handle)?;
+    Ok(1)
+}
+
+fn free_gdi_object(os: &mut WinOs, mem: &mut dyn Memory, handle: u32) -> Result<()> {
+    let slot = (handle & 0xFFFF) as u64;
+    if slot == 0 || slot >= GDI_TABLE_SLOTS || (STOCK_SLOT_BASE..=STOCK_SLOT_LAST).contains(&slot) {
+        return Ok(());
+    }
     let base = os.win32k_state.gdi_table_base;
     if base != 0 {
-        mem.write_u8(base + slot * GDI_ENTRY_SIZE + GDI_ENTRY_TYPE_OFF, 0)?;
+        let entry = base + slot * GDI_ENTRY_SIZE;
+        if mem.read_u8(entry + GDI_ENTRY_TYPE_OFF)? & GDI_ENTRY_IN_USE != 0 {
+            mem.write_u8(entry + GDI_ENTRY_TYPE_OFF, 0)?;
+            os.win32k_state.gdi_free_slots.push(slot);
+        }
     }
     os.win32k_state.brushes.retain(|(h, _)| *h != handle);
     os.win32k_state.dcs.retain(|(h, _)| *h != handle);
     os.win32k_state.bitmaps.retain(|(h, _)| *h != handle);
-    Ok(1)
+    Ok(())
 }
 
 fn nt_gdi_intersect_clip_rect(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
@@ -3384,6 +3404,40 @@ mod tests {
         mem.map(Region::new("scratch", 0x10_0000, 0x10_000, Perm::RW)).unwrap();
         os.set_syscall_guest_rsp_for_test(0x10_8000);
         (os, mem)
+    }
+
+    #[test]
+    fn a_deleted_gdi_object_returns_its_table_slot() {
+        let (mut os, mut mem) = os_with_gdi();
+
+        let mut last = 0;
+        for i in 0..(GDI_TABLE_SLOTS as usize * 4) {
+            let (handle, _) = alloc_gdi_object(&mut os, &mut mem, gdi_type::REGION)
+                .unwrap()
+                .unwrap_or_else(|| panic!("the GDI table ran out after {i} create/delete pairs"));
+            assert_ne!(handle, 0);
+            free_gdi_object(&mut os, &mut mem, handle).unwrap();
+            last = handle;
+        }
+        assert_ne!(last, 0);
+        assert!(
+            os.win32k_state.gdi_next_slot < GDI_TABLE_SLOTS,
+            "a balanced create/delete pair must not consume a fresh slot each time"
+        );
+    }
+
+    #[test]
+    fn freeing_a_gdi_object_twice_lists_its_slot_once() {
+        let (mut os, mut mem) = os_with_gdi();
+
+        let (handle, _) = alloc_gdi_object(&mut os, &mut mem, gdi_type::BITMAP).unwrap().unwrap();
+        free_gdi_object(&mut os, &mut mem, handle).unwrap();
+        free_gdi_object(&mut os, &mut mem, handle).unwrap();
+        assert_eq!(os.win32k_state.gdi_free_slots.len(), 1);
+
+        let (again, _) = alloc_gdi_object(&mut os, &mut mem, gdi_type::BITMAP).unwrap().unwrap();
+        assert_eq!(again, handle, "the recycled slot comes back with the same type tag");
+        assert!(os.win32k_state.gdi_free_slots.is_empty());
     }
 
     #[test]
