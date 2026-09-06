@@ -196,6 +196,89 @@ pub trait Memory {
         None
     }
 
+    // ---- host spans (the W8.6 JIT software-TLB seam) ----------------------
+    //
+    // A JIT that calls back into this trait for every guest load and store pays
+    // a call, a region lookup and a `Result` for each one, and that was measured
+    // at ~40% of a whole 7-Zip run. These three methods let it keep a small
+    // direct-mapped cache of *host* addresses instead, so the common access is a
+    // handful of emitted instructions with no call at all.
+    //
+    // The seam is deliberately narrow. It hands out **safe slices**, not raw
+    // pointers, so a backend needs no `unsafe` to provide it and the bounds of
+    // what it exposes are checked by the compiler; turning one into a pointer
+    // that outlives the borrow is the *caller's* explicit `unsafe`, and the
+    // caller is the one crate in this workspace allowed to write it. Every
+    // method is defaulted to "no host mapping", so a backend opts in and every
+    // test double is untouched.
+
+    /// The host bytes backing `[addr, addr+len)`, when that whole range lies
+    /// inside a **single** region that carries `needed`.
+    ///
+    /// `None` means "ask the ordinary way" and is always a valid answer — the
+    /// default, for every backend that has no stable host mapping. A backend
+    /// that does implement it must return `None` rather than `Some` whenever a
+    /// direct access through the returned bytes would not be equivalent to the
+    /// same access made through [`read`](Memory::read) / [`read_uint`]:
+    ///
+    /// * the range leaves the region, is unmapped, or lacks `needed` — so an
+    ///   access that would fault can never be served from a span, and therefore
+    ///   still faults at exactly the instruction it faulted at before;
+    /// * anything the backend would otherwise *observe* about the access is
+    ///   armed — a data watchpoint, most concretely (roadmap W9.3). An armed
+    ///   watchpoint must keep seeing every guest access, so it is expressed here
+    ///   as "no spans while armed" rather than as a rule the caller has to
+    ///   remember.
+    ///
+    /// The bytes stay where they are until [`layout_generation`] changes.
+    ///
+    /// [`read_uint`]: Memory::read_uint
+    /// [`layout_generation`]: Memory::layout_generation
+    fn host_span(&self, addr: u64, len: usize, needed: Perm) -> Option<&[u8]> {
+        let _ = (addr, len, needed);
+        None
+    }
+
+    /// As [`host_span`](Memory::host_span), for a range that will be
+    /// **written** through.
+    ///
+    /// One extra rule, and it is the important one: a backend must **never**
+    /// return a writable span covering executable memory. A write through the
+    /// returned bytes cannot bump [`code_generation`](Memory::code_generation)
+    /// or [`code_page_generation`](Memory::code_page_generation), so a guest
+    /// that rewrites its own code through such a span would be invisible to a
+    /// JIT's invalidation — the one failure this seam must not make possible.
+    /// Stores into executable memory therefore always go the ordinary way.
+    fn host_span_mut(&mut self, addr: u64, len: usize, needed: Perm) -> Option<&mut [u8]> {
+        let _ = (addr, len, needed);
+        None
+    }
+
+    /// A counter bumped by **every** change that can move or free the bytes a
+    /// span points at, or change the permissions under them: mapping, unmapping,
+    /// re-protecting, and any reallocation of the backend's own storage.
+    ///
+    /// A cache of host addresses is valid exactly as long as this does not move,
+    /// so a caller holding one compares it once per batch of work rather than
+    /// re-resolving per access. A backend that never hands out spans can leave
+    /// this at `0`. **Missing a bump is a use-after-free**, so the rule for an
+    /// implementor is to bump on the mutation funnel, not at each call site.
+    fn layout_generation(&self) -> u64 {
+        0
+    }
+
+    /// Is anything armed that must observe every guest data access — a data
+    /// watchpoint (roadmap W9.3)?
+    ///
+    /// [`host_span`](Memory::host_span) already refuses while this is true, so
+    /// this is not what makes an armed watchpoint correct. It is what lets a
+    /// caller *throw away* a cache it filled earlier, at a boundary of its own
+    /// choosing, rather than re-testing per access — which is what keeps the
+    /// far more common detached case free.
+    fn watchpoints_armed(&self) -> bool {
+        false
+    }
+
     // ---- self-modifying-code detection (the W8 JIT invalidation seam) -----
     //
     // The interpreter decodes fresh every step, so self-modifying code already
