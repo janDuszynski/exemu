@@ -333,8 +333,15 @@ impl WinOs {
     /// host stderr when tracing is enabled; otherwise swallow them (a chatty
     /// guest must not spam a non-trace run). The bytes are already
     /// caller-formatted; we do not re-interpret them.
+    ///
+    /// `EXEMU_WINE_DBG` forces the sink on for a run whose [`WinConfig::trace`]
+    /// is off — which is **every gate test**, since a test that captured this
+    /// stream would be pinned to Wine's log strings. Those tests are exactly the
+    /// runs whose `WINEDEBUG` channels one needs to read while diagnosing, so
+    /// without an env escape hatch the only way to see them is to edit the test.
+    /// Deliberately env-only and read fresh (this is not a hot path).
     pub(crate) fn wine_dbg_sink(&mut self, bytes: &[u8]) {
-        if self.cfg.trace {
+        if self.cfg.trace || std::env::var_os("EXEMU_WINE_DBG").is_some() {
             eprint!("[wine] {}", String::from_utf8_lossy(bytes));
         }
     }

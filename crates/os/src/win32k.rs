@@ -303,6 +303,137 @@ const NT_GDI_INTERSECT_CLIP_RECT: u32 = 0x1238;
 const NT_GDI_GET_TEXT_METRICS_W: u32 = 0x1229;
 const NT_GDI_GET_TEXT_EXTENT_EX_W: u32 = 0x1227;
 
+// --- W6.2: memory DCs and bitmaps, which an icon and an image list cannot do
+//     without ---------------------------------------------------------------
+//
+// **The prototypes below are not remembered — they are read out of the pinned
+// `gdi32.dll`'s own DWARF, which the Wine build ships in `.debug_info`.** Each
+// `NtGdi*` declaration carries its full parameter list, so the argument order
+// is recovered rather than inferred from a disassembly of one call site. The
+// indices are the `mov eax,IDX` immediates of `win32u.dll`'s stubs, pinned in
+// `crates/os/tests/user_abi.rs`.
+//
+/// `NtGdiCreateCompatibleDC(HDC)` — a **memory DC**, the off-screen surface
+/// every icon, image list and double-buffered control composes into.
+const NT_GDI_CREATE_COMPATIBLE_DC: u32 = 0x10ae;
+/// `NtGdiCreateBitmap(INT width, INT height, UINT planes, UINT bpp,
+/// const void *bits)`.
+const NT_GDI_CREATE_BITMAP: u32 = 0x10a7;
+/// `NtGdiCreateCompatibleBitmap(HDC, INT width, INT height)`.
+const NT_GDI_CREATE_COMPATIBLE_BITMAP: u32 = 0x10ad;
+/// `NtGdiSelectBitmap(HDC, HGDIOBJ)` — the `SelectObject` arm for bitmaps
+/// (`gdi32!SelectObject` routes a `0x09`-typed handle here).
+const NT_GDI_SELECT_BITMAP: u32 = 0x126b;
+/// `NtGdiGetDeviceCaps(HDC, INT index)`.
+const NT_GDI_GET_DEVICE_CAPS: u32 = 0x11f4;
+/// `NtGdiCreateDIBSection(HDC, HANDLE section, DWORD offset,
+/// const BITMAPINFO *bmi, UINT usage, UINT header_size, ULONG flags,
+/// ULONG_PTR color_space, void **bits)` — a bitmap whose pixels the **caller**
+/// can address. Note the two facts that matter and that a guess gets wrong:
+/// `bmi` is **arg3** and the `void **bits` out-parameter is **arg8**.
+const NT_GDI_CREATE_DIB_SECTION: u32 = 0x10b0;
+/// `NtGdiExtGetObjectW(HGDIOBJ, INT count, void *buffer)` — `GetObjectW`.
+const NT_GDI_EXT_GET_OBJECT_W: u32 = 0x11c7;
+
+// --- `BITMAPINFOHEADER`, documented layout (all fixed-width, so identical on
+//     32- and 64-bit). Only the geometry is read.
+const BIH_WIDTH: u64 = 0x04;
+const BIH_HEIGHT: u64 = 0x08;
+const BIH_PLANES: u64 = 0x0c;
+const BIH_BIT_COUNT: u64 = 0x0e;
+
+// --- `BITMAP`, what `GetObjectW` fills for an `HBITMAP` (documented layout; on
+//     64-bit `bmBits` is 8-aligned, which makes the struct 0x20 bytes).
+const BITMAP_TYPE: u64 = 0x00;
+const BITMAP_WIDTH: u64 = 0x04;
+const BITMAP_HEIGHT: u64 = 0x08;
+const BITMAP_WIDTH_BYTES: u64 = 0x0c;
+const BITMAP_PLANES: u64 = 0x10;
+const BITMAP_BITS_PIXEL: u64 = 0x12;
+const BITMAP_BITS: u64 = 0x18;
+/// `sizeof(BITMAP)` on the 64-bit guest this runs.
+const BITMAP_SIZE: u32 = 0x20;
+
+/// The bit depth every exemu surface and compatible bitmap is: BGRA32, the one
+/// format the presenter and every GDI primitive here already speak.
+const SURFACE_BPP: u32 = 32;
+
+// --- W6.2: icon and cursor objects, which exemu had none of -----------------
+//
+// The whole file dialog hangs off these. `shell32!SIC_Initialize` loads
+// `IDI_SHELL_FILE` before it can populate the system image list;
+// `user32!CURSORICON_Load` finds and picks the resource entry correctly and then
+// calls `create_cursoricon_object`, which **allocates the object first** —
+// `NtUserCallOneParam(is_icon, NtUserCallOneParam_CreateCursorIcon)` — and gives
+// up returning 0 the moment that answers 0. Unserviced, it always did, which is
+// why the trace showed `CURSORICON_Load` failing with no further syscall issued.
+//
+/// `NtUserCallOneParam_CreateCursorIcon`, the multiplexed allocator. **Recovered
+/// from the pinned `user32.dll`'s own DWARF**, which names the whole enumeration
+/// (`…_CreateCursorIcon = 0`, `…_GetSysColor = 6`, `…_GetSysColorBrush = 7`,
+/// `…_GetSystemMetrics = 9`) — the last three of which are the values exemu had
+/// already recovered by other means, so the numbering is cross-checked rather
+/// than taken on faith.
+const CALL_ONE_CREATE_CURSOR_ICON: u64 = 0x00;
+/// `NtUserSetCursorIconData(HCURSOR, UNICODE_STRING *module,
+/// UNICODE_STRING *res_name, struct cursoricon_desc *desc)`.
+const NT_USER_SET_CURSOR_ICON_DATA: u32 = 0x1548;
+/// `NtUserGetIconInfo(HICON, ICONINFO *, UNICODE_STRING *module,
+/// UNICODE_STRING *res_name, DWORD *bpp, LONG unused)`.
+const NT_USER_GET_ICON_INFO: u32 = 0x1403;
+/// `NtUserGetIconSize(HICON, UINT step, LONG *width, LONG *height)`.
+const NT_USER_GET_ICON_SIZE: u32 = 0x1404;
+/// `NtUserFindExistingCursorIcon(UNICODE_STRING *module,
+/// UNICODE_STRING *res_name, void *desc)` — the shared-icon cache lookup.
+const NT_USER_FIND_EXISTING_CURSOR_ICON: u32 = 0x13c5;
+/// `NtUserDestroyCursor(HCURSOR, ULONG flags)`.
+const NT_USER_DESTROY_CURSOR: u32 = 0x137f;
+
+// --- `struct cursoricon_desc` and `struct cursoricon_frame`, the private
+//     user32→win32k blocks `NtUserSetCursorIconData` carries. **Both layouts are
+//     read out of the pinned `user32.dll`'s DWARF**, where they are declared in
+//     full — not reconstructed from a call site, and not remembered.
+const DESC_NUM_FRAMES: u64 = 0x08;
+const DESC_FRAMES: u64 = 0x10;
+const FRAME_WIDTH: u64 = 0x00;
+const FRAME_HEIGHT: u64 = 0x04;
+const FRAME_COLOR: u64 = 0x08;
+const FRAME_ALPHA: u64 = 0x10;
+const FRAME_MASK: u64 = 0x18;
+const FRAME_HOTSPOT_X: u64 = 0x20;
+const FRAME_HOTSPOT_Y: u64 = 0x24;
+// (`sizeof(struct cursoricon_frame)` is 0x28 — the stride of `desc->frames`.
+//  exemu reads frame 0 only, so it never walks the array; the size is recorded
+//  here for whoever adds animated cursors.)
+
+// --- `ICONINFO`, the documented public struct `GetIconInfo` fills. Confirmed
+//     against the same DWARF (`struct _ICONINFO`, 0x20 bytes on 64-bit).
+const ICONINFO_F_ICON: u64 = 0x00;
+const ICONINFO_X_HOTSPOT: u64 = 0x04;
+const ICONINFO_Y_HOTSPOT: u64 = 0x08;
+const ICONINFO_HBM_MASK: u64 = 0x10;
+const ICONINFO_HBM_COLOR: u64 = 0x18;
+
+/// The `GetDeviceCaps` indices exemu answers (documented `wingdi.h` values).
+mod dev_caps {
+    /// `TECHNOLOGY`.
+    pub const TECHNOLOGY: u64 = 2;
+    /// `HORZRES` / `VERTRES` — the display surface in pixels.
+    pub const HORZRES: u64 = 8;
+    pub const VERTRES: u64 = 10;
+    /// `BITSPIXEL` — colour bits per pixel.
+    pub const BITSPIXEL: u64 = 12;
+    /// `PLANES`.
+    pub const PLANES: u64 = 14;
+    /// `NUMCOLORS` — −1 for a device with more colours than a palette holds.
+    pub const NUMCOLORS: u64 = 24;
+    /// `LOGPIXELSX` / `LOGPIXELSY` — the DPI the process was told it runs at.
+    pub const LOGPIXELSX: u64 = 88;
+    pub const LOGPIXELSY: u64 = 90;
+    /// `DT_RASDISPLAY`, the answer to `TECHNOLOGY`.
+    pub const DT_RASDISPLAY: u32 = 1;
+}
+
 // --- W6.2: two USER primitives that were answering nothing ------------------
 /// `NtUserSetProp(hwnd, str, handle)` — `user32!SetPropW` is a bare tail-jump
 /// into it (@ RVA 0x46c30), so its arguments arrive untouched.
@@ -615,6 +746,10 @@ mod call_hwnd_param {
 
 /// `NtUserCallOneParam(arg, code)` selectors.
 mod call_one_param {
+    /// `CreateCursorIcon` — `arg` is the `is_icon` flag. See
+    /// [`super::CALL_ONE_CREATE_CURSOR_ICON`] for how the numbering is
+    /// recovered.
+    pub const CREATE_CURSOR_ICON: u64 = super::CALL_ONE_CREATE_CURSOR_ICON;
     /// `GetSysColor` — `arg` is the `COLOR_*` index.
     pub const GET_SYS_COLOR: u64 = 0x06;
     /// `GetSysColorBrush` — `arg` is the `COLOR_*` index.
@@ -985,6 +1120,61 @@ struct Surface {
     h: u32,
 }
 
+/// A GDI **bitmap** object (roadmap W6.2) — the off-screen pixel store an icon
+/// frame, an image list or any double-buffered control draws into.
+///
+/// Every bitmap gets a **real guest-mapped store** at the depth it asked for,
+/// with the DWORD-aligned row stride every DIB uses, because the caller may
+/// address those pixels itself: `CreateDIBSection` hands the pointer straight
+/// back, and `CreateBitmap`'s optional `bits` argument seeds them. A 32-bpp
+/// top-down bitmap's store is laid out **exactly** like a window [`Surface`],
+/// which is what lets it be selected into a memory DC and drawn into by the
+/// primitives already written against a surface, unchanged.
+#[derive(Clone, Copy)]
+struct Bitmap {
+    w: i32,
+    /// Height in rows, always positive — a DIB's negative `biHeight` is recorded
+    /// in `top_down` instead, which is what it actually means.
+    h: i32,
+    planes: u32,
+    bpp: u32,
+    /// Guest address of the first row, or 0 when no store could be mapped.
+    bits: u64,
+    /// Row stride in bytes, DWORD-aligned.
+    stride: u32,
+    /// True when row 0 is the **top** row — how exemu's surfaces and a
+    /// negative-height DIB are laid out. A bottom-up bitmap still gets a real,
+    /// addressable store; what exemu declines is to *render* into one with its
+    /// own top-down primitives rather than draw it upside down.
+    top_down: bool,
+}
+
+/// An icon or cursor object (roadmap W6.2) — a **USER** object, not a GDI one,
+/// which is why it lives in its own table with its own handle space.
+///
+/// `user32!create_cursoricon_object` allocates it empty first
+/// ([`CALL_ONE_CREATE_CURSOR_ICON`]) and only then describes it with
+/// `NtUserSetCursorIconData`, so an object exists between those two calls with
+/// nothing in it — hence every field but `is_icon` starting at 0.
+#[derive(Clone, Copy, Default)]
+struct IconObject {
+    /// `TRUE` for an icon, `FALSE` for a cursor. The one thing the allocator is
+    /// told, and what `GetIconInfo` reports back as `fIcon`.
+    is_icon: bool,
+    /// The first frame's extent in pixels. A static icon has exactly one frame;
+    /// an animated cursor has several and exemu keeps the first, which is what
+    /// every non-animating caller draws.
+    width: i32,
+    height: i32,
+    /// The frame's hotspot. Meaningful for a cursor; `user32` sets it to the
+    /// half-extent for an icon.
+    hotspot: (i32, i32),
+    /// The frame's colour, alpha and mask `HBITMAP`s, as the caller built them.
+    color: u32,
+    alpha: u32,
+    mask: u32,
+}
+
 /// A device context bound to a window (W4.3 / W4.8). Every HDC handed back by
 /// GetDC/GetDCEx/BeginPaint records the hwnd it draws into so the NtGdi paint
 /// handlers can resolve `hdc → hwnd → surface`.
@@ -1018,6 +1208,13 @@ struct Dc {
     /// nothing outside it is drawn. For a top-level window this is the whole
     /// client area; for a child it is its rect clipped by every ancestor.
     clip: [i32; 4],
+    /// The bitmap selected into this DC, for a **memory DC** (roadmap W6.2), or
+    /// 0. A window DC never has one. A fresh memory DC starts on Windows'
+    /// 1×1 monochrome stock bitmap, which nothing can usefully draw into, so
+    /// exemu starts it on nothing and treats drawing as a no-op until a real
+    /// bitmap is selected — the same "visibly does nothing" choice `brush`
+    /// makes above, and for the same reason.
+    bitmap: u32,
 }
 
 /// win32k unix-backend state (roadmap W4.1/W4.2): the client PFN table, the
@@ -1053,6 +1250,10 @@ pub(crate) struct Win32kState {
     /// GDI object the recovered paint paths actually consume: `FillRect` selects
     /// one and `PatBlt`s `PATCOPY` with it.
     brushes: Vec<(u32, u32)>,
+    /// Live bitmaps, `handle → `[`Bitmap`] (roadmap W6.2).
+    bitmaps: Vec<(u32, Bitmap)>,
+    /// Live icon/cursor objects, `HICON → `[`IconObject`] (roadmap W6.2).
+    icons: Vec<(u32, IconObject)>,
     /// `GetSysColorBrush` cache, `COLOR_* index → handle`. Windows hands back the
     /// *same* handle for a given index every time (the caller must not delete
     /// it), so this both matches the contract and stops a repainting control
@@ -1238,6 +1439,12 @@ impl Win32kState {
         self.dcs.iter().find(|(h, _)| *h == hdc).map(|(_, d)| d)
     }
 
+    /// The [`Bitmap`] behind an `HBITMAP`, or `None` when the handle was never
+    /// minted here (roadmap W6.2).
+    fn bitmap(&self, handle: u32) -> Option<Bitmap> {
+        self.bitmaps.iter().find(|(h, _)| *h == handle).map(|(_, b)| *b)
+    }
+
     /// Does `hwnd`'s client rect contain the surface-space point `(x, y)`?
     fn contains_point(&self, hwnd: u32, x: i32, y: i32) -> bool {
         let (ox, oy) = self.client_origin(hwnd);
@@ -1380,6 +1587,23 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_SET_PROP, nt_user_set_prop);
     os.set_win32k_handler(NT_USER_GET_PROP, nt_user_get_prop);
     os.set_win32k_handler(NT_USER_REMOVE_PROP, nt_user_remove_prop);
+    // W6.2 — the GDI bitmap object model. Landed one handler at a time, with
+    // `exemu corpus --only "wine wow64"` (a 0.3 s row, and the one that
+    // notices) run after each; every one of these is inert on both pins.
+    os.set_win32k_handler(NT_GDI_GET_DEVICE_CAPS, nt_gdi_get_device_caps);
+    os.set_win32k_handler(NT_GDI_CREATE_COMPATIBLE_DC, nt_gdi_create_compatible_dc);
+    os.set_win32k_handler(NT_GDI_CREATE_BITMAP, nt_gdi_create_bitmap);
+    os.set_win32k_handler(NT_GDI_CREATE_COMPATIBLE_BITMAP, nt_gdi_create_compatible_bitmap);
+    os.set_win32k_handler(NT_GDI_SELECT_BITMAP, nt_gdi_select_bitmap);
+    os.set_win32k_handler(NT_GDI_CREATE_DIB_SECTION, nt_gdi_create_dib_section);
+    os.set_win32k_handler(NT_GDI_EXT_GET_OBJECT_W, nt_gdi_ext_get_object_w);
+    // W6.2 — icon/cursor objects. `NtUserCallOneParam`'s CreateCursorIcon arm
+    // is the allocator; see [`create_cursor_icon`].
+    os.set_win32k_handler(NT_USER_SET_CURSOR_ICON_DATA, nt_user_set_cursor_icon_data);
+    os.set_win32k_handler(NT_USER_GET_ICON_INFO, nt_user_get_icon_info);
+    os.set_win32k_handler(NT_USER_GET_ICON_SIZE, nt_user_get_icon_size);
+    os.set_win32k_handler(NT_USER_FIND_EXISTING_CURSOR_ICON, nt_user_find_existing_cursor_icon);
+    os.set_win32k_handler(NT_USER_DESTROY_CURSOR, nt_user_destroy_cursor);
 }
 
 /// Allocate a fresh nonzero handle (HWND/HDC) from the shared handle space. The
@@ -2514,6 +2738,7 @@ fn nt_user_call_one_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memo
     let arg = os.syscall_arg(cpu, mem, 0)?;
     let code = os.syscall_arg(cpu, mem, 1)?;
     match code {
+        call_one_param::CREATE_CURSOR_ICON => Ok(create_cursor_icon(os, arg != 0)),
         call_one_param::GET_SYS_COLOR => Ok(sys_color(arg as u32)),
         call_one_param::GET_SYS_COLOR_BRUSH => {
             // A stock system brush: a real GDI handle carrying the colour, so a
@@ -2723,7 +2948,7 @@ fn alloc_dc(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<u32> {
     // asking where its DC sits therefore gets its real offset in the parent.
     mem.write_u32(obj + DC_ATTR_ORG_X, org.0 as u32)?;
     mem.write_u32(obj + DC_ATTR_ORG_Y, org.1 as u32)?;
-    os.win32k_state.dcs.push((hdc, Dc { hwnd, brush: 0, org, clip }));
+    os.win32k_state.dcs.push((hdc, Dc { hwnd, brush: 0, org, clip, bitmap: 0 }));
     Ok(hdc)
 }
 
@@ -3668,6 +3893,19 @@ impl DcTarget {
 fn dc_surface(os: &WinOs, hdc: u32) -> Option<DcTarget> {
     let dc = os.win32k_state.dc(hdc)?;
     let (org, clip) = (dc.org, dc.clip);
+    // A **memory DC** (roadmap W6.2) has no window: its surface is whatever
+    // bitmap is selected into it. A top-down 32-bpp bitmap's store is laid out
+    // exactly like a window surface, so every primitive below works on it
+    // unchanged; any other shape has no top-down BGRA32 interpretation and
+    // draws nothing rather than drawing it wrong.
+    if dc.hwnd == 0 {
+        let b = os.win32k_state.bitmap(dc.bitmap)?;
+        if !b.top_down || b.bpp != SURFACE_BPP || b.stride != b.w.max(0) as u32 * 4 {
+            return None;
+        }
+        let surface = Surface { base: b.bits, w: b.w.max(0) as u32, h: b.h.max(0) as u32 };
+        return Some(DcTarget { surface, org: (0, 0), clip: [0, 0, b.w, b.h] });
+    }
     let owner = os.win32k_state.surface_owner(dc.hwnd);
     let surface = os.win32k_state.window(owner)?.surface?;
     Some(DcTarget { surface, org, clip })
@@ -4118,6 +4356,411 @@ fn nt_gdi_select_font(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) 
     Ok(os.syscall_arg(cpu, mem, 1)? as u32)
 }
 
+// ============ W6.2: memory DCs, bitmaps and the display's properties =========
+
+/// Mint a [`Bitmap`] of `w`×`h` at `planes`×`bpp`, map its guest-visible store
+/// and register it. Returns 0 when the handle table or the address space is
+/// exhausted, which is `CreateBitmap`'s own failure value.
+///
+/// The store is the DWORD-aligned DIB layout at the depth actually asked for, so
+/// a caller that writes its own pixels through the pointer lays them out exactly
+/// where exemu says they are — that agreement is the whole contract of
+/// `CreateDIBSection`, and of `CreateBitmap`'s `bits` argument.
+fn alloc_bitmap(
+    os: &mut WinOs,
+    mem: &mut dyn Memory,
+    w: i32,
+    h: i32,
+    planes: u32,
+    bpp: u32,
+    top_down: bool,
+) -> Result<u32> {
+    let (planes, bpp) = (planes.max(1), bpp);
+    let rows = h.unsigned_abs() as u64;
+    let stride = (w.max(0) as u64 * bpp as u64 * planes as u64).div_ceil(32) * 4;
+    if w <= 0 || rows == 0 || stride == 0 {
+        return Ok(0);
+    }
+    let Some((handle, _)) = alloc_gdi_object(os, mem, gdi_type::BITMAP)? else {
+        return Ok(0);
+    };
+    let Some(bits) = os.map_anywhere(mem, stride * rows, Perm::RW, "gdi-bitmap") else {
+        return Ok(0);
+    };
+    let bmp = Bitmap { w, h: rows as i32, planes, bpp, bits, stride: stride as u32, top_down };
+    os.win32k_state.bitmaps.push((handle, bmp));
+    Ok(handle)
+}
+
+/// `NtGdiCreateCompatibleDC(hdc)` → a **memory DC** (roadmap W6.2).
+///
+/// A memory DC is a device context with no window behind it: whatever bitmap is
+/// selected into it *is* its surface. `user32!create_icon_frame` takes one
+/// before it builds an icon's colour and mask bitmaps, and
+/// `comctl32!ImageList_Create` takes two (image and mask) and returns **NULL**
+/// if either fails — which is how comdlg32's file dialog came to dereference a
+/// null `HIMAGELIST`.
+///
+/// The `hdc` argument names the device to be compatible with and is ignored:
+/// exemu has one device, BGRA32 at [`SURFACE_BPP`] bits.
+fn nt_gdi_create_compatible_dc(
+    os: &mut WinOs,
+    _cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    alloc_memory_dc(os, mem)
+}
+
+/// Allocate a window-less DC object — the shared body of
+/// [`nt_gdi_create_compatible_dc`].
+fn alloc_memory_dc(os: &mut WinOs, mem: &mut dyn Memory) -> Result<u32> {
+    let Some((hdc, obj)) = alloc_gdi_object(os, mem, gdi_type::DC)? else {
+        return Ok(0);
+    };
+    mem.write_u32(obj + DC_ATTR_ORG_X, 0)?;
+    mem.write_u32(obj + DC_ATTR_ORG_Y, 0)?;
+    let dc = Dc { hwnd: 0, brush: 0, org: (0, 0), clip: [0, 0, 0, 0], bitmap: 0 };
+    os.win32k_state.dcs.push((hdc, dc));
+    Ok(hdc)
+}
+
+/// `NtGdiCreateBitmap(width, height, planes, bpp, bits)` → an `HBITMAP`.
+///
+/// The optional `bits` argument seeds the pixels, in the caller's own DIB
+/// layout — which is the layout [`alloc_bitmap`] mapped, so the copy is byte for
+/// byte. `user32!create_icon_frame` builds an icon's **1-bpp mask** exactly this
+/// way, straight out of the resource.
+fn nt_gdi_create_bitmap(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let w = os.syscall_arg_u32(cpu, mem, 0)? as i32;
+    let h = os.syscall_arg_u32(cpu, mem, 1)? as i32;
+    let planes = os.syscall_arg_u32(cpu, mem, 2)?;
+    let bpp = os.syscall_arg_u32(cpu, mem, 3)?;
+    let src = os.syscall_arg(cpu, mem, 4)?;
+    let handle = alloc_bitmap(os, mem, w, h, planes, bpp, true)?;
+    if handle == 0 {
+        return Ok(0);
+    }
+    if src != 0 {
+        let bmp = os.win32k_state.bitmap(handle).expect("just registered");
+        let mut buf = vec![0u8; bmp.stride as usize * bmp.h as usize];
+        mem.read(src, &mut buf)?;
+        mem.write(bmp.bits, &buf)?;
+    }
+    Ok(handle)
+}
+
+/// `NtGdiCreateCompatibleBitmap(hdc, width, height)` → an `HBITMAP` of the
+/// device's own depth, which for exemu is always [`SURFACE_BPP`].
+fn nt_gdi_create_compatible_bitmap(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let w = os.syscall_arg_u32(cpu, mem, 1)? as i32;
+    let h = os.syscall_arg_u32(cpu, mem, 2)? as i32;
+    alloc_bitmap(os, mem, w, h, 1, SURFACE_BPP, true)
+}
+
+/// `NtGdiCreateDIBSection(hdc, section, offset, bmi, usage, header_size, flags,
+/// color_space, bits)` → an `HBITMAP` whose pixels the caller can address, with
+/// that address written back through the `bits` out-parameter (roadmap W6.2).
+///
+/// **`bmi` is argument 3 and `bits` is argument 8** — recovered from the pinned
+/// `gdi32.dll`'s own DWARF declaration of `NtGdiCreateDIBSection`, and confirmed
+/// against `gdi32!CreateDIBSection` (@ RVA 0x122d0), which moves its `rdx` (the
+/// `BITMAPINFO*`) into `r9` = arg3, its `r8d` (`usage`) into `[rsp+0x20]` =
+/// arg4, and its `r9` (the `void **bits`) into `[rsp+0x40]` = arg8.
+///
+/// A negative `biHeight` is the documented top-down form. exemu maps a store of
+/// the right stride and size either way; what it declines is to render into a
+/// bottom-up one with its own top-down primitives.
+fn nt_gdi_create_dib_section(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let bmi = os.syscall_arg(cpu, mem, 3)?;
+    let out_bits = os.syscall_arg(cpu, mem, 8)?;
+    if bmi == 0 {
+        return Ok(0);
+    }
+    let w = mem.read_u32(bmi + BIH_WIDTH)? as i32;
+    let h = mem.read_u32(bmi + BIH_HEIGHT)? as i32;
+    let planes = mem.read_u16(bmi + BIH_PLANES)? as u32;
+    let bpp = mem.read_u16(bmi + BIH_BIT_COUNT)? as u32;
+    let handle = alloc_bitmap(os, mem, w, h, planes, bpp, h < 0)?;
+    if handle == 0 {
+        return Ok(0);
+    }
+    // A DIB section whose pixels the caller cannot reach is not a DIB section;
+    // failing here is more honest than handing back a handle with no address.
+    let bits = os.win32k_state.bitmap(handle).map_or(0, |b| b.bits);
+    if bits == 0 {
+        return Ok(0);
+    }
+    if out_bits != 0 {
+        mem.write_u64(out_bits, bits)?;
+    }
+    Ok(handle)
+}
+
+/// `NtGdiSelectBitmap(hdc, hbitmap)` → the bitmap that was selected before.
+/// Only a memory DC ever consults its selection; selecting into a window DC is
+/// accepted, recorded, and simply never read.
+fn nt_gdi_select_bitmap(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
+    let hbm = os.syscall_arg(cpu, mem, 1)? as u32;
+    if os.win32k_state.bitmap(hbm).is_none() {
+        return Ok(0);
+    }
+    // A DC that does not exist cannot hold a selection; 0 is `SelectObject`'s
+    // own failure value.
+    Ok(os
+        .win32k_state
+        .dcs
+        .iter_mut()
+        .find(|(h, _)| *h == hdc)
+        .map(|(_, dc)| std::mem::replace(&mut dc.bitmap, hbm))
+        .unwrap_or(0))
+}
+
+/// `NtGdiGetDeviceCaps(hdc, index)` — the display's properties.
+///
+/// Every answer is a real property of exemu's one device (a BGRA32 raster
+/// display at the process's configured DPI), from the same place the rest of
+/// win32k decides it, so a caller that sizes a bitmap or picks an icon depth
+/// from these gets something it can actually draw into. An index exemu does not
+/// model answers 0, which is what `GetDeviceCaps` returns for an unsupported
+/// capability.
+fn nt_gdi_get_device_caps(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let index = os.syscall_arg(cpu, mem, 1)?;
+    Ok(match index {
+        dev_caps::TECHNOLOGY => dev_caps::DT_RASDISPLAY,
+        // The same numbers `GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)` reports,
+        // read from the one function that decides them.
+        dev_caps::HORZRES => system_metric(0),
+        dev_caps::VERTRES => system_metric(1),
+        dev_caps::BITSPIXEL => SURFACE_BPP,
+        dev_caps::PLANES => 1,
+        // −1: "more colours than a palette can hold", the documented answer for
+        // a direct-colour device.
+        dev_caps::NUMCOLORS => u32::MAX,
+        dev_caps::LOGPIXELSX | dev_caps::LOGPIXELSY => os.cfg.dpi,
+        _ => 0,
+    })
+}
+
+/// `NtGdiExtGetObjectW(handle, count, buffer)` → `GetObjectW`.
+///
+/// Only bitmaps carry a description here. Every other object type answers 0,
+/// which is what `GetObjectW` returns for a handle it cannot describe — and in
+/// particular **fonts deliberately still answer 0**: exemu mints no `HFONT`, so
+/// describing one would be inventing a font that does not exist.
+///
+/// **Why a bitmap must answer.** `user32!create_alpha_bitmap` calls
+/// `GetObjectW(hbitmap, sizeof(BITMAP), &bm)` on the colour bitmap of every icon
+/// frame and reads its width, height and depth back out; with 0 it abandons the
+/// frame. The numbers here are the ones [`alloc_bitmap`] really used, so the
+/// guest's view and exemu's cannot drift.
+fn nt_gdi_ext_get_object_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let handle = os.syscall_arg(cpu, mem, 0)? as u32;
+    let count = os.syscall_arg_u32(cpu, mem, 1)?;
+    let buffer = os.syscall_arg(cpu, mem, 2)?;
+    let Some(b) = os.win32k_state.bitmap(handle) else { return Ok(0) };
+
+    // A NULL buffer (or a zero count) is the documented "how big is it" query.
+    if buffer == 0 || count == 0 {
+        return Ok(BITMAP_SIZE);
+    }
+    if count < BITMAP_SIZE {
+        return Ok(0);
+    }
+    mem.write_u32(buffer + BITMAP_TYPE, 0)?;
+    mem.write_u32(buffer + BITMAP_WIDTH, b.w as u32)?;
+    mem.write_u32(buffer + BITMAP_HEIGHT, b.h as u32)?;
+    mem.write_u32(buffer + BITMAP_WIDTH_BYTES, b.stride)?;
+    mem.write_u16(buffer + BITMAP_PLANES, b.planes as u16)?;
+    mem.write_u16(buffer + BITMAP_BITS_PIXEL, b.bpp as u16)?;
+    mem.write_u64(buffer + BITMAP_BITS, b.bits)?;
+    Ok(BITMAP_SIZE)
+}
+
+// ==================== W6.2: icon and cursor objects ==========================
+
+/// `NtUserCallOneParam(is_icon, NtUserCallOneParam_CreateCursorIcon)` → a fresh,
+/// **empty** icon/cursor object (roadmap W6.2).
+///
+/// This is the allocation `user32!create_cursoricon_object` (@ RVA 0x58f90) does
+/// *before* anything else, and gives up on immediately if it answers 0:
+///
+/// ```text
+///   movsxd rcx, edx                  ; param = is_icon
+///   xor    edx, edx                  ; code  = NtUserCallOneParam_CreateCursorIcon
+///   call   NtUserCallOneParam
+///   mov    rbp, rax
+///   je     <return NULL>
+/// ```
+///
+/// Unserviced it always answered 0, so **every** `LoadIcon`/`LoadCursor`/
+/// `CreateIconFromResourceEx` in the process failed — including
+/// `shell32!SIC_Initialize`'s `IDI_SHELL_FILE`, whose failure is what left
+/// comdlg32's file dialog without a system image list.
+fn create_cursor_icon(os: &mut WinOs, is_icon: bool) -> u32 {
+    let handle = alloc_handle(os);
+    os.win32k_state.icons.push((handle, IconObject { is_icon, ..IconObject::default() }));
+    handle
+}
+
+/// `NtUserSetCursorIconData(hicon, module, res_name, desc)` → TRUE.
+///
+/// The second half of an icon's construction: user32 has built the frame's
+/// bitmaps and now hands the kernel side the `struct cursoricon_desc` describing
+/// them. exemu records the **first** frame — a static icon has exactly one, and
+/// an animated cursor's first frame is what a non-animating caller draws.
+///
+/// `module` and `res_name` name where the icon came from, for the shared-icon
+/// cache; exemu keeps no cache (see [`nt_user_find_existing_cursor_icon`]) and
+/// so ignores them.
+fn nt_user_set_cursor_icon_data(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let hicon = os.syscall_arg(cpu, mem, 0)? as u32;
+    let desc = os.syscall_arg(cpu, mem, 3)?;
+    if desc == 0 || !os.win32k_state.icons.iter().any(|(h, _)| *h == hicon) {
+        return Ok(0);
+    }
+    let frames = mem.read_u64(desc + DESC_FRAMES)?;
+    if frames == 0 || mem.read_u32(desc + DESC_NUM_FRAMES)? == 0 {
+        return Ok(0);
+    }
+    let f = frames; // frame 0 — see the doc comment above.
+    let (w, h) = (mem.read_u32(f + FRAME_WIDTH)? as i32, mem.read_u32(f + FRAME_HEIGHT)? as i32);
+    let color = mem.read_u64(f + FRAME_COLOR)? as u32;
+    let alpha = mem.read_u64(f + FRAME_ALPHA)? as u32;
+    let mask = mem.read_u64(f + FRAME_MASK)? as u32;
+    let hotspot =
+        (mem.read_u32(f + FRAME_HOTSPOT_X)? as i32, mem.read_u32(f + FRAME_HOTSPOT_Y)? as i32);
+
+    if let Some((_, icon)) = os.win32k_state.icons.iter_mut().find(|(h, _)| *h == hicon) {
+        icon.width = w;
+        icon.height = h;
+        icon.hotspot = hotspot;
+        icon.color = color;
+        icon.alpha = alpha;
+        icon.mask = mask;
+    }
+    Ok(1)
+}
+
+/// `NtUserFindExistingCursorIcon(module, res_name, desc)` → the cached shared
+/// icon for that resource, or 0.
+///
+/// **exemu keeps no shared-icon cache, and 0 is the whole correct answer**: it
+/// means "not cached", and the caller then loads the resource and builds the
+/// object itself. Serviced explicitly rather than left to the blanket stub so
+/// the `EXEMU_W32K_TRACE` `<UNSERVICED>` marker keeps meaning "nobody has
+/// thought about this index" — and so nobody is tempted to answer it with a
+/// fabricated handle again: a throwaway probe that did exactly that ran 7.5M
+/// instructions further and then died on the handle it had invented.
+fn nt_user_find_existing_cursor_icon(
+    _os: &mut WinOs,
+    _cpu: &mut CpuState,
+    _mem: &mut dyn Memory,
+) -> Result<u32> {
+    Ok(0)
+}
+
+/// Duplicate an `HBITMAP` — a new object with its own store, pixel for pixel.
+/// Returns 0 for a handle that is not a live bitmap (including 0 itself, which
+/// an icon with no alpha or no colour plane legitimately carries).
+fn copy_bitmap(os: &mut WinOs, mem: &mut dyn Memory, src: u32) -> Result<u32> {
+    let Some(b) = os.win32k_state.bitmap(src) else { return Ok(0) };
+    let dst = alloc_bitmap(os, mem, b.w, b.h, b.planes, b.bpp, b.top_down)?;
+    if dst == 0 {
+        return Ok(0);
+    }
+    let bits = os.win32k_state.bitmap(dst).map_or(0, |d| d.bits);
+    let mut buf = vec![0u8; b.stride as usize * b.h.max(0) as usize];
+    mem.read(b.bits, &mut buf)?;
+    mem.write(bits, &buf)?;
+    Ok(dst)
+}
+
+/// `NtUserGetIconInfo(hicon, ICONINFO *info, module, res_name, bpp, unused)`
+/// → TRUE, with `info` filled.
+///
+/// **The bitmaps handed back are copies.** `GetIconInfo`'s documented contract
+/// is that the caller owns and deletes `hbmMask`/`hbmColor`, and
+/// `comctl32!ImageList_ReplaceIcon` does exactly that — so returning the icon's
+/// own bitmaps would let the first image list built from an icon destroy it for
+/// everyone else.
+fn nt_user_get_icon_info(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hicon = os.syscall_arg(cpu, mem, 0)? as u32;
+    let info = os.syscall_arg(cpu, mem, 1)?;
+    let bpp_out = os.syscall_arg(cpu, mem, 4)?;
+    let Some(icon) = os.win32k_state.icons.iter().find(|(h, _)| *h == hicon).map(|(_, i)| *i)
+    else {
+        return Ok(0);
+    };
+    if info == 0 {
+        return Ok(0);
+    }
+    let mask = copy_bitmap(os, mem, icon.mask)?;
+    let color = copy_bitmap(os, mem, icon.color)?;
+    mem.write_u32(info + ICONINFO_F_ICON, u32::from(icon.is_icon))?;
+    mem.write_u32(info + ICONINFO_X_HOTSPOT, icon.hotspot.0 as u32)?;
+    mem.write_u32(info + ICONINFO_Y_HOTSPOT, icon.hotspot.1 as u32)?;
+    mem.write_u64(info + ICONINFO_HBM_MASK, mask as u64)?;
+    mem.write_u64(info + ICONINFO_HBM_COLOR, color as u64)?;
+    if bpp_out != 0 {
+        let bpp = os.win32k_state.bitmap(icon.color).map_or(0, |b| b.bpp);
+        mem.write_u32(bpp_out, bpp)?;
+    }
+    Ok(1)
+}
+
+/// `NtUserGetIconSize(hicon, step, LONG *width, LONG *height)` → TRUE.
+///
+/// **`height` is the icon's height doubled**, and that is not a mistake — it is
+/// the mask-bitmap convention this syscall reports in, read straight out of its
+/// only caller: `user32!get_icon_size` (@ RVA 0x607a0) calls it with
+/// `(hicon, 0, &size->cx, &size->cy)` and then **halves `cy`** (`shr edx,31;
+/// add edx,ecx; sar edx,1`) before returning. Reporting the plain height here
+/// would silently give every caller a half-height icon.
+fn nt_user_get_icon_size(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hicon = os.syscall_arg(cpu, mem, 0)? as u32;
+    let out_w = os.syscall_arg(cpu, mem, 2)?;
+    let out_h = os.syscall_arg(cpu, mem, 3)?;
+    let Some(icon) = os.win32k_state.icons.iter().find(|(h, _)| *h == hicon).map(|(_, i)| *i)
+    else {
+        return Ok(0);
+    };
+    if out_w != 0 {
+        mem.write_u32(out_w, icon.width as u32)?;
+    }
+    if out_h != 0 {
+        mem.write_u32(out_h, icon.height.saturating_mul(2) as u32)?;
+    }
+    Ok(1)
+}
+
+/// `NtUserDestroyCursor(hicon, flags)` → TRUE. Drops the object; the bitmaps it
+/// referenced belong to it and go with it.
+fn nt_user_destroy_cursor(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hicon = os.syscall_arg(cpu, mem, 0)? as u32;
+    let Some(icon) = os.win32k_state.icons.iter().find(|(h, _)| *h == hicon).map(|(_, i)| *i)
+    else {
+        return Ok(0);
+    };
+    os.win32k_state.icons.retain(|(h, _)| *h != hicon);
+    for bm in [icon.color, icon.alpha, icon.mask] {
+        os.win32k_state.bitmaps.retain(|(h, _)| *h != bm);
+    }
+    Ok(1)
+}
+
 /// `NtGdiGetTextMetricsW(hdc, TEXTMETRICW*, flags)` — fill the caller's metrics
 /// from the stand-in font cell.
 ///
@@ -4234,6 +4877,7 @@ fn nt_gdi_delete_object_app(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     }
     os.win32k_state.brushes.retain(|(h, _)| *h != handle);
     os.win32k_state.dcs.retain(|(h, _)| *h != handle);
+    os.win32k_state.bitmaps.retain(|(h, _)| *h != handle);
     Ok(1)
 }
 
@@ -4418,6 +5062,234 @@ mod tests {
         // The control: an index exemu does not model still answers 0 rather
         // than a fabricated size, so this is not a blanket "return something".
         assert_eq!(system_metric(0x0fff), 0, "an unmodelled metric stays honestly 0");
+    }
+
+    // ---- W6.2: the GDI bitmap object model and icon/cursor objects ---------
+
+    /// A `WinOs` whose GDI handle table can be published: `ensure_gdi_table`
+    /// needs a mapped PEB to write the table pointer into, and every bitmap
+    /// store comes out of `map_anywhere`.
+    fn os_with_gdi() -> (WinOs, VirtualMemory) {
+        const PEB: u64 = 0x7F00_0000;
+        let mut os =
+            WinOs::new(crate::WinConfig { is_64bit: true, peb_addr: PEB, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("peb", PEB, 0x1000, Perm::RW)).unwrap();
+        mem.map(Region::new("scratch", 0x10_0000, 0x10_000, Perm::RW)).unwrap();
+        os.set_syscall_guest_rsp_for_test(0x10_8000);
+        (os, mem)
+    }
+
+    /// A bitmap's store is really mapped and really addressable, at the stride
+    /// `GetObjectW` reports — the agreement `CreateDIBSection` depends on
+    /// (roadmap W6.2). Checked at both depths the icon path uses: the 32-bpp
+    /// colour plane and the 1-bpp mask.
+    #[test]
+    fn a_bitmap_store_matches_the_geometry_get_object_reports() {
+        let (mut os, mut mem) = os_with_gdi();
+
+        // 32-bpp: stride is 4 bytes per pixel, no padding needed.
+        let color = alloc_bitmap(&mut os, &mut mem, 32, 32, 1, 32, true).unwrap();
+        assert_ne!(color, 0, "the colour plane was allocated");
+        let b = os.win32k_state.bitmap(color).unwrap();
+        assert_eq!(b.stride, 32 * 4);
+        assert_ne!(b.bits, 0, "and its pixels have a guest address");
+        // Every byte of the store is writable — the whole point of the mapping.
+        let last = b.bits + (b.stride as u64 * b.h as u64) - 4;
+        mem.write_u32(last, 0xDEAD_BEEF).unwrap();
+        assert_eq!(mem.read_u32(last).unwrap(), 0xDEAD_BEEF);
+
+        // 1-bpp: 32 bits = 4 bytes, which is already DWORD-aligned; 33 pixels
+        // rounds up to 8. This is the rule an icon mask is built with.
+        let mask = alloc_bitmap(&mut os, &mut mem, 32, 64, 1, 1, true).unwrap();
+        assert_eq!(os.win32k_state.bitmap(mask).unwrap().stride, 4);
+        let odd = alloc_bitmap(&mut os, &mut mem, 33, 8, 1, 1, true).unwrap();
+        assert_eq!(os.win32k_state.bitmap(odd).unwrap().stride, 8, "DWORD-aligned rows");
+
+        // `GetObjectW` reports exactly those numbers back.
+        let buf = 0x10_1000u64;
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, color as u64);
+        cpu.set_reg(Reg::Rdx, BITMAP_SIZE as u64);
+        cpu.set_reg(Reg::R8, buf);
+        assert_eq!(nt_gdi_ext_get_object_w(&mut os, &mut cpu, &mut mem).unwrap(), BITMAP_SIZE);
+        assert_eq!(mem.read_u32(buf + BITMAP_WIDTH).unwrap(), 32);
+        assert_eq!(mem.read_u32(buf + BITMAP_HEIGHT).unwrap(), 32);
+        assert_eq!(mem.read_u32(buf + BITMAP_WIDTH_BYTES).unwrap(), 32 * 4);
+        assert_eq!(mem.read_u16(buf + BITMAP_BITS_PIXEL).unwrap(), 32);
+        assert_eq!(mem.read_u64(buf + BITMAP_BITS).unwrap(), b.bits);
+
+        // The control: a handle that is not a bitmap is not described. In
+        // particular a **font** handle still answers 0 — exemu mints none, and
+        // describing one would be inventing a font.
+        cpu.set_reg(Reg::R10, 0x000A_0007);
+        assert_eq!(nt_gdi_ext_get_object_w(&mut os, &mut cpu, &mut mem).unwrap(), 0);
+    }
+
+    /// `NtGdiCreateDIBSection` reads its `BITMAPINFO` from **argument 3** and
+    /// writes the pixel address back through **argument 8** (roadmap W6.2).
+    ///
+    /// Those two positions are the whole ABI risk in this call, and getting
+    /// either wrong is silent: the guest gets a handle whose pixels it cannot
+    /// find. Driving the real handler through the real argument registers —
+    /// rather than calling a helper — is what makes this test able to catch it.
+    #[test]
+    fn create_dib_section_reads_arg3_and_writes_the_pixels_back_through_arg8() {
+        let (mut os, mut mem) = os_with_gdi();
+        let bmi = 0x10_2000u64;
+        let out = 0x10_3000u64;
+        mem.write_u32(bmi + BIH_WIDTH, 48).unwrap();
+        // Negative height: the documented top-down form.
+        mem.write_u32(bmi + BIH_HEIGHT, (-16i32) as u32).unwrap();
+        mem.write_u16(bmi + BIH_PLANES, 1).unwrap();
+        mem.write_u16(bmi + BIH_BIT_COUNT, 32).unwrap();
+
+        let mut cpu = CpuState::default();
+        let rsp = 0x10_8000u64;
+        cpu.set_reg(Reg::R10, 0); // arg0 hdc
+        cpu.set_reg(Reg::Rdx, 0); // arg1 section
+        cpu.set_reg(Reg::R8, 0); // arg2 offset
+        cpu.set_reg(Reg::R9, bmi); // arg3 bmi  <- the one that matters
+        for i in 4..=8u64 {
+            mem.write_u64(rsp + 0x28 + (i - 4) * 8, if i == 8 { out } else { 0 }).unwrap();
+        }
+        let h = nt_gdi_create_dib_section(&mut os, &mut cpu, &mut mem).unwrap();
+        assert_ne!(h, 0, "a DIB section was created from arg3's BITMAPINFO");
+
+        let b = os.win32k_state.bitmap(h).unwrap();
+        assert_eq!((b.w, b.h), (48, 16), "geometry came from the header");
+        assert!(b.top_down, "a negative biHeight is the top-down form");
+        assert_eq!(mem.read_u64(out).unwrap(), b.bits, "arg8 received the pixel address");
+        assert_ne!(b.bits, 0);
+        // And that address is really the store: a write through it is visible
+        // through the handle's own record.
+        mem.write_u32(b.bits, 0x1122_3344).unwrap();
+        assert_eq!(mem.read_u32(os.win32k_state.bitmap(h).unwrap().bits).unwrap(), 0x1122_3344);
+
+        // A NULL `BITMAPINFO` fails rather than inventing a size.
+        cpu.set_reg(Reg::R9, 0);
+        assert_eq!(nt_gdi_create_dib_section(&mut os, &mut cpu, &mut mem).unwrap(), 0);
+    }
+
+    /// A memory DC's surface **is** the bitmap selected into it, and nothing
+    /// before that (roadmap W6.2).
+    #[test]
+    fn a_memory_dc_draws_into_whatever_bitmap_is_selected_into_it() {
+        let (mut os, mut mem) = os_with_gdi();
+        let mut cpu = CpuState::default();
+        let hdc = nt_gdi_create_compatible_dc(&mut os, &mut cpu, &mut mem).unwrap();
+        assert_ne!(hdc, 0);
+        assert!(dc_surface(&os, hdc).is_none(), "a fresh memory DC has no surface at all");
+
+        let hbm = alloc_bitmap(&mut os, &mut mem, 16, 8, 1, 32, true).unwrap();
+        cpu.set_reg(Reg::R10, hdc as u64);
+        cpu.set_reg(Reg::Rdx, hbm as u64);
+        assert_eq!(nt_gdi_select_bitmap(&mut os, &mut cpu, &mut mem).unwrap(), 0, "none before");
+
+        let t = dc_surface(&os, hdc).expect("the selected bitmap is now the surface");
+        assert_eq!((t.surface.w, t.surface.h), (16, 8));
+        assert_eq!(t.surface.base, os.win32k_state.bitmap(hbm).unwrap().bits);
+        assert_eq!(t.clip, [0, 0, 16, 8], "clipped to the bitmap, not to a window");
+
+        // Selecting a second bitmap returns the first, as `SelectObject` does.
+        let other = alloc_bitmap(&mut os, &mut mem, 4, 4, 1, 32, true).unwrap();
+        cpu.set_reg(Reg::Rdx, other as u64);
+        assert_eq!(nt_gdi_select_bitmap(&mut os, &mut cpu, &mut mem).unwrap(), hbm);
+
+        // A **bottom-up** bitmap has a real store but exemu's own top-down
+        // primitives decline it rather than draw it inverted.
+        let flipped = alloc_bitmap(&mut os, &mut mem, 4, 4, 1, 32, false).unwrap();
+        assert_ne!(os.win32k_state.bitmap(flipped).unwrap().bits, 0);
+        cpu.set_reg(Reg::Rdx, flipped as u64);
+        nt_gdi_select_bitmap(&mut os, &mut cpu, &mut mem).unwrap();
+        assert!(dc_surface(&os, hdc).is_none());
+    }
+
+    /// The two halves of building an icon — `NtUserCallOneParam`'s
+    /// `CreateCursorIcon` arm and `NtUserSetCursorIconData` — and what
+    /// `GetIconInfo`/`GetIconSize` then report (roadmap W6.2).
+    #[test]
+    fn an_icon_is_allocated_then_described_and_reports_itself_back() {
+        let (mut os, mut mem) = os_with_gdi();
+        let mut cpu = CpuState::default();
+
+        // 1. The allocation `user32!create_cursoricon_object` does first and
+        //    gives up on if it answers 0 — which is what it always did.
+        cpu.set_reg(Reg::R10, 1); // param = is_icon
+        cpu.set_reg(Reg::Rdx, call_one_param::CREATE_CURSOR_ICON);
+        let hicon = nt_user_call_one_param(&mut os, &mut cpu, &mut mem).unwrap();
+        assert_ne!(hicon, 0, "an empty icon object exists before it is described");
+
+        // 2. Its description, in the `cursoricon_desc`/`cursoricon_frame`
+        //    layout read out of the pinned user32's DWARF.
+        let color = alloc_bitmap(&mut os, &mut mem, 32, 32, 1, 32, true).unwrap();
+        let mask = alloc_bitmap(&mut os, &mut mem, 32, 64, 1, 1, true).unwrap();
+        let (desc, frame) = (0x10_4000u64, 0x10_5000u64);
+        mem.write_u32(desc + DESC_NUM_FRAMES, 1).unwrap();
+        mem.write_u64(desc + DESC_FRAMES, frame).unwrap();
+        mem.write_u32(frame + FRAME_WIDTH, 32).unwrap();
+        mem.write_u32(frame + FRAME_HEIGHT, 32).unwrap();
+        mem.write_u64(frame + FRAME_COLOR, color as u64).unwrap();
+        mem.write_u64(frame + FRAME_ALPHA, 0).unwrap();
+        mem.write_u64(frame + FRAME_MASK, mask as u64).unwrap();
+        mem.write_u32(frame + FRAME_HOTSPOT_X, 16).unwrap();
+        mem.write_u32(frame + FRAME_HOTSPOT_Y, 16).unwrap();
+
+        cpu.set_reg(Reg::R10, hicon as u64);
+        cpu.set_reg(Reg::Rdx, 0); // module
+        cpu.set_reg(Reg::R8, 0); // res_name
+        cpu.set_reg(Reg::R9, desc);
+        assert_eq!(nt_user_set_cursor_icon_data(&mut os, &mut cpu, &mut mem).unwrap(), 1);
+
+        // 3. `GetIconInfo` — and the bitmaps it hands back are **copies**,
+        //    because its caller owns and deletes them.
+        let info = 0x10_6000u64;
+        cpu.set_reg(Reg::R10, hicon as u64);
+        cpu.set_reg(Reg::Rdx, info);
+        for i in 4..=5u64 {
+            mem.write_u64(0x10_8000 + 0x28 + (i - 4) * 8, 0).unwrap();
+        }
+        assert_eq!(nt_user_get_icon_info(&mut os, &mut cpu, &mut mem).unwrap(), 1);
+        assert_eq!(mem.read_u32(info + ICONINFO_F_ICON).unwrap(), 1);
+        assert_eq!(mem.read_u32(info + ICONINFO_X_HOTSPOT).unwrap(), 16);
+        assert_eq!(mem.read_u32(info + ICONINFO_Y_HOTSPOT).unwrap(), 16);
+        let (got_mask, got_color) = (
+            mem.read_u64(info + ICONINFO_HBM_MASK).unwrap() as u32,
+            mem.read_u64(info + ICONINFO_HBM_COLOR).unwrap() as u32,
+        );
+        assert_ne!(got_mask, 0);
+        assert_ne!(got_color, 0);
+        assert_ne!(got_color, color, "GetIconInfo hands back a COPY the caller may delete");
+        assert_ne!(got_mask, mask, "…and so does the mask");
+        assert_eq!(os.win32k_state.bitmap(got_color).unwrap().bpp, 32, "same geometry, own store");
+        assert_ne!(os.win32k_state.bitmap(got_color).unwrap().bits, 0);
+
+        // 4. `GetIconSize` reports the height **doubled** — the mask-bitmap
+        //    convention `user32!get_icon_size` halves back out. Reporting the
+        //    plain height here would give every caller a half-height icon.
+        let (w, h) = (0x10_7000u64, 0x10_7010u64);
+        cpu.set_reg(Reg::R10, hicon as u64);
+        cpu.set_reg(Reg::Rdx, 0);
+        cpu.set_reg(Reg::R8, w);
+        cpu.set_reg(Reg::R9, h);
+        assert_eq!(nt_user_get_icon_size(&mut os, &mut cpu, &mut mem).unwrap(), 1);
+        assert_eq!(mem.read_u32(w).unwrap(), 32);
+        assert_eq!(mem.read_u32(h).unwrap(), 64, "2 x the icon height, per get_icon_size");
+
+        // The control: an unknown handle is not an icon.
+        cpu.set_reg(Reg::R10, 0xDEAD);
+        assert_eq!(nt_user_get_icon_size(&mut os, &mut cpu, &mut mem).unwrap(), 0);
+    }
+
+    /// The shared-icon cache lookup answers "not cached", every time
+    /// (roadmap W6.2) — and that is the *correct* answer, not a stub.
+    /// A throwaway probe that instead invented a handle here ran 7.5M
+    /// instructions further and then died on its own fiction.
+    #[test]
+    fn the_shared_icon_cache_answers_not_cached() {
+        let (mut os, mut mem) = os_with_gdi();
+        let mut cpu = CpuState::default();
+        assert_eq!(nt_user_find_existing_cursor_icon(&mut os, &mut cpu, &mut mem).unwrap(), 0);
     }
 
     /// `NtUserEnumDisplaySettings` writes the DEVMODEW display fields at their
