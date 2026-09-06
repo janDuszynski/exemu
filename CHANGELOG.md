@@ -23,8 +23,48 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 1047, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1052, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### The file dialog tells the truth: an honest cancel instead of a hollow TRUE (W6.2)
+- **`GetOpenFileNameW` had started returning TRUE with an untouched `lpstrFile`**,
+  and the only visible sign was the comdlg sample's failure tally "improving"
+  from 5 to 3 while every one of its seven reported tags stayed byte-identical.
+  A hollow TRUE is worse than the FALSE it replaced: a real application takes an
+  empty path for a valid selection. Read out of the pinned `user32.dll` rather
+  than remembered — `DIALOG_DoDialogBox` (RVA 0x19930) answers a `WM_QUIT` by
+  re-posting the quit and breaking out with `dlgInfo->idResult` untouched, and
+  `DIALOG_get_info` (RVA 0x19eb0) pre-initialises exactly that field to `IDOK`.
+  That is genuinely what Wine does; the defect was exemu **manufacturing** a
+  `WM_QUIT` for a run with no window host and aiming it at a modal dialog.
+- **A run nobody is sitting in front of now closes a modal dialog rather than
+  quitting at it**, in the two stages a window server uses: `WM_CLOSE` first —
+  the message a click on the close box sends, and the one user32's `DEFDLG_Proc`
+  answers by posting the Cancel button's command — and, if the dialog does
+  nothing with it, the window is destroyed, which is what makes the loop's
+  `IsWindow` check fail and its answer an honest 0. exemu writes no byte of
+  user32's private `DIALOGINFO`. Only windows user32 attached a `DIALOGINFO` to
+  are touched; an ordinary main window still just gets the `WM_QUIT` its pump is
+  documented to stop on. `GetOpenFileNameW` and `GetSaveFileNameW` now both
+  answer FALSE with `CommDlgExtendedError() == 0` — a plain cancel.
+- **`NtUserPostMessage` (win32u 0x14d0) had no handler at all**, so every
+  `PostMessage` a Wine DLL made was silently dropped — nothing says so, because
+  the return value is almost never checked. Found because `DEFDLG_Proc`'s
+  `WM_CLOSE` arm *posts* `WM_COMMAND(IDCANCEL)` rather than destroying the
+  window, so closing any Wine dialog did nothing whatsoever.
+- **Correction: icons never worked.** `NtUserSetCursorIconData` rejected every
+  descriptor whose `num_frames` was zero, and user32 leaves it zero for every
+  ordinary icon (`num_steps`/`num_frames` count an *animated* cursor's steps and
+  frames). user32 answers a FALSE there by destroying the object it had just
+  allocated and returning NULL, so **no `LoadIcon` in a Wine guest had ever
+  produced an icon** — including after the icon-object work above. The earlier
+  evidence was about reaching the call, not about it succeeding; the
+  `NtUserDestroyCursor` immediately after it in the same trace is what said
+  otherwise. Only a non-NULL frame pointer was ever required.
+- **The sample now prints each dialog's raw `BOOL`** (`OPENRET`/`SAVERET`) out of
+  a scratch dword of its own, and the gate ties the tally to the observables that
+  explain it: a leg that reports TRUE must have produced a path, and with no path
+  the count is exactly five, itemised. A lower number is not progress.
 
 ### Icons exist: the object every `LoadIcon` in a Wine guest was failing on (W6.2)
 - **Every `LoadIcon`/`LoadCursor`/`CreateIconFromResourceEx` in a Wine-path guest

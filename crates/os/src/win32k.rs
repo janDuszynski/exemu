@@ -58,6 +58,9 @@ const NT_USER_END_PAINT: u32 = 0x13bc;
 const NT_USER_GET_MESSAGE: u32 = 0x141b;
 const NT_USER_PEEK_MESSAGE: u32 = 0x14ca;
 const NT_USER_POST_QUIT_MESSAGE: u32 = 0x14d1;
+/// `NtUserPostMessage` — `user32!PostMessageW`/`A` are bare thunks into it, and
+/// so is every `PostMessage` Wine's own USER code makes internally.
+const NT_USER_POST_MESSAGE: u32 = 0x14d0;
 const NT_USER_TRANSLATE_MESSAGE: u32 = 0x15d8;
 const NT_USER_DISPATCH_MESSAGE: u32 = 0x138b;
 
@@ -393,7 +396,6 @@ const NT_USER_DESTROY_CURSOR: u32 = 0x137f;
 //     user32→win32k blocks `NtUserSetCursorIconData` carries. **Both layouts are
 //     read out of the pinned `user32.dll`'s DWARF**, where they are declared in
 //     full — not reconstructed from a call site, and not remembered.
-const DESC_NUM_FRAMES: u64 = 0x08;
 const DESC_FRAMES: u64 = 0x10;
 const FRAME_WIDTH: u64 = 0x00;
 const FRAME_HEIGHT: u64 = 0x04;
@@ -825,6 +827,44 @@ mod call_two_param {
     /// = 0`), in the enumeration cross-checked in
     /// [`super::call_hwnd::GET_DIALOG_INFO`].
     pub const GET_DIALOG_PROC: u64 = 0x00;
+    /// **`AllocWinProc`** — the other half of the pair, and **the answer that
+    /// decides whether a dialog procedure is ever called at all** (roadmap
+    /// W6.2). `a` is a window procedure and `b` an "ANSI?" flag; the answer is
+    /// the opaque `WNDPROC` **handle** to store and pass around.
+    ///
+    /// `user32!WINPROC_AllocProc` (RVA 0x51dc0) is the whole definition, five
+    /// instructions long:
+    ///
+    /// ```text
+    ///   mov  r8d, 0x9        ; NtUserAllocWinProc
+    ///   test edx, edx        ; the caller's `unicode`
+    ///   sete dl              ; …passed on as `ansi`
+    ///   movzx edx, dl
+    ///   jmp  NtUserCallTwoParam
+    /// ```
+    ///
+    /// Wine's kernel side mints a small pseudo-handle here and maps it back in
+    /// [`GET_DIALOG_PROC`]; exemu keeps no such table, so — for exactly the
+    /// reason spelled out there — **the procedure is its own handle**, and the
+    /// two selectors are each other's identity.
+    ///
+    /// Answering **0** (the module's honest default for an unknown selector)
+    /// was not honest here, because the caller stores the answer:
+    /// `user32!DIALOG_CreateIndirect` does
+    /// `SetWindowLongPtrW(hwnd, DWLP_DLGPROC, AllocWinProc(dlgProc, unicode))`,
+    /// so a zero **erased the dialog procedure of every dialog in the process**.
+    /// `DefDlgProcW` then found `DWLP_DLGPROC == 0`, called nothing, and fell
+    /// straight through to `DefWindowProcW` — visible in a win32u trace as the
+    /// `SetWindowLongPtr(hwnd, 8, 0)` immediately after
+    /// `NtUserCallTwoParam(<real proc>, 0, 9)`. comdlg32's `FileOpenDlgProc95`
+    /// never saw a single message, which is why its `WM_COMMAND`/`IDCANCEL` arm
+    /// (`FILEDLG95_Clean` then `EndDialog(hwnd, FALSE)`, comdlg32 RVA 0x1141b)
+    /// could not run and the file dialog could not be cancelled.
+    ///
+    /// Value from the pinned user32's DWARF (`NtUserAllocWinProc = 9`, the last
+    /// member of the same enumeration `NtUserCallTwoParam_GetDialogProc = 0`
+    /// opens), and independently from the disassembly above.
+    pub const ALLOC_WIN_PROC: u64 = 0x09;
 }
 
 /// `NtUserCallOneParam(arg, code)` selectors.
@@ -1196,6 +1236,12 @@ struct Window {
     /// (roadmap W6.2). Opaque to exemu: it is user32's own heap block, and
     /// win32k's whole contract is to keep it and hand it back.
     dialog_info: u64,
+    /// Whether this dialog has already been handed the `WM_CLOSE` that a run
+    /// with nobody at the keyboard owes it (roadmap W6.2) — see
+    /// [`cancel_unattended_dialog`]. Set once, so a dialog that ignores it
+    /// still falls through to the `WM_QUIT` it used to get rather than being
+    /// closed round after round.
+    dialog_cancelled: bool,
 }
 
 /// A per-window backing surface (W4.3): a guest-mapped top-down BGRA32 DIB the
@@ -1626,6 +1672,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_GET_MESSAGE, nt_user_get_message);
     os.set_win32k_handler(NT_USER_PEEK_MESSAGE, nt_user_peek_message);
     os.set_win32k_handler(NT_USER_POST_QUIT_MESSAGE, nt_user_post_quit_message);
+    os.set_win32k_handler(NT_USER_POST_MESSAGE, nt_user_post_message);
     os.set_win32k_handler(NT_USER_TRANSLATE_MESSAGE, nt_user_translate_message);
     os.set_win32k_handler(NT_USER_DISPATCH_MESSAGE, nt_user_dispatch_message);
     // Cursor / display driver members (W4.7).
@@ -2154,6 +2201,7 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
             instance,
             props: Vec::new(),
             dialog_info: 0,
+            dialog_cancelled: false,
         },
     ));
 
@@ -3299,6 +3347,108 @@ fn quit_when_headless(os: &mut WinOs) {
     }
 }
 
+/// **A run nobody is sitting in front of CLOSES a modal dialog; it does not let
+/// it succeed** (roadmap W6.2).
+///
+/// The pump's answer to "there is no window host" is a `WM_QUIT`
+/// ([`quit_when_headless`], and the same for a host that went away). For a
+/// `while (GetMessage)` loop that is exactly right. For a **modal dialog** it is
+/// a lie, and a dangerous one, because of what Wine's dialog manager does with
+/// it. From the pinned `user32.dll` — `DIALOG_DoDialogBox`, COFF symbol value
+/// 0x18930, i.e. RVA 0x19930 (`.text` starts at +0x1000, so a symbol value is
+/// 0x1000 short of the RVA):
+///
+/// ```text
+///   cmpl $0x12, 0x38(%rsp)        ; msg.message == WM_QUIT ?
+///   je   .quit
+///   …
+/// .quit:
+///   movl 0x40(%rsp), %ecx         ; msg.wParam
+///   call *__imp_NtUserPostQuitMessage
+///   call IsWindow                 ; still a window? then fall into .end
+/// .end:
+///   movl 0x20(%rsi), %esi         ; retval = dlgInfo->idResult
+///   call *__imp_NtUserNotifyWinEvent
+///   call *__imp_NtUserDestroyWindow
+///   movl %esi, %eax               ; …and RETURN IT
+/// ```
+///
+/// `WM_QUIT` re-posts the quit and **breaks out of the loop with
+/// `dlgInfo->idResult` untouched** — and `user32!DIALOG_get_info` (RVA 0x19eb0)
+/// pre-initialises exactly that field, `HeapAlloc(heap, 0, 0x28)` zeroed and
+/// then `[rax+0x20] = 1`, to **`IDOK`**. So a dialog nobody ever touched
+/// reports `IDOK`, and `comdlg32!GetOpenFileNameW` hands its caller **TRUE with
+/// an untouched `lpstrFile`**. That is worse than an honest failure: an
+/// application takes the empty path for a valid selection.
+///
+/// The bug is not in Wine — that is genuinely what Wine does with a `WM_QUIT` —
+/// it is in exemu **manufacturing** one and aiming it at a modal dialog. The
+/// true statement about a run with no user is not "the application asked to
+/// quit" but *"this dialog can never be completed"*, and the gesture that says
+/// so is closing it. So: once a quit is the only thing left to deliver, every
+/// live dialog is handed `WM_CLOSE` first, exactly once.
+///
+/// It happens in **two stages, in that order** — which is what a window server
+/// shutting a session down does:
+///
+/// 1. **`WM_CLOSE`**, the same message a real user's click on the title-bar
+///    close box produces, and the one that gives the dialog its chance to end
+///    itself properly. `user32!DEFDLG_Proc` answers it by *posting* the Cancel
+///    button's `WM_COMMAND(IDCANCEL)` — it does **not** fall through to
+///    `DefWindowProcW`'s `DestroyWindow` the way an ordinary window does — and
+///    comdlg32's `FileOpenDlgProc95` turns that into `FILEDLG95_Clean` +
+///    `EndDialog(hwnd, FALSE)` (comdlg32 RVA 0x1141b), setting `idResult = 0`
+///    and the `DF_END` flag the loop above breaks on.
+/// 2. **Destroy it**, if it is still there on a later round: it was asked, it
+///    did nothing, and the host it belonged to is gone regardless. A destroyed
+///    window fails the `IsWindow` on the `.quit` path, so the loop takes that
+///    `je` to `xor esi,esi; ret` — an honest **0**, reached without exemu
+///    writing a single byte of user32's private `DIALOGINFO`.
+///
+/// Either way `GetOpenFileNameW` answers FALSE with
+/// `CommDlgExtendedError() == 0`, which is a plain cancel — what actually
+/// happened.
+///
+/// Deliberately narrow:
+/// * only windows user32 has attached a `DIALOGINFO` to
+///   ([`SetDialogInfo`](call_hwnd_param::SET_DIALOG_INFO)) are dialogs at all,
+///   so an ordinary main window is untouched and still just sees the `WM_QUIT`
+///   its pump is documented to stop on;
+/// * only when the queue is otherwise empty and no native input is waiting, so
+///   neither stage can overtake a real message;
+/// * innermost first (latest created), because that is the one currently
+///   pumping; an enclosing dialog gets its turn afterwards.
+fn cancel_unattended_dialog(os: &mut WinOs) {
+    let t = &os.threads[os.current];
+    if t.quit_code.is_none() || !t.msgs.is_empty() {
+        return;
+    }
+    if !os.win32k_state.raw_input.is_empty() {
+        return;
+    }
+    // The innermost dialog that has (`asked`) or has not yet been sent its
+    // `WM_CLOSE`.
+    fn dialog(st: &Win32kState, asked: bool) -> Option<u32> {
+        st.windows
+            .iter()
+            .rev()
+            .find(|(_, w)| w.dialog_info != 0 && w.dialog_cancelled == asked)
+            .map(|(h, _)| *h)
+    }
+    // Stage 1 — ask.
+    if let Some(hwnd) = dialog(&os.win32k_state, false) {
+        if let Some(w) = os.win32k_state.window_mut(hwnd) {
+            w.dialog_cancelled = true;
+        }
+        os.post_internal(hwnd as u64, WM_CLOSE, 0, 0);
+        return;
+    }
+    // Stage 2 — it was asked, and it is still here.
+    if let Some(hwnd) = dialog(&os.win32k_state, true) {
+        destroy_window(os, hwnd);
+    }
+}
+
 /// `NtUserGetMessage(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax)`.
 ///
 /// Headless / console / emulated-corpus runs (no input channel attached) get a
@@ -3319,6 +3469,9 @@ fn nt_user_get_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
         // A shown window owes an initial WM_PAINT; synthesize it when the queue
         // is otherwise empty (roadmap W4.6) so the guest's WM_PAINT handler runs.
         synthesize_paint(os);
+        // A quit is about to be the only thing left: cancel any modal dialog
+        // first, rather than letting it report the IDOK it was born with.
+        cancel_unattended_dialog(os);
         // 1. Anything already posted, in order.
         if !os.threads[os.current].msgs.is_empty() {
             if let Some(m) = os.msg_next() {
@@ -3835,6 +3988,7 @@ fn nt_user_peek_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
     quit_when_headless(os);
     os.drain_input();
     synthesize_paint(os);
+    cancel_unattended_dialog(os);
     if !os.threads[os.current].msgs.is_empty() {
         if let Some(m) = os.msg_peek(remove) {
             os.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
@@ -3887,6 +4041,44 @@ fn nt_user_translate_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn M
     }
     // TRUE means "this was a key message", whether or not it produced a
     // character — the documented contract.
+    Ok(1)
+}
+
+/// `NtUserPostMessage(hwnd, msg, wParam, lParam)` — **put a message on a
+/// window's queue and return at once** (roadmap W6.2).
+///
+/// Unserviced, every `PostMessage` a Wine DLL made was silently dropped, and the
+/// loss is invisible: the caller gets 0 (which it usually ignores) and the
+/// message simply never arrives. The case that exposed it is
+/// `user32!DEFDLG_Proc`'s `WM_CLOSE` arm, which does **not** destroy the window
+/// the way `DefWindowProcW` would — it posts the Cancel button's command
+/// instead, visible in a win32u trace as
+/// `NtUserPostMessage(hwnd, 0x111, IDCANCEL) <UNSERVICED>` immediately after
+/// `GetDlgItem(hwnd, IDCANCEL)`. So closing any Wine dialog did nothing at all.
+///
+/// exemu is single-threaded on the guest side, so "the target window's thread"
+/// is the running one — the same assumption [`WinOs::post_internal`] already
+/// makes. Two documented cases are not plain enqueues:
+///
+/// * `WM_QUIT` posted this way behaves as `PostQuitMessage`, so it stays the
+///   last message the queue ever delivers rather than being overtaken by
+///   whatever is queued behind it (the emulated path's `PostMessage` in
+///   `crate::msg` already reads it that way);
+/// * a non-zero `hwnd` that names no live window cannot receive anything, and
+///   answering TRUE for it would invent a delivery.
+fn nt_user_post_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg(cpu, mem, 0)?;
+    let message = os.syscall_arg(cpu, mem, 1)? as u32;
+    let wparam = os.syscall_arg(cpu, mem, 2)?;
+    let lparam = os.syscall_arg(cpu, mem, 3)?;
+    if message == crate::msg::WM_QUIT {
+        os.threads[os.current].quit_code = Some(wparam as i32);
+        return Ok(1);
+    }
+    if hwnd != 0 && os.win32k_state.window(hwnd as u32).is_none() {
+        return Ok(0);
+    }
+    os.post_internal(hwnd, message, wparam, lparam);
     Ok(1)
 }
 
@@ -4381,7 +4573,10 @@ pub mod abi {
     /// both of these calls back to back through one parked import slot, which is
     /// what lets the test read them as a pair (roadmap W6.2).
     pub const CALL_TWO_PARAM_VIA_SET_WINDOW_LONG_PTR_A: [(&str, u64); 2] =
-        [("AllocWinProc", 0x09), ("GetDialogProc", super::call_two_param::GET_DIALOG_PROC)];
+        [
+            ("AllocWinProc", super::call_two_param::ALLOC_WIN_PROC),
+            ("GetDialogProc", super::call_two_param::GET_DIALOG_PROC),
+        ];
 
     /// `NtGdiGetAndSetDCDword` selectors, as `(gdi32 setter, code)`.
     pub const DC_DWORD: [(&str, u64); 2] = [
@@ -4787,6 +4982,29 @@ fn create_cursor_icon(os: &mut WinOs, is_icon: bool) -> u32 {
 /// them. exemu records the **first** frame — a static icon has exactly one, and
 /// an animated cursor's first frame is what a non-animating caller draws.
 ///
+/// **A static icon carries no counts at all, and refusing it is what made every
+/// icon in a Wine guest fail** (roadmap W6.2). `user32!create_icon_from_bitmapinfo`
+/// builds one `struct cursoricon_frame` on its stack and points a
+/// `struct cursoricon_desc` at it, leaving `num_steps` **and** `num_frames`
+/// zero — those two count an *animated* cursor's steps and frames, and a plain
+/// icon has neither. Dumped straight out of a live call, the whole descriptor is
+///
+/// ```text
+///   +0x00 flags      = 0x00008040
+///   +0x04 num_steps  = 0
+///   +0x08 num_frames = 0            <-- and it is *supposed* to be
+///   +0x10 frames     = 0x10001fe638 --> { width 32, height 32,
+///                                         color/alpha/mask: three real HBITMAPs }
+/// ```
+///
+/// so treating `num_frames == 0` as "nothing to record" rejected a perfectly
+/// good icon. user32 answers a FALSE here by destroying the object it just
+/// allocated and returning NULL (`NtUserDestroyCursor` follows immediately in
+/// the trace), which is why the earlier evidence — `NtUserSetCursorIconData`
+/// being *reached* at all, and `+cursor` logging `CURSORICON_Load` instead of
+/// failing before it — did not mean the icon had been created. The one
+/// requirement that is real is a non-NULL `frames`.
+///
 /// `module` and `res_name` name where the icon came from, for the shared-icon
 /// cache; exemu keeps no cache (see [`nt_user_find_existing_cursor_icon`]) and
 /// so ignores them.
@@ -4800,8 +5018,11 @@ fn nt_user_set_cursor_icon_data(
     if desc == 0 || !os.win32k_state.icons.iter().any(|(h, _)| *h == hicon) {
         return Ok(0);
     }
+    // The frame array is the only thing that must be there: a static icon leaves
+    // both counts zero and supplies exactly one frame. An *animated* cursor is
+    // the case that fills them in, and even then frame 0 is what exemu records.
     let frames = mem.read_u64(desc + DESC_FRAMES)?;
-    if frames == 0 || mem.read_u32(desc + DESC_NUM_FRAMES)? == 0 {
+    if frames == 0 {
         return Ok(0);
     }
     let f = frames; // frame 0 — see the doc comment above.
@@ -5393,8 +5614,12 @@ mod tests {
         //    layout read out of the pinned user32's DWARF.
         let color = alloc_bitmap(&mut os, &mut mem, 32, 32, 1, 32, true).unwrap();
         let mask = alloc_bitmap(&mut os, &mut mem, 32, 64, 1, 1, true).unwrap();
+        // **A static icon, described exactly as user32 describes one**: both
+        // `num_steps` and `num_frames` left ZERO — they count an animated
+        // cursor's steps and frames, and a plain icon has neither — with a
+        // single frame hung off `frames`. Reading those zeros as "nothing to
+        // record" is what made every icon in a Wine guest fail.
         let (desc, frame) = (0x10_4000u64, 0x10_5000u64);
-        mem.write_u32(desc + DESC_NUM_FRAMES, 1).unwrap();
         mem.write_u64(desc + DESC_FRAMES, frame).unwrap();
         mem.write_u32(frame + FRAME_WIDTH, 32).unwrap();
         mem.write_u32(frame + FRAME_HEIGHT, 32).unwrap();
@@ -5627,6 +5852,7 @@ mod tests {
                 instance: 0,
                 props: Vec::new(),
                 dialog_info: 0,
+                dialog_cancelled: false,
             },
         ));
         hwnd
@@ -5766,6 +5992,86 @@ mod tests {
         // "nothing here" and leaving the guest to spin.
         assert_eq!(call(&mut os, &mut mem, true), 0);
         assert_eq!(mem.read_u32(lp + 8).unwrap(), WM_QUIT, "…on every later round too");
+    }
+
+    /// **`NtUserPostMessage` actually queues** (roadmap W6.2) — unserviced, it
+    /// answered 0 and dropped every `PostMessage` in the process, including the
+    /// `WM_COMMAND(IDCANCEL)` `user32!DEFDLG_Proc` posts to close a dialog.
+    ///
+    /// Also pins the two cases that are not a plain enqueue: a posted `WM_QUIT`
+    /// behaves as `PostQuitMessage` (so it stays *last*, behind anything already
+    /// queued), and an `hwnd` that names no window cannot receive anything.
+    #[test]
+    fn nt_user_post_message_queues_and_a_posted_quit_stays_last() {
+        const WM_QUIT: u32 = 0x0012;
+        const WM_COMMAND: u32 = 0x0111;
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        let hwnd = child(&mut os, 0, [0, 0, 100, 100]);
+
+        let post = |os: &mut WinOs, mem: &mut VirtualMemory, h: u64, m: u32, w: u64| -> u32 {
+            let mut cpu = CpuState::default();
+            cpu.set_rsp(0x2_0800);
+            cpu.set_reg(exemu_core::Reg::R10, h);
+            cpu.set_reg(exemu_core::Reg::Rdx, m as u64);
+            cpu.set_reg(exemu_core::Reg::R8, w);
+            cpu.set_reg(exemu_core::Reg::R9, 0);
+            nt_user_post_message(os, &mut cpu, mem).unwrap()
+        };
+
+        assert_eq!(post(&mut os, &mut mem, hwnd as u64, WM_COMMAND, 2), 1, "posted");
+        assert_eq!(post(&mut os, &mut mem, 0, WM_QUIT, 7), 1, "…and so is a quit");
+        assert_eq!(post(&mut os, &mut mem, 0xDEAD, WM_COMMAND, 0), 0, "…but not to a dead hwnd");
+
+        // The command comes out first even though the quit was posted after it:
+        // a quit is not queued, it is the answer once the queue runs dry.
+        let first = os.msg_next().expect("the queued command");
+        assert_eq!((first.hwnd, first.message, first.wparam), (hwnd as u64, WM_COMMAND, 2));
+        let last = os.msg_next().expect("then the quit");
+        assert_eq!((last.message, last.wparam), (WM_QUIT, 7), "with the posted exit code");
+        assert!(os.msg_next().is_none(), "and nothing after it");
+    }
+
+    /// **A modal dialog nobody can complete is closed, and then destroyed —
+    /// never allowed to report success** (roadmap W6.2).
+    ///
+    /// `user32!DIALOG_DoDialogBox` answers a `WM_QUIT` by breaking its loop and
+    /// returning `dlgInfo->idResult`, which `DIALOG_get_info` pre-initialises to
+    /// `IDOK`; so handing a hostless run's manufactured quit straight to a
+    /// dialog made `GetOpenFileNameW` return **TRUE with an untouched
+    /// `lpstrFile`**. Both stages are asserted here because they are two
+    /// different claims: the dialog is *asked* first (`WM_CLOSE`, the same thing
+    /// a click on the close box sends), and only a dialog that does nothing with
+    /// it is destroyed — which is what makes the loop's `IsWindow` check fail
+    /// and its return value an honest 0.
+    #[test]
+    fn an_unattended_dialog_is_closed_and_then_destroyed() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let plain = child(&mut os, 0, [0, 0, 100, 100]);
+        let dialog = child(&mut os, 0, [0, 0, 100, 100]);
+        // What makes it a dialog: user32 attached a DIALOGINFO to it.
+        os.win32k_state.window_mut(dialog).unwrap().dialog_info = 0x4000_0000;
+        // …and what makes the run unattended: a quit is all that is left.
+        os.threads[os.current].quit_code = Some(0);
+
+        // Stage 1: the dialog is asked to close. The plain window is not touched.
+        cancel_unattended_dialog(&mut os);
+        let m = os.msg_next().expect("a WM_CLOSE was posted");
+        assert_eq!((m.hwnd, m.message), (dialog as u64, WM_CLOSE), "to the dialog, not {plain:#x}");
+        assert!(os.win32k_state.window(dialog).is_some(), "asking does not destroy it");
+
+        // Stage 2: it ignored the close, so it goes. Only then does the pump's
+        // WM_QUIT reach a dialog — and by then there is no dialog to lie for it.
+        os.threads[os.current].quit_code = Some(0);
+        cancel_unattended_dialog(&mut os);
+        assert!(os.win32k_state.window(dialog).is_none(), "the dialog is gone");
+        assert!(os.win32k_state.window(plain).is_some(), "an ordinary window is not");
+        assert!(os.threads[os.current].msgs.is_empty(), "and nothing more was invented");
+
+        // With no dialog left there is nothing to do, however often it is asked.
+        cancel_unattended_dialog(&mut os);
+        assert!(os.threads[os.current].msgs.is_empty());
     }
 
     /// **`IsChild`'s two arguments, pinned in the order `user32!IsChild`
@@ -6143,6 +6449,7 @@ mod tests {
                 instance: 0x1_4000_0000,
                 props: Vec::new(),
                 dialog_info: 0,
+                dialog_cancelled: false,
             },
         ));
         let mut mem = VirtualMemory::new();
