@@ -23,8 +23,47 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 915, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 919, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### `NtUserMessageCall` dispatches on an allow-list (W6.3)
+- **`NtUserMessageCall` is not a family of sends.** The `type` argument in its
+  6th slot selects one of 19 members, and only nine of them deliver a message to
+  a window procedure. exemu used to dispatch every *unrecognised* type to the
+  target window's WndProc, which is a self-feeding loop rather than a
+  conservative default: `user32!DefWindowProcW` brackets every message with
+  `SPY_EnterMessage`/`SPY_ExitMessage`, and each of those is another
+  `NtUserMessageCall` — so answering one of them with a send re-delivers the
+  message that is already being handled. Measured on `SteamSetup.exe` for the
+  one member that was already named (`SpyGetMsgName`): 461 nested callbacks in
+  ~200k instructions, into a 2 MiB stack overflow.
+- **The whole type space was recovered from the pinned Wine 11.0 PE set**, not
+  from a header. Every caller fills the slot with a `mov dword ptr [rsp+0x28],
+  imm32` (i386: `[esp+0x14]`) right before the win32u thunk, so sweeping each PE
+  that imports `NtUserMessageCall` enumerates it; the 64-bit and 32-bit builds
+  agree entry for entry. The members and the routine that issues each:
+  `0x29a` `USER_ScrollBarProc`, `0x29c` `PopupMenuWndProc`, `0x29d`
+  `DesktopWndProc`, `0x29e` `DefWindowProc`/`NC_HandleSysCommand`, `0x2ab`
+  `CallWindowProc`, `0x2b1` `SendMessage`, `0x2b3` `SendMessageTimeout`, `0x2b7`
+  `SendNotifyMessage`, `0x2b8` `SendMessageCallback`, `0x300`
+  `explorer!clipboard_wndproc`, `0x303`/`0x304` `SPY_Enter`/`ExitMessage`,
+  `0x305` `imm32!ImeProcessKey`, `0x306` explorer's systray, `0x308`
+  `post_dde_message`, `0x309` `wintab32!WTInfoW`, `0x3001` `dispatch_message`,
+  `0x3002` `SPY_GetMsgName`. `0x307` has **no caller in the pinned set** and is
+  recovered from `wow64win!wow64_NtUserMessageCall`'s own switch instead.
+- **Three dispositions, no fall-through to a WndProc.** The five kernel-side
+  window procedures (`DefWindowProc` and the scroll-bar / menu / desktop /
+  clipboard procedures) run exemu's own `def_window_proc`; the four sends plus
+  `dispatch_message` and `CallWindowProc` reach a procedure; everything else —
+  the spy hooks, the IME / systray / tablet driver calls, the DDE post, and any
+  type this build has never seen — answers the module's honest zero, the same
+  clean "no object" `honest_stub` gives.
+- **Two new pins in `crates/app/tests/win32k_abi.rs`**: one asserts each named
+  type against the routine that issues it, the other sweeps every `.pdata`
+  function of all five pinned PEs that import the syscall and fails if any of
+  them issues a type exemu does not name. Three unit tests in
+  `crates/os/src/win32k.rs` pin the behaviour itself, including that an unknown
+  type installs no callback frame. Corpus Δ0 on all ten entries.
 
 ### comdlg32's file dialog, measured and root-caused (W6.2)
 - **A guest actually calls `GetOpenFileNameW`** now — `crates/app/src/

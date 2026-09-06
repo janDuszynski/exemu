@@ -105,29 +105,72 @@ mod thread_state {
 }
 
 /// `NtUserMessageCall`'s **type** argument (the 6th slot). One syscall carries
-/// the whole `SendMessage`/`DefWindowProc`/`CallWindowProc`/dispatch family, and
-/// the type is what says which — recovered from the immediate each user32
-/// wrapper stores at `[rsp+0x28]` right before the win32u thunk:
+/// the whole `SendMessage`/`DefWindowProc`/`CallWindowProc`/dispatch family
+/// *plus* a set of calls that are not message deliveries at all, and the type is
+/// what says which.
+///
+/// **The whole type space, recovered from the pinned Wine 11.0 PE set** — not
+/// from a header. Every caller fills the slot with a `mov dword ptr [rsp+0x28],
+/// imm32` (i386: `[esp+0x14]`) right before the win32u thunk, so scanning each
+/// DLL that imports `NtUserMessageCall` for that store enumerates the space; the
+/// 64-bit and 32-bit builds agree entry for entry, and
+/// `wow64win!wow64_NtUserMessageCall`'s own `switch` is the independent check
+/// that nothing is missing (its arms are exactly `0x29a..=0x304`, `0x305`,
+/// `0x306`, `0x307`, `0x308`, `0x309`, `0x3001`, `0x3002`).
 ///
 /// ```text
-///   SendMessageW         mov [rsp+0x28], 0x2b1
-///   SendMessageTimeoutW  mov [rsp+0x28], 0x2b3
-///   SendNotifyMessageW   mov [rsp+0x28], 0x2b7
-///   SendMessageCallbackW mov [rsp+0x28], 0x2b8
-///   CallWindowProcW      mov [rsp+0x28], 0x2ab
-///   DefWindowProcW       mov [rsp+0x28], 0x29e
-///   (internal) dispatch_message, the tail of DispatchMessageW:
-///                        mov [rsp+0x28], 0x3001
+///   type    pinned caller                              is it a send?
+///   0x29a   user32!USER_ScrollBarProc                  no — win32k's own proc
+///   0x29c   user32!PopupMenuWndProc{A,W}               no — win32k's own proc
+///   0x29d   user32!DesktopWndProc{A,W}                 no — win32k's own proc
+///   0x29e   user32!DefWindowProc{A,W}, NC_HandleSysCommand
+///                                                      no — win32k's own proc
+///   0x2ab   user32!CallWindowProc{A,W}                 yes, to resultInfo+0
+///   0x2b1   user32!SendMessage{A,W}                    yes
+///   0x2b3   user32!SendMessageTimeout{A,W}             yes
+///   0x2b7   user32!SendNotifyMessage{A,W}              yes
+///   0x2b8   user32!SendMessageCallback{A,W}            yes
+///   0x300   explorer!clipboard_wndproc                 no — win32k's own proc
+///   0x303   user32!SPY_EnterMessage                    no — a trace hook
+///   0x304   user32!SPY_ExitMessage                     no — a trace hook
+///   0x305   imm32!ImeProcessKey, imm32!ImeToAsciiEx    no — an IME driver call
+///   0x306   explorer systray (initialize_systray, show/hide/modify_icon,
+///           handle_incoming, handle_parent_notify)     no — a systray call
+///   0x307   (no caller anywhere in the pinned PE set)  no
+///   0x308   user32!post_dde_message                    no — a *post*
+///   0x309   wintab32!WTInfo{A,W}, TABLET_WindowProc    no — a tablet call
+///   0x3001  user32!dispatch_message (tail of DispatchMessage{A,W})   yes
+///   0x3002  user32!SPY_GetMsgName                      no — a query
 /// ```
 ///
-/// **Getting this wrong is not cosmetic.** `DefWindowProcW` is *nothing but*
-/// this syscall — the pinned user32 handles only five IME/syscommand messages
-/// client-side and forwards everything else, `WM_NCHITTEST` included — so a
-/// handler that re-dispatches type `0x29e` to the window's own WndProc calls the
-/// proc that just called `DefWindowProc`, for ever.
+/// **Getting this wrong is not cosmetic, and "unknown ⇒ send" is the trap.**
+/// `DefWindowProcW` is *nothing but* this syscall — the pinned user32 handles
+/// only five IME/syscommand messages client-side and forwards everything else,
+/// `WM_NCHITTEST` included — so a handler that re-dispatches type `0x29e` to the
+/// window's own WndProc calls the proc that just called `DefWindowProc`, for
+/// ever. The same shape is available to every non-send type above, because
+/// `DefWindowProcW` brackets *every* message with `SPY_EnterMessage` /
+/// `SPY_ExitMessage`, each of which is another `NtUserMessageCall`. Hence
+/// [`nt_user_message_call`] dispatches on an **allow-list** and answers
+/// everything else with the module's honest zero.
 mod message_call {
+    // --- win32k's own window procedures. Not the application's: dispatching
+    //     any of these to the target window's WndProc calls the procedure that
+    //     just called *it*. exemu has no scroll-bar / menu / desktop /
+    //     clipboard procedure of its own, so the honest stand-in for all five
+    //     is the kernel-side default procedure it does have.
+    /// `USER_ScrollBarProc` — the built-in `SCROLLBAR` procedure.
+    pub const SCROLL_BAR_WND_PROC: u64 = 0x29a;
+    /// `PopupMenuWndProc{A,W}` — the built-in menu-popup procedure.
+    pub const POPUP_MENU_WND_PROC: u64 = 0x29c;
+    /// `DesktopWndProc{A,W}` — the desktop window's procedure.
+    pub const DESKTOP_WND_PROC: u64 = 0x29d;
     /// `DefWindowProc{A,W}` — the kernel-side default window procedure.
     pub const DEF_WINDOW_PROC: u64 = 0x29e;
+    /// `explorer!clipboard_wndproc` — the clipboard owner window's procedure.
+    pub const CLIPBOARD_WND_PROC: u64 = 0x300;
+
+    // --- the real sends: a WndProc runs, and its LRESULT is the answer.
     /// `CallWindowProc{A,W}` — `resultInfo` arrives with the proc at offset 0.
     pub const CALL_WINDOW_PROC: u64 = 0x2ab;
     /// `SendMessage{A,W}`.
@@ -141,6 +184,34 @@ mod message_call {
     /// The internal `dispatch_message` every `DispatchMessage{A,W}` that is not
     /// `WM_PAINT`/`WM_TIMER` lowers to.
     pub const DISPATCH_MESSAGE: u64 = 0x3001;
+
+    // --- everything below is *not* a message delivery. None of them may reach
+    //     a WndProc; all of them answer with the module's honest zero, and
+    //     `SPY_GET_MSG_NAME` additionally fills the caller's buffer.
+    /// `SPY_EnterMessage` — the trace hook `DefWindowProc{A,W}` and every
+    /// window procedure call in user32 open with. A pure notification.
+    pub const SPY_ENTER: u64 = 0x303;
+    /// `SPY_ExitMessage` — its closing twin.
+    pub const SPY_EXIT: u64 = 0x304;
+    /// `imm32!ImeProcessKey` / `ImeToAsciiEx` — a call into the IME driver.
+    pub const IME_DRIVER_CALL: u64 = 0x305;
+    /// `explorer`'s system-tray calls (`initialize_systray`, `show_icon`,
+    /// `hide_icon`, `modify_icon`, `handle_incoming`, `handle_parent_notify`).
+    pub const SYSTRAY_CALL: u64 = 0x306;
+    /// **No caller in the pinned PE set.** Only
+    /// `wow64win!wow64_NtUserMessageCall` has an arm for it, which passes the
+    /// 32-bit `resultInfo` through unchanged unless `msg == 0`, in which case it
+    /// hands down a local qword and copies the low half back — an out-parameter
+    /// query shape. Whatever issues it lives on the side exemu never loads (a
+    /// display driver / `win32u.so`), so it is named here only to keep this
+    /// table complete.
+    pub const DRIVER_CALL_307: u64 = 0x307;
+    /// `user32!post_dde_message` — a **post**, not a send: it queues a DDE
+    /// message and answers whether the queueing succeeded.
+    pub const POST_DDE_MESSAGE: u64 = 0x308;
+    /// `wintab32!WTInfo{A,W}` / `TABLET_WindowProc` — a call into the tablet
+    /// driver.
+    pub const TABLET_CALL: u64 = 0x309;
     /// **`SpyGetMsgName`** — not a message send at all: a *query* for the
     /// printable name of message `msg` (roadmap W5.10).
     ///
@@ -157,6 +228,38 @@ mod message_call {
     /// 461 nested callbacks in ~200k instructions, ending in a 2 MiB 64-bit
     /// stack overflow inside `wow64!Wow64KiUserCallbackDispatcher`.
     pub const SPY_GET_MSG_NAME: u64 = 0x3002;
+
+    /// The **allow-list**: the types that really do deliver a message to the
+    /// target window's procedure. `CALL_WINDOW_PROC` and `DISPATCH_MESSAGE` are
+    /// deliberately absent — both reach a WndProc, but each needs its own
+    /// `resultInfo`/return handling and has its own arm.
+    pub const SENDS: [u64; 4] =
+        [SEND_MESSAGE, SEND_MESSAGE_TIMEOUT, SEND_NOTIFY_MESSAGE, SEND_MESSAGE_CALLBACK];
+
+    /// win32k's own window procedures — answered by exemu's kernel-side
+    /// `def_window_proc`, never by the application's WndProc.
+    pub const KERNEL_WND_PROCS: [u64; 5] = [
+        DEF_WINDOW_PROC,
+        SCROLL_BAR_WND_PROC,
+        POPUP_MENU_WND_PROC,
+        DESKTOP_WND_PROC,
+        CLIPBOARD_WND_PROC,
+    ];
+
+    /// The types that are not message deliveries at all. Listed so the pin test
+    /// can assert this module covers the whole recovered space; the dispatcher
+    /// reaches them through its catch-all, which answers every unknown type the
+    /// same way.
+    pub const NOT_A_MESSAGE: [u64; 8] = [
+        SPY_ENTER,
+        SPY_EXIT,
+        IME_DRIVER_CALL,
+        SYSTRAY_CALL,
+        DRIVER_CALL_307,
+        POST_DDE_MESSAGE,
+        TABLET_CALL,
+        SPY_GET_MSG_NAME,
+    ];
 }
 
 /// `CallWindowProc`'s `resultInfo` block starts with the procedure to call —
@@ -1955,27 +2058,36 @@ fn nt_user_set_window_pos(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memo
 /// **whole message-delivery family behind one index**, selected by the `type`
 /// argument (see [`message_call`]).
 ///
-/// * [`SEND_MESSAGE`](message_call::SEND_MESSAGE) and its notify/timeout/callback
-///   variants: deliver synchronously to the window's WndProc; the syscall's
-///   return value **is** the `LRESULT`. (`SendMessageW` zeroes `resultInfo+8`
-///   before the call and only re-dispatches client-side if the kernel filled it,
-///   which exemu never does — so returning the LRESULT is exactly the contract.)
+/// Dispatch is an **allow-list**: only a type recovered as a genuine message
+/// delivery reaches a WndProc. Everything else — including a type this build has
+/// never seen — takes the module's honest zero, because "unknown ⇒ send" is a
+/// self-feeding loop (see [`message_call`]), not a conservative default.
+///
+/// * [`SENDS`](message_call::SENDS) — `SendMessage{A,W}` and its
+///   notify/timeout/callback variants: deliver synchronously to the window's
+///   WndProc; the syscall's return value **is** the `LRESULT`. (`SendMessageW`
+///   zeroes `resultInfo+8` before the call and only re-dispatches client-side if
+///   the kernel filled it, which exemu never does — so returning the LRESULT is
+///   exactly the contract.)
 /// * [`DISPATCH_MESSAGE`](message_call::DISPATCH_MESSAGE): the tail of
 ///   `DispatchMessage{A,W}` for every message that is not `WM_PAINT`/`WM_TIMER`
 ///   — i.e. **this is how a mouse or key message reaches its window**. Same
 ///   delivery, but the syscall must answer **zero**: a non-zero answer tells
 ///   user32 to run `dispatch_win_proc_params` over a `resultInfo` block the
 ///   caller never initialized.
-/// * [`DEF_WINDOW_PROC`](message_call::DEF_WINDOW_PROC): `DefWindowProc{A,W}` is
-///   *nothing but* this syscall, so it must run [`def_window_proc`] here.
-///   Re-dispatching it to the window's WndProc would call the procedure that
-///   just called `DefWindowProc`, without end.
+/// * [`KERNEL_WND_PROCS`](message_call::KERNEL_WND_PROCS): `DefWindowProc{A,W}`
+///   is *nothing but* this syscall, and the scroll-bar / menu / desktop /
+///   clipboard procedures are win32k's in the same way, so all five run
+///   [`def_window_proc`] here. Re-dispatching any of them to the window's
+///   WndProc would call the procedure that just called *it*, without end.
 /// * [`CALL_WINDOW_PROC`](message_call::CALL_WINDOW_PROC): the procedure to call
 ///   is at offset 0 of `resultInfo`.
+/// * [`SPY_GET_MSG_NAME`](message_call::SPY_GET_MSG_NAME): a query — fill the
+///   caller's buffer, run nothing.
 ///
 /// `WM_SETTEXT` keeps its native arm on the send path (there is no dedicated
-/// `NtUserSetWindowText` syscall — `SetWindowTextW` delivers it here): update
-/// the stored title and notify the driver.
+/// `NtUserSetWindowText` syscall — `SetWindowTextW` sends it here through
+/// `SendMessageW`): update the stored title and notify the driver.
 fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
     let msg = os.syscall_arg(cpu, mem, 1)? as u32;
@@ -1990,11 +2102,28 @@ fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
     let call_type = os.syscall_arg(cpu, mem, 5)? as u32 as u64;
     let ansi = os.syscall_arg(cpu, mem, 6)? as u32 != 0;
 
+    if message_call::KERNEL_WND_PROCS.contains(&call_type) {
+        let r = def_window_proc(os, cpu, mem, hwnd, msg, wparam, lparam, ansi)?;
+        os.return_u64_from_syscall(r);
+        return Ok(0); // ignored: the 64-bit LRESULT above is what reaches rax
+    }
+    if message_call::SENDS.contains(&call_type) {
+        if msg == WM_SETTEXT {
+            let text = read_text_param(mem, lparam, ansi)?;
+            if let Some(w) = os.win32k_state.window_mut(hwnd) {
+                w.title = text.clone();
+            }
+            os.driver.set_window_text(hwnd, &text);
+            return Ok(1);
+        }
+        // A send wants the WndProc's own LRESULT.
+        return dispatch_to_wndproc(os, cpu, mem, hwnd as u64, msg, wparam, lparam, None);
+    }
+
     match call_type {
-        message_call::DEF_WINDOW_PROC => {
-            let r = def_window_proc(os, cpu, mem, hwnd, msg, wparam, lparam, ansi)?;
-            os.return_u64_from_syscall(r);
-            Ok(0) // ignored: the 64-bit LRESULT above is what reaches rax
+        // `DispatchMessage` must see 0 (see the doc comment above).
+        message_call::DISPATCH_MESSAGE => {
+            dispatch_to_wndproc(os, cpu, mem, hwnd as u64, msg, wparam, lparam, Some(0))
         }
         // A *query*, not a send: name the message into the caller's buffer.
         // exemu has no table of Win32 message names, so it answers with the
@@ -2025,19 +2154,12 @@ fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
             os.call_wndprocs_from_syscall(cpu, mem, vec![(proc, m.into_args())], Some(0), 0)?;
             Ok(0)
         }
-        _ => {
-            if msg == WM_SETTEXT && call_type != message_call::DISPATCH_MESSAGE {
-                let text = read_text_param(mem, lparam, ansi)?;
-                if let Some(w) = os.win32k_state.window_mut(hwnd) {
-                    w.title = text.clone();
-                }
-                os.driver.set_window_text(hwnd, &text);
-                return Ok(1);
-            }
-            // `DispatchMessage` must see 0; a send wants the WndProc's LRESULT.
-            let forced = (call_type == message_call::DISPATCH_MESSAGE).then_some(0);
-            dispatch_to_wndproc(os, cpu, mem, hwnd as u64, msg, wparam, lparam, forced)
-        }
+        // The spy hooks, the IME / systray / tablet driver calls, the DDE post,
+        // and anything this build has never seen. None of them delivers a
+        // message, so none of them may run a WndProc: answer the same clean
+        // "nothing serviced" zero [`honest_stub`] gives, rather than a WndProc
+        // call the caller never asked for.
+        _ => Ok(0),
     }
 }
 
@@ -3716,21 +3838,55 @@ pub mod abi {
         ("GetCapture", super::thread_state::CAPTURE),
     ];
 
-    /// `NtUserMessageCall`'s `type` argument, as `(user32 export, type)`. The
-    /// immediate each wrapper stores in the syscall's 6th argument slot.
-    pub const MESSAGE_CALL_TYPES: [(&str, u64); 6] = [
-        ("SendMessageW", super::message_call::SEND_MESSAGE),
-        ("SendMessageTimeoutW", super::message_call::SEND_MESSAGE_TIMEOUT),
-        ("SendNotifyMessageW", super::message_call::SEND_NOTIFY_MESSAGE),
-        ("SendMessageCallbackW", super::message_call::SEND_MESSAGE_CALLBACK),
-        ("CallWindowProcW", super::message_call::CALL_WINDOW_PROC),
-        ("DefWindowProcW", super::message_call::DEF_WINDOW_PROC),
+    /// `NtUserMessageCall`'s `type` argument, as `(dll, routine, type)` — the
+    /// immediate that routine stores in the syscall's 6th argument slot. One
+    /// entry per member of the whole recovered family, not just the sends:
+    /// naming a query as a query is what stops it being dispatched to a WndProc.
+    /// Routines with no export of their own are reached through the pinned
+    /// DLLs' COFF symbol table.
+    pub const MESSAGE_CALL_TYPES: [(&str, &str, u64); 18] = [
+        ("user32.dll", "SendMessageW", super::message_call::SEND_MESSAGE),
+        ("user32.dll", "SendMessageTimeoutW", super::message_call::SEND_MESSAGE_TIMEOUT),
+        ("user32.dll", "SendNotifyMessageW", super::message_call::SEND_NOTIFY_MESSAGE),
+        ("user32.dll", "SendMessageCallbackW", super::message_call::SEND_MESSAGE_CALLBACK),
+        ("user32.dll", "CallWindowProcW", super::message_call::CALL_WINDOW_PROC),
+        ("user32.dll", "DefWindowProcW", super::message_call::DEF_WINDOW_PROC),
+        ("user32.dll", "NC_HandleSysCommand", super::message_call::DEF_WINDOW_PROC),
+        ("user32.dll", "USER_ScrollBarProc", super::message_call::SCROLL_BAR_WND_PROC),
+        ("user32.dll", "PopupMenuWndProcW", super::message_call::POPUP_MENU_WND_PROC),
+        ("user32.dll", "DesktopWndProcW", super::message_call::DESKTOP_WND_PROC),
+        ("user32.dll", "SPY_EnterMessage", super::message_call::SPY_ENTER),
+        ("user32.dll", "SPY_ExitMessage", super::message_call::SPY_EXIT),
+        ("user32.dll", "SPY_GetMsgName", super::message_call::SPY_GET_MSG_NAME),
+        ("user32.dll", "post_dde_message", super::message_call::POST_DDE_MESSAGE),
+        ("explorer.exe", "clipboard_wndproc", super::message_call::CLIPBOARD_WND_PROC),
+        ("explorer.exe", "initialize_systray", super::message_call::SYSTRAY_CALL),
+        ("imm32.dll", "ImeProcessKey", super::message_call::IME_DRIVER_CALL),
+        ("wintab32.dll", "WTInfoW", super::message_call::TABLET_CALL),
     ];
 
     /// The type the internal `dispatch_message` — the tail of
     /// `DispatchMessage{A,W}` — passes. Not reachable by export name; the test
     /// follows `DispatchMessageW`'s own call into it.
     pub const MESSAGE_CALL_DISPATCH: u64 = super::message_call::DISPATCH_MESSAGE;
+
+    /// The type with **no caller in the pinned PE set**: only
+    /// `wow64win!wow64_NtUserMessageCall` has an arm for it. Pinned from that
+    /// thunk instead, which is also the completeness check on the table above.
+    pub const MESSAGE_CALL_DRIVER_307: u64 = super::message_call::DRIVER_CALL_307;
+
+    /// `CallWindowProc{A,W}`'s type — a send, but to the procedure in
+    /// `resultInfo+0` rather than the window's own, so it has its own arm.
+    pub const MESSAGE_CALL_CALL_WINDOW_PROC: u64 = super::message_call::CALL_WINDOW_PROC;
+
+    /// The three dispositions [`nt_user_message_call`](super::nt_user_message_call)
+    /// gives a type: deliver to the window's procedure, run exemu's kernel-side
+    /// default procedure, or answer the honest zero and run nothing.
+    pub const MESSAGE_CALL_SENDS: [u64; 4] = super::message_call::SENDS;
+    /// win32k's own window procedures — never the application's.
+    pub const MESSAGE_CALL_KERNEL_PROCS: [u64; 5] = super::message_call::KERNEL_WND_PROCS;
+    /// The members that are not message deliveries at all.
+    pub const MESSAGE_CALL_NOT_A_MESSAGE: [u64; 8] = super::message_call::NOT_A_MESSAGE;
 
     /// `WM_NCHITTEST`, and the `HTCLIENT`/`HTTRANSPARENT` codes exemu's routing
     /// branches on.
@@ -4897,5 +5053,123 @@ mod tests {
             "the duplicate's slot now holds the proc user32 published"
         );
         assert_eq!(mem.read_u64(0x1_0000 + 0x1800).unwrap(), 0, "the running image is untouched");
+    }
+
+    // ---- W6.3: NtUserMessageCall dispatches on an allow-list ---------------
+
+    /// Drive `NtUserMessageCall(hwnd, WM_NCCREATE, 0x80, 0, resultInfo, ty, 0)`
+    /// through the real handler and report `(status, callback frames installed)`.
+    /// A frame is the observable "a WndProc is about to run".
+    fn message_call(
+        os: &mut WinOs,
+        mem: &mut VirtualMemory,
+        hwnd: u32,
+        result_info: u64,
+        ty: u64,
+    ) -> (u32, usize) {
+        const GUEST_RSP: u64 = MSG_CALL_STACK + 0x800;
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, hwnd as u64);
+        cpu.set_reg(Reg::Rdx, WM_NCCREATE as u64);
+        cpu.set_reg(Reg::R8, 0x80); // wParam — SPY_GetMsgName's buffer size
+        cpu.set_reg(Reg::R9, 0); // lParam
+        mem.write_u64(GUEST_RSP + 0x28, result_info).unwrap();
+        mem.write_u64(GUEST_RSP + 0x30, ty).unwrap();
+        mem.write_u64(GUEST_RSP + 0x38, 0).unwrap();
+        let status = nt_user_message_call(os, &mut cpu, mem).unwrap();
+        (status, os.win32k_cb.len())
+    }
+
+    const MSG_CALL_STACK: u64 = 0x7000_0000;
+    const MSG_CALL_SCRATCH: u64 = 0x7000_2000;
+    const MSG_CALL_WNDPROC: u64 = 0x4000_1000;
+
+    /// A window with a WndProc, a mapped guest stack for the callback frame, and
+    /// a scratch page for `resultInfo`.
+    fn message_call_fixture() -> (WinOs, VirtualMemory, u32) {
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("stack", MSG_CALL_STACK, 0x1000, Perm::RW)).unwrap();
+        mem.map(Region::new("scratch", MSG_CALL_SCRATCH, 0x1000, Perm::RW)).unwrap();
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let hwnd = child(&mut os, 0, [0, 0, 100, 100]);
+        os.win32k_state.window_mut(hwnd).unwrap().wndproc = MSG_CALL_WNDPROC;
+        os.set_syscall_guest_rsp_for_test(MSG_CALL_STACK + 0x800);
+        (os, mem, hwnd)
+    }
+
+    /// **A query type must not reach a WndProc.** `SpyGetMsgName` (`0x3002`) is
+    /// the one that bit: `user32!DefWindowProcW` brackets every message with
+    /// `SPY_EnterMessage`, which asks for the message's name — so dispatching
+    /// the query as a send makes the kernel re-send the message that is already
+    /// being handled. On `SteamSetup.exe` that was 461 nested callbacks in
+    /// ~200k instructions, ending in a 2 MiB stack overflow.
+    ///
+    /// The fix is the allow-list, so the property tested is the general one:
+    /// **no** member outside [`message_call::SENDS`] installs a callback frame,
+    /// and neither does a type this build has never seen.
+    #[test]
+    fn a_message_call_query_type_never_reaches_a_wndproc() {
+        let (mut os, mut mem, hwnd) = message_call_fixture();
+
+        // The control: a real send does install one, so an empty frame stack
+        // below means "declined", not "the fixture cannot call back at all".
+        let (_, frames) = message_call(&mut os, &mut mem, hwnd, 0, message_call::SEND_MESSAGE);
+        assert_eq!(frames, 1, "SendMessage runs the window's WndProc");
+
+        for ty in message_call::NOT_A_MESSAGE {
+            let (mut os, mut mem, hwnd) = message_call_fixture();
+            let (status, frames) =
+                message_call(&mut os, &mut mem, hwnd, MSG_CALL_SCRATCH, ty);
+            assert_eq!(frames, 0, "type {ty:#x} is not a send, yet it ran a WndProc");
+            assert_eq!(status, 0, "type {ty:#x} answers the honest zero");
+        }
+
+        // A type from neither list — a future Wine member, or garbage in the
+        // slot — takes the same path. "Unknown ⇒ send" is what made 0x3002
+        // recurse; it must not be the default for its successors.
+        for ty in [0x0000_1234, 0x0000_2b2, 0x0003_0003, 0xFFFF_FFFF] {
+            let (mut os, mut mem, hwnd) = message_call_fixture();
+            let (status, frames) = message_call(&mut os, &mut mem, hwnd, MSG_CALL_SCRATCH, ty);
+            assert_eq!(frames, 0, "unknown type {ty:#x} ran a WndProc");
+            assert_eq!(status, 0, "unknown type {ty:#x} answers the honest zero");
+        }
+    }
+
+    /// The spy hooks are the ones that make the loop self-feeding, so they get
+    /// their own statement of the property: `SPY_EnterMessage` /
+    /// `SPY_ExitMessage` fire on *every* message user32 delivers, and each is a
+    /// separate `NtUserMessageCall`. And `SpyGetMsgName` still answers — the
+    /// caller prints the buffer with `"%s"`, so leaving it untouched is a
+    /// garbage string, not a clean refusal.
+    #[test]
+    fn the_spy_hooks_answer_without_delivering_anything() {
+        let (mut os, mut mem, hwnd) = message_call_fixture();
+        for ty in [message_call::SPY_ENTER, message_call::SPY_EXIT] {
+            let (status, frames) = message_call(&mut os, &mut mem, hwnd, 0, ty);
+            assert_eq!((status, frames), (0, 0), "spy hook {ty:#x} delivers nothing");
+        }
+
+        let (status, frames) =
+            message_call(&mut os, &mut mem, hwnd, MSG_CALL_SCRATCH, message_call::SPY_GET_MSG_NAME);
+        assert_eq!((status, frames), (0, 0), "the name query delivers nothing");
+        let name = crate::api::read_astr(&mem, MSG_CALL_SCRATCH).unwrap();
+        assert_eq!(name, format!("{WM_NCCREATE:#06x}"), "the query filled the caller's buffer");
+    }
+
+    /// **win32k's own window procedures run exemu's kernel-side default, not the
+    /// application's WndProc.** `DefWindowProc` is the famous one — a window
+    /// procedure calls it, so re-dispatching it to that procedure never
+    /// terminates — but the scroll-bar, menu, desktop and clipboard procedures
+    /// are win32k's in exactly the same way.
+    #[test]
+    fn the_kernel_side_window_procedures_do_not_call_the_application() {
+        for ty in message_call::KERNEL_WND_PROCS {
+            let (mut os, mut mem, hwnd) = message_call_fixture();
+            let (_, frames) = message_call(&mut os, &mut mem, hwnd, 0, ty);
+            assert_eq!(frames, 0, "kernel procedure {ty:#x} called the application's WndProc");
+            // `WM_NCCREATE` is answered TRUE by the kernel default — "carry on
+            // creating me" — which is the answer that reaches rax.
+            assert_eq!(os.syscall_result64, Some(1), "type {ty:#x} answers WM_NCCREATE");
+        }
     }
 }
