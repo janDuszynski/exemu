@@ -11,7 +11,7 @@ use objc2::{MainThreadMarker, MainThreadOnly};
 
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
-    NSEventType, NSView, NSWindow, NSWindowStyleMask,
+    NSEventModifierFlags, NSEventType, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
 use objc2_core_foundation::{CFString, CGPoint, CGSize};
@@ -94,8 +94,30 @@ impl CocoaWindow {
     }
 
     pub fn order_front(&self) {
-        self.window.makeKeyAndOrderFront(None);
         self._app.activate();
+        self.window.makeKeyAndOrderFront(None);
+    }
+
+    pub fn synth_click(&self, x: f64, y: f64) {
+        let h = self.window.contentView().map(|v| v.bounds().size.height).unwrap_or(0.0);
+        let loc = NSPoint::new(x, h - y);
+        for (t, up) in [(NSEventType::LeftMouseDown, false), (NSEventType::LeftMouseUp, true)] {
+            let ev = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                t,
+                loc,
+                NSEventModifierFlags::empty(),
+                0.0,
+                self.window.windowNumber(),
+                None,
+                0,
+                1,
+                if up { 0.0 } else { 1.0 },
+            );
+            if let Some(ev) = ev {
+                self._app.postEvent_atStart(&ev, false);
+            }
+        }
+        eprintln!("[exemu-gui] synthetic click at ({x}, {y})");
     }
 
     pub fn order_out(&self) {
@@ -257,6 +279,13 @@ fn translate_event(event: &NSEvent, mtm: MainThreadMarker) -> Option<InputEvent>
     }
 }
 
+const SYNTH_CLICK_DELAY_MS: u128 = 1500;
+
+fn parse_point(spec: &str) -> Option<(f64, f64)> {
+    let (x, y) = spec.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
 fn forwards_event(target: Option<isize>, window_number: isize) -> bool {
     target.is_some_and(|n| n == window_number)
 }
@@ -305,6 +334,10 @@ impl WindowHost {
 
     pub fn input_target(&self) -> Option<isize> {
         self.windows.get(&self.model.primary()?).map(|w| w.window_number())
+    }
+
+    pub fn primary_window(&self) -> Option<&CocoaWindow> {
+        self.windows.get(&self.model.primary()?)
     }
 
     fn run(&mut self, action: HostAction, cmd: &WindowCommand) {
@@ -387,10 +420,13 @@ pub fn run_live(
 
     let auto_close_ms: Option<u128> =
         std::env::var("EXEMU_COCOA_MAX_MS").ok().and_then(|s| s.parse().ok());
+    let synth_click: Option<(f64, f64)> =
+        std::env::var("EXEMU_COCOA_SYNTH_CLICK").ok().and_then(|s| parse_point(&s));
     let start = std::time::Instant::now();
     let mut auto_close_sent = false;
 
     let mut host = WindowHost::new();
+    let mut synth_sent = false;
     let mut last_pump = std::time::Instant::now();
     loop {
         match cmd_rx.try_recv() {
@@ -406,6 +442,14 @@ pub fn run_live(
                 pump_events(host.input_target(), &input_tx, 0.01);
                 host.reap_closed(&input_tx);
                 last_pump = std::time::Instant::now();
+                if let Some((x, y)) = synth_click {
+                    if !synth_sent && start.elapsed().as_millis() >= SYNTH_CLICK_DELAY_MS {
+                        if let Some(win) = host.primary_window() {
+                            win.synth_click(x, y);
+                            synth_sent = true;
+                        }
+                    }
+                }
                 if let Some(ms) = auto_close_ms {
                     if !auto_close_sent && start.elapsed().as_millis() >= ms {
                         let _ = input_tx.send(InputEvent::Close);
@@ -655,6 +699,15 @@ mod tests {
         assert_eq!(client_point(479.0, 0.0, 260.0), (479, 260), "the bottom edge is y = height");
         assert_eq!(client_point(23.6, 41.4, 260.0), (24, 219), "sub-pixel locations round");
         assert_eq!(client_point(-4.0, 300.0, 260.0), (-4, -40), "outside the client stays signed");
+    }
+
+    #[test]
+    fn a_synthetic_click_point_parses_or_is_refused() {
+        assert_eq!(parse_point("150,90"), Some((150.0, 90.0)));
+        assert_eq!(parse_point(" 12.5 , 7 "), Some((12.5, 7.0)));
+        assert_eq!(parse_point("150"), None);
+        assert_eq!(parse_point("150,"), None);
+        assert_eq!(parse_point("x,90"), None);
     }
 
     #[test]
