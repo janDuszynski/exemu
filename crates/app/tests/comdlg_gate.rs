@@ -282,18 +282,34 @@ fn wine_get_open_file_name_w_accepts_exactly_two_struct_sizes() {
 /// * `CommDlgExtendedError()` stays **0** — no struct, find-resource or
 ///   load-resource failure.
 ///
-/// What is still missing, and is the remaining W6.2 work: **the dialog is modal
-/// and headless, so its message loop ends with no selection** and
-/// `GetOpenFileNameW` still returns `FALSE` with `lpstrFile` empty. Driving it
-/// (synthesizing the selection + `IDOK`, or bridging to a native panel) is the
-/// next step.
+/// * **The modal loop now runs.** With `GetDialogInfo`/`SetDialogInfo`/
+///   `GetDialogProc` serviced (roadmap W6.2), `DIALOG_DoDialogBox` fetches its
+///   `DIALOGINFO` and pumps, where it used to give up before reaching
+///   `NtUserGetMessage` even once.
 ///
-/// A detail worth keeping: because `GetSaveFileNameW` returns `FALSE` without
-/// touching the buffer, the guest still holds the file name it *proposed*,
-/// opens that relative name, and writes to it — landing in the sandbox root. So
-/// "a file was written" is emphatically **not** evidence that the save dialog
-/// worked, which is why the open leg (whose buffer starts empty) carries the
-/// claim.
+/// ## **THE HOLLOW TRUE — read this before believing any number here**
+///
+/// Running the modal loop makes `GetOpenFileNameW` return **TRUE**, and that
+/// TRUE means nothing. `DIALOG_DoDialogBox` breaks its loop on the pending
+/// `WM_QUIT` and returns `dlgInfo->idResult`, which user32 pre-initialises to
+/// `IDOK`. So the call succeeds with `lpstrFile` **untouched**.
+///
+/// The visible consequence is that the sample's failure tally *improves* from 5
+/// to 3 — the two "the dialog returned FALSE" failures disappear — while the
+/// guest is no better off than before. **A smaller number here is not
+/// progress.** Everything this file asserts about the outcome is therefore
+/// asserted on the returned **path** and on the **bytes read back through it**,
+/// never on the return value; the tally is pinned only so that it cannot move
+/// silently.
+///
+/// What is still missing, and is the remaining W6.2 work: nobody types a file
+/// name or presses the default button, so the dialog closes with no selection.
+///
+/// A detail worth keeping: `GetSaveFileNameW`'s buffer starts out holding the
+/// name the guest *proposed*, so the guest opens that relative name and writes
+/// to it — landing in the sandbox root — whatever the dialog does. So "a file
+/// was written" is emphatically **not** evidence that the save dialog worked,
+/// which is why the open leg (whose buffer starts empty) carries the claim.
 #[test]
 fn wine_file_dialog_is_built_but_never_completes() {
     if !wine_dlls_present() {
@@ -304,8 +320,9 @@ fn wine_file_dialog_is_built_but_never_completes() {
     let r = report(&res.stdout);
     eprintln!("comdlg wine gap: exit={} steps={} {r:?}", res.exit_code, res.steps);
 
-    // Still FALSE — but now for a *later* reason: the modal loop ran and ended
-    // with no selection, rather than the dialog never existing.
+    // **The load-bearing pair.** The call now answers TRUE (see the hollow-TRUE
+    // note above), so the only honest questions are "what path came back?" and
+    // "what did opening it read?" — and the answer to both is still nothing.
     assert_eq!(tag(&r, comdlg_sample::TAG_OPEN), "", "GetOpenFileNameW returned no path");
     assert_eq!(tag(&r, comdlg_sample::TAG_READ), "", "so nothing could be opened and read");
     assert_ne!(
@@ -357,10 +374,12 @@ fn wine_file_dialog_is_built_but_never_completes() {
         "the template's Open/Cancel buttons reach the driver. Got {created:?}"
     );
 
-    // The failure count the sample reports: dialog FALSE + empty path + failed
-    // CreateFileW + empty read, for the open leg, and dialog FALSE for the save
-    // leg (whose own file write succeeds, as described above).
-    assert_eq!(res.exit_code, 5, "the exact failure tally of the measured gap");
+    // The failure count the sample reports: empty path + failed CreateFileW +
+    // empty read, all on the open leg. It was **5** before the modal loop ran,
+    // and the two that vanished are the two "the dialog returned FALSE" legs —
+    // replaced by a TRUE that proves nothing. Pinned so the tally cannot move
+    // silently, never as evidence of progress; see the hollow-TRUE note above.
+    assert_eq!(res.exit_code, 3, "the exact failure tally of the measured gap");
 }
 
 // ==========================================================================

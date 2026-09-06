@@ -487,6 +487,8 @@ const SIMPLEREGION: u32 = 2;
 const NT_USER_CALL_HWND: u32 = 0x1332;
 const NT_USER_CALL_HWND_PARAM: u32 = 0x1336;
 const NT_USER_CALL_ONE_PARAM: u32 = 0x133d;
+/// `NtUserCallTwoParam(a, b, code)` — the two-argument fan-in (roadmap W6.2).
+const NT_USER_CALL_TWO_PARAM: u32 = 0x133e;
 /// `NtUserSetWindowLong` / `NtUserSetWindowLongPtr` — the write half of the
 /// `GetWindowLong*` family the multiplexers read.
 const NT_USER_SET_WINDOW_LONG: u32 = 0x15a3;
@@ -699,6 +701,38 @@ const GWLP_ID: i64 = -12;
 
 /// `NtUserCallHwnd(hwnd, code)` selectors.
 mod call_hwnd {
+    /// **`GetDialogInfo`** — the per-window `DIALOGINFO` user32's dialog
+    /// manager keeps a dialog's state in (roadmap W6.2). A **pointer**, so it
+    /// comes back through the whole of RAX.
+    ///
+    /// win32k's only job here is storage: the block is user32's own, allocated
+    /// by `user32!DIALOG_get_info` (RVA 0x19eb0) out of the process heap and
+    /// opaque to exemu. That function is what pins both halves of the pair,
+    /// without needing the enumeration at all —
+    ///
+    /// ```text
+    ///   mov  edx, 1                     ; NtUserCallHwnd_GetDialogInfo
+    ///   call NtUserCallHwnd
+    ///   test rax, rax                   ; a pointer, not a BOOL
+    ///   jne  <return it>
+    ///   …HeapAlloc(heap, 0, 0x28); zero it; [rax+0x20] = 1
+    ///   mov  r8d, 0x18                  ; NtUserCallHwndParam_SetDialogInfo
+    ///   call NtUserCallHwndParam
+    /// ```
+    ///
+    /// — and the pinned user32's DWARF names the same two values
+    /// (`NtUserCallHwnd_GetDialogInfo = 1`,
+    /// `NtUserCallHwndParam_SetDialogInfo = 24`), in the enumeration that also
+    /// carries `NtUserGetFullWindowHandle = 15` and `NtUserCallHwnd_GetParent =
+    /// 5`, both of which exemu had already recovered by disassembly. That
+    /// agreement is what makes the numbering trustworthy rather than merely
+    /// convenient.
+    ///
+    /// Unserviced, this answered 0 and `DIALOG_DoDialogBox` gave up before its
+    /// modal loop: `NtUserGetMessage` and `NtUserPeekMessage` were reached
+    /// **zero** times in a whole comdlg32 run, against 40
+    /// `NtUserCreateWindowEx`.
+    pub const GET_DIALOG_INFO: u64 = 0x01;
     /// `GetDpiForWindow`.
     pub const GET_DPI_FOR_WINDOW: u64 = 0x02;
     /// `GetParent`.
@@ -761,6 +795,36 @@ mod call_hwnd_param {
     /// a FALSE as "this message is not mine" and declines to run the dialog's
     /// keyboard interface at all.
     pub const IS_CHILD: u64 = 0x13;
+    /// **`SetDialogInfo`** — the write half of
+    /// [`super::call_hwnd::GET_DIALOG_INFO`], where the derivation of both
+    /// values lives. `param` is the `DIALOGINFO *` user32 has just allocated.
+    pub const SET_DIALOG_INFO: u64 = 0x18;
+}
+
+/// `NtUserCallTwoParam(a, b, code)` selectors.
+mod call_two_param {
+    /// **`GetDialogProc`** — `a` is a window procedure and `b` an "ANSI?" flag;
+    /// the answer is the procedure to call for that flavour (roadmap W6.2).
+    ///
+    /// Wine's kernel side keeps A/W procedure *pairs* for the procedures it has
+    /// registered itself, and answers with the requested half; for anything it
+    /// does not recognise the documented answer is the procedure it was handed.
+    /// exemu keeps no such pairing, so **the procedure is its own answer** for
+    /// either flavour — which is also the only answer that can be right, since
+    /// the address user32 passed in is the address it should call.
+    ///
+    /// Answering **0** is what made this visible: user32 asks twice in a row
+    /// about the same address (`(proc, 0)` then `(proc, 1)`, a pair the win32u
+    /// trace shows plainly) and, with both answering "not one of mine and not a
+    /// procedure either", declines to invoke anything. In the Total Commander
+    /// transcript the address is `user32+0x3f9e0`, which the COFF symbols name
+    /// **`MSGBOX_DlgProc`** — user32's own message-box procedure, so the guest
+    /// was being refused a dialog user32 itself had built.
+    ///
+    /// Value from the pinned user32's DWARF (`NtUserCallTwoParam_GetDialogProc
+    /// = 0`), in the enumeration cross-checked in
+    /// [`super::call_hwnd::GET_DIALOG_INFO`].
+    pub const GET_DIALOG_PROC: u64 = 0x00;
 }
 
 /// `NtUserCallOneParam(arg, code)` selectors.
@@ -1127,6 +1191,11 @@ struct Window {
     /// `err:commctrl:COMCTL32_SubclassProc Our sub classing stack got erased`
     /// on every control comctl32 subclasses.
     props: Vec<(String, u64)>,
+    /// The `DIALOGINFO *` user32 attached with `NtUserCallHwndParam`'s
+    /// [`SetDialogInfo`](call_hwnd_param::SET_DIALOG_INFO) selector, or 0
+    /// (roadmap W6.2). Opaque to exemu: it is user32's own heap block, and
+    /// win32k's whole contract is to keep it and hand it back.
+    dialog_info: u64,
 }
 
 /// A per-window backing surface (W4.3): a guest-mapped top-down BGRA32 DIB the
@@ -1585,6 +1654,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_CALL_HWND, nt_user_call_hwnd);
     os.set_win32k_handler(NT_USER_CALL_HWND_PARAM, nt_user_call_hwnd_param);
     os.set_win32k_handler(NT_USER_CALL_ONE_PARAM, nt_user_call_one_param);
+    os.set_win32k_handler(NT_USER_CALL_TWO_PARAM, nt_user_call_two_param);
     os.set_win32k_handler(NT_USER_SET_WINDOW_LONG, nt_user_set_window_long);
     os.set_win32k_handler(NT_USER_SET_WINDOW_LONG_PTR, nt_user_set_window_long_ptr);
     // NtGdi paint path (W4.3): rasterize into the per-window surface.
@@ -2083,6 +2153,7 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
             id: if style & WS_CHILD != 0 { menu } else { 0 },
             instance,
             props: Vec::new(),
+            dialog_info: 0,
         },
     ));
 
@@ -2690,8 +2761,32 @@ fn nt_user_call_hwnd(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
         call_hwnd::IS_SELF_THREAD => st.window(hwnd).map(|_| hwnd).unwrap_or(0),
         // Also the validated handle, not a boolean — see the constant.
         call_hwnd::GET_FULL_WINDOW_HANDLE => st.window(hwnd).map(|_| hwnd).unwrap_or(0),
+        // A pointer, so it goes back through the whole of RAX rather than
+        // through the u32 syscall return.
+        call_hwnd::GET_DIALOG_INFO => {
+            let info = st.window(hwnd).map(|w| w.dialog_info).unwrap_or(0);
+            os.return_u64_from_syscall(info);
+            return Ok(0); // ignored: the 64-bit value above is what reaches rax
+        }
         _ => 0,
     })
+}
+
+/// `NtUserCallTwoParam(a, b, code)` — the two-argument fan-in (roadmap W6.2).
+///
+/// Only [`GetDialogProc`](call_two_param::GET_DIALOG_PROC) is answered; every
+/// other selector keeps the module's honest zero, for the reason the
+/// `NtUserCallHwnd` family spells out — "unknown ⇒ do something" is how a fan-in
+/// multiplexer starts inventing behaviour.
+fn nt_user_call_two_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let a = os.syscall_arg(cpu, mem, 0)?;
+    let code = os.syscall_arg(cpu, mem, 2)?;
+    if code == call_two_param::GET_DIALOG_PROC {
+        // A procedure address: back through RAX whole.
+        os.return_u64_from_syscall(a);
+        return Ok(0); // ignored: the 64-bit value above is what reaches rax
+    }
+    Ok(0)
 }
 
 /// `NtUserCallHwndParam(hwnd, param, code)` — the two-argument window family:
@@ -2732,6 +2827,11 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
             for (i, v) in rect.iter().enumerate() {
                 mem.write_u32(out + (i as u64) * 4, *v as u32)?;
             }
+            Ok(1)
+        }
+        call_hwnd_param::SET_DIALOG_INFO => {
+            let Some(w) = os.win32k_state.window_mut(hwnd) else { return Ok(0) };
+            w.dialog_info = param;
             Ok(1)
         }
         // `hwnd` is the parent and `param` the child — see the constant, which
@@ -4138,7 +4238,7 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 pub mod abi {
     /// win32u syscall indices, as `(export name, index)`. The index is the
     /// `mov eax, imm32` immediate in that export's stub.
-    pub const SYSCALLS: [(&str, u32); 36] = [
+    pub const SYSCALLS: [(&str, u32); 37] = [
         ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
         ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
         ("NtUserSetCapture", super::NT_USER_SET_CAPTURE),
@@ -4164,6 +4264,7 @@ pub mod abi {
         ("NtUserCallHwnd", super::NT_USER_CALL_HWND),
         ("NtUserCallHwndParam", super::NT_USER_CALL_HWND_PARAM),
         ("NtUserCallOneParam", super::NT_USER_CALL_ONE_PARAM),
+        ("NtUserCallTwoParam", super::NT_USER_CALL_TWO_PARAM),
         ("NtUserSetWindowLong", super::NT_USER_SET_WINDOW_LONG),
         ("NtUserSetWindowLongPtr", super::NT_USER_SET_WINDOW_LONG_PTR),
         ("NtGdiExtTextOutW", super::NT_GDI_EXT_TEXT_OUT_W),
@@ -4179,7 +4280,7 @@ pub mod abi {
 
     /// `NtUserCallHwnd(hwnd, code)` selectors, as `(user32 export that issues
     /// this code, code)`.
-    pub const CALL_HWND: [(&str, u64); 6] = [
+    pub const CALL_HWND: [(&str, u64); 7] = [
         ("IsWindow", super::call_hwnd::IS_WINDOW),
         ("IsWindowEnabled", super::call_hwnd::IS_WINDOW_ENABLED),
         ("IsWindowUnicode", super::call_hwnd::IS_WINDOW_UNICODE),
@@ -4188,6 +4289,10 @@ pub mod abi {
         // `WIN_IsCurrentProcess`, which `SetWindowTextW` inlines the call to,
         // and whose result `DefWindowProcW` uses as the window handle.
         ("SetWindowTextW", super::call_hwnd::IS_SELF_THREAD),
+        // Not an export — an internal routine, reached through the COFF symbol
+        // table. `DIALOG_get_info` is where both halves of the dialog-info pair
+        // are read off (roadmap W6.2).
+        ("DIALOG_get_info", super::call_hwnd::GET_DIALOG_INFO),
     ];
 
     /// `NtUserGetThreadState(index)` selectors, as `(user32 export, index)` —
@@ -4255,12 +4360,13 @@ pub mod abi {
     pub const HT_TRANSPARENT: i64 = super::hit::TRANSPARENT;
 
     /// `NtUserCallHwndParam(hwnd, param, code)` selectors, likewise.
-    pub const CALL_HWND_PARAM: [(&str, u64); 5] = [
+    pub const CALL_HWND_PARAM: [(&str, u64); 6] = [
         ("GetWindowRect", super::call_hwnd_param::GET_WINDOW_RECT),
         ("GetClientRect", super::call_hwnd_param::GET_CLIENT_RECT),
         ("GetWindowLongPtrA", super::call_hwnd_param::GET_WINDOW_LONG_PTR_A),
         ("GetWindowLongPtrW", super::call_hwnd_param::GET_WINDOW_LONG_PTR_W),
         ("IsChild", super::call_hwnd_param::IS_CHILD),
+        ("DIALOG_get_info", super::call_hwnd_param::SET_DIALOG_INFO),
     ];
 
     /// `NtUserCallOneParam(arg, code)` selectors, likewise.
@@ -4269,6 +4375,13 @@ pub mod abi {
         ("GetSysColorBrush", super::call_one_param::GET_SYS_COLOR_BRUSH),
         ("GetSystemMetrics", super::call_one_param::GET_SYSTEM_METRICS),
     ];
+
+    /// `NtUserCallTwoParam(a, b, code)` selectors, as
+    /// `(the user32 routine that passes it, code)`. `SetWindowLongPtrA` makes
+    /// both of these calls back to back through one parked import slot, which is
+    /// what lets the test read them as a pair (roadmap W6.2).
+    pub const CALL_TWO_PARAM_VIA_SET_WINDOW_LONG_PTR_A: [(&str, u64); 2] =
+        [("AllocWinProc", 0x09), ("GetDialogProc", super::call_two_param::GET_DIALOG_PROC)];
 
     /// `NtGdiGetAndSetDCDword` selectors, as `(gdi32 setter, code)`.
     pub const DC_DWORD: [(&str, u64); 2] = [
@@ -5513,6 +5626,7 @@ mod tests {
                 id: 0,
                 instance: 0,
                 props: Vec::new(),
+                dialog_info: 0,
             },
         ));
         hwnd
@@ -6028,6 +6142,7 @@ mod tests {
                 id: 0x65,
                 instance: 0x1_4000_0000,
                 props: Vec::new(),
+                dialog_info: 0,
             },
         ));
         let mut mem = VirtualMemory::new();
