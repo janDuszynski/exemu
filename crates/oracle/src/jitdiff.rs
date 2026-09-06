@@ -688,7 +688,6 @@ fn diff_mem(a: &VirtualMemory, b: &VirtualMemory, sp: &Space) -> Option<String> 
 #[allow(clippy::too_many_arguments)]
 fn run_lapped(
     jit: &mut Jit,
-    mode: Mode,
     plan: &TrialPlan,
     laps: u32,
     mut mem_j: VirtualMemory,
@@ -706,14 +705,58 @@ fn run_lapped(
     // write — so the reference has to be given that same instruction rather than
     // left one behind it.
     let mut stopped_mid_instruction = false;
+    // The two sides are compared **after every step**, not once at the end. A
+    // lapped trial runs the same block many times, so a state difference
+    // introduced on lap 1 would otherwise surface only as a fault several
+    // instructions later, at an address that says nothing about what went wrong.
+    let mut done: u32 = 0;
+    fn catch_up(
+        cpu_i: &mut Interpreter,
+        mem_i: &mut VirtualMemory,
+        done: &mut u32,
+        total: u32,
+    ) -> Option<String> {
+        let mut hooks = NoHooks;
+        while *done < total {
+            match cpu_i.step(mem_i, &mut hooks) {
+                Ok(Exit::Continue) => *done += 1,
+                other => {
+                    let rip = cpu_i.state().rip;
+                    let mut w = [0u8; 16];
+                    let _ = mem_i.fetch(rip, &mut w);
+                    return Some(format!(
+                        "interpreter stopped after {done} of {total} instructions at rip={rip:#x} [{}]: {other:?}",
+                        w.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+                    ));
+                }
+            }
+        }
+        None
+    }
     while (total as u64) < budget {
         let left = budget - total as u64;
+        // **The mode is re-read every time**, not fixed at the start of the
+        // trial. A guest can change it while it runs — a far jump through a CS
+        // selector is how a WoW64 process switches (roadmap W5.2), and `iret`
+        // reloads CS too — and the same bytes are two different programs in the
+        // two modes. The real run loop in `crates/app` re-reads it per iteration
+        // for exactly this reason; a lapped trial is the first thing here that
+        // calls `Jit::run` more than once, and pinning the mode made a 64-bit
+        // block run for an interpreter that had switched to 32-bit.
+        let mode = mode_of(cpu_j.bits());
         let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, left);
         total += run.insns();
         last = run;
+        if let Some(r) = catch_up(&mut cpu_i, &mut mem_i, &mut done, total) {
+            return (last, Some(r));
+        }
+        if let Some(r) = diff_state(cpu_j.state(), cpu_i.state()) {
+            return (last, Some(r));
+        }
         match run {
-            // Stopped on the budget: that is the end of the trial.
-            Run::Executed { .. } => break,
+            // Stopped on the budget: the `while` above decides whether that is
+            // the end of the trial.
+            Run::Executed { .. } => {}
             // Rewound onto a faulting access. The interpreter is required to
             // fail on that same instruction below, so stop here and let the
             // comparison speak.
@@ -732,18 +775,8 @@ fn run_lapped(
         }
     }
 
-    for step in 0..total {
-        match cpu_i.step(&mut mem_i, &mut hooks) {
-            Ok(Exit::Continue) => {}
-            other => {
-                return (
-                    last,
-                    Some(format!(
-                        "interpreter stopped after {step} of {total} instructions: {other:?}"
-                    )),
-                )
-            }
-        }
+    if let Some(r) = catch_up(&mut cpu_i, &mut mem_i, &mut done, total) {
+        return (last, Some(r));
     }
     if stopped_mid_instruction {
         // Whatever it did to the JIT side's state before it stopped, it does
@@ -804,7 +837,7 @@ fn run_one(jit: &mut Jit, bits: Bits, plan: &TrialPlan, laps: u32) -> (Run, Opti
     // it lands wherever it lands, which is also a test that the chain stops on
     // an instruction boundary the interpreter agrees with.
     if laps > 1 {
-        return run_lapped(jit, mode, plan, laps, mem_j, cpu_j, mem_i, cpu_i);
+        return run_lapped(jit, plan, laps, mem_j, cpu_j, mem_i, cpu_i);
     }
     let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
 
