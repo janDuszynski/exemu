@@ -23,9 +23,69 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 931, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1019, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### Window properties, and the handle every window procedure is given (W6.2)
+- **`SetProp`/`GetProp`/`RemoveProp` had no implementation at all.** `GetProp`
+  answered NULL for something that had just been set — and window properties are
+  where a large part of Wine's own USER layer keeps per-window state. The visible
+  symptom was `err:commctrl:COMCTL32_SubclassProc Our sub classing stack got
+  erased` on *every* control comctl32 subclasses; it is gone. Properties are
+  keyed by name, with the documented integer-atom overload, and the stored value
+  comes back at full 64-bit width because what callers park there is a pointer to
+  their own allocation, not a BOOL.
+- **Every dialog procedure in the process was being called with `hwnd = 0`.**
+  `user32!WIN_GetFullHandle` — the handle widener each user32 entry point runs
+  its `HWND` through — is one `NtUserCallHwnd` selector, and exemu answered it
+  with 0. `user32!call_dialog_proc` widens the handle and passes the result to
+  the dialog procedure *as its window*, so a dialog procedure could not name its
+  own window: comdlg32's file-dialog procedure could not even store its own
+  state. exemu's handles are already full, so the answer is the validated
+  identity.
+- Both are re-derived from the pinned binaries on every test run
+  (`crates/os/tests/user_abi.rs`), so a Wine-prefix refresh that renumbers the
+  SSDT fails a test instead of silently bringing the bug back.
+
+### A real codepage table, and an honest codepage surface (W6.x)
+- **msvcrt was running with empty multibyte tables on every Wine-booted guest.**
+  `NtGetNlsSectionPtr(type 0xb, id)` answered *every* codepage with the same
+  `CP_UTF8`-marked stub — and cached it by section type alone, so a second
+  distinct codepage would have got the first one's view. `RtlInitCodePageTable`
+  short-paths on that marker, so the conversion ran as UTF-8 under whatever
+  codepage the guest had named. The C runtime asks for **20127** (US-ASCII, its
+  default single-byte locale), round-trips all 256 byte values through
+  `MultiByteToWideChar`/`WideCharToMultiByte` into 256-byte buffers, and UTF-8
+  needs 384 bytes for the return leg — hence
+  `err:msvcrt:create_mbcinfo … ret=0 (exp 256), error=122`, and hence empty
+  `mbctype` tables in every guest that touches the CRT.
+- **The surface was measured, not guessed.** A new `EXEMU_NLS_TRACE` seam logs
+  every `NtGetNlsSectionPtr(type, id)`. Over a full Wine boot of both WoW64
+  corpus binaries the complete request set is four calls: sort, case,
+  normalisation, and codepage **20127** (six times) — nothing else. On the
+  emulated path the two conversion APIs are reached 11,311 times, every one of
+  them with `CP_ACP`, which is UTF-8 there because `GetACP` reports 65001.
+- **What is supported, and what is refused.** exemu now builds a real
+  `C_#####.nls` image for **20127**, **28591** (ISO 8859-1) and **1252**
+  (Windows ANSI) — one generator, all three bijections on their defined range,
+  so the reverse direction needs no best-fit guessing. Every other codepage is
+  refused with `STATUS_OBJECT_NAME_NOT_FOUND`, exactly as a missing `.nls` file
+  would be, and surfaces to the guest as `ERROR_INVALID_PARAMETER`. The DBCS
+  codepages (932, 936, 949, 950, 1361) are deliberately out of scope: their
+  tables are real `.nls` data the pinned prefix does not ship, and an
+  approximation would corrupt text silently. **A wrong conversion is worse than
+  a refused one, and a silently-empty table is worse than both.**
+- The table format was recovered from the pinned `ntdll.dll` itself —
+  `RtlInitCodePageTable`, `RtlCustomCPToUnicodeN` and `RtlUnicodeToCustomCPN` —
+  and `crates/os/tests/nls_abi.rs` re-derives every offset from the binaries on
+  each run, so a prefix refresh that reshapes the table fails a test instead of
+  quietly mis-converting text.
+- exemu's own `WideCharToMultiByte`/`MultiByteToWideChar` thunks now convert
+  through the same tables, so the emulated and the Wine path cannot disagree,
+  and `lpUsedDefaultChar` is answered honestly.
+- Corpus: 7-Zip byte-identical; the two Wine rows *fall* — SteamSetup
+  −29,799 and Firefox −14,762 instructions — because the failed conversions,
+  their `err:`-channel formatting and msvcrt's fallback no longer happen.
 ### Where the comctl6 side-by-side assembly actually is (W6.1, diagnosis)
 - With Wine's own debug channels on, a WoW64 guest that asks for themed controls
   reports `fixme:actctx:parse_depend_manifests Could not find dependent assembly
