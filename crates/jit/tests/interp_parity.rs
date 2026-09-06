@@ -616,3 +616,101 @@ fn a_conditional_branch_lands_on_the_right_side() {
         parity(Bits::B64, &code, name, &s);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The rewind after a store-only fault
+// ---------------------------------------------------------------------------
+
+/// Build an address space whose **data page is not writable**, so a
+/// read-modify-write instruction's load succeeds and its store does not.
+///
+/// This is the one fault shape the generated differential could not reach: it
+/// maps every data region `RW`, so a store that faults is always a store whose
+/// *load* would have faulted too — and a load faults before the instruction has
+/// computed anything. A store faults after it has computed everything,
+/// including its flags. Real guests hit this constantly (`.rdata`, `.text`, and
+/// any page a guest has re-protected), and so does an armed data watchpoint
+/// (roadmap W9.3), which is how it was found.
+fn ro_data(bits: Bits, code: &[u8], seed: &CpuState) -> (VirtualMemory, Interpreter) {
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
+    mem.map(Region::new("data", DATA, 0x1000, Perm::READ)).unwrap();
+    mem.map(Region::new("stack", 0x3_0000, 0x2000, Perm::RW)).unwrap();
+    mem.poke(CODE, code).unwrap();
+    let mut cpu = Interpreter::with_bits(bits);
+    *cpu.state_mut() = seed.clone();
+    cpu.state_mut().rip = CODE;
+    (mem, cpu)
+}
+
+/// Run `code` on both engines, expecting the JIT to rewind onto a faulting
+/// **store** after `expect_retired` instructions, and requiring the rewound
+/// state to be exactly the interpreter's state after those same instructions.
+fn store_fault_parity(bits: Bits, code: &[u8], expect_retired: u32, what: &str) {
+    if !jit_available() {
+        return;
+    }
+    let seed = CpuState {
+        // CF|PF|AF|SF|OF set, so a lost flag is visible.
+        rflags: 0x896,
+        gpr: {
+            let mut g = [0u64; 16];
+            g[4] = 0x3_1000; // rsp
+            g[7] = DATA; // rdi
+            g
+        },
+        ..CpuState::default()
+    };
+    let (mut mem_j, mut cpu_j) = ro_data(bits, code, &seed);
+    let mode = match bits {
+        Bits::B64 => Mode::Long,
+        Bits::B32 => Mode::Protected,
+    };
+    let mut jit = Jit::new(1 << 20).unwrap();
+    let ran = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
+    assert_eq!(ran, Run::Faulted { insns: expect_retired }, "{what}: {ran:?}");
+
+    let (mut mem_i, mut cpu_i) = ro_data(bits, code, &seed);
+    let mut hooks = NoHooks;
+    for i in 0..expect_retired {
+        assert!(
+            matches!(cpu_i.step(&mut mem_i, &mut hooks), Ok(Exit::Continue)),
+            "{what}: the interpreter stopped at instruction {i}"
+        );
+    }
+    diff(cpu_j.state(), cpu_i.state(), what);
+    // …and the instruction the JIT refused really does fault.
+    assert!(cpu_i.step(&mut mem_i, &mut hooks).is_err(), "{what}: that store did not fault");
+}
+
+/// `inc byte [rdi]` into a read-only page. The load succeeds, the flags are
+/// computed, and *then* the store faults — so the rewind has to undo a flag
+/// update that has already happened. Before this was fixed the block returned
+/// `rflags = 0x2`: the flags of the `inc` that never happened.
+#[test]
+fn a_store_only_fault_rewinds_the_flags_it_had_already_computed() {
+    store_fault_parity(Bits::B64, &[0xFE, 0x07, 0xC3], 0, "inc byte [rdi] 64-bit");
+    store_fault_parity(Bits::B32, &[0xFE, 0x07, 0xC3], 0, "inc byte [rdi] 32-bit");
+    // A wider one, and a different flag shape: `add [rdi], eax` defines CF too.
+    store_fault_parity(Bits::B64, &[0x01, 0x07, 0xC3], 0, "add [rdi], eax");
+    store_fault_parity(Bits::B64, &[0x29, 0x07, 0xC3], 0, "sub [rdi], eax");
+    store_fault_parity(Bits::B64, &[0x21, 0x07, 0xC3], 0, "and [rdi], eax");
+    store_fault_parity(Bits::B64, &[0xF6, 0x1F, 0xC3], 0, "neg byte [rdi]");
+    store_fault_parity(Bits::B64, &[0xD1, 0x27, 0xC3], 0, "shl dword [rdi], 1");
+    store_fault_parity(Bits::B64, &[0x31, 0x07, 0xC3], 0, "xor [rdi], eax");
+}
+
+/// The same, but with a **deferred** flag state to rewind to (roadmap W8.4):
+/// the `add` before it leaves its flags pending precisely because the `inc`
+/// overwrites them, so the rewind must restore a state expressed in the pending
+/// operand registers — which the `inc` has since loaded its own operands into.
+/// Restoring `rflags` alone is not enough here, which is why the spill is four
+/// registers wide.
+#[test]
+fn a_store_only_fault_rewinds_to_a_deferred_flag_state() {
+    // add eax, 1 ; add [rdi], eax ; ret — the second fully overwrites the
+    // first's flags, which is exactly the condition the deferral scan looks for.
+    let code = [0x83, 0xC0, 0x01, 0x01, 0x07, 0xC3];
+    store_fault_parity(Bits::B64, &code, 1, "deferred then a faulting store 64-bit");
+    store_fault_parity(Bits::B32, &code, 1, "deferred then a faulting store 32-bit");
+}

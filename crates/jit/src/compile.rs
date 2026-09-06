@@ -99,6 +99,26 @@ const R_MASK: u32 = 28; // 0x8D5 = CF|PF|AF|ZF|SF|OF
 const TLB_ENTRY_SHIFT: u32 = 5;
 
 /// Scratch registers, dead across any helper call.
+/// The block's stack frame, in bytes. 80 of it is the ten callee-saved role
+/// registers plus `x30`; the last 32 are [`FSPILL`], the rewind's scratch.
+/// 16-byte aligned, as AAPCS64 requires.
+const FRAME: i32 = 128;
+
+/// Frame offset of the four-register **flag spill** (roadmap W8.4 + W9.3).
+///
+/// A guest store can fault *after* its instruction has already computed its
+/// flags — the store is the last thing an RMW does — and the rewind must show
+/// the flags as of the instruction's **start**. Those live only in registers the
+/// instruction has by then overwritten, so a flag-setting instruction with a
+/// memory operand parks all four here first: `R_FLAGS`/`R_FR` in the low pair,
+/// `R_FA`/`R_FB` in the high one, two `stp`s in all.
+///
+/// The cold path reloads them and the ordinary rewind machinery then works
+/// unchanged, including for an instruction whose *entry* flag state was itself
+/// deferred (roadmap W8.4) — which is precisely the case that cannot be
+/// reconstructed from anything else.
+const FSPILL: i32 = 96;
+
 const T0: u32 = 9;
 const T1: u32 = 10;
 const T2: u32 = 11;
@@ -394,6 +414,10 @@ struct StoreStub {
     before: Flags,
     /// … and as of after it (the "committed, now stop" path).
     after: Flags,
+    /// Did this instruction park the four flag registers in [`FSPILL`] before
+    /// touching them? Then the rewind reloads them first, because `before` is
+    /// expressed in terms of registers the instruction has since overwritten.
+    spilled: bool,
 }
 
 /// The block being built.
@@ -413,6 +437,10 @@ pub struct Compiler {
     /// Whether the instruction being lowered should leave its flags pending.
     /// Purely a cost decision — either answer is correct.
     defer: bool,
+    /// Whether the instruction being lowered has parked the flag registers in
+    /// [`FSPILL`]. See that constant: it is what makes a **store** fault rewind
+    /// to the right flags, as a load fault already did.
+    spilled: bool,
     fault_stubs: Vec<FaultStub>,
     store_stubs: Vec<StoreStub>,
     /// Branches to the shared epilogue.
@@ -493,6 +521,7 @@ impl Compiler {
             flags: Flags::Live,
             insn_flags: Flags::Live,
             defer: false,
+            spilled: false,
             fault_stubs: Vec::new(),
             store_stubs: Vec::new(),
             exits: Vec::new(),
@@ -569,8 +598,28 @@ impl Compiler {
             let next = rip.wrapping_add(insn.len as u64) & mode.addr_mask();
             // Deferring this instruction's flags only pays when a later one
             // overwrites them first (roadmap W8.4); either answer is correct.
-            c.defer = flag_effect(&insn) != FlagEffect::Neutral
-                && defer_pays(mem, mode, next, DEFER_SCAN);
+            let sets_flags = flag_effect(&insn) != FlagEffect::Neutral;
+            c.defer = sets_flags && defer_pays(mem, mode, next, DEFER_SCAN);
+            // An instruction that both touches memory and moves the flags may
+            // have to be *rewound* after it has already moved them: its store
+            // is the last thing it does, and a store can fault (a read-only
+            // page, or an armed data watchpoint — roadmap W9.3). Park the flag
+            // state where the rewind can find it. Two `stp`s, and only for the
+            // instructions that can actually need it. See `FSPILL`.
+            c.spilled = sets_flags && matches!(insn.rm, Rm::Mem(_));
+            if c.spilled {
+                c.asm.stp(R_FLAGS, R_FR, crate::a64::SP, FSPILL);
+                // The pending operands only matter when there *is* a pending
+                // state to rewind to — one `stp` in the common case, two in the
+                // rare one. (Today `overwriter_settles` happens to keep a
+                // deferred state from ever reaching a memory-destination RMW,
+                // so this second pair is belt to that heuristic's braces: it
+                // makes the rewind correct by construction rather than by a
+                // property of a cost decision.)
+                if c.flags != Flags::Live {
+                    c.asm.stp(R_FA, R_FB, crate::a64::SP, FSPILL + 16);
+                }
+            }
             match c.lower(&insn, next) {
                 Lowered::Ok => {
                     c.insns += 1;
@@ -647,7 +696,7 @@ impl Compiler {
 
     fn prologue(&mut self) {
         let a = &mut self.asm;
-        a.stp_pre(19, 20, crate::a64::SP, -96);
+        a.stp_pre(19, 20, crate::a64::SP, -FRAME);
         a.stp(21, 22, crate::a64::SP, 16);
         a.stp(23, 24, crate::a64::SP, 32);
         a.stp(25, 26, crate::a64::SP, 48);
@@ -673,7 +722,7 @@ impl Compiler {
         a.ldp(25, 26, crate::a64::SP, 48);
         a.ldp(27, 28, crate::a64::SP, 64);
         a.ldr(8, 30, crate::a64::SP, 80);
-        a.ldp_post(19, 20, crate::a64::SP, 96);
+        a.ldp_post(19, 20, crate::a64::SP, FRAME);
         a.ret();
     }
 
@@ -825,6 +874,15 @@ impl Compiler {
                 }
             }
             self.asm.bind(is_fault);
+            // The store faulted, so the instruction never happened — but it had
+            // already computed its flags into the very registers `s.before` is
+            // written in terms of. Put them back before rewinding.
+            if s.spilled {
+                self.asm.ldp(R_FLAGS, R_FR, crate::a64::SP, FSPILL);
+                if s.before != Flags::Live {
+                    self.asm.ldp(R_FA, R_FB, crate::a64::SP, FSPILL + 16);
+                }
+            }
             self.exit_to(s.before, s.rip, s.retired, ExitKind::Fault);
         }
         let faults = std::mem::take(&mut self.fault_stubs);
@@ -1005,6 +1063,7 @@ impl Compiler {
             commit,
             before: self.insn_flags,
             after: self.flags,
+            spilled: self.spilled,
         });
         self.asm.bind(done);
         self.emit_commit(commit);
@@ -2400,6 +2459,7 @@ impl Compiler {
             commit: Commit::Gpr { idx: 4, size: 8, has_rex: true },
             before: self.insn_flags,
             after: self.flags,
+            spilled: self.spilled,
         });
         self.asm.bind(done);
         self.store_gpr(R_VAL, 4, 8, true);
