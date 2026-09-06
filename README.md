@@ -793,6 +793,24 @@ and `EnumDisplaySettings`/`ChangeDisplaySettings` present a single 1920×1080
 monitor. `exemu cocoa-demo` still opens the same presenter directly with a test
 frame.
 
+**The host mirrors the window tree the guest actually asked for.** Only a
+*top-level* window becomes an `NSWindow`; a control created against a parent
+(`BUTTON`, `EDIT`, a comctl32 progress bar) shares its parent's window and its
+client coordinate space, so a click inside a control is hit-tested by win32k
+(`WM_NCHITTEST`, capture, the deepest topmost child) rather than by AppKit. A
+window created without `WS_VISIBLE` stays off screen until `ShowWindow`;
+`SW_HIDE` orders it out without destroying it and a later `SW_SHOW` reuses the
+same window; a `SetWindowPos` that changes the client size resizes the host
+window and its drawable. Host input is forwarded only from the window win32k
+will route it to, so an event on another window is dropped rather than delivered
+to the wrong one — with more than one top-level window on screen that is still
+the first shown one, because the input channel carries no window identity yet.
+The event pump also runs on a fixed interval while the guest is presenting, so
+an app that redraws continuously cannot starve its own window of mouse and
+keyboard events. Verified on screen: `exemu run --gui --wine-boot <dir>
+<gui-sample.exe>` puts a titled 480×260 `NSWindow` up with the guest's CoreText
+text and GDI rectangles in it.
+
 **`WINEDEBUG` works on the Wine path.** Wine's own `TRACE`/`WARN`/`ERR`/`FIXME`
 channels are resolved by `ntdll` against a per-process option array the unix
 side publishes, and the emulator is that unix side: it builds the array from the
