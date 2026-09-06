@@ -10,12 +10,25 @@
 //! Accesses must fall entirely within a single region; an access that spans
 //! a gap (or two separate regions) is reported as [`EmuError::Unmapped`],
 //! which is exactly what a real page fault would do.
+//!
+//! ## Data watchpoints (roadmap W9.3)
+//!
+//! [`VirtualMemory::set_debug`] hands this backend the process's shared
+//! [`DebugControl`], and every *guest* data access then reports itself to the
+//! handle's watchpoint side via
+//! [`note_watch_hit`](DebugControl::note_watch_hit). The `Memory` trait gains
+//! nothing — this is a concrete capability of this one implementation, so every
+//! other implementor (the test doubles) is untouched. A watchpoint is never
+//! expressed as a write into guest memory, so arming one cannot move the
+//! self-modifying-code generation counters and cannot be seen by a guest that
+//! checksums itself.
 
 #![forbid(unsafe_code)]
 
 use std::cell::Cell;
 use std::collections::HashMap;
 
+use exemu_core::debug::{DebugControl, WatchKind};
 use exemu_core::{EmuError, Memory, Perm, Region, Result, CODE_PAGE_SIZE};
 
 struct Mapped {
@@ -57,6 +70,17 @@ pub struct VirtualMemory {
     /// `Vec::get`, so a stale index (after a map/unmap shifts the vector) can
     /// only cause a miss, never a mis-resolution.
     hints: [Cell<usize>; HINT_SLOTS],
+    /// The process's shared debug handle, or `None` when no debugger is
+    /// attached — which is every ordinary run, every corpus entry and almost
+    /// every test (roadmap W9.3).
+    ///
+    /// A *detached* [`DebugControl`] is stored as `None` rather than as
+    /// `Some(inert handle)`: `attached` is fixed for the whole life of a handle
+    /// (it is chosen by [`DebugControl::detached`] / [`DebugControl::attached`]
+    /// and never mutated), so collapsing it here cannot go stale, and it keeps
+    /// the not-debugging path down to a null test on one already-loaded word —
+    /// no atomic, no lock. See [`note_watched_access`](Self::note_watched_access).
+    debug: Option<DebugControl>,
 }
 
 /// Slots in the region-lookup cache. A power of two so the index is a mask.
@@ -94,6 +118,11 @@ impl VirtualMemory {
     /// loader/kernel does when it patches an image (e.g. filling the Import
     /// Address Table, which usually lives in a read-only section). Still
     /// bounds-checked against a single region.
+    ///
+    /// Not a guest access, so it fires no data watchpoint (roadmap W9.3) — the
+    /// loader filling an IAT is the host writing, not the program. It *does*
+    /// still bump the self-modifying-code seam, because a JIT has to notice the
+    /// bytes it compiled changing no matter who changed them.
     pub fn poke(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -120,6 +149,65 @@ impl VirtualMemory {
     /// Total number of bytes currently mapped.
     pub fn mapped_bytes(&self) -> u64 {
         self.regions.iter().map(|m| m.region.size).sum()
+    }
+
+    // ---- data watchpoints (roadmap W9.3) ---------------------------------
+
+    /// Install the process's shared debug handle, so that a guest read or write
+    /// landing in an armed watchpoint range is recorded on it. Called once at
+    /// load time with the same handle the run loop and the JIT hold — an
+    /// inherent setter, the same shape as `Interpreter::set_clock`, not a trait
+    /// method, so the `Memory` trait gains no new obligation.
+    ///
+    /// Passing a detached handle is the same as never calling this at all: a
+    /// detached [`DebugControl`] is inert for its whole life, so it is dropped
+    /// here rather than kept and re-tested on every access.
+    pub fn set_debug(&mut self, debug: DebugControl) {
+        self.debug = debug.is_attached().then_some(debug);
+    }
+
+    /// The installed debug handle, or `None` when none is attached (which is
+    /// also what a detached handle collapses to — see [`set_debug`](Self::set_debug)).
+    pub fn debug(&self) -> Option<&DebugControl> {
+        self.debug.as_ref()
+    }
+
+    /// Report a completed *guest* data access to the debug handle.
+    ///
+    /// Three tiers, so that arming nothing costs nothing:
+    ///
+    /// 1. **Not debugging** (the default everywhere): one null test on the
+    ///    `Option`'s niche — no atomic, no lock — and the branch is never taken.
+    /// 2. **Attached but unarmed:** one relaxed load of the watch Bloom filter
+    ///    and a compare against zero ([`DebugControl::any_watchpoints`]).
+    /// 3. **Armed:** out of line, in [`record_watch_hit`](Self::record_watch_hit).
+    ///
+    /// Called *after* the access has succeeded, which is deliberate: the
+    /// interpreter's watchpoints are trap-**after**, matching x86 data
+    /// breakpoints, so the run loop stops with the instruction's effect already
+    /// visible. A faulting access (unmapped, or the wrong permission) never
+    /// reaches here and records nothing, exactly as a real page fault would
+    /// preempt a data breakpoint.
+    #[inline]
+    fn note_watched_access(&self, addr: u64, len: usize, kind: WatchKind) {
+        let Some(d) = self.debug.as_ref() else { return };
+        if !d.any_watchpoints() {
+            return;
+        }
+        Self::record_watch_hit(d, addr, len, kind);
+    }
+
+    /// The armed half of [`note_watched_access`](Self::note_watched_access),
+    /// kept out of line so the two fast rejects above stay a handful of
+    /// instructions. The recorded address is the **accessed** address, not the
+    /// watchpoint's base — an access that merely straddles the range's first
+    /// byte reports where the guest actually pointed.
+    #[cold]
+    #[inline(never)]
+    fn record_watch_hit(d: &DebugControl, addr: u64, len: usize, kind: WatchKind) {
+        if d.is_watched(addr, len as u64, kind) {
+            d.note_watch_hit(addr, kind);
+        }
     }
 
     // ---- internals -------------------------------------------------------
@@ -239,9 +327,15 @@ impl Memory for VirtualMemory {
         }
         let (idx, start, end) = self.locate(addr, buf.len(), Perm::READ, "read")?;
         buf.copy_from_slice(&self.regions[idx].bytes[start..end]);
+        self.note_watched_access(addr, buf.len(), WatchKind::Read);
         Ok(())
     }
 
+    /// Instruction fetch. Deliberately **not** watched: a data watchpoint
+    /// watches data, and the debugger's instruction-address breakpoints
+    /// (roadmap W9.3 S2/S3) are the mechanism for "stop when the guest executes
+    /// here". Fetching every instruction through a watch probe would also put
+    /// the check on the single hottest path in the emulator.
     fn fetch(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
@@ -262,6 +356,7 @@ impl Memory for VirtualMemory {
         if is_exec {
             self.note_code_write(addr, data.len());
         }
+        self.note_watched_access(addr, data.len(), WatchKind::Write);
         Ok(())
     }
 
@@ -286,6 +381,7 @@ impl Memory for VirtualMemory {
         };
         let (idx, start, end) = self.locate(addr, len, Perm::READ, "read")?;
         let b = &self.regions[idx].bytes[start..end];
+        self.note_watched_access(addr, len, WatchKind::Read);
         Ok(match size {
             1 => b[0] as u64,
             2 => u16::from_le_bytes([b[0], b[1]]) as u64,
@@ -315,6 +411,7 @@ impl Memory for VirtualMemory {
         if is_exec {
             self.note_code_write(addr, len);
         }
+        self.note_watched_access(addr, len, WatchKind::Write);
         Ok(())
     }
 
