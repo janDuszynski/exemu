@@ -620,26 +620,94 @@ pub fn decode_bitmask(n: u32, immr: u32, imms: u32, is64: bool) -> Option<u64> {
     Some(out)
 }
 
+/// Is `x` a single contiguous run of ones (`0*1+0*` read from the bottom)?
+/// `0` is not — it has no run at all.
+#[inline]
+fn is_shifted_mask(x: u64) -> bool {
+    if x == 0 {
+        return false;
+    }
+    let t = x >> x.trailing_zeros();
+    t.count_ones() == 64 - t.leading_zeros()
+}
+
 /// Find the `(N, immr, imms)` encoding of `value` as a logical immediate, if it
-/// has one. Implemented as a search over [`decode_bitmask`] rather than the
-/// forward algorithm: the decoder is the architecture's own definition, so an
-/// encoding it accepts is correct by construction.
+/// has one.
+///
+/// Closed form, then **verified against [`decode_bitmask`]** before it is
+/// returned — so the architecture's own definition is still what decides
+/// whether an encoding is correct, exactly as when this was a search over all
+/// 8192 triples (roadmap W8.6). The search was not cheap enough to leave in: it
+/// ran the decoder ~4100 times for a value whose element is 64 bits wide (the
+/// `and #0xff` every `flags_szp_into` emits is one), and at ~15 emitted
+/// instructions per compiled guest instruction that came to **4.6% of the whole
+/// 7-Zip run** — spent inside the compiler, not the compiled code.
+///
+/// The derivation is the standard one: the element size is the smallest power
+/// of two whose repetition reproduces the value; within one element the value
+/// must be a rotation of `0*1+`, which gives the run length (`imms`) and the
+/// rotation (`immr`); the element size is folded into the high bits of `imms`
+/// with `N` as its top bit. Nothing here is trusted — a triple that does not
+/// decode back to `value` is reported as "not encodable", and
+/// `every_encodable_value_is_found_by_the_closed_form` proves over the whole
+/// 16384-triple space that no value the old search could encode is lost.
 pub fn encode_bitmask(value: u64, is64: bool) -> Option<(u32, u32, u32)> {
-    let value = if is64 { value } else { value & 0xffff_ffff };
+    let width: u32 = if is64 { 64 } else { 32 };
+    let all: u64 = if is64 { u64::MAX } else { 0xffff_ffff };
+    let value = value & all;
     // 0 and all-ones have no encoding.
-    if value == 0 || (is64 && value == u64::MAX) || (!is64 && value == 0xffff_ffff) {
+    if value == 0 || value == all {
         return None;
     }
-    for n in 0..2u32 {
-        for immr in 0..64u32 {
-            for imms in 0..64u32 {
-                if decode_bitmask(n, immr, imms, is64) == Some(value) {
-                    return Some((n, immr, imms));
-                }
-            }
+
+    // 1. Element size: halve while the two halves still agree.
+    let mut size = width;
+    loop {
+        size /= 2;
+        let mask = (1u64 << size) - 1;
+        if (value & mask) != ((value >> size) & mask) {
+            size *= 2;
+            break;
+        }
+        if size <= 2 {
+            break;
         }
     }
-    None
+    let esize_mask: u64 = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
+    let mut elem = value & esize_mask;
+
+    // 2. The rotation that turns the element into `0*1+`, and the run length.
+    let (rot, ones) = if is_shifted_mask(elem) {
+        let i = elem.trailing_zeros();
+        (i, (elem >> i).trailing_ones())
+    } else {
+        // The run wraps round the element: fill the bits above it so the
+        // *complement* is the contiguous run instead.
+        elem |= !esize_mask;
+        if !is_shifted_mask(!elem) {
+            return None;
+        }
+        let clo = (!elem).leading_zeros(); // leading ones of `elem`
+        let ones = (clo + elem.trailing_ones()).checked_sub(64 - size)?;
+        (64 - clo, ones)
+    };
+    if ones == 0 || ones >= size || rot >= size {
+        return None;
+    }
+
+    let immr = (size - rot) & (size - 1);
+    // `size` as a mask in the high bits of the 7-bit `N:imms` field, with the
+    // run length (biased by one) in the low bits; `N` is that field's bit 6.
+    let nimms = (!(size - 1) << 1) | (ones - 1);
+    let n = ((nimms >> 6) & 1) ^ 1;
+    let imms = nimms & 0x3f;
+
+    // The architecture's own decoder has the last word.
+    if decode_bitmask(n, immr, imms, is64) == Some(value) {
+        Some((n, immr, imms))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -811,6 +879,73 @@ mod tests {
         assert_eq!(encode_bitmask(0x8D5, true), None);
         assert_eq!(encode_bitmask(0, true), None);
         assert_eq!(encode_bitmask(u64::MAX, true), None);
+    }
+
+    /// The closed-form encoder (roadmap W8.6) replaced a search over all 8192
+    /// `(N, immr, imms)` triples. This walks that whole space — which is exactly
+    /// the set of values the search could ever have found — and requires the
+    /// closed form to encode every one of them. So the replacement provably
+    /// loses nothing: there is no value the old encoder accepted and this one
+    /// declines.
+    #[test]
+    fn every_encodable_value_is_found_by_the_closed_form() {
+        for is64 in [false, true] {
+            let mut seen = 0u32;
+            for n in 0..2u32 {
+                for immr in 0..64u32 {
+                    for imms in 0..64u32 {
+                        let Some(v) = decode_bitmask(n, immr, imms, is64) else { continue };
+                        seen += 1;
+                        let got = encode_bitmask(v, is64)
+                            .unwrap_or_else(|| panic!("{v:#x} (is64={is64}) lost"));
+                        // Several triples can name the same value; what has to
+                        // hold is that the one returned decodes back to it.
+                        assert_eq!(
+                            decode_bitmask(got.0, got.1, got.2, is64),
+                            Some(v),
+                            "{v:#x} (is64={is64}) encoded as {got:?}"
+                        );
+                    }
+                }
+            }
+            // 5334 for 64-bit; 3648 for 32-bit, where `N` must be 0 and half
+            // the space is reserved. The floor only guards against the loop
+            // silently walking an empty set.
+            assert!(seen > 3000, "only {seen} encodable triples for is64={is64}");
+        }
+    }
+
+    /// ...and nothing *outside* that space is accepted: for a wide sweep of
+    /// values, "encodable" means precisely "some triple decodes to it".
+    #[test]
+    fn the_closed_form_declines_exactly_what_no_triple_encodes() {
+        let mut encodable = std::collections::HashSet::new();
+        for n in 0..2u32 {
+            for immr in 0..64u32 {
+                for imms in 0..64u32 {
+                    if let Some(v) = decode_bitmask(n, immr, imms, true) {
+                        encodable.insert(v);
+                    }
+                }
+            }
+        }
+        // A deterministic spread: small constants, single bits, runs, and the
+        // masks the compiler actually asks for.
+        let mut vals: Vec<u64> = (0..=0x3ffu64).collect();
+        for b in 0..64 {
+            vals.push(1u64 << b);
+            vals.push(!(1u64 << b));
+            vals.push((1u64 << b).wrapping_sub(1));
+            vals.push(0x8D5u64 << (b % 32));
+        }
+        vals.extend([0xffff_ffffu64, 0xffff_ffff_ffff_ff00, 0x0f0f_0f0f_0f0f_0f0f, 0xdead_beef]);
+        for v in vals {
+            assert_eq!(
+                encode_bitmask(v, true).is_some(),
+                encodable.contains(&v),
+                "{v:#x} disagrees with the decoder's own reachable set"
+            );
+        }
     }
 
     #[test]

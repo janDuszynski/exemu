@@ -108,15 +108,28 @@ pub struct LinkSlot {
     pub code: u64,
 }
 
+/// The load helper's type, as compiled code calls it.
+pub type ReadFn<M> = unsafe extern "C" fn(*mut BlockCtx<'_, M>, u64, u32) -> ReadResult;
+
+/// The store helper's type.
+pub type WriteFn<M> = unsafe extern "C" fn(*mut BlockCtx<'_, M>, u64, u32, u64) -> u64;
+
 /// Everything a compiled block needs that is not the register file.
 ///
 /// The emitted code loads and stores this struct at fixed offsets ([`ctx_off`])
 /// and passes its address to the helpers; it never interprets the `mem` field,
-/// which is why that field can stay an ordinary Rust trait object.
+/// which is why that field can stay an ordinary Rust reference.
+///
+/// `M` is the guest-memory backend, **by value rather than as `dyn Memory`**
+/// (roadmap W8.6). It buys nothing structurally — the helpers still go through
+/// the same [`Memory`] impl, in the same order, with the same checks — but it
+/// takes the vtable dispatch out of the single hottest path in the JIT: with
+/// the backend's type known, `read_uint`/`write_uint` are direct calls that
+/// ThinLTO can inline into [`jit_read`]/[`jit_write`], which also collapses the
+/// 40-byte `Result<u64, EmuError>` those methods return through memory. Guest
+/// loads and stores were **40% of the whole 7-Zip run** when this was measured.
 #[repr(C)]
-pub struct BlockCtx<'a> {
-    /// Guest memory. Only the helpers below dereference it.
-    pub mem: &'a mut dyn Memory,
+pub struct BlockCtx<'a, M: Memory + ?Sized> {
     /// 256-byte table: `parity[b]` is the x86 PF for a result whose low byte is
     /// `b` (1 when the byte has an even number of set bits). Compiled code
     /// computes PF with an `and`+`ldrb` instead of a five-instruction fold.
@@ -129,9 +142,9 @@ pub struct BlockCtx<'a> {
     pub code_lo: u64,
     pub code_hi: u64,
     /// Address of [`jit_read`], loaded and `blr`-ed by compiled code.
-    pub read: unsafe extern "C" fn(*mut BlockCtx<'_>, u64, u32) -> ReadResult,
+    pub read: ReadFn<M>,
     /// Address of [`jit_write`].
-    pub write: unsafe extern "C" fn(*mut BlockCtx<'_>, u64, u32, u64) -> u64,
+    pub write: WriteFn<M>,
     /// Guest instructions retired since [`crate::Jit::run`] was entered — kept
     /// here rather than in a register because a chain of natively linked blocks
     /// carries it across block boundaries without returning to Rust.
@@ -169,9 +182,17 @@ pub struct BlockCtx<'a> {
     /// from. Read by [`jit_write`] on every store, so it is a table lookup and
     /// not a set-membership test.
     pub code_pages: *const u64,
+    /// Guest memory. Only the helpers below dereference it.
+    ///
+    /// **Last on purpose.** `M` is a type parameter (roadmap W8.6), so this is
+    /// a thin pointer for a concrete backend and a fat one for `dyn Memory`;
+    /// putting it last means every offset above it is the same either way, and
+    /// the emitter's [`ctx_off`] constants hold for every instantiation.
+    /// `ctx_offsets_do_not_depend_on_the_memory_type` pins that.
+    pub mem: &'a mut M,
 }
 
-impl BlockCtx<'_> {
+impl<M: Memory + ?Sized> BlockCtx<'_, M> {
     /// Might a compiled block live on `addr`'s page? A clear bit is a definitive
     /// no; a set bit is confirmed against the engine's exact page set on the
     /// rare path (see [`crate::Jit`]).
@@ -188,19 +209,25 @@ impl BlockCtx<'_> {
 }
 
 /// Byte offsets of the [`BlockCtx`] fields the emitter loads and stores.
+///
+/// Taken against `dyn Memory`, and identical for every other backend: `mem` is
+/// the struct's last field, so the type parameter cannot move anything the
+/// emitter addresses (see [`BlockCtx::mem`]).
 pub mod ctx_off {
     use super::BlockCtx;
-    pub const PARITY: u32 = std::mem::offset_of!(BlockCtx<'static>, parity) as u32;
-    pub const CODE_LO: u32 = std::mem::offset_of!(BlockCtx<'static>, code_lo) as u32;
-    pub const READ: u32 = std::mem::offset_of!(BlockCtx<'static>, read) as u32;
-    pub const WRITE: u32 = std::mem::offset_of!(BlockCtx<'static>, write) as u32;
-    pub const RETIRED: u32 = std::mem::offset_of!(BlockCtx<'static>, retired) as u32;
-    pub const BUDGET: u32 = std::mem::offset_of!(BlockCtx<'static>, budget) as u32;
-    pub const LINKS: u32 = std::mem::offset_of!(BlockCtx<'static>, links) as u32;
-    pub const LINK_EPOCH: u32 = std::mem::offset_of!(BlockCtx<'static>, link_epoch) as u32;
-    pub const PENDING: u32 = std::mem::offset_of!(BlockCtx<'static>, pending) as u32;
-    pub const TRAIL: u32 = std::mem::offset_of!(BlockCtx<'static>, trail) as u32;
-    pub const TRAIL_AT: u32 = std::mem::offset_of!(BlockCtx<'static>, trail_at) as u32;
+    use exemu_core::Memory;
+    type Ctx = BlockCtx<'static, dyn Memory>;
+    pub const PARITY: u32 = std::mem::offset_of!(Ctx, parity) as u32;
+    pub const CODE_LO: u32 = std::mem::offset_of!(Ctx, code_lo) as u32;
+    pub const READ: u32 = std::mem::offset_of!(Ctx, read) as u32;
+    pub const WRITE: u32 = std::mem::offset_of!(Ctx, write) as u32;
+    pub const RETIRED: u32 = std::mem::offset_of!(Ctx, retired) as u32;
+    pub const BUDGET: u32 = std::mem::offset_of!(Ctx, budget) as u32;
+    pub const LINKS: u32 = std::mem::offset_of!(Ctx, links) as u32;
+    pub const LINK_EPOCH: u32 = std::mem::offset_of!(Ctx, link_epoch) as u32;
+    pub const PENDING: u32 = std::mem::offset_of!(Ctx, pending) as u32;
+    pub const TRAIL: u32 = std::mem::offset_of!(Ctx, trail) as u32;
+    pub const TRAIL_AT: u32 = std::mem::offset_of!(Ctx, trail_at) as u32;
 }
 
 /// The parity table (`PF` = 1 when the low byte has an even population count).
@@ -219,7 +246,11 @@ pub static PARITY: [u8; 256] = {
 /// # Safety
 /// `ctx` must be the pointer the engine passed into the block: a live,
 /// exclusively-borrowed `BlockCtx` for the duration of the call.
-pub unsafe extern "C" fn jit_read(ctx: *mut BlockCtx<'_>, addr: u64, size: u32) -> ReadResult {
+pub unsafe extern "C" fn jit_read<M: Memory + ?Sized>(
+    ctx: *mut BlockCtx<'_, M>,
+    addr: u64,
+    size: u32,
+) -> ReadResult {
     // SAFETY: the engine builds the `BlockCtx` on its own stack, hands the block
     // a raw pointer to it, and holds no reference to it while the block runs —
     // so this is the only live borrow for the duration of the call.
@@ -234,7 +265,12 @@ pub unsafe extern "C" fn jit_read(ctx: *mut BlockCtx<'_>, addr: u64, size: u32) 
 ///
 /// # Safety
 /// As [`jit_read`].
-pub unsafe extern "C" fn jit_write(ctx: *mut BlockCtx<'_>, addr: u64, size: u32, value: u64) -> u64 {
+pub unsafe extern "C" fn jit_write<M: Memory + ?Sized>(
+    ctx: *mut BlockCtx<'_, M>,
+    addr: u64,
+    size: u32,
+    value: u64,
+) -> u64 {
     // SAFETY: see `jit_read`.
     let ctx = unsafe { &mut *ctx };
     // Two questions, because they have two different answers.
@@ -254,8 +290,17 @@ pub unsafe extern "C" fn jit_write(ctx: *mut BlockCtx<'_>, addr: u64, size: u32,
     // deciding whether to unlink for real. One shift, one multiply and one load,
     // on a path a store takes ~10% of guest instructions.
     let own = addr < ctx.code_hi && addr.saturating_add(size as u64) > ctx.code_lo;
+    // The second probe is only worth making when the access really does span two
+    // pages. `code_page_bit` depends on nothing but `addr / CODE_PAGE_SIZE`
+    // (pinned by `the_page_hash_puts_one_page_in_exactly_one_bit`), so within a
+    // page the two probes are the same probe — and every store was paying for it.
+    // The offset test also covers the address-space wrap that made the old form
+    // use `wrapping_add`: an `addr` high enough to wrap has a page offset high
+    // enough to take the branch.
+    let spans_two_pages =
+        (addr & (exemu_core::CODE_PAGE_SIZE - 1)) + size as u64 > exemu_core::CODE_PAGE_SIZE;
     let page = ctx.code_page_hit(addr)
-        || (size > 1 && ctx.code_page_hit(addr.wrapping_add(size as u64 - 1)));
+        || (spans_two_pages && ctx.code_page_hit(addr.wrapping_add(size as u64 - 1)));
     match ctx.mem.write_uint(addr, size as u8, value) {
         Err(_) => status::FAULT,
         Ok(()) => {
@@ -278,6 +323,80 @@ pub unsafe extern "C" fn jit_write(ctx: *mut BlockCtx<'_>, addr: u64, size: u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `BlockCtx` over `mem` with `pages` marked as holding compiled code.
+    fn ctx_over<'a>(
+        mem: &'a mut exemu_memory::VirtualMemory,
+        table: &'a mut [u64],
+        pages: &[u64],
+    ) -> BlockCtx<'a, exemu_memory::VirtualMemory> {
+        for &p in pages {
+            let bit = code_page_bit(p);
+            table[(bit >> 6) as usize] |= 1 << (bit & 63);
+        }
+        BlockCtx {
+            parity: PARITY.as_ptr(),
+            code_lo: 0,
+            code_hi: 0,
+            read: jit_read,
+            write: jit_write,
+            retired: 0,
+            budget: 0,
+            links: std::ptr::null(),
+            link_epoch: 7,
+            pending: NO_SLOT,
+            trail: std::ptr::null_mut(),
+            trail_at: 0,
+            smc: NO_SMC,
+            smc_hits: 0,
+            code_pages: table.as_ptr(),
+            mem,
+        }
+    }
+
+    /// The store helper probes the page-hash table for the access's **last**
+    /// byte only when the access really spans two pages (roadmap W8.6). Within a
+    /// page the two probes are the same probe, so skipping the second is free;
+    /// across one it is not, and this is the case that would go silently
+    /// unnoticed if the test were dropped. Reported the same either way.
+    #[test]
+    fn a_store_straddling_into_a_code_page_is_still_reported() {
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
+        // Only the *second* page is one a compiled block was built from.
+        let mut ctx = ctx_over(&mut mem, &mut table, &[0x9000]);
+        // A 4-byte store whose first byte is on 0x8000 and whose last is on
+        // 0x9000. The first probe misses; only the second can catch it.
+        // SAFETY: `ctx` is a live, exclusively borrowed context, which is
+        // exactly what the helper's contract asks for.
+        let st = unsafe { jit_write(&mut ctx as *mut _, 0x8ffe, 4, 0x1122_3344) };
+        assert_eq!(st, status::OK, "not the running block's own code");
+        assert_eq!(ctx.smc_hits, 1, "the straddling store must be reported");
+        assert_eq!(ctx.smc, 0x8ffe);
+        assert_eq!(ctx.link_epoch, LINK_EPOCH_DEAD, "the chain's links must die");
+        // ...and the store itself happened, unchanged.
+        assert_eq!(mem.read_u32(0x8ffe).unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn a_store_inside_a_page_no_block_was_built_from_is_not_reported() {
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
+        let mut ctx = ctx_over(&mut mem, &mut table, &[0x9000]);
+        // Wholly inside 0x8000, including the 8-byte store that ends on the
+        // page's last byte — the boundary the offset test is written against.
+        for (addr, size) in [(0x8000u64, 8u32), (0x8ff8, 8), (0x8fff, 1)] {
+            // SAFETY: as above.
+            let st = unsafe { jit_write(&mut ctx as *mut _, addr, size, 0) };
+            assert_eq!(st, status::OK, "{addr:#x}");
+        }
+        assert_eq!(ctx.smc_hits, 0);
+        assert_eq!(ctx.link_epoch, 7, "the links must stay live");
+    }
 
     #[test]
     fn parity_table_matches_the_interpreters_definition() {
@@ -304,8 +423,51 @@ mod tests {
         ] {
             assert_eq!(off % 8, 0, "offset {off} is not 8-aligned");
             assert!(off < 4096 * 8, "offset {off} is past the scaled immediate");
-            assert!((off as usize) < std::mem::size_of::<BlockCtx<'static>>());
+            assert!((off as usize) < std::mem::size_of::<BlockCtx<'static, dyn Memory>>());
         }
+    }
+
+    /// The emitter's offsets are compile-time constants taken against one
+    /// instantiation, but a block runs with whatever backend the caller passed
+    /// (roadmap W8.6). `mem` is last precisely so that cannot matter: a thin
+    /// `&mut VirtualMemory` and a fat `&mut dyn Memory` must put every field the
+    /// emitter addresses in the same place.
+    #[test]
+    fn ctx_offsets_do_not_depend_on_the_memory_type() {
+        macro_rules! offs {
+            ($t:ty) => {
+                [
+                    std::mem::offset_of!(BlockCtx<'static, $t>, parity),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, code_lo),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, code_hi),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, read),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, write),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, retired),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, budget),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, links),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, link_epoch),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, pending),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, trail),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, trail_at),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, smc),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, smc_hits),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, code_pages),
+                ]
+            };
+        }
+        // A stand-in for any concrete backend: what matters is that it is
+        // `Sized`, so `&mut M` is a thin pointer where `&mut dyn Memory` is fat.
+        struct Thin;
+        impl Memory for Thin {
+            fn read(&self, _: u64, _: &mut [u8]) -> exemu_core::Result<()> {
+                unreachable!()
+            }
+            fn write(&mut self, _: u64, _: &[u8]) -> exemu_core::Result<()> {
+                unreachable!()
+            }
+        }
+        assert_eq!(offs!(Thin), offs!(dyn Memory));
+        assert_eq!(offs!(Thin)[0], 0, "the emitter's first field must be at 0");
     }
 
     #[test]
