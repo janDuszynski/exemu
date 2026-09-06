@@ -48,6 +48,7 @@ mod win32k;
 /// each one from the pinned Wine binaries and assert it against the value the
 /// handlers really use.
 pub use win32k::abi as win32k_abi;
+pub mod winedebug;
 pub mod wow64;
 
 use std::collections::HashMap;

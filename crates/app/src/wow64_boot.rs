@@ -49,6 +49,7 @@ use std::path::Path;
 
 use exemu_core::{Cpu, EmuError, Memory, Perm, Result};
 use exemu_memory::VirtualMemory;
+use exemu_os::winedebug;
 use exemu_os::wow64::{self, Wow64Image};
 
 /// Base of the sub-4 GiB arena holding every image a 32-bit guest can address:
@@ -79,18 +80,35 @@ pub const WOW64_EXTRA: u64 = WOW64_TEB64 + 0x8000;
 /// loader arena, which is above 4 GiB on this layout.
 pub const WOW64_EXTRA_SIZE: u64 = 0x2_0000;
 /// The 32-bit TEB (`fs:`). `TEB64.WowTebOffset` is the delta to here.
+///
+/// The **0x2000 gap to `WOW64_PEB32`** is not padding: the 32-bit `ntdll` keeps
+/// `__wine_dbg_strdup`'s per-thread string ring at
+/// `TEB32 + `[`STRDUP_RING_OFF_32`](exemu_os::winedebug::STRDUP_RING_OFF_32)
+/// (= +0x1000), past the TEB struct and past the
+/// [`ACTIVATION_CONTEXT_STACK`](exemu_os::wow64::TEB32_ACTIVATION_CONTEXT_STACK)
+/// exemu lays at +0x1800, so anything placed there would be overwritten by the
+/// first `TRACE` a 32-bit builtin emits.
 pub const WOW64_TEB32: u64 = WOW64_EXTRA;
 /// `PEB32` (`fs:[0x30]`).
+///
+/// Also a 0x2000 span, and for the mirror-image reason: the 32-bit `ntdll`
+/// reads its **debug-channel option array** at
+/// `PEB32 + `[`OPTIONS_OFF_32`](exemu_os::winedebug::OPTIONS_OFF_32) (= +0x1000)
+/// — a *different* offset from the 64-bit ntdll's +0x2000. The WoW64
+/// CPU-reserved area used to sit exactly there, so every `TRACE`/`WARN` guard in
+/// every 32-bit builtin resolved its channel flags out of the live 32-bit
+/// register save area.
 pub const WOW64_PEB32: u64 = WOW64_EXTRA + 0x2000;
 /// The WoW64 CPU-reserved area (`TEB64+0x1488` points here) holding the
-/// `WOW64_CONTEXT` that `BTCpuSimulate` loads the 32-bit registers from.
-pub const WOW64_CPU_AREA: u64 = WOW64_EXTRA + 0x3000;
+/// `WOW64_CONTEXT` that `BTCpuSimulate` loads the 32-bit registers from. Clear
+/// of `PEB32`'s debug-option page (see [`WOW64_PEB32`]).
+pub const WOW64_CPU_AREA: u64 = WOW64_EXTRA + 0x4000;
 /// The `WOW64INFO` block `BTCpuProcessInit` flags through `TEB64+0x14d0`.
-pub const WOW64_INFO: u64 = WOW64_EXTRA + 0x4000;
+pub const WOW64_INFO: u64 = WOW64_EXTRA + 0x5000;
 /// A sub-4 GiB arena for `PEB32.ProcessParameters` and the strings it points at.
-pub const WOW64_PARAMS: u64 = WOW64_EXTRA + 0x5000;
+pub const WOW64_PARAMS: u64 = WOW64_EXTRA + 0x6000;
 /// Bytes available to it (the rest of the WoW64 block).
-pub const WOW64_PARAMS_SIZE: u64 = WOW64_EXTRA_SIZE - 0x5000;
+pub const WOW64_PARAMS_SIZE: u64 = WOW64_EXTRA_SIZE - 0x6000;
 
 /// The 32-bit guest's own stack (separate from the 64-bit stack the WoW64 thunk
 /// layer runs on — `BTCpuSimulate` `xchg`es between them).
@@ -265,6 +283,22 @@ pub fn build(
     mem.write_u16(WOW64_PEB32 + wow64::peb32::OS_BUILD_NUMBER, 19043)?;
     mem.write_u32(WOW64_PEB32 + wow64::peb32::OS_PLATFORM_ID, 2)?; // VER_PLATFORM_WIN32_NT
     mem.write_u32(WOW64_PEB32 + wow64::peb32::SESSION_ID, 1)?;
+
+    // The 32-bit half of Wine's debug-channel mechanism. `ntdll32`'s
+    // `__wine_dbg_get_channel_flags` resolves every `TRACE`/`WARN`/`ERR`/
+    // `FIXME` guard in every 32-bit builtin against an option array it reads at
+    // `PEB32 + OPTIONS_OFF_32`, and caches the answer back into the channel
+    // object — so what stands at that address decides, once and for the whole
+    // process, whether a guest pays for a logging branch on every hot call.
+    // Publishing the same options the 64-bit half gets is what makes the two
+    // halves of a WoW64 process agree; see `exemu_os::winedebug`.
+    winedebug::write_options(
+        mem,
+        WOW64_PEB32,
+        winedebug::OPTIONS_OFF_32,
+        WOW64_CPU_AREA - (WOW64_PEB32 + winedebug::OPTIONS_OFF_32),
+        &winedebug::Options::from_env(),
+    )?;
 
     // The CPU-reserved area pointer + the WOW64INFO block wow64cpu's process
     // init flags (`or dword [P+4],1` through `TEB64+0x14d0`).
@@ -585,4 +619,62 @@ pub fn bind_guest_imports(
         }
     }
     Ok((bound, missing))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The WoW64 block's spacing is load-bearing, not padding.** Wine's 32-bit
+    /// `ntdll` puts two scratch regions at fixed offsets from the 32-bit TEB and
+    /// PEB, and neither is announced anywhere: a structure placed on top of one
+    /// is silently read as debug state. That is exactly what used to happen —
+    /// the CPU-reserved area sat at `PEB32 + `[`winedebug::OPTIONS_OFF_32`], so
+    /// the 32-bit builtins resolved every `TRACE`/`WARN` guard against the live
+    /// 32-bit register save area.
+    #[test]
+    fn the_wow64_block_leaves_wines_debug_scratch_alone() {
+        // TEB32's `__wine_dbg_strdup` ring must fit before PEB32 …
+        let ring = WOW64_TEB32 + winedebug::STRDUP_RING_OFF_32 + winedebug::STRDUP_RING_SIZE;
+        assert!(ring <= WOW64_PEB32, "the 32-bit debug-string ring runs into PEB32");
+        // … and must not land on the ACTIVATION_CONTEXT_STACK either.
+        const {
+            assert!(
+                winedebug::STRDUP_RING_OFF_32 + winedebug::STRDUP_RING_SIZE
+                    <= wow64::TEB32_ACTIVATION_CONTEXT_STACK,
+                "the ring overlaps TEB32's activation-context stack"
+            )
+        };
+        // PEB32's option array must fit before whatever comes next.
+        let opts = WOW64_PEB32 + winedebug::OPTIONS_OFF_32;
+        assert!(
+            opts + winedebug::OPTION_SIZE <= WOW64_CPU_AREA,
+            "the option array overlaps the CPU-reserved area — the W6.4 bug"
+        );
+        // Every structure in the block is distinct and ordered.
+        let blocks = [WOW64_TEB32, WOW64_PEB32, WOW64_CPU_AREA, WOW64_INFO, WOW64_PARAMS];
+        for w in blocks.windows(2) {
+            assert!(w[0] < w[1], "the WoW64 block is laid out in order: {w:#x?}");
+        }
+        assert_eq!(
+            WOW64_PARAMS + WOW64_PARAMS_SIZE,
+            WOW64_EXTRA + WOW64_EXTRA_SIZE,
+            "the parameter arena runs to the end of the block and no further"
+        );
+        // The 64-bit half's own scratch pages sit clear of the 32-bit block.
+        const {
+            assert!(
+                WOW64_PEB64 + winedebug::OPTIONS_OFF_64 + 0x1000 <= WOW64_EXTRA,
+                "the 64-bit option page runs into the WoW64 block"
+            )
+        };
+        // The 64-bit ring sits *above* the one-page PEB64, in the gap before
+        // PEB64's own option page — the ordering the plain 64-bit layout has.
+        let ring64 = WOW64_TEB64 + winedebug::STRDUP_RING_OFF_64;
+        assert!(WOW64_PEB64 + 0x1000 <= ring64, "the 64-bit ring overlaps the PEB page");
+        assert!(
+            ring64 + winedebug::STRDUP_RING_SIZE <= WOW64_PEB64 + winedebug::OPTIONS_OFF_64,
+            "the 64-bit ring runs into the 64-bit option page"
+        );
+    }
 }

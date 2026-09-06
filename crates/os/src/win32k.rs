@@ -5127,7 +5127,7 @@ mod tests {
         // A type from neither list — a future Wine member, or garbage in the
         // slot — takes the same path. "Unknown ⇒ send" is what made 0x3002
         // recurse; it must not be the default for its successors.
-        for ty in [0x0000_1234, 0x0000_2b2, 0x0003_0003, 0xFFFF_FFFF] {
+        for ty in [0x0000_1234, 0x0000_02b2, 0x0003_0003, 0xFFFF_FFFF] {
             let (mut os, mut mem, hwnd) = message_call_fixture();
             let (status, frames) = message_call(&mut os, &mut mem, hwnd, MSG_CALL_SCRATCH, ty);
             assert_eq!(frames, 0, "unknown type {ty:#x} ran a WndProc");

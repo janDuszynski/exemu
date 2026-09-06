@@ -162,21 +162,32 @@ fn unwind_builtin_dll(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memor
 }
 
 /// Entry 2 — `wine_dbg_write(params)`. The `params` block is
-/// `{ const char *str; SIZE_T len; }` (confirmed from the pinned
-/// `__wine_dbg_write` stub: it stores the caller's string pointer at `rsp+0x20`
-/// and the length at `rsp+0x28`, then passes `r8 = rsp+0x20`, `edx = 2`). Copy
-/// the bytes out of guest memory to the host trace sink and return the number of
-/// bytes written (Wine's `write()`-shaped return).
+/// `{ const char *str; unsigned int len; }` — a pointer, then a **32-bit**
+/// length in a slot the ABI pads to 8.
+///
+/// **The length is a dword and reading it as a qword is a live bug.** Both
+/// pinned callers fill the block with a `movq` for the pointer and a `movl` for
+/// the length (`__wine_dbg_write` rva 0x3f440: `movq %rcx,0x20(%rsp)` /
+/// `movl %edx,0x28(%rsp)`; `__wine_dbg_output` rva 0x3f300 does the same), and
+/// neither writes the upper half — it is whatever the frame's uninitialised
+/// stack held. Reading 64 bits picks that up, and a garbage length walks the
+/// copy below off the end of the mapped page and faults *inside the syscall*.
+/// It stayed invisible only while exemu published no debug-channel options, so
+/// nothing ever emitted (roadmap W6.4); the same 32/64 slot trap as
+/// `NtUserMessageCall`'s `type`.
+///
+/// Copy the bytes out of guest memory to the host trace sink and return the
+/// number of bytes written (Wine's `write()`-shaped return).
 fn wine_dbg_write(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
     if args == 0 {
         return Ok(0);
     }
-    // `{ const char *str; SIZE_T len; }` — 4-byte fields when the caller is the
-    // 32-bit ntdll of a WoW64 process (roadmap W5.3).
+    // The pointer narrows to 4 bytes when the caller is the 32-bit ntdll of a
+    // WoW64 process (roadmap W5.3); the length is 4 bytes either way.
     let (str_ptr, len) = if os.unix_call_wow64 {
         (mem.read_u32(args)? as u64, mem.read_u32(args + 4)? as usize)
     } else {
-        (mem.read_u64(args)?, mem.read_u64(args + 8)? as usize)
+        (mem.read_u64(args)?, mem.read_u32(args + 8)? as usize)
     };
     if str_ptr == 0 || len == 0 {
         return Ok(0);
