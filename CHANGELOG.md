@@ -65,6 +65,35 @@ end-to-end on the default path.
   reaches gdi32's bundled Uniscribe and faults at `gdi32+0x38819`, because
   `NtGdiHfontCreate` is unserviced and no DC ever carries a font. Off by default,
   so no existing run changes.
+### An input event names the window it came from (W4.6)
+- **`exemu_core::InputEvent` carries an `hwnd`.** `MouseMove`, `MouseButton` and
+  `Key` each gained one; `Close` did not, because the host only sends it when the
+  last window has gone and it means "quit", not "this window closed". The host
+  fills it in from the only identity it honestly has — an `NSEvent`'s
+  `windowNumber` resolves to the guest **top-level** whose `NSWindow` received the
+  event, and `event_client_pos` already converts through that same window's
+  content view, so the hwnd and the coordinates come from one window.
+- **win32k hit-tests down from that window instead of from `shown_window()`.**
+  `route_raw_input` resolves the named window's surface owner and walks
+  `window_from_point_in` from there; the `HTTRANSPARENT` re-walk uses the same
+  root. `keyboard_target` takes the focus or the active window only when it lives
+  under the named window, and otherwise the named window itself — a key typed
+  into the second window can no longer land in the first window's focus. Capture
+  still wins over everything, as on Windows.
+- **What used to be the first shown window now routes per window.** Before this,
+  a click in the second of two top-level windows reached the first one's
+  controls; with several windows on screen there was no way to reach any but the
+  first. An event naming a window win32k never made, or one the guest has hidden,
+  is dropped rather than delivered to the wrong one, and an event with no hwnd
+  (a test injector, the hostless path) keeps the old first-shown-window rule.
+- **Pinned headlessly, and mutation-checked.** Two win32k unit tests build two
+  top-level windows with a control each and route a click and a keystroke at the
+  second; one `cocoa.rs` test resolves an `NSWindow` number to its guest hwnd
+  through the pure `WindowModel`, with no AppKit window involved. Ignoring the
+  event's hwnd in `route_raw_input`, in `keyboard_target` and in the host's
+  lookup turns exactly those three red and leaves the other 126 win32k tests
+  green; restored. Workspace 1079 → 1081, corpus 11/11 at delta 0.
+
 ### One host window per top-level, and input that goes only where it is routed (W4.6)
 - **A real `NSWindow` was confirmed on screen, by looking at it.** `exemu run
   --gui --wine-boot <dir> <gui-sample.exe>` puts up a titled 480×260 window
@@ -90,10 +119,7 @@ end-to-end on the default path.
   Only the last visible window disappearing quits the guest.
 - **Input is forwarded only from the window win32k will route it to.** An
   `NSEvent` belonging to any other window is dropped rather than delivered to the
-  wrong one at the wrong coordinates. With several top-level windows that target
-  is still the first shown one: `InputEvent` carries no window identity, so
-  closing that gap needs a field in `exemu_core` and a matching lookup in
-  win32k's `window_from_point`/`keyboard_target`.
+  wrong one at the wrong coordinates.
 - **A guest that redraws continuously no longer starves its own window.** The
   old loop pumped `NSEvent`s only when the command channel ran dry, so a stream
   of `Present`s meant no events at all; the pump now runs on a fixed 8 ms
