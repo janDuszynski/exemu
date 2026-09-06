@@ -212,6 +212,7 @@ const STUB_FONT_DESCENT: u32 = 3;
 
 const SIMPLEREGION: u32 = 2;
 
+const NT_USER_BUILD_HWND_LIST: u32 = 0x132d;
 const NT_USER_CALL_HWND: u32 = 0x1332;
 const NT_USER_CALL_HWND_PARAM: u32 = 0x1336;
 const NT_USER_CALL_ONE_PARAM: u32 = 0x133d;
@@ -319,9 +320,22 @@ mod call_hwnd_param {
     pub const GET_WINDOW_LONG_PTR_W: u64 = 0x0c;
     pub const GET_WINDOW_RECT: u64 = 0x0d;
     pub const GET_CLIENT_RECT: u64 = 0x0e;
+    pub const GET_WINDOW_RELATIVE: u64 = 0x10;
     pub const IS_CHILD: u64 = 0x13;
     pub const SET_DIALOG_INFO: u64 = 0x18;
 }
+
+mod window_relative {
+    pub const HWND_FIRST: u64 = 0;
+    pub const HWND_LAST: u64 = 1;
+    pub const HWND_NEXT: u64 = 2;
+    pub const HWND_PREV: u64 = 3;
+    pub const OWNER: u64 = 4;
+    pub const CHILD: u64 = 5;
+}
+
+const HWND_LIST_MAX: usize = 4096;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 
 mod call_two_param {
     pub const GET_DIALOG_PROC: u64 = 0x00;
@@ -794,6 +808,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_CALL_HWND_PARAM, nt_user_call_hwnd_param);
     os.set_win32k_handler(NT_USER_CALL_ONE_PARAM, nt_user_call_one_param);
     os.set_win32k_handler(NT_USER_CALL_TWO_PARAM, nt_user_call_two_param);
+    os.set_win32k_handler(NT_USER_BUILD_HWND_LIST, nt_user_build_hwnd_list);
     os.set_win32k_handler(NT_USER_SET_WINDOW_LONG, nt_user_set_window_long);
     os.set_win32k_handler(NT_USER_SET_WINDOW_LONG_PTR, nt_user_set_window_long_ptr);
     os.set_win32k_handler(NT_GDI_EXT_TEXT_OUT_W, nt_gdi_ext_text_out_w);
@@ -1565,6 +1580,82 @@ fn nt_user_call_hwnd(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
     })
 }
 
+fn window_relative(st: &Win32kState, hwnd: u32, rel: u64) -> u32 {
+    let Some(w) = st.window(hwnd) else { return 0 };
+    let (parent, style) = (w.parent, w.style);
+    if rel == window_relative::CHILD {
+        return st.windows.iter().find(|(_, c)| c.parent == hwnd).map(|(h, _)| *h).unwrap_or(0);
+    }
+    if rel == window_relative::OWNER {
+        return if style & WS_CHILD == 0 { parent } else { 0 };
+    }
+    let siblings: Vec<u32> =
+        st.windows.iter().filter(|(_, c)| c.parent == parent).map(|(h, _)| *h).collect();
+    let at = siblings.iter().position(|h| *h == hwnd);
+    match rel {
+        window_relative::HWND_FIRST => siblings.first().copied().unwrap_or(0),
+        window_relative::HWND_LAST => siblings.last().copied().unwrap_or(0),
+        window_relative::HWND_NEXT => at.and_then(|i| siblings.get(i + 1)).copied().unwrap_or(0),
+        window_relative::HWND_PREV => {
+            at.filter(|i| *i > 0).and_then(|i| siblings.get(i - 1)).copied().unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+fn collect_descendants(st: &Win32kState, root: u32, depth: usize, out: &mut Vec<u32>) {
+    if depth >= WINDOW_ANCESTRY_MAX {
+        return;
+    }
+    let kids: Vec<u32> =
+        st.windows.iter().filter(|(_, w)| w.parent == root).map(|(h, _)| *h).collect();
+    for k in kids {
+        if out.len() >= HWND_LIST_MAX {
+            return;
+        }
+        out.push(k);
+        collect_descendants(st, k, depth + 1, out);
+    }
+}
+
+fn hwnd_list(st: &Win32kState, hwnd: u32, descendants: bool) -> Vec<u32> {
+    if descendants {
+        let mut out = Vec::new();
+        collect_descendants(st, hwnd, 0, &mut out);
+        return out;
+    }
+    if hwnd == 0 {
+        return st.windows.iter().filter(|(_, w)| w.parent == 0).map(|(h, _)| *h).collect();
+    }
+    let Some(parent) = st.window(hwnd).map(|w| w.parent) else { return Vec::new() };
+    st.windows
+        .iter()
+        .skip_while(|(h, _)| *h != hwnd)
+        .filter(|(_, w)| w.parent == parent)
+        .map(|(h, _)| *h)
+        .take(HWND_LIST_MAX)
+        .collect()
+}
+
+fn nt_user_build_hwnd_list(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg_u32(cpu, mem, 1)?;
+    let descendants = os.syscall_arg_u32(cpu, mem, 2)? != 0;
+    let count = os.syscall_arg_u32(cpu, mem, 5)? as usize;
+    let buffer = os.syscall_arg(cpu, mem, 6)?;
+    let size_out = os.syscall_arg(cpu, mem, 7)?;
+    let list = hwnd_list(&os.win32k_state, hwnd, descendants);
+    if size_out != 0 {
+        mem.write_u32(size_out, (list.len() + 1) as u32)?;
+    }
+    if buffer == 0 || list.len() + 1 > count {
+        return Ok(STATUS_BUFFER_TOO_SMALL);
+    }
+    for (i, h) in list.iter().enumerate() {
+        mem.write_u64(buffer + (i as u64) * 8, *h as u64)?;
+    }
+    Ok(0)
+}
+
 fn nt_user_call_two_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let a = os.syscall_arg(cpu, mem, 0)?;
     let code = os.syscall_arg(cpu, mem, 2)?;
@@ -1607,6 +1698,9 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
                 mem.write_u32(out + (i as u64) * 4, *v as u32)?;
             }
             Ok(1)
+        }
+        call_hwnd_param::GET_WINDOW_RELATIVE => {
+            Ok(window_relative(&os.win32k_state, hwnd, param))
         }
         call_hwnd_param::SET_DIALOG_INFO => {
             let Some(w) = os.win32k_state.window_mut(hwnd) else { return Ok(0) };
@@ -2668,7 +2762,8 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 }
 
 pub mod abi {
-    pub const SYSCALLS: [(&str, u32); 37] = [
+    pub const SYSCALLS: [(&str, u32); 38] = [
+        ("NtUserBuildHwndList", super::NT_USER_BUILD_HWND_LIST),
         ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
         ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
         ("NtUserSetCapture", super::NT_USER_SET_CAPTURE),
@@ -2759,11 +2854,12 @@ pub mod abi {
     pub const HT_CLIENT: i64 = super::hit::CLIENT;
     pub const HT_TRANSPARENT: i64 = super::hit::TRANSPARENT;
 
-    pub const CALL_HWND_PARAM: [(&str, u64); 6] = [
+    pub const CALL_HWND_PARAM: [(&str, u64); 7] = [
         ("GetWindowRect", super::call_hwnd_param::GET_WINDOW_RECT),
         ("GetClientRect", super::call_hwnd_param::GET_CLIENT_RECT),
         ("GetWindowLongPtrA", super::call_hwnd_param::GET_WINDOW_LONG_PTR_A),
         ("GetWindowLongPtrW", super::call_hwnd_param::GET_WINDOW_LONG_PTR_W),
+        ("GetWindow", super::call_hwnd_param::GET_WINDOW_RELATIVE),
         ("IsChild", super::call_hwnd_param::IS_CHILD),
         ("DIALOG_get_info", super::call_hwnd_param::SET_DIALOG_INFO),
     ];
@@ -3791,6 +3887,66 @@ mod tests {
             },
         ));
         hwnd
+    }
+
+    #[test]
+    fn get_window_walks_the_sibling_chain_a_dialog_is_searched_along() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let dlg = child(&mut os, 0, [0, 0, 100, 100]);
+        let a = child(&mut os, dlg, [0, 0, 10, 10]);
+        let b = child(&mut os, dlg, [0, 0, 10, 10]);
+        let c = child(&mut os, dlg, [0, 0, 10, 10]);
+        let inner = child(&mut os, b, [0, 0, 5, 5]);
+        let st = &os.win32k_state;
+
+        assert_eq!(window_relative(st, dlg, window_relative::CHILD), a);
+        assert_eq!(window_relative(st, a, window_relative::HWND_NEXT), b);
+        assert_eq!(window_relative(st, b, window_relative::HWND_NEXT), c);
+        assert_eq!(window_relative(st, c, window_relative::HWND_NEXT), 0);
+        assert_eq!(window_relative(st, c, window_relative::HWND_PREV), b);
+        assert_eq!(window_relative(st, a, window_relative::HWND_PREV), 0);
+        assert_eq!(window_relative(st, c, window_relative::HWND_FIRST), a);
+        assert_eq!(window_relative(st, a, window_relative::HWND_LAST), c);
+        assert_eq!(window_relative(st, a, window_relative::OWNER), 0, "a child has no owner");
+        assert_eq!(window_relative(st, dlg, window_relative::OWNER), 0);
+        assert_eq!(window_relative(st, inner, window_relative::HWND_NEXT), 0);
+        assert_eq!(window_relative(st, 0xDEAD, window_relative::CHILD), 0);
+
+        assert_eq!(hwnd_list(st, a, false), vec![a, b, c], "GetDlgItem sees every control once");
+        assert_eq!(hwnd_list(st, dlg, true), vec![a, b, inner, c], "…and EnumChildWindows recurses");
+        assert_eq!(hwnd_list(st, 0, false), vec![dlg], "a zero hwnd is the top-level chain");
+    }
+
+    #[test]
+    fn build_hwnd_list_reserves_the_terminator_slot_its_caller_writes() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        mem.map_fixed(0x10_0000, 0x10_000, Perm::RW, "stack").unwrap();
+        os.set_syscall_guest_rsp_for_test(0x10_8000);
+        let dlg = child(&mut os, 0, [0, 0, 100, 100]);
+        let a = child(&mut os, dlg, [0, 0, 10, 10]);
+        let b = child(&mut os, dlg, [0, 0, 10, 10]);
+
+        let (buffer, size_out) = (0x2_0000u64, 0x2_0800u64);
+        let mut cpu = CpuState::default();
+        let mut call = |cpu: &mut CpuState, mem: &mut VirtualMemory, count: u64| {
+            cpu.set_reg(Reg::Rdx, a as u64);
+            cpu.set_reg(Reg::R8, 0);
+            mem.write_u64(0x10_8000 + 0x28, 0).unwrap();
+            mem.write_u64(0x10_8000 + 0x30, count).unwrap();
+            mem.write_u64(0x10_8000 + 0x38, buffer).unwrap();
+            mem.write_u64(0x10_8000 + 0x40, size_out).unwrap();
+            nt_user_build_hwnd_list(&mut os, cpu, mem).unwrap()
+        };
+
+        assert_eq!(call(&mut cpu, &mut mem, 2), STATUS_BUFFER_TOO_SMALL, "two windows need three");
+        assert_eq!(mem.read_u32(size_out).unwrap(), 3, "…and the retry size says so");
+
+        assert_eq!(call(&mut cpu, &mut mem, 3), 0);
+        assert_eq!(mem.read_u32(size_out).unwrap(), 3);
+        assert_eq!(mem.read_u64(buffer).unwrap(), a as u64);
+        assert_eq!(mem.read_u64(buffer + 8).unwrap(), b as u64);
     }
 
     #[test]
