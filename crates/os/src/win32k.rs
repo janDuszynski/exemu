@@ -166,6 +166,8 @@ const ICONINFO_X_HOTSPOT: u64 = 0x04;
 const ICONINFO_Y_HOTSPOT: u64 = 0x08;
 const ICONINFO_HBM_MASK: u64 = 0x10;
 const ICONINFO_HBM_COLOR: u64 = 0x18;
+const USTR_LENGTH: u64 = 0x00;
+const USTR_BUFFER: u64 = 0x08;
 
 mod dev_caps {
     pub const TECHNOLOGY: u64 = 2;
@@ -210,6 +212,7 @@ const STUB_FONT_DESCENT: u32 = 3;
 
 const SIMPLEREGION: u32 = 2;
 
+const NT_USER_BUILD_HWND_LIST: u32 = 0x132d;
 const NT_USER_CALL_HWND: u32 = 0x1332;
 const NT_USER_CALL_HWND_PARAM: u32 = 0x1336;
 const NT_USER_CALL_ONE_PARAM: u32 = 0x133d;
@@ -236,7 +239,7 @@ const GDI_ENTRY_SIZE: u64 = 24;
 const GDI_ENTRY_GENERATION_OFF: u64 = 0xC;
 const GDI_ENTRY_TYPE_OFF: u64 = 0xE;
 const GDI_ENTRY_OBJECT_OFF: u64 = 0x10;
-const GDI_TABLE_SLOTS: u64 = 128;
+const GDI_TABLE_SLOTS: u64 = 4096;
 const GDI_ENTRY_IN_USE: u8 = 0x01;
 const GDI_DC_OBJECT_SIZE: u64 = 0x100;
 
@@ -317,14 +320,35 @@ mod call_hwnd_param {
     pub const GET_WINDOW_LONG_PTR_W: u64 = 0x0c;
     pub const GET_WINDOW_RECT: u64 = 0x0d;
     pub const GET_CLIENT_RECT: u64 = 0x0e;
+    pub const GET_WINDOW_RELATIVE: u64 = 0x10;
     pub const IS_CHILD: u64 = 0x13;
     pub const SET_DIALOG_INFO: u64 = 0x18;
 }
+
+mod window_relative {
+    pub const HWND_FIRST: u64 = 0;
+    pub const HWND_LAST: u64 = 1;
+    pub const HWND_NEXT: u64 = 2;
+    pub const HWND_PREV: u64 = 3;
+    pub const OWNER: u64 = 4;
+    pub const CHILD: u64 = 5;
+}
+
+const HWND_LIST_MAX: usize = 4096;
+const DIALOG_CLASS: &str = "#32770";
+const IDC_FILENAME_COMBO: u64 = 0x47c;
+const IDOK: u64 = 1;
+const WM_COMMAND: u32 = 0x0111;
+const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 
 mod call_two_param {
     pub const GET_DIALOG_PROC: u64 = 0x00;
     pub const ALLOC_WIN_PROC: u64 = 0x09;
 }
+
+const WINPROC_HANDLE_TAG: u64 = 0xFFFF_0000;
+const WINPROC_HANDLE_MASK: u64 = 0xFFFF;
+const WINPROC_MAX: usize = 0x1000;
 
 mod call_one_param {
     pub const CREATE_CURSOR_ICON: u64 = super::CALL_ONE_CREATE_CURSOR_ICON;
@@ -531,6 +555,12 @@ struct Bitmap {
 }
 
 #[derive(Clone, Copy, Default)]
+struct WinProc {
+    proc_a: u64,
+    proc_w: u64,
+}
+
+#[derive(Clone, Copy, Default)]
 struct IconObject {
     is_icon: bool,
     width: i32,
@@ -562,9 +592,13 @@ pub(crate) struct Win32kState {
     brushes: Vec<(u32, u32)>,
     bitmaps: Vec<(u32, Bitmap)>,
     icons: Vec<(u32, IconObject)>,
+    win_procs: Vec<WinProc>,
+    driven_dialogs: Vec<u32>,
+    pick_text: u64,
     sys_brushes: Vec<(u32, u32)>,
     gdi_table_base: u64,
     gdi_next_slot: u64,
+    gdi_free_slots: Vec<u64>,
     gdi_dc_arena: u64,
     cursor_pos: (i32, i32),
     current_cursor: u64,
@@ -791,6 +825,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_CALL_HWND_PARAM, nt_user_call_hwnd_param);
     os.set_win32k_handler(NT_USER_CALL_ONE_PARAM, nt_user_call_one_param);
     os.set_win32k_handler(NT_USER_CALL_TWO_PARAM, nt_user_call_two_param);
+    os.set_win32k_handler(NT_USER_BUILD_HWND_LIST, nt_user_build_hwnd_list);
     os.set_win32k_handler(NT_USER_SET_WINDOW_LONG, nt_user_set_window_long);
     os.set_win32k_handler(NT_USER_SET_WINDOW_LONG_PTR, nt_user_set_window_long_ptr);
     os.set_win32k_handler(NT_GDI_EXT_TEXT_OUT_W, nt_gdi_ext_text_out_w);
@@ -1562,14 +1597,193 @@ fn nt_user_call_hwnd(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
     })
 }
 
-fn nt_user_call_two_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
-    let a = os.syscall_arg(cpu, mem, 0)?;
-    let code = os.syscall_arg(cpu, mem, 2)?;
-    if code == call_two_param::GET_DIALOG_PROC {
-        os.return_u64_from_syscall(a);
-        return Ok(0);
+fn edit_within(st: &Win32kState, root: u32) -> Option<u32> {
+    let mut frontier = vec![root];
+    for _ in 0..WINDOW_ANCESTRY_MAX {
+        let mut next = Vec::new();
+        for (h, w) in &st.windows {
+            if !frontier.contains(&w.parent) {
+                continue;
+            }
+            if w.class_name.eq_ignore_ascii_case("Edit") {
+                return Some(*h);
+            }
+            next.push(*h);
+        }
+        if next.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
+}
+
+fn drive_file_dialog(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
+    let Some(pick) = os.cfg.file_dialog_pick.clone() else { return false };
+    let st = &os.win32k_state;
+    let Some((hwnd, target)) = st
+        .windows
+        .iter()
+        .filter(|(h, w)| w.class_name == DIALOG_CLASS && !st.driven_dialogs.contains(h))
+        .find_map(|(h, _)| {
+            let combo = st
+                .windows
+                .iter()
+                .find(|(_, w)| w.parent == *h && w.id == IDC_FILENAME_COMBO)
+                .map(|(c, _)| *c)?;
+            Some((*h, edit_within(st, combo).unwrap_or(combo)))
+        })
+    else {
+        return false;
+    };
+
+    if os.win32k_state.pick_text == 0 {
+        let bytes: Vec<u8> =
+            pick.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+        let Some(base) = os.map_anywhere(mem, bytes.len() as u64, Perm::RW, "dialog-pick") else {
+            return false;
+        };
+        if mem.write(base, &bytes).is_err() {
+            return false;
+        }
+        os.win32k_state.pick_text = base;
+    }
+
+    os.win32k_state.driven_dialogs.push(hwnd);
+    let text = os.win32k_state.pick_text;
+    os.post_internal(target as u64, WM_SETTEXT, 0, text);
+    os.post_internal(hwnd as u64, WM_COMMAND, IDOK, 0);
+    true
+}
+
+fn window_relative(st: &Win32kState, hwnd: u32, rel: u64) -> u32 {
+    let Some(w) = st.window(hwnd) else { return 0 };
+    let (parent, style) = (w.parent, w.style);
+    if rel == window_relative::CHILD {
+        return st.windows.iter().find(|(_, c)| c.parent == hwnd).map(|(h, _)| *h).unwrap_or(0);
+    }
+    if rel == window_relative::OWNER {
+        return if style & WS_CHILD == 0 { parent } else { 0 };
+    }
+    let siblings: Vec<u32> =
+        st.windows.iter().filter(|(_, c)| c.parent == parent).map(|(h, _)| *h).collect();
+    let at = siblings.iter().position(|h| *h == hwnd);
+    match rel {
+        window_relative::HWND_FIRST => siblings.first().copied().unwrap_or(0),
+        window_relative::HWND_LAST => siblings.last().copied().unwrap_or(0),
+        window_relative::HWND_NEXT => at.and_then(|i| siblings.get(i + 1)).copied().unwrap_or(0),
+        window_relative::HWND_PREV => {
+            at.filter(|i| *i > 0).and_then(|i| siblings.get(i - 1)).copied().unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+fn collect_descendants(st: &Win32kState, root: u32, depth: usize, out: &mut Vec<u32>) {
+    if depth >= WINDOW_ANCESTRY_MAX {
+        return;
+    }
+    let kids: Vec<u32> =
+        st.windows.iter().filter(|(_, w)| w.parent == root).map(|(h, _)| *h).collect();
+    for k in kids {
+        if out.len() >= HWND_LIST_MAX {
+            return;
+        }
+        out.push(k);
+        collect_descendants(st, k, depth + 1, out);
+    }
+}
+
+fn hwnd_list(st: &Win32kState, hwnd: u32, descendants: bool) -> Vec<u32> {
+    if descendants {
+        let mut out = Vec::new();
+        collect_descendants(st, hwnd, 0, &mut out);
+        return out;
+    }
+    if hwnd == 0 {
+        return st.windows.iter().filter(|(_, w)| w.parent == 0).map(|(h, _)| *h).collect();
+    }
+    let Some(parent) = st.window(hwnd).map(|w| w.parent) else { return Vec::new() };
+    st.windows
+        .iter()
+        .skip_while(|(h, _)| *h != hwnd)
+        .filter(|(_, w)| w.parent == parent)
+        .map(|(h, _)| *h)
+        .take(HWND_LIST_MAX)
+        .collect()
+}
+
+fn nt_user_build_hwnd_list(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hwnd = os.syscall_arg_u32(cpu, mem, 1)?;
+    let descendants = os.syscall_arg_u32(cpu, mem, 2)? != 0;
+    let count = os.syscall_arg_u32(cpu, mem, 5)? as usize;
+    let buffer = os.syscall_arg(cpu, mem, 6)?;
+    let size_out = os.syscall_arg(cpu, mem, 7)?;
+    let list = hwnd_list(&os.win32k_state, hwnd, descendants);
+    if size_out != 0 {
+        mem.write_u32(size_out, (list.len() + 1) as u32)?;
+    }
+    if buffer == 0 || list.len() + 1 > count {
+        return Ok(STATUS_BUFFER_TOO_SMALL);
+    }
+    for (i, h) in list.iter().enumerate() {
+        mem.write_u64(buffer + (i as u64) * 8, *h as u64)?;
     }
     Ok(0)
+}
+
+fn winproc_slot(value: u64) -> Option<usize> {
+    if value & !WINPROC_HANDLE_MASK != WINPROC_HANDLE_TAG {
+        return None;
+    }
+    Some((value & WINPROC_HANDLE_MASK) as usize)
+}
+
+fn alloc_win_proc(st: &mut Win32kState, func: u64, ansi: bool) -> u64 {
+    if func == 0 || winproc_slot(func).is_some() {
+        return func;
+    }
+    let existing = st
+        .win_procs
+        .iter()
+        .position(|p| if ansi { p.proc_a == func } else { p.proc_w == func });
+    if let Some(slot) = existing {
+        return WINPROC_HANDLE_TAG | slot as u64;
+    }
+    if st.win_procs.len() >= WINPROC_MAX {
+        return func;
+    }
+    let entry = if ansi {
+        WinProc { proc_a: func, proc_w: 0 }
+    } else {
+        WinProc { proc_a: 0, proc_w: func }
+    };
+    st.win_procs.push(entry);
+    WINPROC_HANDLE_TAG | (st.win_procs.len() - 1) as u64
+}
+
+fn get_dialog_proc(st: &Win32kState, value: u64, ansi: bool) -> u64 {
+    let Some(slot) = winproc_slot(value) else { return value };
+    st.win_procs.get(slot).map(|p| if ansi { p.proc_a } else { p.proc_w }).unwrap_or(0)
+}
+
+fn nt_user_call_two_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let a = os.syscall_arg(cpu, mem, 0)?;
+    let b = os.syscall_arg(cpu, mem, 1)?;
+    let code = os.syscall_arg(cpu, mem, 2)?;
+    match code {
+        call_two_param::GET_DIALOG_PROC => {
+            let proc = get_dialog_proc(&os.win32k_state, a, b != 0);
+            os.return_u64_from_syscall(proc);
+            Ok(0)
+        }
+        call_two_param::ALLOC_WIN_PROC => {
+            let handle = alloc_win_proc(&mut os.win32k_state, a, b != 0);
+            os.return_u64_from_syscall(handle);
+            Ok(0)
+        }
+        _ => Ok(0),
+    }
 }
 
 fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
@@ -1604,6 +1818,9 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
                 mem.write_u32(out + (i as u64) * 4, *v as u32)?;
             }
             Ok(1)
+        }
+        call_hwnd_param::GET_WINDOW_RELATIVE => {
+            Ok(window_relative(&os.win32k_state, hwnd, param))
         }
         call_hwnd_param::SET_DIALOG_INFO => {
             let Some(w) = os.win32k_state.window_mut(hwnd) else { return Ok(0) };
@@ -1798,11 +2015,17 @@ fn alloc_gdi_object(os: &mut WinOs, mem: &mut dyn Memory, ty: u16) -> Result<Opt
     if !ensure_gdi_table(os, mem) {
         return Ok(None);
     }
-    let slot = os.win32k_state.gdi_next_slot;
-    if slot >= GDI_TABLE_SLOTS {
-        return Ok(None);
-    }
-    os.win32k_state.gdi_next_slot += 1;
+    let slot = match os.win32k_state.gdi_free_slots.pop() {
+        Some(slot) => slot,
+        None => {
+            let slot = os.win32k_state.gdi_next_slot;
+            if slot >= GDI_TABLE_SLOTS {
+                return Ok(None);
+            }
+            os.win32k_state.gdi_next_slot += 1;
+            slot
+        }
+    };
 
     let entry = os.win32k_state.gdi_table_base + slot * GDI_ENTRY_SIZE;
     let obj = os.win32k_state.gdi_dc_arena + slot * GDI_DC_OBJECT_SIZE;
@@ -1897,7 +2120,7 @@ fn nt_user_release_dc(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) 
     if let Some(hwnd) = os.win32k_state.dc(hdc).map(|d| d.hwnd) {
         present_surface(os, mem, hwnd)?;
     }
-    os.win32k_state.dcs.retain(|(h, _)| *h != hdc);
+    free_gdi_object(os, mem, hdc)?;
     Ok(1)
 }
 
@@ -1931,7 +2154,7 @@ fn nt_user_end_paint(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
     }
     if ps != 0 {
         let hdc = mem.read_u64(ps)? as u32;
-        os.win32k_state.dcs.retain(|(h, _)| *h != hdc);
+        free_gdi_object(os, mem, hdc)?;
     }
     Ok(1)
 }
@@ -1972,6 +2195,7 @@ fn cancel_unattended_dialog(os: &mut WinOs) {
 fn nt_user_get_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let lp = os.syscall_arg(cpu, mem, 0)?;
     loop {
+        drive_file_dialog(os, mem);
         quit_when_headless(os);
         os.drain_input();
         synthesize_paint(os);
@@ -2346,6 +2570,7 @@ fn nt_user_peek_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
     const PM_REMOVE: u32 = 0x0001;
     let lp = os.syscall_arg(cpu, mem, 0)?;
     let remove = os.syscall_arg(cpu, mem, 4)? as u32 & PM_REMOVE != 0;
+    drive_file_dialog(os, mem);
     quit_when_headless(os);
     os.drain_input();
     synthesize_paint(os);
@@ -2659,7 +2884,8 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 }
 
 pub mod abi {
-    pub const SYSCALLS: [(&str, u32); 37] = [
+    pub const SYSCALLS: [(&str, u32); 38] = [
+        ("NtUserBuildHwndList", super::NT_USER_BUILD_HWND_LIST),
         ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
         ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
         ("NtUserSetCapture", super::NT_USER_SET_CAPTURE),
@@ -2750,11 +2976,12 @@ pub mod abi {
     pub const HT_CLIENT: i64 = super::hit::CLIENT;
     pub const HT_TRANSPARENT: i64 = super::hit::TRANSPARENT;
 
-    pub const CALL_HWND_PARAM: [(&str, u64); 6] = [
+    pub const CALL_HWND_PARAM: [(&str, u64); 7] = [
         ("GetWindowRect", super::call_hwnd_param::GET_WINDOW_RECT),
         ("GetClientRect", super::call_hwnd_param::GET_CLIENT_RECT),
         ("GetWindowLongPtrA", super::call_hwnd_param::GET_WINDOW_LONG_PTR_A),
         ("GetWindowLongPtrW", super::call_hwnd_param::GET_WINDOW_LONG_PTR_W),
+        ("GetWindow", super::call_hwnd_param::GET_WINDOW_RELATIVE),
         ("IsChild", super::call_hwnd_param::IS_CHILD),
         ("DIALOG_get_info", super::call_hwnd_param::SET_DIALOG_INFO),
     ];
@@ -3086,9 +3313,20 @@ fn copy_bitmap(os: &mut WinOs, mem: &mut dyn Memory, src: u32) -> Result<u32> {
     Ok(dst)
 }
 
+fn clear_unicode_string(mem: &mut dyn Memory, addr: u64) -> Result<()> {
+    if addr == 0 {
+        return Ok(());
+    }
+    mem.write_u16(addr + USTR_LENGTH, 0)?;
+    mem.write_u64(addr + USTR_BUFFER, 0)?;
+    Ok(())
+}
+
 fn nt_user_get_icon_info(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hicon = os.syscall_arg(cpu, mem, 0)? as u32;
     let info = os.syscall_arg(cpu, mem, 1)?;
+    let module = os.syscall_arg(cpu, mem, 2)?;
+    let res_name = os.syscall_arg(cpu, mem, 3)?;
     let bpp_out = os.syscall_arg(cpu, mem, 4)?;
     let Some(icon) = os.win32k_state.icons.iter().find(|(h, _)| *h == hicon).map(|(_, i)| *i)
     else {
@@ -3097,6 +3335,8 @@ fn nt_user_get_icon_info(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
     if info == 0 {
         return Ok(0);
     }
+    clear_unicode_string(mem, module)?;
+    clear_unicode_string(mem, res_name)?;
     let mask = copy_bitmap(os, mem, icon.mask)?;
     let color = copy_bitmap(os, mem, icon.color)?;
     mem.write_u32(info + ICONINFO_F_ICON, u32::from(icon.is_icon))?;
@@ -3219,14 +3459,27 @@ fn nt_gdi_delete_object_app(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     if (STOCK_SLOT_BASE..=STOCK_SLOT_LAST).contains(&slot) {
         return Ok(1);
     }
+    free_gdi_object(os, mem, handle)?;
+    Ok(1)
+}
+
+fn free_gdi_object(os: &mut WinOs, mem: &mut dyn Memory, handle: u32) -> Result<()> {
+    let slot = (handle & 0xFFFF) as u64;
+    if slot == 0 || slot >= GDI_TABLE_SLOTS || (STOCK_SLOT_BASE..=STOCK_SLOT_LAST).contains(&slot) {
+        return Ok(());
+    }
     let base = os.win32k_state.gdi_table_base;
     if base != 0 {
-        mem.write_u8(base + slot * GDI_ENTRY_SIZE + GDI_ENTRY_TYPE_OFF, 0)?;
+        let entry = base + slot * GDI_ENTRY_SIZE;
+        if mem.read_u8(entry + GDI_ENTRY_TYPE_OFF)? & GDI_ENTRY_IN_USE != 0 {
+            mem.write_u8(entry + GDI_ENTRY_TYPE_OFF, 0)?;
+            os.win32k_state.gdi_free_slots.push(slot);
+        }
     }
     os.win32k_state.brushes.retain(|(h, _)| *h != handle);
     os.win32k_state.dcs.retain(|(h, _)| *h != handle);
     os.win32k_state.bitmaps.retain(|(h, _)| *h != handle);
-    Ok(1)
+    Ok(())
 }
 
 fn nt_gdi_intersect_clip_rect(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
@@ -3384,6 +3637,40 @@ mod tests {
         mem.map(Region::new("scratch", 0x10_0000, 0x10_000, Perm::RW)).unwrap();
         os.set_syscall_guest_rsp_for_test(0x10_8000);
         (os, mem)
+    }
+
+    #[test]
+    fn a_deleted_gdi_object_returns_its_table_slot() {
+        let (mut os, mut mem) = os_with_gdi();
+
+        let mut last = 0;
+        for i in 0..(GDI_TABLE_SLOTS as usize * 4) {
+            let (handle, _) = alloc_gdi_object(&mut os, &mut mem, gdi_type::REGION)
+                .unwrap()
+                .unwrap_or_else(|| panic!("the GDI table ran out after {i} create/delete pairs"));
+            assert_ne!(handle, 0);
+            free_gdi_object(&mut os, &mut mem, handle).unwrap();
+            last = handle;
+        }
+        assert_ne!(last, 0);
+        assert!(
+            os.win32k_state.gdi_next_slot < GDI_TABLE_SLOTS,
+            "a balanced create/delete pair must not consume a fresh slot each time"
+        );
+    }
+
+    #[test]
+    fn freeing_a_gdi_object_twice_lists_its_slot_once() {
+        let (mut os, mut mem) = os_with_gdi();
+
+        let (handle, _) = alloc_gdi_object(&mut os, &mut mem, gdi_type::BITMAP).unwrap().unwrap();
+        free_gdi_object(&mut os, &mut mem, handle).unwrap();
+        free_gdi_object(&mut os, &mut mem, handle).unwrap();
+        assert_eq!(os.win32k_state.gdi_free_slots.len(), 1);
+
+        let (again, _) = alloc_gdi_object(&mut os, &mut mem, gdi_type::BITMAP).unwrap().unwrap();
+        assert_eq!(again, handle, "the recycled slot comes back with the same type tag");
+        assert!(os.win32k_state.gdi_free_slots.is_empty());
     }
 
     #[test]
@@ -3546,6 +3833,42 @@ mod tests {
     }
 
     #[test]
+    fn get_icon_info_empties_the_module_and_resource_strings_it_is_handed() {
+        let (mut os, mut mem) = os_with_gdi();
+        let mut cpu = CpuState::default();
+
+        cpu.set_reg(Reg::R10, 1);
+        cpu.set_reg(Reg::Rdx, call_one_param::CREATE_CURSOR_ICON);
+        let hicon = nt_user_call_one_param(&mut os, &mut cpu, &mut mem).unwrap();
+
+        let (module, res_name, info) = (0x10_4000u64, 0x10_4100u64, 0x10_4200u64);
+        for base in [module, res_name] {
+            mem.write_u16(base + USTR_LENGTH, 0x1C55).unwrap();
+            mem.write_u16(base + 2, 0x206).unwrap();
+            mem.write_u64(base + USTR_BUFFER, 0xDEAD_BEEF).unwrap();
+        }
+        cpu.set_reg(Reg::R10, hicon as u64);
+        cpu.set_reg(Reg::Rdx, info);
+        cpu.set_reg(Reg::R8, module);
+        cpu.set_reg(Reg::R9, res_name);
+        mem.write_u64(0x10_8000 + 0x28, 0).unwrap();
+        assert_eq!(nt_user_get_icon_info(&mut os, &mut cpu, &mut mem).unwrap(), 1);
+
+        for base in [module, res_name] {
+            assert_eq!(
+                mem.read_u16(base + USTR_LENGTH).unwrap(),
+                0,
+                "GetIconInfoExW writes its terminator at szModName[Length]"
+            );
+            assert_eq!(
+                mem.read_u64(base + USTR_BUFFER).unwrap(),
+                0,
+                "…and reads the buffer field back as the integer resource id"
+            );
+        }
+    }
+
+    #[test]
     fn the_shared_icon_cache_answers_not_cached() {
         let (mut os, mut mem) = os_with_gdi();
         let mut cpu = CpuState::default();
@@ -3686,6 +4009,92 @@ mod tests {
             },
         ));
         hwnd
+    }
+
+    #[test]
+    fn a_winproc_handle_round_trips_only_through_the_flavour_it_was_allocated_for() {
+        let mut st = Win32kState::default();
+        const PROC_W: u64 = 0x4001_2345;
+        const PROC_A: u64 = 0x4009_9999;
+
+        assert_eq!(alloc_win_proc(&mut st, 0, false), 0, "a null procedure stays null");
+
+        let hw = alloc_win_proc(&mut st, PROC_W, false);
+        assert_ne!(hw, PROC_W, "a handle is not the procedure address");
+        assert!(hw >= 2, "GetWindowLongPtrW keeps the raw value for 0 and 1");
+        assert_eq!(get_dialog_proc(&st, hw, false), PROC_W, "SetWindowLongPtrW round-trips it");
+        assert_eq!(get_dialog_proc(&st, hw, true), 0, "…and the ANSI flavour is not this one");
+
+        assert_eq!(alloc_win_proc(&mut st, PROC_W, false), hw, "the same pair reuses its slot");
+        assert_eq!(alloc_win_proc(&mut st, hw, false), hw, "an existing handle is left alone");
+
+        let ha = alloc_win_proc(&mut st, PROC_A, true);
+        assert_ne!(ha, hw);
+        assert_eq!(get_dialog_proc(&st, ha, true), PROC_A);
+        assert_eq!(get_dialog_proc(&st, ha, false), 0);
+
+        assert_eq!(get_dialog_proc(&st, PROC_W, false), PROC_W, "a plain address is its own answer");
+        assert_eq!(get_dialog_proc(&st, WINPROC_HANDLE_TAG | 0x800, false), 0, "an unissued slot");
+    }
+
+    #[test]
+    fn get_window_walks_the_sibling_chain_a_dialog_is_searched_along() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let dlg = child(&mut os, 0, [0, 0, 100, 100]);
+        let a = child(&mut os, dlg, [0, 0, 10, 10]);
+        let b = child(&mut os, dlg, [0, 0, 10, 10]);
+        let c = child(&mut os, dlg, [0, 0, 10, 10]);
+        let inner = child(&mut os, b, [0, 0, 5, 5]);
+        let st = &os.win32k_state;
+
+        assert_eq!(window_relative(st, dlg, window_relative::CHILD), a);
+        assert_eq!(window_relative(st, a, window_relative::HWND_NEXT), b);
+        assert_eq!(window_relative(st, b, window_relative::HWND_NEXT), c);
+        assert_eq!(window_relative(st, c, window_relative::HWND_NEXT), 0);
+        assert_eq!(window_relative(st, c, window_relative::HWND_PREV), b);
+        assert_eq!(window_relative(st, a, window_relative::HWND_PREV), 0);
+        assert_eq!(window_relative(st, c, window_relative::HWND_FIRST), a);
+        assert_eq!(window_relative(st, a, window_relative::HWND_LAST), c);
+        assert_eq!(window_relative(st, a, window_relative::OWNER), 0, "a child has no owner");
+        assert_eq!(window_relative(st, dlg, window_relative::OWNER), 0);
+        assert_eq!(window_relative(st, inner, window_relative::HWND_NEXT), 0);
+        assert_eq!(window_relative(st, 0xDEAD, window_relative::CHILD), 0);
+
+        assert_eq!(hwnd_list(st, a, false), vec![a, b, c], "GetDlgItem sees every control once");
+        assert_eq!(hwnd_list(st, dlg, true), vec![a, b, inner, c], "…and EnumChildWindows recurses");
+        assert_eq!(hwnd_list(st, 0, false), vec![dlg], "a zero hwnd is the top-level chain");
+    }
+
+    #[test]
+    fn build_hwnd_list_reserves_the_terminator_slot_its_caller_writes() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        mem.map_fixed(0x10_0000, 0x10_000, Perm::RW, "stack").unwrap();
+        os.set_syscall_guest_rsp_for_test(0x10_8000);
+        let dlg = child(&mut os, 0, [0, 0, 100, 100]);
+        let a = child(&mut os, dlg, [0, 0, 10, 10]);
+        let b = child(&mut os, dlg, [0, 0, 10, 10]);
+
+        let (buffer, size_out) = (0x2_0000u64, 0x2_0800u64);
+        let mut cpu = CpuState::default();
+        let mut call = |cpu: &mut CpuState, mem: &mut VirtualMemory, count: u64| {
+            cpu.set_reg(Reg::Rdx, a as u64);
+            cpu.set_reg(Reg::R8, 0);
+            mem.write_u64(0x10_8000 + 0x28, 0).unwrap();
+            mem.write_u64(0x10_8000 + 0x30, count).unwrap();
+            mem.write_u64(0x10_8000 + 0x38, buffer).unwrap();
+            mem.write_u64(0x10_8000 + 0x40, size_out).unwrap();
+            nt_user_build_hwnd_list(&mut os, cpu, mem).unwrap()
+        };
+
+        assert_eq!(call(&mut cpu, &mut mem, 2), STATUS_BUFFER_TOO_SMALL, "two windows need three");
+        assert_eq!(mem.read_u32(size_out).unwrap(), 3, "…and the retry size says so");
+
+        assert_eq!(call(&mut cpu, &mut mem, 3), 0);
+        assert_eq!(mem.read_u32(size_out).unwrap(), 3);
+        assert_eq!(mem.read_u64(buffer).unwrap(), a as u64);
+        assert_eq!(mem.read_u64(buffer + 8).unwrap(), b as u64);
     }
 
     #[test]

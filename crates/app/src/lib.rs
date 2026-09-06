@@ -159,6 +159,7 @@ pub struct RunConfig {
     pub spawn_depth: u32,
     pub jit: bool,
     pub dpi: u32,
+    pub file_dialog_pick: Option<String>,
     pub debug: Option<exemu_core::DebugSession>,
 }
 
@@ -183,6 +184,7 @@ impl Default for RunConfig {
             spawn_depth: 0,
             jit: false,
             dpi: 96,
+            file_dialog_pick: std::env::var("EXEMU_FILE_DIALOG_PICK").ok().filter(|s| !s.is_empty()),
             debug: None,
         }
     }
@@ -418,6 +420,7 @@ impl Process {
             image_name: module_name.clone(),
             wine_dll_dir: wine_dll_dir.clone(),
             dpi: cfg.dpi,
+            file_dialog_pick: cfg.file_dialog_pick.clone(),
         });
 
         os.set_unwind_table(image.function_table.clone());
