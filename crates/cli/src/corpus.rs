@@ -195,6 +195,14 @@ pub struct Entry {
     /// Per-entry for the same reason `virtual_clock` is — it selects which
     /// engine the pin describes.
     pub jit: bool,
+    /// Run this entry with a **debugger handle attached but nothing armed**
+    /// (`EXEMU_DEBUG_IDLE`, roadmap W9.3). Pinned to the *same* numbers as the
+    /// undebugged entry for the same binary, because the whole claim the debug
+    /// seam rests on is that attaching costs nothing: a detached handle is
+    /// inert, and an attached-but-unarmed one is one relaxed load against a
+    /// zero filter. An entry that drifts from its twin means attaching started
+    /// costing something, which is exactly what this gate exists to catch.
+    pub debug_idle: bool,
     /// Boot this entry on the **Wine PE DLL set** in this directory
     /// (`--wine-boot <dir>`, the `x86_64-windows` half of the pinned prefix),
     /// resolved relative to the manifest like `path`. `None` keeps the
@@ -386,6 +394,9 @@ impl Manifest {
             if e.jit {
                 let _ = writeln!(o, "jit       = {}", e.jit);
             }
+            if e.debug_idle {
+                let _ = writeln!(o, "debug_idle = {}", e.debug_idle);
+            }
             if let Some(dir) = &e.wine_boot {
                 let _ = writeln!(o, "wine_boot = {}", quote(dir));
             }
@@ -501,6 +512,7 @@ impl Entry {
             quick: matches!(get("quick"), Some(Value::Bool(true))),
             virtual_clock: matches!(get("virtual_clock"), Some(Value::Bool(true))),
             jit: matches!(get("jit"), Some(Value::Bool(true))),
+            debug_idle: matches!(get("debug_idle"), Some(Value::Bool(true))),
             wine_boot: match get("wine_boot") {
                 Some(Value::Str(s)) => Some(s.clone()),
                 _ => None,
@@ -592,12 +604,20 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
         .env_remove("EXEMU_VIRTUAL_CLOCK")
         // Same reasoning for the JIT: an entry runs on the engine its pin
         // describes, never on whatever the developer's environment selects.
-        .env_remove("EXEMU_JIT");
+        .env_remove("EXEMU_JIT")
+        .env_remove("EXEMU_DEBUG_IDLE");
     if e.virtual_clock {
         cmd.arg("--virtual-clock");
     }
     if e.jit {
         cmd.arg("--jit");
+    }
+    // Same hygiene as `EXEMU_JIT`: the manifest decides, never the developer's
+    // environment. `EXEMU_DEBUG_IDLE` is an env var rather than a flag because
+    // it is a *test* affordance — it attaches a handle with nothing armed, so
+    // the run is observably identical to an undebugged one.
+    if e.debug_idle {
+        cmd.env("EXEMU_DEBUG_IDLE", "1");
     }
     // The prefix is passed as an ABSOLUTE path: the child runs with its working
     // directory set to the binary's own folder (see the bare-`argv[0]` note
@@ -1237,6 +1257,32 @@ tolerance = 0
 
     /// The JIT flag round-trips, and is absent by default — so an entry never
     /// silently changes which engine its pin describes.
+    #[test]
+    fn the_debug_idle_flag_round_trips() {
+        const TEXT: &str = r#"[[binary]]
+path      = "example_exe/d.exe"
+quick     = true
+virtual_clock = true
+debug_idle = true
+max_steps = 1000
+outcome   = "exit"
+exit_code = 0
+steps     = 12345
+tolerance = 0
+"#;
+        let m = Manifest::parse(TEXT, PathBuf::from("/repo")).expect("parse");
+        assert!(m.entries[0].debug_idle);
+        let again = Manifest::parse(&m.to_toml(), PathBuf::from("/repo")).expect("reparse");
+        assert!(again.entries[0].debug_idle, "the flag survives a rewrite");
+        let plain = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
+        assert!(!plain.entries[0].debug_idle);
+        assert!(
+            !plain.to_toml().contains("debug_idle"),
+            "an undebugged entry does not grow the key, so the diff of a \
+             re-bless stays readable"
+        );
+    }
+
     #[test]
     fn the_jit_flag_round_trips() {
         const TEXT: &str = r#"[[binary]]

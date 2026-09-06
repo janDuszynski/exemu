@@ -142,6 +142,20 @@ tolerance = 0
 artifacts = 108
 
 [[binary]]
+name      = "7z2602-x64.exe (debug attached)"
+path      = "example_exe/7z2602-x64.exe"
+note      = "The SAME binary with a DEBUGGER HANDLE ATTACHED and nothing armed (roadmap W9.3). Pinned to exactly the undebugged entry's numbers, because that is the claim the whole debug seam rests on: a detached handle is inert, and an attached-but-unarmed one costs one relaxed load against a zero Bloom filter — 2 ARM64 instructions on the memory hot path, 6 when attached. If this twin ever drifts from the entry above by one instruction or one artifact, attaching has started costing something, and every measurement taken with the debugger present becomes suspect. Deliberately run WITHOUT --jit so the pin covers the interpreter path; the JIT half is asserted in-process by the JitReport-equality gate in crates/app/tests/debug.rs, which compares all nine fields. MUTATION-CHECKED: because attaching is free, this entry would pass identically if the flag did nothing, so the attachment itself was verified separately — a temporary eprintln at the attach site fired on exactly the run WITH EXEMU_DEBUG_IDLE set and not on the run without it (1 vs 0), then was reverted. Read this row as 'attaching costs nothing', not as 'a debugger was proven present'; the latter is what the in-process gate asserts."
+quick     = false
+virtual_clock = true
+debug_idle = true
+max_steps = 800000000
+outcome   = "exit"
+exit_code = 0
+steps     = 496505572
+tolerance = 0
+artifacts = 108
+
+[[binary]]
 name      = "SteamSetup.exe"
 path      = "example_exe/SteamSetup.exe"
 note      = "32-bit NSIS installer. Decompresses and runs its archive, loads its plugins, builds its dialog, then stores a NULL from a stubbed API and writes through it. The worst host-clock drifter in the corpus (Δ−189 across one pass, Δ+675 across another); 4 virtual-clock runs are identical."
