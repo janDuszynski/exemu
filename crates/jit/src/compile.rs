@@ -1113,6 +1113,7 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
                 };
             }
             0xC0 | 0xC1 => imm = c.u8()? as u64,
+            0xC2 => imm = c.u16()? as u64,
             0xC6 => imm = c.u8()? as u64,
             0xC7 => {
                 let size = opsize(&pfx);
@@ -1505,6 +1506,31 @@ impl Compiler {
                         Lowered::Ok
                     }
                 }
+            }
+
+            0xC2 | 0xC3 if !p.p66 => {
+                self.materialize();
+                let w = self.mode.stack_width();
+                self.asm.ldr(8, R_ADDR, R_STATE, gpr_off(4));
+                if !self.mode.is64() {
+                    let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
+                    debug_assert!(ok);
+                }
+                self.emit_load(R_FA, w);
+                let released = w as u64 + if insn.opcode == 0xC2 { insn.imm } else { 0 };
+                if released < 4096 {
+                    self.asm.add_imm(true, T0, R_ADDR, released as u32, false);
+                } else {
+                    self.asm.mov_imm64(T0, released);
+                    self.asm.add_reg(true, T0, R_ADDR, T0, 0);
+                }
+                if !self.mode.is64() {
+                    let ok = self.asm.and_imm(true, T0, T0, 0xffff_ffff);
+                    debug_assert!(ok);
+                }
+                self.asm.str(8, T0, R_STATE, gpr_off(4));
+                self.exit_indirect(Flags::Live, R_FA, self.insns + 1);
+                Lowered::Terminated
             }
 
             0xC9 => {

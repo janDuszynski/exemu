@@ -268,7 +268,7 @@ const RBP: u8 = 5;
 
 fn boundary_shape(rng: &mut Rng, bits: Bits, sp: &Space) -> (Vec<u8>, String, u64) {
     let mut b = Vec::new();
-    let (label, n) = match rng.below(9) {
+    let (label, n) = match rng.below(11) {
         0 => {
             mov_reg_imm(&mut b, bits, RSP, sp.push_sp);
             let r = rng.below(8) as u8;
@@ -359,6 +359,18 @@ fn boundary_shape(rng: &mut Rng, bits: Bits, sp: &Space) -> (Vec<u8>, String, u6
             b.push(disp);
             (format!("mov ebp,{:#x} ; {what}", sp.wrap_base), 2)
         }
+        9 => {
+            mov_reg_imm(&mut b, bits, RSP, sp.pop_sp);
+            b.push(0xC3);
+            (format!("mov esp,{:#x} ; ret", sp.pop_sp), 2)
+        }
+        10 => {
+            mov_reg_imm(&mut b, bits, RSP, sp.pop_sp);
+            let extra = rng.next_u32() as u16;
+            b.push(0xC2);
+            b.extend_from_slice(&extra.to_le_bytes());
+            (format!("mov esp,{:#x} ; ret {extra:#x}", sp.pop_sp), 2)
+        }
         _ => unreachable!(),
     };
     (b, label, n)
@@ -377,6 +389,7 @@ struct TrialPlan {
     label: String,
     seed: Seed,
     generated: u64,
+    tail: u64,
     layout: Layout,
     space: Space,
     at: u64,
@@ -391,7 +404,17 @@ fn trial_at(cfg: &JitFuzzConfig, index: u64) -> TrialPlan {
     let mut bytes = Vec::new();
     let mut labels: Vec<String> = Vec::new();
     let mut generated = 0u64;
-    let room = sp.code_len as usize - if cfg.laps > 1 { 5 } else { 1 };
+    let lap_by_ret = cfg.laps > 1 && rng.boolean();
+    let mov_len = match bits {
+        Bits::B32 => 5,
+        Bits::B64 => 10,
+    };
+    let tail_len = match (cfg.laps > 1, lap_by_ret) {
+        (true, true) => mov_len + 2,
+        (true, false) => 5,
+        (false, _) => 1,
+    };
+    let room = sp.code_len as usize - tail_len;
     for _ in 0..cfg.chain.max(1) {
         let (b, label, n) = if rng.below(4) == 0 {
             boundary_shape(&mut rng, bits, &sp)
@@ -406,15 +429,29 @@ fn trial_at(cfg: &JitFuzzConfig, index: u64) -> TrialPlan {
         labels.push(label);
         generated += n;
     }
+    let tail;
     if sp.flush && !bytes.is_empty() && rng.boolean() {
         let cut = (1 + rng.below(6) as usize).min(bytes.len() - 1);
         bytes.truncate(bytes.len() - cut);
+        tail = 1;
+    } else if cfg.laps > 1 && lap_by_ret {
+        let top = if sp.flush {
+            sp.code_base + sp.code_len - (bytes.len() + tail_len) as u64
+        } else {
+            sp.code_base
+        };
+        mov_reg_imm(&mut bytes, bits, 0, top);
+        bytes.push(0x50);
+        bytes.push(0xC3);
+        tail = 3;
     } else if cfg.laps > 1 {
         let back = -((bytes.len() + 5) as i64) as i32;
         bytes.push(0xE9);
         bytes.extend_from_slice(&back.to_le_bytes());
+        tail = 1;
     } else {
         bytes.push(0xC3);
+        tail = 1;
     }
     seed.gpr[RSP as usize] = sp.sp;
     let at = if sp.flush {
@@ -422,7 +459,7 @@ fn trial_at(cfg: &JitFuzzConfig, index: u64) -> TrialPlan {
     } else {
         sp.code_base
     };
-    TrialPlan { bytes, label: labels.join(" ; "), seed, generated, layout, space: sp, at }
+    TrialPlan { bytes, label: labels.join(" ; "), seed, generated, tail, layout, space: sp, at }
 }
 
 fn setup(bits: Bits, plan: &TrialPlan) -> Option<(VirtualMemory, Interpreter)> {
@@ -522,7 +559,7 @@ fn run_lapped(
     mut mem_i: VirtualMemory,
     mut cpu_i: Interpreter,
 ) -> (Run, Option<String>) {
-    let budget = laps as u64 * (plan.generated + 1);
+    let budget = laps as u64 * (plan.generated + plan.tail);
     let mut hooks = NoHooks;
     let mut total: u32 = 0;
     let mut last = Run::NotCompiled;
@@ -743,7 +780,7 @@ fn run_one_debugged(
     let bits = cfg.bits;
     let mode = mode_of(bits);
     let mut hooks = NoHooks;
-    let budget = plan.generated + 1;
+    let budget = plan.generated + plan.tail;
 
     jit.set_debug(DebugControl::detached());
     jit.invalidate();

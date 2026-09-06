@@ -514,6 +514,8 @@ mod tests {
     use exemu_core::{Perm, Region};
     use exemu_memory::VirtualMemory;
 
+    const DECLINED: u8 = 0xF4;
+
     const CODE: u64 = 0x1000;
     const DATA: u64 = 0x2000;
 
@@ -530,7 +532,7 @@ mod tests {
         let code = [
             0xB8, 0x05, 0x00, 0x00, 0x00,
             0x83, 0xC0, 0x07,
-            0xC3,
+            DECLINED,
         ];
         let mut mem = mem_with(&code);
         let mut st = CpuState::new();
@@ -591,7 +593,7 @@ mod tests {
         let code = [
             0xC6, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00, 0x90,
             0xB8, 0x07, 0x00, 0x00, 0x00,
-            0xC3,
+            DECLINED,
         ];
         mem.poke(CODE, &code).unwrap();
         let mut st = CpuState::new();
@@ -607,8 +609,8 @@ mod tests {
     fn a_store_into_another_block_invalidates_it() {
         let mut mem = VirtualMemory::new();
         mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
-        let a = [0xC6, 0x04, 0x25, 0x41, 0x10, 0x00, 0x00, 0x02, 0xC3];
-        let b = [0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3];
+        let a = [0xC6, 0x04, 0x25, 0x41, 0x10, 0x00, 0x00, 0x02, DECLINED];
+        let b = [0xB8, 0x01, 0x00, 0x00, 0x00, DECLINED];
         mem.poke(CODE, &a).unwrap();
         mem.poke(CODE + 0x40, &b).unwrap();
         let mut jit = Jit::new(64 * 1024).unwrap();
@@ -630,7 +632,7 @@ mod tests {
 
     #[test]
     fn the_same_bytes_are_cached_separately_per_cpu_mode() {
-        let code = [0x48, 0xFF, 0xC0, 0xC3];
+        let code = [0x48, 0xFF, 0xC0, DECLINED];
         let mut mem = mem_with(&code);
         let mut jit = Jit::new(64 * 1024).unwrap();
 
@@ -659,7 +661,7 @@ mod tests {
         let mut mem = VirtualMemory::new();
         mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
         mem.map(Region::new("data", DATA, 0x1000, Perm::RWX)).unwrap();
-        let code = [0xC6, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x01, 0xC3];
+        let code = [0xC6, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x01, DECLINED];
         mem.poke(CODE, &code).unwrap();
         let mut jit = Jit::new(64 * 1024).unwrap();
         let mut st = CpuState::new();
@@ -671,7 +673,7 @@ mod tests {
         assert_eq!(jit.stats().blocks_compiled, 1, "and the block is compiled once");
     }
 
-    const LOAD_DATA: [u8; 8] = [0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0xC3];
+    const LOAD_DATA: [u8; 8] = [0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, DECLINED];
 
     fn mem_two_page_data(code: &[u8], perm: Perm) -> VirtualMemory {
         let mut m = VirtualMemory::new();
@@ -719,7 +721,7 @@ mod tests {
     #[test]
     fn making_a_region_executable_puts_its_stores_back_on_the_helper() {
         let mut mem = mem_two_page_data(
-            &[0xC6, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x01, 0xC3],
+            &[0xC6, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x01, DECLINED],
             Perm::RW,
         );
         let mut jit = Jit::new(64 * 1024).unwrap();
@@ -780,7 +782,7 @@ mod tests {
             0x50,
             0x5B,
             0x8A, 0x0D,
-            0xC3,
+            DECLINED,
         ];
         let run = |tlb_on: bool| {
             let mut mem = mem_two_page_data(&code, Perm::RW);
@@ -815,7 +817,7 @@ mod tests {
         let code: [u8; 15] = [
             0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00,
             0x8B, 0x1C, 0x25, 0x00, 0x60, 0x00, 0x00,
-            0xC3,
+            DECLINED,
         ];
         let mut mem = mem_two_page_data(&code, Perm::RW);
         let mut jit = Jit::new(64 * 1024).unwrap();
@@ -836,7 +838,7 @@ mod tests {
         let code: [u8; 15] = [
             0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00,
             0x8B, 0x0C, 0x25, 0xFC, 0x2F, 0x00, 0x00,
-            0xC3,
+            DECLINED,
         ];
         let mut mem = mem_data_pages(&code, 1);
         mem.write_u32(DATA, 0x4444_4444).unwrap();
@@ -858,7 +860,7 @@ mod tests {
         let code: [u8; 16] = [
             0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00,
             0x48, 0x8B, 0x1C, 0x25, 0xFC, 0x2F, 0x00, 0x00,
-            0xC3,
+            DECLINED,
         ];
         let mut mem = mem_data_pages(&code, 1);
         let mut jit = Jit::new(64 * 1024).unwrap();
@@ -882,7 +884,7 @@ mod tests {
         let code: [u8; 16] = [
             0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00,
             0x48, 0x8B, 0x1C, 0x25, 0xFC, 0x2F, 0x00, 0x00,
-            0xC3,
+            DECLINED,
         ];
         let mut mem = mem_data_pages(&code, 2);
         mem.write_u32(DATA + 0xffc, 0xAAAA_AAAA).unwrap();
@@ -905,7 +907,7 @@ mod tests {
         0x83, 0xC0, 0x07,
         0xEB, 0x00,
         0x83, 0xC0, 0x09,
-        0xC3,
+        DECLINED,
     ];
 
     #[test]
@@ -924,7 +926,7 @@ mod tests {
         let chains = jit.stats().chains;
         assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1000), Run::SideExit { insns: 5 });
         assert_eq!(st.gpr[0], 21, "all three blocks ran (5 + 7 + 9)");
-        assert_eq!(st.rip, CODE + 15, "left sitting on the `ret`");
+        assert_eq!(st.rip, CODE + 15, "left sitting on the declined opcode");
         assert_eq!(jit.stats().chains, chains + 1, "three blocks, one entry");
     }
 
@@ -998,7 +1000,7 @@ mod tests {
         0xFF, 0xC9,
         0x75, 0xFC,
         0x31, 0xC0,
-        0xC3,
+        DECLINED,
     ];
 
     #[test]
@@ -1069,7 +1071,7 @@ mod tests {
         a.push(0xE9);
         a.extend_from_slice(&(0x40 - (jmp_at + 5)).to_le_bytes());
         mem.poke(CODE, &a).unwrap();
-        mem.poke(CODE + 0x40, &[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]).unwrap();
+        mem.poke(CODE + 0x40, &[0xB8, 0x01, 0x00, 0x00, 0x00, DECLINED]).unwrap();
         let mut jit = Jit::new(64 * 1024).unwrap();
 
         let mut st = CpuState::new();
@@ -1077,13 +1079,79 @@ mod tests {
         jit.run(&mut st, &mut mem, Mode::Long, 1000);
         assert_eq!(st.gpr[0], 2, "B already ran from the rewritten bytes");
 
-        mem.poke(CODE + 0x40, &[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]).unwrap();
+        mem.poke(CODE + 0x40, &[0xB8, 0x01, 0x00, 0x00, 0x00, DECLINED]).unwrap();
         st = CpuState::new();
         st.rip = CODE;
         st.gpr[0] = 0xDEAD;
         jit.run(&mut st, &mut mem, Mode::Long, 1000);
         assert_eq!(st.gpr[0], 2, "the chain executed a stale copy of block B");
         assert!(jit.stats().unlinks > 0, "the store never broke the links");
+    }
+
+    const CALL_LOOP: [u8; 17] = [
+        0xB9, 0x08, 0x00, 0x00, 0x00,
+        0xE8, 0x06, 0x00, 0x00, 0x00,
+        0xFF, 0xC9,
+        0x75, 0xF7,
+        DECLINED,
+        0x90,
+        0xC3,
+    ];
+
+    #[test]
+    fn a_warm_return_reaches_its_caller_without_returning_to_rust() {
+        let mut mem = mem_with(&CALL_LOOP);
+        mem.map(Region::new("stack", 0x8000, 0x1000, Perm::RW)).unwrap();
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        st.rip = CODE;
+        st.gpr[4] = 0x8800;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1000), Run::SideExit { insns: 33 });
+        assert_eq!(st.gpr[1], 0, "ecx counted down to zero");
+        assert_eq!(st.rip, CODE + 14, "left on the declined opcode");
+        assert_eq!(st.gpr[4], 0x8800, "every call was matched by its ret");
+
+        let taken = jit.stats().links_taken;
+        let chains = jit.stats().chains;
+        st = CpuState::new();
+        st.rip = CODE;
+        st.gpr[4] = 0x8800;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1000), Run::SideExit { insns: 33 });
+        assert_eq!(jit.stats().chains - chains, 1, "one entry into native code");
+        assert_eq!(
+            jit.stats().links_taken - taken,
+            23,
+            "every transition, the eight returns included, was a native link"
+        );
+    }
+
+    #[test]
+    fn a_return_to_a_new_target_misses_the_cache_and_still_lands() {
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
+        mem.map(Region::new("stack", 0x8000, 0x1000, Perm::RW)).unwrap();
+        mem.poke(CODE, &[0xC3]).unwrap();
+        mem.poke(CODE + 0x40, &[0xB8, 0x07, 0x00, 0x00, 0x00, DECLINED]).unwrap();
+        mem.poke(CODE + 0x80, &[0xB8, 0x09, 0x00, 0x00, 0x00, DECLINED]).unwrap();
+        let mut jit = Jit::new(64 * 1024).unwrap();
+
+        for (round, (slot, want, links)) in
+            [(CODE + 0x40, 7u64, 0), (CODE + 0x40, 7, 1), (CODE + 0x80, 9, 0)].iter().enumerate()
+        {
+            mem.write_u64(0x8800, *slot).unwrap();
+            let before = jit.stats().links_taken;
+            let mut st = CpuState::new();
+            st.rip = CODE;
+            st.gpr[4] = 0x8800;
+            jit.run(&mut st, &mut mem, Mode::Long, 1000);
+            assert_eq!(st.gpr[0], *want, "round {round}: the ret to {slot:#x} ran the wrong block");
+            assert_eq!(st.gpr[4], 0x8808, "round {round}: rsp moved by exactly one slot");
+            assert_eq!(
+                jit.stats().links_taken - before,
+                *links,
+                "round {round}: the cached target must be taken only when it is the one popped"
+            );
+        }
     }
 
     #[test]
@@ -1095,7 +1163,7 @@ mod tests {
         jit.run(&mut st, &mut mem, Mode::Long, 1000);
         let unlinks = jit.stats().unlinks;
 
-        let store = [0xC7, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0xC3];
+        let store = [0xC7, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, DECLINED];
         mem.poke(DATA, &store).unwrap();
         mem.map(Region::new("more", DATA + 0x1000, 0x1000, Perm::RWX)).unwrap();
         mem.poke(DATA + 0x1000, &store).unwrap();
