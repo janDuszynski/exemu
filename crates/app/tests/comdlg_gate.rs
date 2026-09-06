@@ -228,7 +228,7 @@ fn wine_file_dialog_is_built_but_never_completes() {
 }
 
 #[test]
-fn driving_the_dialog_reaches_the_text_layout_path_and_stops_there() {
+fn driving_the_dialog_gets_through_text_layout_and_stops_in_the_comboboxex() {
     if !wine_dlls_present() {
         eprintln!("SKIP: {WINE_DLLS} not present (the Wine DLL set is git-ignored)");
         return;
@@ -256,10 +256,23 @@ fn driving_the_dialog_reaches_the_text_layout_path_and_stops_there() {
         Err(e) => e.to_string(),
     };
     eprintln!("comdlg wine drive: {err}");
+    assert!(err.contains("0xc0000005"), "the drive still ends in an access violation: {err}");
     assert!(
-        err.contains("0xc0000005"),
-        "the wall is an access violation in gdi32's bundled Uniscribe, not something \
-         else: {err}"
+        !err.contains("0xc0000005 at 0x70"),
+        "0x70 is ScriptCache::tm.tmHeight read through a NULL ScriptCache — the font wall, \
+         which GDI font objects removed. If it is back, NtGdiHfontCreate / NtGdiGetDCObject / \
+         NtGdiExtGetObjectW stopped agreeing with gdi32!init_script_cache: {err}"
+    );
+    let faulted: u64 = err
+        .split("faulted after ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        faulted > 50_533_163,
+        "the drive must get PAST the font wall, which stopped it at 50,533,163 instructions; \
+         got {faulted} ({err})"
     );
 }
 

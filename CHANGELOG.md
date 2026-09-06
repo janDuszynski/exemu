@@ -58,13 +58,60 @@ end-to-end on the default path.
   combo and delivers `CDN_INITDONE`/`CDN_FOLDERCHANGE`/`CDN_SELCHANGE` — 65.7M
   instructions where it used to spend 3M. `GetOpenFileNameW` still returns FALSE
   with `CommDlgExtendedError() == 0`, an honest cancel, and no access violation.
-- **The next wall is fonts, and it is pinned rather than described.** A headless
-  run can now be told what a user would have typed
+- **The next wall was fonts, and it is now behind us** — see the section below.
+  A headless run can be told what a user would have typed
   (`RunConfig::file_dialog_pick`, `EXEMU_FILE_DIALOG_PICK`); it posts `WM_SETTEXT`
-  into the file-name combo's edit and `WM_COMMAND(IDOK)` to the dialog. That
-  reaches gdi32's bundled Uniscribe and faults at `gdi32+0x38819`, because
-  `NtGdiHfontCreate` is unserviced and no DC ever carries a font. Off by default,
-  so no existing run changes.
+  into the file-name combo's edit and `WM_COMMAND(IDOK)` to the dialog. Off by
+  default, so no existing run changes.
+
+### GDI grows font objects, and the 32-bit half of the handle table (W6.2)
+- **`NtGdiHfontCreate` (win32u 0x1233) answers a real `HFONT`.** Its first
+  argument is an `ENUMLOGFONTEXDVW` (0x1a4 bytes) whose first member is the
+  caller's `LOGFONTW` (0x5c bytes, `lfFaceName` at +0x1c) — read off
+  `gdi32!CreateFontIndirectExW`, which passes `rdx = 0x1a4`, and off
+  `CreateFontIndirectW`, which builds one on its own stack out of five `movdqu`
+  copies of the caller's 0x5c bytes. exemu keeps those bytes verbatim and hands
+  back an `NTGDI_OBJ_FONT` handle, which is the type `gdi32!SelectObject`
+  dispatches on.
+- **`NtGdiGetDCObject` (0x11f0) answers what a DC carries.** Its second argument
+  is an `NTGDI_OBJ_*` value shifted left 16 — the same encoding as the high half
+  of a GDI handle — recovered from `gdi32!GetCurrentObject`'s jump table, which
+  turns `OBJ_FONT` into `0xa0000`, `OBJ_BRUSH` into `0x100000`, `OBJ_PEN` into
+  `0x300000` and `OBJ_BITMAP` into `0x50000` (`NTGDI_OBJ_SURF`). A DC with
+  nothing selected reports the stock `SYSTEM_FONT`, as Wine's own DC init does.
+- **`NtGdiExtGetObjectW` fills a `LOGFONTW` for a font handle**, `NtGdiSelectFont`
+  answers the font that was there before instead of echoing its argument,
+  `NtGdiGetTextFaceW` answers the selected face, and `NtGdiGetFontData` answers
+  `GDI_ERROR` — the honest answer for a font exemu has no file for, and the one
+  that sends Uniscribe down its non-sfnt path.
+- **`TEXTMETRICW` now follows the selected font.** It was a fixed 16x8 cell for
+  every DC in every guest; it is now derived from the `LOGFONTW` — a negative
+  `lfHeight` is an em size and the cell is `em + ceil(em/4)`, `tmAscent +
+  tmDescent == tmHeight`, and weight, italic, underline, strike-out, charset and
+  pitch/family come straight from the `LOGFONT`. Text extents ask the display
+  driver to measure at that cell height rather than a hardcoded 16 px.
+- **That is what gdi32's bundled Uniscribe was missing.** `init_script_cache`
+  (gdi32 RVA 0x45e90) is `GetCurrentObject(hdc, OBJ_FONT)` →
+  `GetObjectW(hfont, 0x5c, &lf)` → reject if `lf.lfFaceName[0] == 0` →
+  `GetTextMetricsW(hdc, &sc->tm)`; every one of those steps used to fail at the
+  first, so `analysis->glyphs[0].sc` stayed NULL and `ScriptString_pSize`
+  dereferenced it at `gdi32+0x38819` (`sc->tm.tmHeight`, and `tm` sits at +0x70
+  in `ScriptCache` because a 0x5c-byte `LOGFONTW` sits at +0x14 — which
+  `init_script_cache`'s own `memcmp(entry+0x14, &lf, 0x5c)` confirms).
+- **A WoW64 guest's `gdi32` reads the handle table out of its own PEB.** The
+  32-bit `gdi32!GetObjectW` does `mov eax, fs:[0x18]` → `[eax+0x30]` (Peb) →
+  `[eax+0x94]` (`GdiSharedHandleTable`) → `table + LOWORD(handle)*24`, and exemu
+  published that pointer only at `PEB64+0xF8`. The first real `HFONT` therefore
+  made the 32-bit half compute `0 + 0x38*24 + 0xe` and take an access violation
+  at `0x54e`, which is what turned Firefox Installer's clean `exit 1` into a
+  fault. exemu now publishes the pointer in the 32-bit PEB too and maps the
+  table and its object arena below 4 GiB, since the 32-bit side reads both
+  through 32-bit pointers.
+- **Where the drive stops now.** It gets through shaping and stops one wall
+  further on, in `comctl32!COMBOEX_ComboWndProc` (comboex.c:1950): the
+  ComboBoxEx answers its edit's `EN_CHANGE` by asking the inner combo for
+  `CB_GETCURSEL` and dereferencing `COMBOEX_FindItem`'s answer with no NULL
+  check. `GetOpenFileNameW` still returns no path.
 ### One host window per top-level, and input that goes only where it is routed (W4.6)
 - **A real `NSWindow` was confirmed on screen, by looking at it.** `exemu run
   --gui --wine-boot <dir> <gui-sample.exe>` puts up a titled 480×260 window
