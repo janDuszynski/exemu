@@ -1,32 +1,7 @@
-//! Windowing backends for Windows dialogs.
-//!
-//! * [`MinifbGui`] — a live, clickable window (minifb + a bitmap font).
-//! * [`OffscreenGui`] — renders to PNG files and auto-drives the default
-//!   button, so the whole GUI pipeline (parsing → rendering → click →
-//!   extraction) can be exercised and *seen* headlessly.
-//!
-//! Both share [`render::Renderer`]; they differ only in where pixels go and
-//! where input comes from.
-//!
-//! W4.2 additions (driver/presenter split):
-//!
-//! * [`Presenter`] — the surface/present half of a display driver.
-//! * [`OffscreenPresenter`] — writes BGRA frames to PNG files under
-//!   `EXEMU_GUI_SHOT` when set, otherwise just counts frames; runs on the
-//!   interpreter thread, no AppKit.
-//! * [`RecordingDriver`] — implements [`exemu_core::UserDriver`] and records
-//!   every call into a shared log for gate tests.
-
 mod render;
 
-/// The OpenGL / Vulkan host backends behind Wine's `opengl32` and
-/// `winevulkan` (W7.3), plus the unixlib ABI recovered from the pinned Wine
-/// 11.0 binaries that says how a guest reaches them.
 pub mod graphics;
 
-/// The live macOS AppKit/Metal display path (W4.4). macOS-only; the rest of the
-/// crate (the minifb/offscreen dialog backends and the `Presenter` trait) is
-/// cross-platform.
 #[cfg(target_os = "macos")]
 pub mod cocoa;
 #[cfg(target_os = "macos")]
@@ -45,10 +20,6 @@ use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
 use render::Renderer;
 
-/// Promote this (terminal-launched) process to a foreground GUI app so its
-/// window actually appears and can receive keyboard/mouse focus. Without
-/// this, a minifb window on macOS is created but stays invisible/unfocusable
-/// and `is_open()` reports false. No-op off macOS.
 #[cfg(target_os = "macos")]
 fn become_foreground_app() {
     #[repr(C)]
@@ -64,9 +35,6 @@ fn become_foreground_app() {
     const K_CURRENT_PROCESS: u32 = 2;
     const K_TO_FOREGROUND: u32 = 1;
     let psn = ProcessSerialNumber { high: 0, low: K_CURRENT_PROCESS };
-    // Safe: simple, idempotent Carbon calls with a stack-local PSN. Promote
-    // the process to a foreground app and bring it to the front so the window
-    // is visible and can take keyboard/mouse focus.
     unsafe {
         TransformProcessType(&psn, K_TO_FOREGROUND);
         SetFrontProcess(&psn);
@@ -98,9 +66,6 @@ fn seed_texts(tpl: &DialogTemplate) -> HashMap<u32, String> {
         .collect()
 }
 
-// ============================ live window ==================================
-
-/// A real, clickable window backed by minifb.
 pub struct MinifbGui {
     window: Option<Window>,
     r: Renderer,
@@ -108,13 +73,8 @@ pub struct MinifbGui {
     texts: HashMap<u32, String>,
     default_id: u32,
     prev_down: bool,
-    /// Input is ignored for this many initial pump iterations, so the
-    /// keystroke that launched the program isn't taken as a button press.
     warmup: u32,
-    /// Buttons already activated — greyed and non-clickable (one-shot), so a
-    /// second click can't re-trigger the action while it runs.
     disabled: HashSet<u32>,
-    /// True when showing a custom (GDI-drawn) window rather than a dialog.
     custom: bool,
 }
 
@@ -139,9 +99,6 @@ impl MinifbGui {
         }
     }
 
-    /// Input pump for a custom (GDI-drawn) window: returns a client-area
-    /// mouse press or the window-close event; painting is driven by the OS
-    /// layer's WM_PAINT.
     fn pump_custom(&mut self, block: bool) -> Option<GuiEvent> {
         loop {
             if !self.window.as_ref().map(|w| w.is_open()).unwrap_or(false) {
@@ -168,8 +125,6 @@ impl MinifbGui {
     }
 
     fn repaint(&mut self) {
-        // A custom window keeps whatever the guest's GDI drew; only dialogs
-        // are re-composited from their template here.
         if !self.custom {
             if let Some(tpl) = &self.tpl {
                 self.r.paint(tpl, &self.texts, &self.disabled);
@@ -186,19 +141,15 @@ impl Gui for MinifbGui {
     fn open(&mut self, tpl: &DialogTemplate) {
         let (w, h) = Renderer::size_for(tpl);
         let title = if tpl.title.is_empty() { "exemu" } else { &tpl.title };
-        // `topmost` keeps the window in front of the launching terminal — on
-        // macOS a normal CLI-owned window otherwise opens hidden behind it.
         let opts = WindowOptions { resize: false, topmost: true, ..WindowOptions::default() };
         self.window = Window::new(title, w, h, opts).ok();
-        // Activate AFTER creating the window, so minifb's own NSApplication
-        // setup doesn't override the foreground promotion.
         become_foreground_app();
         self.r = Renderer::new(w, h);
         self.texts = seed_texts(tpl);
         self.default_id = default_button(tpl);
         self.tpl = Some(tpl.clone());
         self.prev_down = false;
-        self.warmup = 40; // ~0.3s of ignored input
+        self.warmup = 40;
         self.disabled.clear();
         self.custom = false;
         self.repaint();
@@ -269,7 +220,6 @@ impl Gui for MinifbGui {
             }
             self.repaint();
 
-            // Read input state.
             let (active, enter, esc, down, pos) = self
                 .window
                 .as_mut()
@@ -284,8 +234,6 @@ impl Gui for MinifbGui {
                 })
                 .unwrap_or((false, false, false, false, (0.0, 0.0)));
 
-            // Report the first couple of iterations and any input, always, so
-            // the behavior is visible without needing an env var.
             iter += 1;
             let pressed = down && !self.prev_down;
             self.prev_down = down;
@@ -299,8 +247,6 @@ impl Gui for MinifbGui {
             if self.warmup > 0 {
                 self.warmup -= 1;
             } else {
-                // Each activation is one-shot: disable the button so the
-                // action can't be re-triggered while it runs.
                 if enter && !self.disabled.contains(&self.default_id) {
                     self.disabled.insert(self.default_id);
                     self.repaint();
@@ -328,9 +274,6 @@ impl Gui for MinifbGui {
     }
 
     fn is_open(&self) -> bool {
-        // "A window exists" — the interactive path stays engaged while the
-        // window is alive; the user actually closing it is detected inside
-        // `pump` (which returns `Close`) and by `close()`.
         self.window.is_some()
     }
 
@@ -340,11 +283,6 @@ impl Gui for MinifbGui {
     }
 }
 
-// ============================ offscreen (PNG) ==============================
-
-/// A headless backend that renders dialog states to PNG files and auto-drives
-/// the default button, so the pipeline can be verified without a display.
-/// Enabled by pointing `EXEMU_GUI_SHOT` at an output directory.
 pub struct OffscreenGui {
     dir: PathBuf,
     r: Renderer,
@@ -377,8 +315,6 @@ impl OffscreenGui {
     }
 
     fn snapshot(&mut self, tag: &str) {
-        // Dialogs are composited from their template; custom windows keep
-        // whatever the guest's GDI drew.
         if !self.custom {
             let Some(tpl) = self.tpl.clone() else { return };
             self.r.paint(&tpl, &self.texts, &HashSet::new());
@@ -436,8 +372,6 @@ impl Gui for OffscreenGui {
 
     fn set_text(&mut self, id: u32, text: &str) {
         self.texts.insert(id, text.to_string());
-        // Throttle: capture the first change and then every ~25th (progress
-        // updates fire constantly), to keep a handful of frames.
         self.set_calls += 1;
         if self.set_calls <= 1 || self.set_calls % 25 == 0 {
             self.snapshot("frame");
@@ -452,18 +386,15 @@ impl Gui for OffscreenGui {
         if !self.open {
             return Some(GuiEvent::Close);
         }
-        // Custom windows: they've painted; end the loop.
         if self.custom {
             return Some(GuiEvent::Close);
         }
         if block {
             if !self.clicked {
-                // Auto-"click" the default (Install) button once.
                 self.clicked = true;
                 self.snapshot("click");
                 return Some(GuiEvent::Command(self.default_id));
             }
-            // Nothing more to do; end the loop.
             return Some(GuiEvent::Close);
         }
         None
@@ -479,61 +410,26 @@ impl Gui for OffscreenGui {
     }
 }
 
-// ============================ W4.2: Presenter trait ==========================
-
-/// The surface/present half of a display driver (W4.2).
-///
-/// A [`Presenter`] owns per-HWND backing stores and knows how to flush pixels
-/// from them to the screen (or to a file, for the headless path). The window
-/// management half is covered by [`exemu_core::UserDriver`].
-///
-/// Only the surface operations needed for `OffscreenPresenter` are specified
-/// here; W4.3 grows the trait as the live Cocoa path is added.
 pub trait Presenter: Send {
-    /// Allocate a backing surface for `hwnd` of the given pixel dimensions.
-    ///
-    /// The surface is top-down BGRA32 (`stride = width * 4`), matching the
-    /// DIB format Windows GDI writes into. Replaces any existing surface for
-    /// `hwnd`.
     fn create_surface(&mut self, hwnd: u32, width: u32, height: u32) {
         let _ = (hwnd, width, height);
     }
 
-    /// Release the backing surface for `hwnd`.
     fn destroy_surface(&mut self, hwnd: u32) {
         let _ = hwnd;
     }
 
-    /// Flush `pixels` (top-down BGRA32, `width * height * 4` bytes) to the
-    /// presentation target for `hwnd`.
-    ///
-    /// For `OffscreenPresenter` this writes a PNG to the configured output
-    /// directory (or increments the frame counter when no directory is set).
-    /// For the live Cocoa path (W4.4) it uploads the texture and presents.
     fn flush(&mut self, hwnd: u32, pixels: &[u8], width: u32, height: u32) {
         let _ = (hwnd, pixels, width, height);
     }
 }
 
-// ============================ W4.2: OffscreenPresenter =======================
-
-/// A headless presenter that writes each flushed frame to a PNG file under the
-/// directory named by `EXEMU_GUI_SHOT`, or just counts frames when the variable
-/// is not set.
-///
-/// Runs entirely on the interpreter thread — no AppKit, no channels. This is
-/// the de-risk path for W4.1–W4.3 and the standing CI golden-frame gate
-/// (W4.10).
 pub struct OffscreenPresenter {
-    /// Output directory (from `EXEMU_GUI_SHOT`), or `None` for count-only mode.
     dir: Option<PathBuf>,
-    /// Total frames flushed across all HWNDs since construction.
     frame_count: u64,
 }
 
 impl OffscreenPresenter {
-    /// Build a presenter. If `EXEMU_GUI_SHOT` names a directory, PNGs are
-    /// written there; otherwise every `flush` just increments `frame_count`.
     pub fn new() -> Self {
         let dir = std::env::var_os("EXEMU_GUI_SHOT").map(|v| {
             let p = PathBuf::from(v);
@@ -543,12 +439,6 @@ impl OffscreenPresenter {
         OffscreenPresenter { dir, frame_count: 0 }
     }
 
-    /// Build a presenter with an explicit output directory, bypassing the
-    /// `EXEMU_GUI_SHOT` environment variable.
-    ///
-    /// Pass `None` to get count-only (no PNG) mode regardless of the
-    /// environment. Pass `Some(dir)` to direct PNG output to `dir` without
-    /// setting an env var — useful for tests that want deterministic paths.
     pub fn with_dir(dir: Option<impl Into<PathBuf>>) -> Self {
         let dir = dir.map(|d| {
             let p = d.into();
@@ -558,7 +448,6 @@ impl OffscreenPresenter {
         OffscreenPresenter { dir, frame_count: 0 }
     }
 
-    /// Total frames flushed (useful for assertions in tests).
     pub fn frame_count(&self) -> u64 {
         self.frame_count
     }
@@ -575,9 +464,6 @@ impl Presenter for OffscreenPresenter {
         self.frame_count += 1;
         let Some(dir) = &self.dir else { return };
         let path = dir.join(format!("hwnd{hwnd:08x}-frame{:04}.png", self.frame_count));
-        // The surface is top-down BGRA32 (§5); a PNG declared `Rgba` needs the
-        // B/R channels swapped or every colour comes out wrong. (Grayscale text
-        // on a white ground is swap-invariant, which hid this until now.)
         let rgba = bgra_to_rgba(pixels);
         if let Ok(file) = std::fs::File::create(&path) {
             let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
@@ -591,21 +477,6 @@ impl Presenter for OffscreenPresenter {
     }
 }
 
-// ============================ W4.2: RecordingDriver ==========================
-
-/// A single recorded call to the [`UserDriver`] interface.
-///
-/// The gate test for W4.2 injects a [`RecordingDriver`], runs a headless
-/// guest up to `CreateWindowEx` + `ShowWindow`, and asserts that the expected
-/// calls appear in the log (in order, or as a set — the test's choice).
-///
-/// W4.3 adds [`CreateWindowSurface`] and [`FlushSurface`]; the pixel buffer is
-/// *not* stored — only the dimensions and a cheap "something was drawn" count
-/// (`non_blank`) are recorded so gate tests can assert without holding large
-/// allocations in the log.
-///
-/// [`CreateWindowSurface`]: DriverCall::CreateWindowSurface
-/// [`FlushSurface`]: DriverCall::FlushSurface
 #[derive(Debug, Clone)]
 pub enum DriverCall {
     CreateWindow { hwnd: u32, params: WindowParams },
@@ -616,56 +487,24 @@ pub enum DriverCall {
     SetParent { hwnd: u32, parent: u32 },
     SetWindowRgn { hwnd: u32, rgn_hwnd: u32 },
     SetWindowText { hwnd: u32, text: String },
-    /// A backing surface was allocated for `hwnd` at the given dimensions (W4.3).
     CreateWindowSurface { hwnd: u32, w: u32, h: u32 },
-    /// A frame was presented for `hwnd` (W4.3).
-    ///
-    /// `non_blank` counts pixels in the flushed buffer whose BGR bytes are not
-    /// all equal to the first pixel's BGR value — a cheap signal that *something
-    /// was drawn* beyond a solid fill. The pixel buffer itself is not stored.
     FlushSurface { hwnd: u32, w: u32, h: u32, non_blank: u32 },
 }
 
-/// A [`UserDriver`] that records every call into a shared log.
-///
-/// Clone the [`Arc`] before injecting to keep a handle for post-run
-/// assertions:
-///
-/// ```rust,ignore
-/// let log = Arc::new(Mutex::new(Vec::new()));
-/// let driver = RecordingDriver::new(Arc::clone(&log));
-/// cfg.driver = Some(Box::new(driver));
-/// // … run …
-/// assert!(log.lock().unwrap().iter().any(|c| matches!(c, DriverCall::ShowWindow { .. })));
-/// ```
-///
-/// For tests that need both recording *and* actual presentation (e.g. to
-/// capture golden PNGs while verifying call sequences), wrap an inner driver
-/// with [`RecordingDriver::with_inner`]: every call is logged first, then
-/// forwarded to the inner driver.
 pub struct RecordingDriver {
     log: Arc<Mutex<Vec<DriverCall>>>,
-    /// Optional inner driver that every call is forwarded to after recording.
     inner: Option<Box<dyn UserDriver>>,
 }
 
 impl RecordingDriver {
-    /// Construct a recording driver backed by the given shared log.
     pub fn new(log: Arc<Mutex<Vec<DriverCall>>>) -> Self {
         RecordingDriver { log, inner: None }
     }
 
-    /// Construct a recording driver that also forwards every call to `inner`
-    /// after recording it.
-    ///
-    /// This is the minimal composition that satisfies tests needing both a
-    /// call log and a real presentation (e.g. PNG output). The inner driver
-    /// is notified with identical arguments after the log entry is appended.
     pub fn with_inner(log: Arc<Mutex<Vec<DriverCall>>>, inner: Box<dyn UserDriver>) -> Self {
         RecordingDriver { log, inner: Some(inner) }
     }
 
-    /// Push one call record, silently discarding any poisoning.
     fn push(&self, call: DriverCall) {
         if let Ok(mut guard) = self.log.lock() {
             guard.push(call);
@@ -673,15 +512,6 @@ impl RecordingDriver {
     }
 }
 
-/// Convert a top-down BGRA32 buffer (`stride = width * 4`, the Windows DIB /
-/// win32k surface format) to tightly-packed RGBA8: each `[B, G, R, A]` pixel
-/// becomes `[R, G, B, A]`.
-///
-/// This is the single ground-truth transform shared by every presenter's PNG
-/// path (`OffscreenPresenter`, the Cocoa headless path) and by the W4.4 parity
-/// test, so "PNG parity vs Offscreen" reduces to feeding identical BGRA bytes
-/// through this one function. A live Metal presenter needs no swap — a
-/// `BGRA8Unorm` `MTLTexture` consumes the surface bytes directly (design §5).
 pub fn bgra_to_rgba(pixels: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(pixels.len());
     for px in pixels.chunks_exact(4) {
@@ -690,18 +520,11 @@ pub fn bgra_to_rgba(pixels: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Count pixels in `pixels` (BGRA32, `w * h * 4` bytes) whose BGR bytes are
-/// not all equal to the first pixel's BGR value.
-///
-/// This is a cheap "something was drawn" heuristic: a solid fill returns 0;
-/// any variation in colour returns a positive count. The alpha channel is
-/// ignored because Windows GDI DIBs typically leave it at 0xFF regardless.
 fn count_non_blank(pixels: &[u8], w: u32, h: u32) -> u32 {
     let n = (w as usize) * (h as usize);
     if n == 0 || pixels.len() < n * 4 {
         return 0;
     }
-    // Reference: first pixel's BGR (bytes 0, 1, 2).
     let (b0, g0, r0) = (pixels[0], pixels[1], pixels[2]);
     let mut count = 0u32;
     for i in 1..n {
@@ -786,44 +609,25 @@ impl UserDriver for RecordingDriver {
     }
 }
 
-// ============================ W4.3: PresenterDriver ==========================
-
-/// A [`UserDriver`] that delegates surface/present calls to a [`Presenter`]
-/// (W4.3).
-///
-/// Window-management calls (`create_window`, `show_window`, etc.) are no-ops
-/// in this adapter — the `PresenterDriver` only handles the surface half.
-/// Compose it with another driver (e.g. a future `CocoaDriver`) or use it
-/// standalone for the headless path where window management is not needed.
-///
-/// ```rust,ignore
-/// let presenter = OffscreenPresenter::with_dir(Some("/tmp/frames"));
-/// let driver = PresenterDriver::new(presenter);
-/// cfg.driver = Some(Box::new(driver));
-/// ```
 pub struct PresenterDriver<P: Presenter> {
     presenter: P,
 }
 
 impl<P: Presenter> PresenterDriver<P> {
-    /// Wrap `presenter` in a [`UserDriver`] adapter.
     pub fn new(presenter: P) -> Self {
         PresenterDriver { presenter }
     }
 
-    /// Borrow the inner presenter (e.g. to read `frame_count` after a run).
     pub fn presenter(&self) -> &P {
         &self.presenter
     }
 
-    /// Consume the adapter and return the inner presenter.
     pub fn into_presenter(self) -> P {
         self.presenter
     }
 }
 
 impl<P: Presenter + Send> UserDriver for PresenterDriver<P> {
-    /// Release the presenter's backing surface when the window is destroyed.
     fn destroy_window(&mut self, hwnd: u32) {
         self.presenter.destroy_surface(hwnd);
     }
@@ -843,23 +647,18 @@ mod pixel_tests {
 
     #[test]
     fn swaps_blue_and_red_keeps_alpha() {
-        // Two pixels: opaque blue then semi-transparent red, in BGRA byte order.
-        // blue  = B=255 G=0 R=0 A=255 -> RGBA R=0 G=0 B=255 A=255
-        // red   = B=0 G=0 R=255 A=128 -> RGBA R=255 G=0 B=0 A=128
         let bgra = [255, 0, 0, 255, 0, 0, 255, 128];
         assert_eq!(bgra_to_rgba(&bgra), vec![0, 0, 255, 255, 255, 0, 0, 128]);
     }
 
     #[test]
     fn grayscale_is_swap_invariant() {
-        // Why the bug hid: when B==G==R the swap is a no-op (black text/white bg).
         let gray = [30, 30, 30, 255, 255, 255, 255, 255];
         assert_eq!(bgra_to_rgba(&gray), gray.to_vec());
     }
 
     #[test]
     fn ignores_a_trailing_partial_pixel() {
-        // chunks_exact drops a ragged tail rather than panicking.
         let bgra = [1, 2, 3, 4, 9, 9];
         assert_eq!(bgra_to_rgba(&bgra), vec![3, 2, 1, 4]);
     }

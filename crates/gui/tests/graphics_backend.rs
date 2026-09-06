@@ -1,23 +1,6 @@
-//! W7.3 — the **host** OpenGL / Vulkan backends, exercised for real.
-//!
-//! These are not mock tests. [`OpenGlBackend`] brings up a genuine CGL context
-//! out of `OpenGL.framework`, asks the driver what it is, renders on the GPU
-//! and reads the pixels back; the assertions are on those pixels. The Vulkan
-//! half asserts the honest thing: on a host with an ICD it must answer real
-//! version and extension data, and on a host without one it must fail
-//! *cleanly and by name* rather than panicking or pretending.
-//!
-//! Every case is skip-guarded on backend availability and says why it skipped,
-//! so a CI box with no window server (or no MoltenVK) reports a real reason
-//! instead of a red build or a silent pass.
-
 use exemu_gui::graphics::{GraphicsError, OpenGlBackend, Triangle, VulkanBackend};
 use exemu_gui::{OffscreenPresenter, Presenter};
 
-/// Bring the GL backend up, or explain the skip.
-///
-/// A missing framework / renderer is a legitimate environment answer; anything
-/// else is a bug and fails the test.
 fn gl() -> Option<OpenGlBackend> {
     match OpenGlBackend::init() {
         Ok(b) => Some(b),
@@ -29,18 +12,11 @@ fn gl() -> Option<OpenGlBackend> {
     }
 }
 
-/// Read the BGRA pixel at `(x, y)` of a top-down frame as `(b, g, r, a)`.
 fn px(frame: &[u8], w: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {
     let i = ((y * w + x) * 4) as usize;
     (frame[i], frame[i + 1], frame[i + 2], frame[i + 3])
 }
 
-/// The GL driver-init call must produce a **usable** driver, and the strings
-/// must come from the host — not from a table in exemu.
-///
-/// This is the host-side half of `opengl32`'s unixlib code 0
-/// (`DllMain(DLL_PROCESS_ATTACH)`): if it cannot succeed, the guest's
-/// `opengl32.dll` returns FALSE from `DllMain` and never loads at all.
 #[test]
 fn the_opengl_driver_init_yields_a_context_that_answers_from_the_host() {
     let Some(backend) = gl() else { return };
@@ -53,7 +29,6 @@ fn the_opengl_driver_init_yields_a_context_that_answers_from_the_host() {
         info.extensions.len()
     );
 
-    // A real driver names a version; a stub would leave this empty.
     assert!(
         info.version.starts_with(|c: char| c.is_ascii_digit()),
         "GL_VERSION must start with the version number, got {:?}",
@@ -62,9 +37,6 @@ fn the_opengl_driver_init_yields_a_context_that_answers_from_the_host() {
     assert!(!info.renderer.is_empty(), "GL_RENDERER must name the host renderer");
     assert!(!info.vendor.is_empty(), "GL_VENDOR must name the host vendor");
 
-    // The extension list is the other half of the query Wine's `glGetString`
-    // (unixlib code 130) forwards. A real GL 2.1 driver publishes hundreds;
-    // an invented one would publish none.
     assert!(
         info.extensions.len() > 20,
         "a real driver publishes an extension list, got {}",
@@ -76,20 +48,12 @@ fn the_opengl_driver_init_yields_a_context_that_answers_from_the_host() {
     );
 }
 
-/// The GPU actually draws: a cleared surface plus a triangle, read back in
-/// exemu's own top-down BGRA32 surface format and asserted pixel-wise.
-///
-/// The sample points are chosen to be robust across rasterizers — the corners
-/// are far outside the triangle and the centroid far inside it — so this is a
-/// real correctness assertion, not a golden image that drifts between GPUs.
 #[test]
 fn opengl_renders_a_cleared_surface_and_a_triangle_into_a_bgra_frame() {
     let Some(mut backend) = gl() else { return };
     const W: u32 = 320;
     const H: u32 = 240;
 
-    // Opaque mid-blue ground, opaque red triangle — both exactly representable
-    // as 8-bit, so the readback is exact, not approximate.
     let clear = [0.0f32, 0.0, 1.0, 1.0];
     let tri =
         Triangle { verts: [[-0.6, -0.6], [0.6, -0.6], [0.0, 0.6]], color: [1.0, 0.0, 0.0] };
@@ -107,7 +71,6 @@ fn opengl_renders_a_cleared_surface_and_a_triangle_into_a_bgra_frame() {
     assert_eq!(frame.height, H);
     assert_eq!(frame.bgra.len(), (W * H * 4) as usize, "top-down BGRA32, stride = w*4");
 
-    // Corners are outside the triangle: exactly the clear colour, in BGRA order.
     for (x, y) in [(0, 0), (W - 1, 0), (0, H - 1), (W - 1, H - 1)] {
         assert_eq!(
             px(&frame.bgra, W, x, y),
@@ -116,20 +79,15 @@ fn opengl_renders_a_cleared_surface_and_a_triangle_into_a_bgra_frame() {
         );
     }
 
-    // The centroid is deep inside the triangle: exactly the triangle colour.
     assert_eq!(
         px(&frame.bgra, W, W / 2, H / 2),
         (0, 0, 255, 255),
         "the triangle interior must be opaque red in BGRA order"
     );
 
-    // Byte order is load-bearing: a frame that came back RGBA would pass the
-    // "not the clear colour" check but fail these, so assert the swap directly.
     let (b, g, r, _) = px(&frame.bgra, W, 0, 0);
     assert!(b == 255 && g == 0 && r == 0, "blue must live in byte 0 (BGRA), not byte 2");
 
-    // And it presents: the frame drops straight into the existing surface
-    // path, which is the whole point of reading back as top-down BGRA.
     let dir = std::env::temp_dir().join(format!("exemu-w73-gl-{}", std::process::id()));
     let mut presenter = OffscreenPresenter::with_dir(Some(dir.clone()));
     presenter.flush(1, &frame.bgra, W, H);
@@ -141,8 +99,6 @@ fn opengl_renders_a_cleared_surface_and_a_triangle_into_a_bgra_frame() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Two frames from the same context must be identical — the backend must not
-/// leak state (a stale FBO binding, a stale clear colour) between calls.
 #[test]
 fn opengl_frames_are_reproducible_across_calls() {
     let Some(mut backend) = gl() else { return };
@@ -158,16 +114,9 @@ fn opengl_frames_are_reproducible_across_calls() {
     let b = backend.draw_frame(64, 48, clear, None).expect("second frame");
     assert_eq!(a, b, "the backend must be stateless between frames");
 
-    // 0.25/0.5/0.75 round-trip through an 8-bit RGBA8 renderbuffer exactly.
     assert_eq!(px(&a.bgra, 64, 10, 10), (191, 128, 64, 255));
 }
 
-/// Vulkan: whichever way this host goes, the answer must be honest.
-///
-/// * With an ICD, the version and extension list must come from it — and
-///   `VK_KHR_surface` had better be there, because every presentable ICD has it.
-/// * Without one, the failure must be a *reported* [`GraphicsError`] naming
-///   every path tried, not a panic and not a fabricated success.
 #[test]
 fn vulkan_either_answers_from_a_real_icd_or_fails_cleanly_by_name() {
     match VulkanBackend::init() {
@@ -211,12 +160,8 @@ fn vulkan_either_answers_from_a_real_icd_or_fails_cleanly_by_name() {
     }
 }
 
-/// A library that loads but is not a Vulkan ICD must be reported as such —
-/// `SymbolMissing`, not "not found". A misconfigured `EXEMU_VULKAN_LIBRARY`
-/// that reads as "no Vulkan installed" would send someone hunting the wrong bug.
 #[test]
 fn a_library_that_is_not_an_icd_is_reported_as_a_missing_symbol() {
-    // libSystem always loads on macOS and certainly exports no Vulkan.
     let probe = "/usr/lib/libSystem.B.dylib".to_string();
     if !std::path::Path::new("/usr/lib/dyld").exists() {
         eprintln!("[skip] not a macOS dyld host");
@@ -232,8 +177,6 @@ fn a_library_that_is_not_an_icd_is_reported_as_a_missing_symbol() {
     }
 }
 
-/// A path that does not exist at all is the other half: `LibraryMissing`,
-/// naming what was tried.
 #[test]
 fn a_path_that_does_not_exist_is_reported_as_a_missing_library() {
     let probe = "/nonexistent/exemu-no-such-icd.dylib".to_string();

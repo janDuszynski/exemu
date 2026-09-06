@@ -1,35 +1,21 @@
-//! The hardware→software exception bridge (roadmap W3.3): a guest CPU fault is
-//! marshalled into the `KiUserExceptionDispatcher` stack frame and the CPU is
-//! seated on ntdll's dispatcher, so Wine's own `RtlDispatchException` (real
-//! guest code) runs; a handled exception returns through `NtContinue`.
-//!
-//! These tests drive `WinOs::deliver_hw_exception` directly (it is `pub`) and
-//! assert the exact §4 stack math the dispatcher and `NtContinue` depend on,
-//! then prove the round-trip: the CONTEXT the bridge builds is precisely what
-//! `NtContinue` consumes to resume the faulting thread.
-
 use exemu_core::{flags, Cpu, CpuState, Exit, Memory, Perm, Reg, Region};
 use exemu_cpu::{Bits, Interpreter, GS_BASE};
 use exemu_memory::VirtualMemory;
 use exemu_os::{Trap, TrapMode, WinConfig, WinOs, RVA_KI_USER_EXCEPTION_DISPATCHER};
 
-// A synthetic ntdll base for the direct-delivery assertions. `deliver_hw_exception`
-// only uses it to compute the dispatcher rip; no image need be mapped.
 const NTDLL_BASE: u64 = 0x0000_0001_7000_0000;
 const STACK_TOP: u64 = 0x0000_0010_0000_1000;
 const TEB_SIZE: u64 = 0x2000;
 
-// CONTEXT / EXCEPTION_RECORD field offsets within the built frame (winnt.h
-// AMD64 + the §4 layout), relative to `new_rsp`.
-const CTX_RSP: u64 = 0x98; // CONTEXT.Rsp
-const CTX_RIP: u64 = 0xf8; // CONTEXT.Rip
-const ER: u64 = 0x4F0; // EXCEPTION_RECORD base
-const ER_CODE: u64 = ER; // ExceptionCode @ +0x00
+const CTX_RSP: u64 = 0x98;
+const CTX_RIP: u64 = 0xf8;
+const ER: u64 = 0x4F0;
+const ER_CODE: u64 = ER;
 const ER_ADDRESS: u64 = ER + 0x10;
 const ER_NUM_PARAMS: u64 = ER + 0x18;
 const ER_INFO: u64 = ER + 0x20;
-const MF: u64 = 0x590; // machine frame base
-const MF_RIP: u64 = MF; // RIP @ +0x00
+const MF: u64 = 0x590;
+const MF_RIP: u64 = MF;
 const MF_CS: u64 = MF + 0x08;
 const MF_RFLAGS: u64 = MF + 0x10;
 const MF_OLDRSP: u64 = MF + 0x18;
@@ -37,15 +23,12 @@ const MF_SS: u64 = MF + 0x20;
 
 fn os_mem() -> (WinOs, VirtualMemory) {
     let mut mem = VirtualMemory::new();
-    // A generous guest stack: the frame lands 0x5C0 below the faulting RSP.
     mem.map(Region::new("stack", STACK_TOP - 0x10000, 0x10000, Perm::RW)).unwrap();
     mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW)).unwrap();
     let os = WinOs::new(WinConfig { is_64bit: true, echo: false, teb_base: GS_BASE, ..WinConfig::default() });
     (os, mem)
 }
 
-/// An access-violation delivery lays out CONTEXT + EXCEPTION_RECORD + machine
-/// frame at exactly the §4 offsets and seats the CPU on the dispatcher.
 #[test]
 fn deliver_av_builds_dispatcher_frame() {
     let (mut os, mut mem) = os_mem();
@@ -56,32 +39,28 @@ fn deliver_av_builds_dispatcher_frame() {
     let mut cpu = CpuState::new();
     cpu.rip = fault_rip;
     cpu.set_rsp(old_rsp);
-    cpu.set_reg(Reg::Rbx, 0xB16B_00B5); // a live GPR that must survive into CONTEXT
+    cpu.set_reg(Reg::Rbx, 0xB16B_00B5);
     cpu.rflags = flags::RESERVED_ONE | flags::CF | flags::ZF;
 
     os.deliver_hw_exception(&mut cpu, &mut mem, NTDLL_BASE,
         Trap { code: 0xC000_0005, address: fault_addr, info: &[0, fault_addr], mode: TrapMode::Long })
         .unwrap();
 
-    // The CPU is seated on the dispatcher with RSP → CONTEXT, no return pushed.
     let new_rsp = (old_rsp - 0x5C0) & !0xF;
     assert_eq!(cpu.rip, NTDLL_BASE + RVA_KI_USER_EXCEPTION_DISPATCHER, "rip = KiUserExceptionDispatcher");
     assert_eq!(cpu.rsp(), new_rsp, "rsp = 16-aligned (old_rsp - 0x5C0) & !0xF");
     assert_eq!(cpu.rsp() & 0xf, 0, "rsp 16-byte aligned");
 
-    // CONTEXT @ +0x000: faulting Rip/Rsp and a live GPR.
     assert_eq!(mem.read_u64(new_rsp + CTX_RIP).unwrap(), fault_rip, "CONTEXT.Rip = faulting rip");
     assert_eq!(mem.read_u64(new_rsp + CTX_RSP).unwrap(), old_rsp, "CONTEXT.Rsp = pre-fault rsp");
     assert_eq!(mem.read_u64(new_rsp + 0x78 + 3 * 8).unwrap(), 0xB16B_00B5, "CONTEXT.Rbx captured");
 
-    // EXCEPTION_RECORD @ +0x4F0.
     assert_eq!(mem.read_u32(new_rsp + ER_CODE).unwrap(), 0xC000_0005, "ER.ExceptionCode = AV");
     assert_eq!(mem.read_u64(new_rsp + ER_ADDRESS).unwrap(), fault_addr, "ER.ExceptionAddress");
     assert_eq!(mem.read_u32(new_rsp + ER_NUM_PARAMS).unwrap(), 2, "ER.NumberParameters = 2");
     assert_eq!(mem.read_u64(new_rsp + ER_INFO).unwrap(), 0, "ER.Info[0] = rw (0 = read)");
     assert_eq!(mem.read_u64(new_rsp + ER_INFO + 8).unwrap(), fault_addr, "ER.Info[1] = fault addr");
 
-    // Machine frame @ +0x590.
     assert_eq!(mem.read_u64(new_rsp + MF_RIP).unwrap(), fault_rip, "machine frame RIP");
     assert_eq!(mem.read_u64(new_rsp + MF_CS).unwrap(), 0x33, "machine frame CS = 0x33");
     assert_eq!(mem.read_u64(new_rsp + MF_RFLAGS).unwrap(), cpu.rflags, "machine frame RFLAGS");
@@ -90,8 +69,6 @@ fn deliver_av_builds_dispatcher_frame() {
     assert_eq!(mem.read_u64(new_rsp + MF_SS).unwrap(), 0x2B, "machine frame SS = 0x2B");
 }
 
-/// A `#BP` (int3) delivery reports the address *after* the breakpoint: the
-/// delivered CONTEXT.Rip and ER.ExceptionAddress are the faulting rip + 1.
 #[test]
 fn deliver_bp_reports_rip_plus_one() {
     let (mut os, mut mem) = os_mem();
@@ -99,8 +76,6 @@ fn deliver_bp_reports_rip_plus_one() {
     let int3_rip = 0x0000_0001_4000_2000u64;
 
     let mut cpu = CpuState::new();
-    // The bridge's classifier advances rip past the 0xCC before delivering; model
-    // that here (deliver_hw_exception itself captures cpu.rip verbatim).
     cpu.rip = int3_rip + 1;
     cpu.set_rsp(old_rsp);
 
@@ -115,28 +90,21 @@ fn deliver_bp_reports_rip_plus_one() {
     assert_eq!(mem.read_u32(new_rsp + ER_NUM_PARAMS).unwrap(), 0, "#BP carries no parameters");
 }
 
-/// Round-trip: the CONTEXT the bridge builds is exactly what `NtContinue`
-/// consumes. Deliver an AV, then feed the built CONTEXT (at `new_rsp`) to a real
-/// `ZwContinue` stub through the interpreter and assert it restores the faulting
-/// rip and the pre-fault rsp — proving the frame `NtContinue` reads matches what
-/// the bridge writes.
 #[test]
 fn delivered_context_round_trips_through_nt_continue() {
     let code: u64 = 0x0000_0000_0040_0000;
-    let landing: u64 = 0x0000_0001_4000_1234; // == the faulting rip the CONTEXT carries
+    let landing: u64 = 0x0000_0001_4000_1234;
     let old_rsp = 0x0000_0010_0000_0F00u64;
 
     let mut mem = VirtualMemory::new();
     mem.map(Region::new("stack", STACK_TOP - 0x10000, 0x10000, Perm::RW)).unwrap();
     mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW)).unwrap();
     mem.map(Region::new("code", code, 0x1000, Perm::RX)).unwrap();
-    // The faulting rip must be executable so the resumed thread can land there.
     mem.map(Region::new("landing", landing & !0xfff, 0x1000, Perm::RX)).unwrap();
-    mem.poke(landing, &[0xF4]).unwrap(); // hlt at the faulting rip → test ends
+    mem.poke(landing, &[0xF4]).unwrap();
 
     let mut os = WinOs::new(WinConfig { is_64bit: true, echo: false, teb_base: GS_BASE, ..WinConfig::default() });
 
-    // Build the exception frame for an AV at `landing`.
     let mut faulted = CpuState::new();
     faulted.rip = landing;
     faulted.set_rsp(old_rsp);
@@ -148,11 +116,10 @@ fn delivered_context_round_trips_through_nt_continue() {
     let new_rsp = (old_rsp - 0x5C0) & !0xF;
     assert_eq!(faulted.rsp(), new_rsp);
 
-    // ZwContinue stub: `mov r10,rcx; mov eax,0x43; syscall` — RCX = &CONTEXT.
-    let mut asm = vec![0x49, 0x89, 0xCA]; // mov r10, rcx
+    let mut asm = vec![0x49, 0x89, 0xCA];
     asm.extend_from_slice(&[0xB8]);
-    asm.extend_from_slice(&0x43u32.to_le_bytes()); // mov eax, 0x43 (NtContinue)
-    asm.extend_from_slice(&[0x0F, 0x05]); // syscall
+    asm.extend_from_slice(&0x43u32.to_le_bytes());
+    asm.extend_from_slice(&[0x0F, 0x05]);
     mem.poke(code, &asm).unwrap();
 
     let mut cpu = Interpreter::with_bits(Bits::B64);
@@ -162,8 +129,8 @@ fn delivered_context_round_trips_through_nt_continue() {
         s.set_rsp(STACK_TOP);
         s.gs_base = GS_BASE;
         s.fs_base = GS_BASE;
-        s.set_reg(Reg::Rcx, new_rsp); // &CONTEXT = the frame base the bridge built
-        s.set_reg(Reg::Rbx, 0xDEAD); // junk the CONTEXT must overwrite
+        s.set_reg(Reg::Rcx, new_rsp);
+        s.set_reg(Reg::Rbx, 0xDEAD);
     }
 
     loop {
@@ -181,26 +148,17 @@ fn delivered_context_round_trips_through_nt_continue() {
     assert_eq!(s.rflags & flags::CF, flags::CF, "RFLAGS.CF round-tripped through the CONTEXT");
 }
 
-// ---- the last resort: an exception nothing handles (roadmap W5.12) ---------
-
-/// SSDT index of `NtRaiseException`, from the pinned `ntdll.dll` stub at RVA
-/// 0x10310 (`mov r10,rcx; mov eax,0xcf; … syscall`).
 const SSDT_NT_RAISE_EXCEPTION: u32 = 0xCF;
-/// SSDT index of `NtContinue` (`ZwContinue` @ RVA 0xf190, `mov eax,0x43`).
 const SSDT_NT_CONTINUE: u32 = 0x43;
-/// `EXCEPTION_RECORD` field offsets (x64), as `write_exception_record` lays them.
 const REC_CODE: u64 = 0x00;
 const REC_ADDRESS: u64 = 0x10;
 const REC_NUM_PARAMS: u64 = 0x18;
 
-/// Emit `mov r10,rcx; mov eax,<index>; syscall` — the shape every `Nt*` stub in
-/// the pinned ntdll has, so the syscall is dispatched exactly as guest code
-/// dispatches it.
 fn syscall_stub(index: u32) -> Vec<u8> {
-    let mut asm = vec![0x49, 0x89, 0xCA]; // mov r10, rcx
-    asm.push(0xB8); // mov eax, imm32
+    let mut asm = vec![0x49, 0x89, 0xCA];
+    asm.push(0xB8);
     asm.extend_from_slice(&index.to_le_bytes());
-    asm.extend_from_slice(&[0x0F, 0x05]); // syscall
+    asm.extend_from_slice(&[0x0F, 0x05]);
     asm
 }
 
@@ -212,17 +170,6 @@ fn seated(cpu: &mut Interpreter, rip: u64) {
     s.fs_base = GS_BASE;
 }
 
-/// **The W5.12 gate, at the syscall.** `NtRaiseException(rec, ctx,
-/// FirstChance = FALSE)` is the last resort: Wine's `dispatch_exception`
-/// tail-jumps to it when `call_function_handlers` returned
-/// `STATUS_UNHANDLED_EXCEPTION`, and in NT it never returns — the kernel ends
-/// the process with the exception code.
-///
-/// Letting it return is what made an unhandled fault spin for ever:
-/// `KiUserExceptionDispatcher` is `call dispatch_exception; int3`, so the return
-/// ran the `int3`, exemu delivered the resulting `STATUS_BREAKPOINT` to the same
-/// dispatcher, and round it went. This asserts the two halves of the fix: the
-/// run **ends**, and the exception it ends with is the one in the record.
 #[test]
 fn last_resort_raise_terminates_the_process_with_the_exception() {
     let code_va: u64 = 0x0000_0000_0040_0000;
@@ -245,9 +192,9 @@ fn last_resort_raise_terminates_the_process_with_the_exception() {
     seated(&mut cpu, code_va);
     {
         let s = cpu.state_mut();
-        s.set_reg(Reg::Rcx, rec_va); // ExceptionRecord
-        s.set_reg(Reg::Rdx, 0); // ContextRecord (unread on this path)
-        s.set_reg(Reg::R8, 0); // FirstChance = FALSE — the last resort
+        s.set_reg(Reg::Rcx, rec_va);
+        s.set_reg(Reg::Rdx, 0);
+        s.set_reg(Reg::R8, 0);
     }
 
     let mut exit = None;
@@ -274,10 +221,6 @@ fn last_resort_raise_terminates_the_process_with_the_exception() {
     assert!(os.take_unhandled_exception().is_none(), "taking it clears it");
 }
 
-/// A first-chance raise with no Wine `ntdll` mapped has no dispatcher to enter,
-/// so it answers `STATUS_NOT_IMPLEMENTED` rather than quietly claiming success —
-/// and it must **not** terminate the process. (The emulated corpus, which maps
-/// no Wine core, is on this branch.)
 #[test]
 fn first_chance_raise_without_a_dispatcher_is_refused_not_fatal() {
     let code_va: u64 = 0x0000_0000_0040_0000;
@@ -288,7 +231,6 @@ fn first_chance_raise_without_a_dispatcher_is_refused_not_fatal() {
     mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW)).unwrap();
     mem.map(Region::new("code", code_va, 0x1000, Perm::RX)).unwrap();
     mem.map(Region::new("rec", rec_va, 0x1000, Perm::RW)).unwrap();
-    // `syscall` then `hlt`, so a service that *returns* is observable.
     let mut asm = syscall_stub(SSDT_NT_RAISE_EXCEPTION);
     asm.push(0xF4);
     mem.poke(code_va, &asm).unwrap();
@@ -301,7 +243,7 @@ fn first_chance_raise_without_a_dispatcher_is_refused_not_fatal() {
     {
         let s = cpu.state_mut();
         s.set_reg(Reg::Rcx, rec_va);
-        s.set_reg(Reg::R8, 1); // FirstChance = TRUE
+        s.set_reg(Reg::R8, 1);
     }
     let mut halted = false;
     for _ in 0..64 {
@@ -319,21 +261,12 @@ fn first_chance_raise_without_a_dispatcher_is_refused_not_fatal() {
     assert!(os.take_unhandled_exception().is_none(), "nothing was killed");
 }
 
-/// The re-delivery bound: the *same* exception, at the *same* instruction, with
-/// the guest never resuming, is a loop — and the exception it reports is the one
-/// that **opened** the chain, not whatever the dispatcher did afterwards.
-///
-/// This is the shape the 300M-instruction hang had: an access violation, then
-/// `STATUS_BREAKPOINT` at `ntdll+0x10a5b` for ever. Reporting the breakpoint
-/// would name the `int3` and hide the access violation that caused it.
 #[test]
 fn re_delivery_bound_reports_the_exception_that_opened_the_chain() {
     let mut os =
         WinOs::new(WinConfig { is_64bit: true, echo: false, teb_base: GS_BASE, ..WinConfig::default() });
 
-    // The original fault gets through.
     os.note_exception_delivery(0xC000_0005, 0xDEAD, 0x1_4000_1000).expect("the first delivery");
-    // Then the dispatcher's int3, over and over, at one fixed rip.
     let bp_rip = 0x6_0001_0A5A;
     os.note_exception_delivery(0x8000_0003, bp_rip + 1, bp_rip).expect("a second exception is normal");
     let mut more = 0;
@@ -355,18 +288,6 @@ fn re_delivery_bound_reports_the_exception_that_opened_the_chain() {
     );
 }
 
-/// **The mutation check on the bound**: a guest that keeps *handling* its
-/// exceptions is never bounded, however many it takes.
-///
-/// `NtContinue` is the reset, and it is the right one because every way a Wine
-/// guest successfully finishes with an exception goes through it —
-/// `dispatch_exception` calls it directly when a handler returned
-/// `STATUS_SUCCESS`, and a catch reached via `RtlUnwindEx` ends in
-/// `RtlRestoreContext`'s tail `jmp NtContinue` (both read off the pinned
-/// `ntdll.dll`). So this drives the **real** `NtContinue` syscall between
-/// deliveries, not a private reset hook: 200 identical faults at one address,
-/// each resumed, and the bound never fires — where three in a row without one
-/// does (the test above).
 #[test]
 fn a_guest_that_keeps_resuming_is_never_bounded() {
     let code_va: u64 = 0x0000_0000_0040_0000;
@@ -377,7 +298,7 @@ fn a_guest_that_keeps_resuming_is_never_bounded() {
     mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW)).unwrap();
     mem.map(Region::new("code", code_va, 0x1000, Perm::RX)).unwrap();
     mem.map(Region::new("landing", landing & !0xfff, 0x1000, Perm::RX)).unwrap();
-    mem.poke(landing, &[0xF4]).unwrap(); // hlt where NtContinue resumes
+    mem.poke(landing, &[0xF4]).unwrap();
     mem.poke(code_va, &syscall_stub(SSDT_NT_CONTINUE)).unwrap();
 
     let mut os =
@@ -385,11 +306,8 @@ fn a_guest_that_keeps_resuming_is_never_bounded() {
     let mut cpu = Interpreter::with_bits(Bits::B64);
 
     for round in 0..200u32 {
-        // One fault, delivered.
         os.note_exception_delivery(0xC000_0005, 0xDEAD, landing)
             .unwrap_or_else(|u| panic!("round {round}: bounded a guest that keeps resuming ({u:?})"));
-        // The guest's handler resolves it: build the CONTEXT the bridge would
-        // have written, and hand it to a real `NtContinue`.
         let mut faulted = CpuState::new();
         faulted.rip = landing;
         faulted.set_rsp(STACK_TOP - 0x1000);

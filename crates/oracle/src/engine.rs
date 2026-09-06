@@ -1,7 +1,3 @@
-//! The differential core: seed identical state into exemu and Unicorn, run one
-//! instruction in each, and diff the architectural result under the trial's
-//! defined-flags policy.
-
 use crate::gen::{self, Seed};
 use crate::rng::Rng;
 use exemu_core::hooks::NoHooks;
@@ -13,7 +9,6 @@ use unicorn_engine::{RegisterX86, Unicorn};
 
 const CODE_BASE: u64 = 0x1000;
 
-/// x86 GPR ids in exemu register-index order, per bitness.
 const REGS32: [RegisterX86; 8] = [
     RegisterX86::EAX,
     RegisterX86::ECX,
@@ -43,7 +38,6 @@ const REGS64: [RegisterX86; 16] = [
     RegisterX86::R15,
 ];
 
-/// The eight x87 stack registers (TOP-relative: `ST0` is the current top).
 const STS: [RegisterX86; 8] = [
     RegisterX86::ST0,
     RegisterX86::ST1,
@@ -55,8 +49,6 @@ const STS: [RegisterX86; 8] = [
     RegisterX86::ST7,
 ];
 
-/// The 16 YMM registers (256-bit) — used only by the VEX category to diff the
-/// full AVX register file, incl. the upper 128 bits.
 const YMMS: [RegisterX86; 16] = [
     RegisterX86::YMM0,
     RegisterX86::YMM1,
@@ -76,27 +68,18 @@ const YMMS: [RegisterX86; 16] = [
     RegisterX86::YMM15,
 ];
 
-/// The observable result of one step.
 struct Post {
     gpr: [u64; 16],
     rflags: u64,
     ip: u64,
     xmm: [u128; 16],
-    /// Upper 128 bits of ymm0..ymm15 (the AVX YMM_Hi state), read out only for
-    /// the VEX category (`trial.ymm256`); zero otherwise.
     ymm_hi: [u128; 16],
     data: Vec<u8>,
-    /// x87 physical data registers (80-bit) in ST-relative order as read out
-    /// from the *final* TOP, so both engines are compared register-for-register
-    /// regardless of how many pushes/pops the instruction did.
     st: [u128; 8],
-    /// x87 status and control words.
     sw: u16,
     cw: u16,
 }
 
-/// Per-lane XMM equality under a NaN-aware policy (`nan` = 0 bit-exact, 4 f32
-/// lanes, 8 f64 lanes; a lane NaN in both engines counts as equal).
 fn xmm_eq(a: u128, b: u128, nan: u8) -> bool {
     if a == b {
         return true;
@@ -114,8 +97,6 @@ fn xmm_eq(a: u128, b: u128, nan: u8) -> bool {
     }
 }
 
-// `Post` is deliberately large (full register + XMM snapshot); it lives only
-// for the span of one trial's comparison, so boxing it would just add churn.
 #[allow(clippy::large_enum_variant)]
 enum Outcome {
     Ok(Post),
@@ -149,7 +130,7 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         s.ymm_hi = seed.ymm_hi;
         s.x87.st = seed.st;
         s.x87.cw = seed.cw;
-        s.x87.sw = seed.sw; // TOP=0 at seed time
+        s.x87.sw = seed.sw;
         s.x87.tw = seed.tw;
         s.x87.fip = seed.fip;
         s.x87.fdp = seed.fdp;
@@ -165,7 +146,6 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
                 let s = cpu.state();
                 (s.gpr, s.rflags, s.rip, s.xmm, s.ymm_hi, s.x87.sw, s.x87.cw)
             };
-            // Read the ST stack ST-relative to the final TOP.
             let mut st = [0u128; 8];
             {
                 let x = &cpu.state().x87;
@@ -179,7 +159,6 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             }
             Outcome::Ok(Post { gpr, rflags, ip, xmm, ymm_hi, data, st, sw, cw })
         }
-        // #DE (Interrupt(0)), Halted, ProcessExit, or a memory/decode error.
         _ => Outcome::Fault,
     }
 }
@@ -189,8 +168,6 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         Bits::B32 => (Mode::MODE_32, &REGS32, RegisterX86::EIP),
         Bits::B64 => (Mode::MODE_64, &REGS64, RegisterX86::RIP),
     };
-    // A fresh instance per trial: overwriting code at a fixed address would
-    // otherwise hit Unicorn's stale translation-block cache.
     let mut uc = match Unicorn::new(Arch::X86, mode) {
         Ok(uc) => uc,
         Err(_) => return Outcome::Fault,
@@ -208,10 +185,6 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             return Outcome::Fault;
         }
     }
-    // xmm8..15 / ymm8..15 exist only in 64-bit mode. Seed the full 256-bit YMM
-    // register (low = xmm, high = ymm_hi) so the VEX category's upper halves are
-    // controlled; for non-VEX categories ymm_hi is zero, so this is equivalent
-    // to seeding just the XMM low half.
     let nxmm = if bits == Bits::B64 { 16 } else { 8 };
     for (i, y) in YMMS[..nxmm].iter().enumerate() {
         let mut buf = [0u8; 32];
@@ -221,14 +194,10 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             return Outcome::Fault;
         }
     }
-    // Seed the x87 FPU: control/status/tag words, then the eight stack
-    // registers (TOP=0 at seed time, so ST(i) == seed.st[i]).
     let _ = uc.reg_write(RegisterX86::FPCW, seed.cw as u64);
     let _ = uc.reg_write(RegisterX86::FPSW, seed.sw as u64);
     let _ = uc.reg_write(RegisterX86::FPTAG, seed.tw as u64);
     let _ = uc.reg_write(RegisterX86::MXCSR, seed.mxcsr as u64);
-    // x87 last-instruction pointer/opcode/data-pointer state — only non-zero for
-    // the FXSAVE/XSAVE category, whose save area must round-trip these fields.
     let _ = uc.reg_write(RegisterX86::FIP, seed.fip);
     let _ = uc.reg_write(RegisterX86::FDP, seed.fdp);
     let _ = uc.reg_write(RegisterX86::FOP, seed.fop as u64);
@@ -243,10 +212,6 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
     }
     let _ = uc.reg_write(RegisterX86::EFLAGS, seed.rflags & 0xffff_ffff);
     let _ = uc.reg_write(ip_reg, CODE_BASE);
-    // Run until rip reaches the end of the instruction (count=0 = no limit), so
-    // a REP string op completes all its iterations in one go — exemu executes
-    // the whole REP in a single step(), and count=1 would stop Unicorn after
-    // just the first iteration.
     match uc.emu_start(CODE_BASE, CODE_BASE + code.len() as u64, 0, 0) {
         Ok(()) => {
             let mut gpr = [0u64; 16];
@@ -277,7 +242,6 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
             if uc.mem_read(gen::DATA_BASE, &mut data).is_err() {
                 return Outcome::Fault;
             }
-            // x87 stack (ST-relative to Unicorn's final TOP), status + control.
             let mut st = [0u128; 8];
             for (i, r) in STS.iter().enumerate() {
                 if let Ok(bytes) = uc.reg_read_long(*r) {
@@ -296,7 +260,6 @@ fn run_unicorn(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
     }
 }
 
-/// A single detected divergence, ready to render.
 pub struct Divergence {
     pub index: u64,
     pub label: String,
@@ -319,8 +282,6 @@ fn regs_str(bits: Bits, p: &Post, nreg: usize) -> String {
     parts.join(" ")
 }
 
-/// Compare two successful steps under the trial's policy; `Some(reason)` on
-/// divergence.
 fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Option<String> {
     let mask = width_mask(bits);
     for i in 0..nreg {
@@ -329,10 +290,6 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
         }
         let (av, bv) = (a.gpr[i] & mask, b.gpr[i] & mask);
         if trial.subset_reg & (1 << i) != 0 {
-            // Subset policy (CPUID feature words): every bit exemu advertises
-            // must also be set by the reference. exemu may report *fewer* bits
-            // (an honest subset), but a bit set in exemu yet clear in the
-            // reference is a fabricated capability — a hard divergence.
             let extra = av & !bv & !trial.subset_ignore;
             if extra != 0 {
                 return Some(format!(
@@ -351,25 +308,17 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
     if fa != fb {
         return Some(format!("flags(defined={:#x}) exemu={:#x} unicorn={:#x} Δ={:#x}", trial.defined_flags, fa, fb, fa ^ fb));
     }
-    // xmm8..15 exist only in 64-bit mode; compare them there too (the
-    // generator now reaches them via REX.R/B).
     let nxmm = if bits == Bits::B64 { 16 } else { 8 };
     for i in 0..nxmm {
         if !xmm_eq(a.xmm[i], b.xmm[i], trial.xmm_nan) {
             return Some(format!("xmm{i} exemu={:#034x} unicorn={:#034x}", a.xmm[i], b.xmm[i]));
         }
-        // VEX category: also diff the upper 128 bits of each YMM against the
-        // reference. Only enabled when a zero-upper-correct reference is present
-        // (this Unicorn build is not — see `Trial::ymm256`).
         if trial.ymm256 && !xmm_eq(a.ymm_hi[i], b.ymm_hi[i], trial.xmm_nan) {
             return Some(format!(
                 "ymm{i}[255:128] exemu={:#034x} unicorn={:#034x}",
                 a.ymm_hi[i], b.ymm_hi[i]
             ));
         }
-        // VEX.128 zero-upper assertion: exemu's own upper 128 bits of the
-        // destination(s) must be zero (checked against exemu, not the reference,
-        // which does not model zero-upper). `a` is always the exemu post-state.
         if trial.assert_upper_zero & (1 << i) != 0 && a.ymm_hi[i] != 0 {
             return Some(format!("ymm{i}[255:128] not zeroed by VEX.128: exemu={:#034x}", a.ymm_hi[i]));
         }
@@ -390,9 +339,6 @@ fn diff(bits: Bits, a: &Post, b: &Post, trial: &gen::Trial, nreg: usize) -> Opti
     None
 }
 
-/// x87 stack + status/control comparison (only for `trial.fpu` trials).
-/// Registers flagged `fpu_approx` are compared NaN-aware and to the value they
-/// represent as `f64` (transcendental/ROM-constant slop), not bit-exact.
 fn diff_fpu(a: &Post, b: &Post, trial: &gen::Trial) -> Option<String> {
     for i in 0..8u8 {
         let (x, y) = (a.st[i as usize], b.st[i as usize]);
@@ -400,16 +346,12 @@ fn diff_fpu(a: &Post, b: &Post, trial: &gen::Trial) -> Option<String> {
             continue;
         }
         if trial.fpu_approx & (1 << i) != 0 {
-            // Loose compare for transcendental results: the host math library
-            // and the reference x87 agree only to a few ULP in the last
-            // significand bits, so accept a small tolerance (or both NaN).
             let fx = ext80_to_f64(x);
             let fy = ext80_to_f64(y);
             if (fx.is_nan() && fy.is_nan()) || f64_within_ulps(fx, fy, 4) {
                 continue;
             }
         }
-        // Both-NaN (possibly different payloads) counts as equal.
         if ext80_is_nan(x) && ext80_is_nan(y) {
             continue;
         }
@@ -426,7 +368,6 @@ fn diff_fpu(a: &Post, b: &Post, trial: &gen::Trial) -> Option<String> {
     None
 }
 
-/// Decode a raw 80-bit extended value to the nearest f64 (for loose compares).
 fn ext80_to_f64(v: u128) -> f64 {
     let sign = ((v >> 79) & 1) as u64;
     let exp = ((v >> 64) & 0x7fff) as u32;
@@ -448,8 +389,6 @@ fn ext80_to_f64(v: u128) -> f64 {
     if sign == 1 { -mag } else { mag }
 }
 
-/// True when `a` and `b` are within `max_ulps` units-in-the-last-place of each
-/// other (used only for transcendental result tolerance).
 fn f64_within_ulps(a: f64, b: f64, max_ulps: u64) -> bool {
     if a == b {
         return true;
@@ -468,7 +407,6 @@ fn ext80_is_nan(v: u128) -> bool {
     exp == 0x7fff && frac != 0
 }
 
-/// Configuration for a fuzzing run.
 pub struct FuzzConfig {
     pub bits: Bits,
     pub count: u64,
@@ -476,7 +414,6 @@ pub struct FuzzConfig {
     pub max_report: usize,
 }
 
-/// Aggregate result of a fuzzing run.
 pub struct Summary {
     pub trials: u64,
     pub divergences: u64,
@@ -485,9 +422,7 @@ pub struct Summary {
     pub first: Vec<Divergence>,
 }
 
-/// Run one reproducible trial by global index.
 fn trial_at(bits: Bits, base_seed: u64, index: u64) -> (gen::Trial, Seed) {
-    // Independent, index-addressable stream so any divergence reproduces.
     let mut rng = Rng::new(base_seed ^ index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut seed = gen::seed(&mut rng);
     let trial = gen::build(&mut rng, bits, &mut seed);
@@ -536,8 +471,6 @@ pub fn fuzz(cfg: &FuzzConfig) -> Summary {
     summary
 }
 
-/// Debug helper: reproduce one trial by (seed, index) and dump both engines'
-/// full XMM/YMM state, for diagnosing a specific VEX divergence.
 pub fn debug_index(bits: Bits, base_seed: u64, index: u64) -> String {
     let (trial, seed) = trial_at(bits, base_seed, index);
     let mut out = String::new();
@@ -561,7 +494,6 @@ pub fn debug_index(bits: Bits, base_seed: u64, index: u64) -> String {
     out
 }
 
-/// Render a divergence for the terminal.
 pub fn render(d: &Divergence) -> String {
     format!(
         "  #{:<10} {:<22} [{}]\n      Δ {}\n      exemu:   {}\n      unicorn: {}",

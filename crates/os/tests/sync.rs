@@ -1,13 +1,3 @@
-//! Tests for the Win32 synchronization objects (roadmap P3.6), driven through
-//! the public `Hooks::intercept` seam exactly as the interpreter would.
-//!
-//! These now exercise *real* signaling state: events set/reset/pulse, auto- vs
-//! manual-reset consumption, semaphore counts, mutex ownership, named-object
-//! sharing, and `WaitForSingle/MultipleObjects` returning `WAIT_OBJECT_0` when
-//! satisfied and `WAIT_TIMEOUT` (0x102) for an unsatisfiable zero-timeout wait.
-//! Each call also asserts the 32-bit stdcall stack cleanup matches the declared
-//! argc — a regression here leaks esp (the original Firefox-installer stall).
-
 use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Perm, Reg, Region};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
@@ -16,7 +6,7 @@ const STACK_BASE: u64 = 0x0018_0000;
 const STACK_SIZE: u64 = 0x1000;
 const ESP: u64 = 0x0018_0800;
 const RETADDR: u32 = 0x0041_2233;
-const HEAP: u64 = 0x1000_0000; // scratch for arrays / out-params / names
+const HEAP: u64 = 0x1000_0000;
 
 const WAIT_OBJECT_0: u64 = 0;
 const WAIT_TIMEOUT: u64 = 0x102;
@@ -37,8 +27,6 @@ fn setup() -> (WinOs, VirtualMemory) {
     (os, mem)
 }
 
-/// Invoke a kernel32 API with explicit 32-bit stdcall DWORD arguments,
-/// asserting the callee cleaned up exactly `args.len()` DWORDs. Returns EAX.
 fn call(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState, name: &str, args: &[u32]) -> u64 {
     let thunk = os.resolve_import("kernel32.dll", &ImportSymbol::Named(name.into()));
     cpu.set_rsp(ESP);
@@ -72,7 +60,6 @@ fn put_wstr(mem: &mut VirtualMemory, addr: u64, s: &str) {
 fn create_event_returns_non_null_handle_with_argc_4() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::new();
-    // CreateEventA(attr, bManualReset, bInitialState, lpName).
     let h = call(&mut os, &mut mem, &mut cpu, "CreateEventA", &[0, 1, 0, 0]);
     assert_ne!(h, 0, "CreateEventA must return a NON-NULL handle");
     let h2 = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 0, 0, 0]);
@@ -84,16 +71,12 @@ fn create_event_returns_non_null_handle_with_argc_4() {
 fn manual_reset_event_signal_roundtrip() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::new();
-    // Manual-reset, initially non-signaled.
     let h = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 1, 0, 0]) as u32;
 
-    // Unsignaled + zero timeout → WAIT_TIMEOUT.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_TIMEOUT);
-    // Set → signaled; manual reset stays signaled across repeated waits.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetEvent", &[h]), 1);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_OBJECT_0);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_OBJECT_0);
-    // Reset → unsignaled again.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "ResetEvent", &[h]), 1);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_TIMEOUT);
 }
@@ -102,9 +85,7 @@ fn manual_reset_event_signal_roundtrip() {
 fn auto_reset_event_is_consumed_by_wait() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::new();
-    // Auto-reset, initially signaled.
     let h = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 0, 1, 0]) as u32;
-    // First wait consumes the signal; the second times out.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_OBJECT_0);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_TIMEOUT);
 }
@@ -113,13 +94,10 @@ fn auto_reset_event_is_consumed_by_wait() {
 fn semaphore_counts_down_and_releases() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::new();
-    // CreateSemaphore(attr, lInitialCount=2, lMaximumCount=4, name).
     let h = call(&mut os, &mut mem, &mut cpu, "CreateSemaphoreW", &[0, 2, 4, 0]) as u32;
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_OBJECT_0);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_OBJECT_0);
-    // Count now 0 → times out.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_TIMEOUT);
-    // ReleaseSemaphore(h, 1, &prev): prev count written back is 0, then wait ok.
     let prev = HEAP + 0x100;
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "ReleaseSemaphore", &[h, 1, prev as u32]), 1);
     assert_eq!(mem.read_u32(prev).unwrap(), 0, "previous count");
@@ -130,12 +108,9 @@ fn semaphore_counts_down_and_releases() {
 fn mutex_ownership_and_release() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::new();
-    // CreateMutex(attr, bInitialOwner=0, name) — unowned.
     let h = call(&mut os, &mut mem, &mut cpu, "CreateMutexW", &[0, 0, 0]) as u32;
-    // Acquire (owner becomes current thread), then release succeeds.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h, 0]), WAIT_OBJECT_0);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "ReleaseMutex", &[h]), 1);
-    // Releasing an unowned mutex fails (ERROR_NOT_OWNER → FALSE).
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "ReleaseMutex", &[h]), 0);
 }
 
@@ -143,12 +118,11 @@ fn mutex_ownership_and_release() {
 fn wait_multiple_any_returns_first_signaled_index() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::new();
-    let h0 = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 1, 0, 0]) as u32; // unsignaled
-    let h1 = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 1, 1, 0]) as u32; // signaled
+    let h0 = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 1, 0, 0]) as u32;
+    let h1 = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 1, 1, 0]) as u32;
     let arr = HEAP + 0x200;
     mem.write_u32(arr, h0).unwrap();
     mem.write_u32(arr + 4, h1).unwrap();
-    // WaitForMultipleObjects(2, arr, bWaitAll=FALSE, 0) → WAIT_OBJECT_0 + 1.
     let r = call(&mut os, &mut mem, &mut cpu, "WaitForMultipleObjects", &[2, arr as u32, 0, 0]);
     assert_eq!(r, WAIT_OBJECT_0 + 1, "index of the first signaled object");
 }
@@ -162,10 +136,8 @@ fn named_event_is_shared_across_creates() {
     let h1 = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 1, 0, name as u32]);
     let h2 = call(&mut os, &mut mem, &mut cpu, "CreateEventW", &[0, 1, 0, name as u32]);
     assert_eq!(h1, h2, "same name → same underlying object handle");
-    // OpenEventW(access, inherit, name) resolves the same object.
     let h3 = call(&mut os, &mut mem, &mut cpu, "OpenEventW", &[0, 0, name as u32]);
     assert_eq!(h3, h1);
-    // Signaling through one handle is visible through the shared object.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetEvent", &[h1 as u32]), 1);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[h2 as u32, 0]), WAIT_OBJECT_0);
 }
@@ -181,8 +153,6 @@ fn close_handle_accepts_event_handle() {
 
 #[test]
 fn wait_on_unknown_handle_does_not_hang() {
-    // A wait on a foreign/pseudo handle (e.g. the current process) must report
-    // WAIT_OBJECT_0 immediately rather than block.
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::new();
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "WaitForSingleObject", &[0xDEAD_0000, 0]), WAIT_OBJECT_0);

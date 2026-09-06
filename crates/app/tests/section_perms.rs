@@ -1,22 +1,3 @@
-//! A PE section is mapped with the permissions its own
-//! `IMAGE_SECTION_HEADER.Characteristics` asks for — not `RWX` (roadmap W9.5).
-//!
-//! exemu used to map every section (and the header page) read/write/execute on
-//! the theory that running arbitrary binaries mattered more than reproducing
-//! DEP. The measurement that retired that theory is in this file's sibling
-//! assertions: the two self-modifying guests in the corpus — the UPX-packed
-//! Firefox stub, which decompresses over its own image and jumps into it —
-//! **mark their own sections `MEM_WRITE|MEM_EXECUTE`**, so an honest mapping
-//! hands them exactly the `RWX` they asked for, while an ordinary MSVC image
-//! stops being a `W^X` hole.
-//!
-//! The one deliberate departure, pinned here so it stays visible rather than
-//! becoming folklore: the section carrying the **import address table** is
-//! mapped writable even when the linker marked it read-only, because on the
-//! Wine path the code that binds imports is *guest* code and exemu's
-//! `NtProtectVirtualMemory` is nominal — it records the requested `PAGE_*` for
-//! `VirtualQuery` and never changes a real permission.
-
 use exemu_app::{sample, Process, RunConfig};
 use exemu_core::Perm;
 
@@ -24,9 +5,6 @@ fn silent_cfg() -> RunConfig {
     RunConfig { echo: false, trace: false, ..RunConfig::default() }
 }
 
-/// The permission of the region containing `addr`, or `None` if `addr` is in a
-/// free gap. `Memory::next_region` returns the first region whose end is above
-/// `addr`, so a base at or below `addr` means it is the containing one.
 fn perm_at(proc: &Process, addr: u64) -> Option<Perm> {
     match proc.memory().next_region(addr) {
         Some((base, _, perm)) if base <= addr => Some(perm),
@@ -40,8 +18,6 @@ fn perm_of(proc: &Process, addr: u64, what: &str) -> Perm {
 
 #[test]
 fn a_code_section_is_not_writable_and_a_data_section_is_not_executable() {
-    // `build_with_tls` is the three-section fixture: `.text` CODE|EXECUTE|READ,
-    // `.rdata` INITIALIZED_DATA|READ, `.data` INITIALIZED_DATA|READ|WRITE.
     let bytes = sample::build_with_tls();
     let image = exemu_loader::parse(&bytes).expect("fixture parses");
     let proc = Process::load(&bytes, &mut silent_cfg()).expect("load");
@@ -64,9 +40,6 @@ fn a_code_section_is_not_writable_and_a_data_section_is_not_executable() {
 
 #[test]
 fn the_header_page_is_writable_but_not_executable() {
-    // Writable because packers reconstruct headers/import tables in place at
-    // the image base; never executable, because no section covers
-    // `SizeOfHeaders`, so nothing a linker emitted can be fetched from there.
     let bytes = sample::build_with_tls();
     let image = exemu_loader::parse(&bytes).expect("fixture parses");
     let proc = Process::load(&bytes, &mut silent_cfg()).expect("load");
@@ -77,9 +50,6 @@ fn the_header_page_is_writable_but_not_executable() {
 
 #[test]
 fn the_section_carrying_the_iat_stays_writable() {
-    // The documented carve-out. The fixture's IAT lives in `.rdata`, which the
-    // linker marked read-only; a guest loader binding those slots must be able
-    // to store into them, and `NtProtectVirtualMemory` cannot yet grant that.
     let bytes = sample::build_with_tls();
     let image = exemu_loader::parse(&bytes).expect("fixture parses");
     let iat_rva = image.imports.first().expect("fixture imports something").iat_rva;
@@ -96,12 +66,6 @@ fn the_section_carrying_the_iat_stays_writable() {
     assert!(!perm.contains(Perm::EXEC), "…but not executable");
 }
 
-/// The corpus's self-modifying guest, and the reason an honest mapping does not
-/// break it: UPX marks its own sections writable *and* executable, so mapping
-/// from the characteristics hands the stub exactly the pages it asked for.
-///
-/// Skip-guarded on the git-ignored corpus, like every other test that needs a
-/// real third-party binary.
 #[test]
 fn a_upx_packed_guest_still_gets_rwx_because_it_asked_for_it() {
     let path = std::path::Path::new("../../example_exe/Firefox Installer.exe");
@@ -121,8 +85,6 @@ fn a_upx_packed_guest_still_gets_rwx_because_it_asked_for_it() {
     assert!(checked >= 2, "expected the UPX0/UPX1 pair, saw {checked}");
 }
 
-/// A real MSVC image: everything that is not code stops being executable, and
-/// the read-only sections that do **not** carry the IAT stay read-only.
 #[test]
 fn a_real_msvc_image_maps_pdata_and_rsrc_read_only() {
     let path = std::path::Path::new("../../example_exe/7z2602-x64.exe");

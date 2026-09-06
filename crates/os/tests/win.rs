@@ -1,8 +1,3 @@
-//! Tests for the real HWND window-object model (roadmap P5a.2): distinct
-//! window handles, `Get/SetWindowLongPtr` (subclassing + user data + style),
-//! `Get/Set/RemoveProp`, `IsWindow`, `GetClientRect`/`GetWindowRect`,
-//! `GetClassName`, and per-window `Get/SetWindowText`.
-
 use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Perm, Reg, Region};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
@@ -10,11 +5,9 @@ use exemu_os::{WinConfig, WinOs};
 const RSP: u64 = 0x0000_0010_0000_1000;
 const RETADDR: u64 = 0x0000_0001_4000_1000;
 const SCRATCH: u64 = 0x0000_0000_5000_0000;
-// The first CreateWindowEx yields this HWND (alloc seeds from HWND_CUSTOM).
 const HWND1: u64 = 0x00C1_0000;
 const WNDPROC: u64 = 0x0000_0000_0040_1000;
 
-// GWL/GWLP indices (as u64 two's complement).
 const GWLP_WNDPROC: u64 = (-4i64) as u64;
 const GWLP_USERDATA: u64 = (-21i64) as u64;
 const GWL_STYLE: u64 = (-16i64) as u64;
@@ -52,7 +45,6 @@ fn read_wstr(mem: &VirtualMemory, addr: u64) -> String {
     String::from_utf16_lossy(&u)
 }
 
-/// Invoke a user32 API with register + stack args; assert a normal return.
 fn call(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState, name: &str, args: &[u64]) -> u64 {
     let thunk = os.resolve_import("user32.dll", &ImportSymbol::Named(name.into()));
     cpu.set_rsp(RSP);
@@ -72,12 +64,8 @@ fn call(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState, name: &str,
     cpu.reg(Reg::Rax)
 }
 
-/// Register a class named `class` (wndproc = WNDPROC) and create one window
-/// titled `title`. Returns the (deterministic) HWND. CreateWindowEx delivers
-/// WM_CREATE via the callback driver, so it returns `Resume` rather than to the
-/// caller — we don't run that callback here; the window object already exists.
 fn make_window(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState, class: &str, title: &str) -> u64 {
-    let wc = SCRATCH; // WNDCLASSW: lpfnWndProc @ +8, lpszClassName @ +64 (x64)
+    let wc = SCRATCH;
     let name = SCRATCH + 0x100;
     let title_ptr = SCRATCH + 0x200;
     for i in 0..72 {
@@ -90,15 +78,13 @@ fn make_window(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState, clas
     let atom = call(os, mem, cpu, "RegisterClassW", &[wc]);
     assert_ne!(atom, 0, "RegisterClassW returns an atom");
 
-    // CreateWindowExW(ex=0, class=name, title, style=0x00CF0000, x=100, y=100,
-    //                 w=300, h=200, parent=0, menu=0, inst=0, param=0)
     let thunk = os.resolve_import("user32.dll", &ImportSymbol::Named("CreateWindowExW".into()));
     cpu.set_rsp(RSP);
     mem.write_u64(RSP, RETADDR).unwrap();
     cpu.set_reg(Reg::Rcx, 0);
     cpu.set_reg(Reg::Rdx, name);
     cpu.set_reg(Reg::R8, title_ptr);
-    cpu.set_reg(Reg::R9, 0x00CF_0000); // WS_OVERLAPPEDWINDOW
+    cpu.set_reg(Reg::R9, 0x00CF_0000);
     for (i, v) in [100u64, 100, 300, 200, 0, 0, 0, 0].iter().enumerate() {
         mem.write_u64(RSP + 0x28 + i as u64 * 8, *v).unwrap();
     }
@@ -115,14 +101,13 @@ fn create_yields_real_window_and_is_window() {
     let hwnd = make_window(&mut os, &mut mem, &mut cpu, "MyClass", "Hello");
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "IsWindow", &[hwnd]), 1);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "IsWindow", &[0xDEAD_0000]), 0, "garbage is not a window");
-    // A second window gets a distinct handle.
     let os_ptr = &mut os;
     let hwnd2 = {
         let thunk = os_ptr.resolve_import("user32.dll", &ImportSymbol::Named("CreateWindowExW".into()));
         cpu.set_rsp(RSP);
         mem.write_u64(RSP, RETADDR).unwrap();
         cpu.set_reg(Reg::Rcx, 0);
-        cpu.set_reg(Reg::Rdx, SCRATCH + 0x100); // reuse the registered class name
+        cpu.set_reg(Reg::Rdx, SCRATCH + 0x100);
         cpu.set_reg(Reg::R8, SCRATCH + 0x200);
         cpu.set_reg(Reg::R9, 0);
         for i in 0..8 {
@@ -142,17 +127,14 @@ fn window_long_userdata_and_wndproc_subclass() {
     let mut cpu = CpuState::default();
     let hwnd = make_window(&mut os, &mut mem, &mut cpu, "C", "T");
 
-    // GWLP_USERDATA round-trips.
     call(&mut os, &mut mem, &mut cpu, "SetWindowLongPtrW", &[hwnd, GWLP_USERDATA, 0x1234_5678]);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetWindowLongPtrW", &[hwnd, GWLP_USERDATA]), 0x1234_5678);
 
-    // GWLP_WNDPROC subclassing: get old, set new, get new.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetWindowLongPtrW", &[hwnd, GWLP_WNDPROC]), WNDPROC);
     let old = call(&mut os, &mut mem, &mut cpu, "SetWindowLongPtrW", &[hwnd, GWLP_WNDPROC, 0x9999]);
     assert_eq!(old, WNDPROC, "SetWindowLongPtr returns the previous value");
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetWindowLongPtrW", &[hwnd, GWLP_WNDPROC]), 0x9999);
 
-    // GWL_STYLE reflects the CreateWindowEx style.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetWindowLongW", &[hwnd, GWL_STYLE]), 0x00CF_0000);
 }
 
@@ -175,17 +157,14 @@ fn focus_capture_and_keystate() {
     let mut cpu = CpuState::default();
     let hwnd = make_window(&mut os, &mut mem, &mut cpu, "C", "T");
 
-    // Focus: previous is 0, then GetFocus reflects it.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetFocus", &[hwnd]), 0);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetFocus", &[]), hwnd);
 
-    // Capture: set, query, release.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetCapture", &[hwnd]), 0);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetCapture", &[]), hwnd);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "ReleaseCapture", &[]), 1);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetCapture", &[]), 0);
 
-    // No synthetic input is pressed headless.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetAsyncKeyState", &[0x41]), 0);
 }
 
@@ -193,15 +172,13 @@ fn focus_capture_and_keystate() {
 fn move_window_updates_rect_and_posts_size() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::default();
-    let hwnd = make_window(&mut os, &mut mem, &mut cpu, "C", "T"); // created at (100,100,300,200)
+    let hwnd = make_window(&mut os, &mut mem, &mut cpu, "C", "T");
 
-    // MoveWindow to (50,60) size 400x300.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "MoveWindow", &[hwnd, 50, 60, 400, 300, 1]), 1);
     let rect = SCRATCH + 0x400;
     call(&mut os, &mut mem, &mut cpu, "GetWindowRect", &[hwnd, rect]);
     assert_eq!(read_rect(&mem, rect), (50, 60, 450, 360), "GetWindowRect is (x,y,x+w,y+h)");
 
-    // WM_MOVE then WM_SIZE were posted to the message queue.
     let msg = SCRATCH + 0x500;
     call(&mut os, &mut mem, &mut cpu, "GetMessageW", &[msg, 0, 0, 0]);
     assert_eq!(mem.read_u32(msg + 8).unwrap(), 0x0003, "WM_MOVE");
@@ -227,15 +204,12 @@ fn painting_invalidate_validate_beginpaint() {
     let hwnd = make_window(&mut os, &mut mem, &mut cpu, "C", "T");
     let rect = SCRATCH + 0x400;
 
-    // A fresh window owes a paint over its whole client (0,0,300,200).
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetUpdateRect", &[hwnd, rect, 0]), 1);
     assert_eq!(read_rect(&mem, rect), (0, 0, 300, 200));
 
-    // ValidateRect clears the pending paint.
     call(&mut os, &mut mem, &mut cpu, "ValidateRect", &[hwnd, 0]);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetUpdateRect", &[hwnd, rect, 0]), 0);
 
-    // InvalidateRect with a specific rectangle marks exactly it.
     let inv = SCRATCH + 0x500;
     for (i, v) in [10u32, 20, 110, 120].iter().enumerate() {
         mem.write_u32(inv + i as u64 * 4, *v).unwrap();
@@ -244,7 +218,6 @@ fn painting_invalidate_validate_beginpaint() {
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetUpdateRect", &[hwnd, rect, 0]), 1);
     assert_eq!(read_rect(&mem, rect), (10, 20, 110, 120));
 
-    // BeginPaint fills the PAINTSTRUCT (hdc + rcPaint) and clears the paint.
     let ps = SCRATCH + 0x600;
     let hdc = call(&mut os, &mut mem, &mut cpu, "BeginPaint", &[hwnd, ps]);
     assert_ne!(hdc, 0, "BeginPaint returns a device context");
@@ -257,7 +230,6 @@ fn painting_invalidate_validate_beginpaint() {
         "BeginPaint serviced the paint"
     );
 
-    // GetDC / ReleaseDC.
     let dc = call(&mut os, &mut mem, &mut cpu, "GetDC", &[hwnd]);
     assert_ne!(dc, 0, "GetDC returns a device context");
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "ReleaseDC", &[hwnd, dc]), 1);
@@ -285,7 +257,6 @@ fn client_rect_class_name_and_text() {
     call(&mut os, &mut mem, &mut cpu, "GetClassNameW", &[hwnd, cls, 64]);
     assert_eq!(read_wstr(&mem, cls), "MyWindowClass");
 
-    // Per-window text: created title, then update it.
     let txt = SCRATCH + 0x600;
     call(&mut os, &mut mem, &mut cpu, "GetWindowTextW", &[hwnd, txt, 64]);
     assert_eq!(read_wstr(&mem, txt), "Title");

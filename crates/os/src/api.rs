@@ -1,10 +1,3 @@
-//! The Windows API surface exemu understands, and its native implementations.
-//!
-//! [`Api`] enumerates the recognized symbols; [`Api::classify`] maps a
-//! `(dll, name)` pair to one. [`WinOs::dispatch`] runs the call using the
-//! arguments already in guest registers/stack and returns an [`Outcome`]
-//! (a return value, or process termination).
-
 use std::collections::VecDeque;
 
 use exemu_core::{CpuState, Memory, Reg, Result};
@@ -12,115 +5,49 @@ use exemu_core::{CpuState, Memory, Reg, Result};
 use crate::sync::{SignalOp, SyncKind};
 use crate::{WinOs, HANDLE_PROCESS_HEAP, HANDLE_STDERR, HANDLE_STDIN, HANDLE_STDOUT};
 
-/// The result of servicing an API call.
 pub(crate) enum Outcome {
-    /// Put this value in `rax` and `ret` to the caller.
     Return(u64),
-    /// Terminate the process with this exit code.
     Exit(i32),
-    /// The handler has already set `rip`/`rsp` itself (it is driving a
-    /// re-entrant guest call). Leave the CPU untouched and keep executing.
     Resume,
 }
 
-/// One in-flight `_initterm` invocation: the constructors still to call, the
-/// address to return to when they are all done, and the stack pointer at
-/// `_initterm` entry (which points at that return address).
 pub(crate) struct InittermFrame {
     pub remaining: VecDeque<u64>,
     pub ret: u64,
     pub saved_rsp: u64,
 }
 
-/// A queued sequence of guest callbacks (e.g. a dialog proc receiving
-/// WM_INITDIALOG then WM_COMMAND). Each entry is `(func, args)`; `args` are
-/// passed per the ABI. When the queue drains, control returns to `ret_addr`
-/// with `rsp = final_rsp` and the API's result in the accumulator.
 pub(crate) struct CbFrame {
     pub remaining: VecDeque<(u64, Vec<u64>)>,
     pub ret_addr: u64,
     pub final_rsp: u64,
     pub result: u64,
-    /// A modal dialog loop: when the queue drains, keep pumping the window and
-    /// dispatching WM_COMMANDs to the dialog proc until it calls EndDialog
-    /// (which sets `dialog_result`); then return that value to the caller.
     pub modal: bool,
 }
 
-/// The resume state of a win32k syscall (e.g. `NtUserDispatchMessage`) that
-/// invoked one or more guest WndProcs via
-/// [`WinOs::call_wndprocs_from_syscall`] (roadmap W4.6/W6.2). When the last
-/// WndProc returns to the win32k driver thunk, the guest is put back exactly at
-/// the post-SYSCALL point.
 pub(crate) struct Win32kCbFrame {
-    /// The instruction after the guest's `SYSCALL` (from rcx on entry).
     pub resume_rip: u64,
-    /// The guest rsp captured before the unix-stack switch.
     pub resume_rsp: u64,
-    /// The guest RFLAGS the SYSCALL preserved in r11.
     pub resume_flags: u64,
-    /// WndProc calls still to run before the syscall's caller resumes, as
-    /// `(func, args)`. A **sequence** is what lets a handler that must also
-    /// return a value of its own (`NtUserCreateWindowEx` → the HWND) drive the
-    /// `WM_NCCREATE`/`WM_CREATE` pair: the return-hijack alone could only
-    /// surface the last WndProc's LRESULT (roadmap W6.2).
     pub remaining: VecDeque<(u64, Vec<u64>)>,
-    /// The guest rsp each queued callback's frame is seated below. Normally the
-    /// resume rsp; a handler that parked a struct (a `CREATESTRUCTW`) in the
-    /// scratch below the syscall frame lowers it so the callbacks cannot
-    /// overwrite what they were handed.
     pub call_base: u64,
-    /// What to leave in rax once the queue drains. `None` keeps the last
-    /// callback's own return value — the `DispatchMessage` LRESULT contract.
     pub result: Option<u64>,
-    /// A kernel-side continuation to run when the queue drains, handed the last
-    /// callback's `LRESULT`. This is what makes a callback's *answer* usable by
-    /// the handler that queued it: `WM_NCHITTEST` is dispatched to a window's
-    /// WndProc and the code it returns decides which message the pump delivers
-    /// and to whom (roadmap W4.8 input routing). The continuation may queue more
-    /// callbacks (another hit-test round) and may override [`result`].
-    ///
-    /// [`result`]: Self::result
     pub then: Option<crate::win32k::PendingHitTest>,
-    /// Present when this frame's callbacks run as **client callbacks** through
-    /// `ntdll!KiUserCallbackDispatcher` (a WoW64 process — roadmap W5.10). A
-    /// client callback never returns to a thunk: it leaves through
-    /// `NtCallbackReturn`, so nothing on the way preserves the interrupted
-    /// syscall's non-volatile registers and the kernel has to.
     pub client: Option<Box<ClientCbState>>,
 }
 
-/// The register state a **client callback** displaces, kept kernel-side for the
-/// duration (roadmap W5.10).
-///
-/// Real Windows keeps exactly this in the callback's kernel trap frame. The
-/// chain a WoW64 window-procedure callback runs through —
-/// `KiUserCallbackDispatcher` → `wow64win!wow64_NtUserCallWinProc` →
-/// `wow64!Wow64KiUserCallbackDispatcher` → 32-bit code → `NtCallbackReturn` —
-/// unwinds by `longjmp`, not by returning, so `RBX/RBP/RSI/RDI/R12..R15` and
-/// `XMM6..XMM15` at the `NtCallbackReturn` syscall belong to `wow64win`, not to
-/// the `win32u` frame the original syscall must resume into.
 pub(crate) struct ClientCbState {
-    /// RBX, RBP, RSI, RDI, R12, R13, R14, R15.
     gpr: [u64; 8],
-    /// XMM6..=XMM15.
     xmm: [u128; 10],
 }
 
-/// The non-volatile GPRs, in the order [`ClientCbState::gpr`] stores them.
 const CLIENT_CB_GPRS: [Reg; 8] =
     [Reg::Rbx, Reg::Rbp, Reg::Rsi, Reg::Rdi, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
-/// First XMM register [`ClientCbState::xmm`] covers (through XMM15).
 const CLIENT_CB_XMM_FIRST: u8 = 6;
 
-/// Bytes of sub-4 GiB scratch per win32k callback nesting level.
 const WOW64_CB_SCRATCH_BLOCK: u64 = 0x400;
-/// Nesting levels the scratch covers.
 const WOW64_CB_SCRATCH_DEPTH: u64 = 16;
 
-/// `NtCallbackReturn(void *ret_ptr, ULONG ret_len, NTSTATUS status)` — SSDT
-/// index 5 (roadmap W5.10). See
-/// [`WinOs::client_callback_return`](WinOs::client_callback_return).
 pub(crate) fn ssdt_nt_callback_return(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let ret_ptr = os.syscall_arg(cpu, mem, 0)?;
     let ret_len = os.syscall_arg(cpu, mem, 1)? as u32;
@@ -151,8 +78,6 @@ impl ClientCbState {
     }
 }
 
-/// Every Windows symbol the emulator implements natively. Anything else
-/// becomes [`Api::Unsupported`] and returns 0.
 #[derive(Debug, Clone)]
 pub enum Api {
     GetStdHandle,
@@ -173,40 +98,25 @@ pub enum Api {
     VirtualFree,
     VirtualProtect,
     VirtualQuery,
-    /// Real synchronization objects (roadmap P3.6), see [`crate::sync`].
     CreateSync { kind: crate::sync::SyncKind, ex: bool, wide: bool },
     OpenSync { wide: bool },
     SignalSync { op: crate::sync::SignalOp },
     WaitSingle { ex: bool },
     WaitMultiple { ex: bool },
-    /// Threads + cooperative scheduler (roadmap P3.4), see [`crate::thread`].
     CreateThread,
     ExitThread,
-    /// A thread start-routine returned to the thread-exit thunk.
     ThreadExit,
     ResumeThread,
     SuspendThread,
     TerminateThread,
     GetExitCodeThread,
-    /// `CreateProcessA`/`CreateProcessW` on the **emulated** path (roadmap
-    /// W3.5). The Wine boot reaches child creation through kernelbase and
-    /// `NtCreateUserProcess` instead; both meet in the same process objects.
     CreateProcessApi { wide: bool },
-    /// `GetExitCodeProcess(hProcess, *code)` — the emulated-path counterpart of
-    /// `NtQueryInformationProcess(ProcessBasicInformation)`.
     GetExitCodeProcessApi,
     SwitchToThread,
-    /// Sleep (argc 1) / SleepEx (argc 2), both cooperative-scheduler yields.
     SleepApi { ex: bool },
-    /// Win32 message queue (roadmap P5a.1), see [`crate::msg`].
     PostMessageApi,
     PostThreadMessageApi,
     TranslateMessageApi,
-    /// EncodePointer/DecodePointer (and the Rtl*/System variants): the CRT's
-    /// pointer-obfuscation pair. The only invariant that matters is that
-    /// Decode(Encode(p)) == p, so both are the identity on their argument.
-    /// Returning 0 here (the old stub behaviour) turns a guarded call through
-    /// an "encoded" function pointer into a null call — a hard fault.
     EncodeDecodePointer,
     GetLastError,
     SetLastError,
@@ -231,66 +141,37 @@ pub enum Api {
     GetEnvironmentVariable { wide: bool },
     SetEnvironmentVariable { wide: bool },
     ExpandEnvironmentStrings { wide: bool },
-    /// The codepage-conversion pair. We present the ANSI codepage as UTF-8
-    /// (`GetACP` → 65001), so both directions are UTF-16 ⇄ UTF-8. Returning 0
-    /// (the old stub) breaks the CRT's environment/argv setup, which converts
-    /// its wide strings to narrow with these.
     WideCharToMultiByte,
     MultiByteToWideChar,
     FreeLibrary,
     DisableThreadLibraryCalls,
     GetProcAddress,
 
-    /// Thread/Fiber Local Storage (`Tls*`/`Fls*`). We run single-threaded, so
-    /// a fiber slot behaves exactly like a thread slot; `fiber` only selects
-    /// which slot namespace is used. These must actually round-trip: the MSVC
-    /// CRT stores its per-thread-data pointer via `FlsSetValue` and reads it
-    /// back with `FlsGetValue`; if the set is stubbed to fail (BOOL 0) the CRT
-    /// aborts at startup with "R6016 - not enough space for thread data".
     TlsAlloc { fiber: bool },
     TlsSetValue { fiber: bool },
     TlsGetValue { fiber: bool },
     TlsFree { fiber: bool },
 
-    // --- msvcrt C runtime -------------------------------------------------
     Malloc,
     Calloc,
     Realloc,
     Free,
-    /// memcpy / memmove (both implemented overlap-safe).
     Memcpy,
     Memset,
     Memcmp,
     Strlen,
-    /// The C `exit` family — terminate with the argument.
     CrtExit,
-    /// __getmainargs / __wgetmainargs — populate argc/argv/env.
     GetMainArgs,
-    /// _initterm / _initterm_e — run a table of initializer callbacks.
     Initterm,
-    /// Not an import: the thunk that sequences `_initterm` callbacks.
     InittermDriver,
-    /// `__EH_prolog` — MSVC 32-bit C++ SEH frame prolog helper. Called with
-    /// `eax` = the function's scopetable/handler pointer and `[esp]` = the
-    /// return address into the caller. It links a fresh EXCEPTION_REGISTRATION
-    /// frame at `fs:[0]`, saves the caller's `ebp`, repoints `ebp` into the
-    /// frame and returns to the caller (esp ends 16 bytes below the pre-`call`
-    /// value). The no-op stub left `ebp`/`esp`/`fs:[0]` wrong, so the caller's
-    /// next `ebp`-relative store faulted. 32-bit only (guarded to `Bits::B32`).
     EhProlog,
-    /// A CRT startup/teardown hook we can safely no-op, returning 0.
     CrtNoop,
-    /// A CRT global-accessor (`__p__fmode`, `__p__commode`, `__p___argc`, …):
-    /// returns a writable pointer to a per-name backing cell. The CRT does
-    /// `*__p__fmode() = _fmode`, so this must be a real pointer, not 0.
     CrtGlobalPtr { name: String },
-    // C stdio output (routed to the host console).
     Fputs,
     Fputc,
     Fwrite,
     Puts,
 
-    // --- Win32 string helpers (kernel32/user32) ---------------------------
     CharNextA,
     CharNextW,
     CharPrevW,
@@ -301,16 +182,11 @@ pub enum Api {
     LstrcatW,
     LstrcmpW,
     LstrcmpiW,
-    /// A handle/pointer-returning Win32 stub that must be non-null for the
-    /// caller to proceed; returns a fake handle. Carries its stdcall argc.
     FakeHandle { sym: String, argc: u32 },
 
-    // --- Filesystem (host-backed sandbox) ---------------------------------
     CreateFile { wide: bool },
     ReadFileApi,
     CloseHandle,
-    /// `wide` selects LPCWSTR (W) vs LPCSTR (A) marshalling; these file APIs are
-    /// otherwise identical (roadmap P3.9).
     CreateDirectory { wide: bool },
     GetTempPathW,
     GetTempFileNameW,
@@ -319,20 +195,12 @@ pub enum Api {
     GetFileAttributes { wide: bool },
     DeleteFile { wide: bool },
     GetModuleFileNameW,
-    /// FindFirstFile[Ex][AW] — begin a sandbox directory scan; `ex` selects which
-    /// register holds the find-data buffer pointer (arg1 for the plain form,
-    /// arg2 for the Ex form whose arg1 is fInfoLevelId); `wide` selects the
-    /// WIN32_FIND_DATAW vs …A layout.
     FindFirstFile { ex: bool, wide: bool },
     FindNextFile { wide: bool },
     FindClose,
-    /// GetFullPathName[AW](lpFileName, nBufferLength, lpBuffer, lpFilePart).
     GetFullPathName { wide: bool },
-    /// MoveFile[AW] / MoveFileEx[AW] (rename within the sandbox).
     MoveFile { wide: bool, ex: bool },
-    /// CopyFile[AW](src, dst, bFailIfExists).
     CopyFile { wide: bool },
-    /// SetFileTime(handle, ct, at, mt) — accepted, no-op on the host file.
     SetFileTimeApi,
     GlobalAlloc,
     GlobalReAlloc,
@@ -343,14 +211,8 @@ pub enum Api {
     GetSystemDirectoryW,
     GetWindowsDirectoryW,
 
-    // --- GUI: dialog driving + control text -------------------------------
-    /// Not an import: drives a queued sequence of guest callbacks.
     CallbackDriver,
-    /// Not an import: the return thunk for a WndProc invoked from a win32k
-    /// syscall (roadmap W4.6). When the guest WndProc returns to it, the
-    /// interrupted `NtUser*` syscall is resumed.
     Win32kCbDriver,
-    /// CreateDialogParamW / DialogBoxParamW — invoke the DLGPROC.
     CreateDialogParam { modal: bool },
     SetDlgItemTextW,
     GetDlgItemTextW,
@@ -358,7 +220,6 @@ pub enum Api {
     SendMessageApi,
     SetWindowTextApi,
     GetWindowTextApi,
-    /// Real window-object queries (roadmap P5a.2), see [`crate::win`].
     WindowLong { set: bool },
     IsWindowApi,
     GetWindowRectApi,
@@ -367,13 +228,11 @@ pub enum Api {
     SetPropApi { wide: bool },
     GetPropApi { wide: bool },
     RemovePropApi { wide: bool },
-    /// Painting model (roadmap P5a.4).
     InvalidateRectApi,
     ValidateRectApi,
     GetUpdateRectApi,
     GetDCApi,
     ReleaseDCApi,
-    /// Focus/capture/input + geometry (roadmap P5a.3).
     SetFocusApi,
     GetFocusApi,
     SetCaptureApi,
@@ -386,15 +245,11 @@ pub enum Api {
     GetMessageApi,
     PeekMessageApi,
     IsDialogMessageApi,
-    /// COM object creation — we have no COM, so fail cleanly (null out the
-    /// interface pointer and return an error HRESULT) instead of returning
-    /// S_OK with a null interface, which callers dereference and crash on.
     CoCreateInstanceApi,
     DestroyWindowApi,
     PostQuitMessageApi,
     EndDialogApi,
 
-    // --- custom (CreateWindowEx) windows + GDI ----------------------------
     RegisterClassApi { ex: bool },
     CreateWindowExApi,
     DefWindowProcApi,
@@ -408,7 +263,6 @@ pub enum Api {
     SetTextColorApi,
     CreateSolidBrushApi,
     CreatePenApi,
-    /// GDI device-context objects (roadmap P5b.1).
     CreateFontApi,
     GetObjectApi { wide: bool },
     SaveDCApi,
@@ -420,78 +274,24 @@ pub enum Api {
     MoveToExApi,
     LineToApi,
     SetPixelApi,
-    /// Accepted window/GDI stubs that just return `r` (ShowWindow,
-    /// UpdateWindow, TranslateMessage, DeleteObject, ...).
     WinStub { r: u64, argc: u32 },
-    /// wsprintf(A/W): format into a caller buffer (subset of format specs).
     WsprintfApi { wide: bool },
-    /// MessageBox(A/W): echo the caption/text to the console and answer IDOK,
-    /// so a program that reports status or an error keeps running instead of
-    /// getting a bogus 0 (not a valid dialog result).
     MessageBoxApi { wide: bool },
-    /// GetUserObjectInformation(A/W): report the process window station as a
-    /// visible, interactive session (UOI_FLAGS → WSF_VISIBLE) so a GUI program
-    /// that gates on an interactive desktop proceeds instead of erroring out.
     GetUserObjectInfoApi,
-    /// LoadLibrary(Ex)(A/W): load a DLL, return a module handle. `argc` is 1
-    /// for the plain form and 3 for the Ex form (32-bit stack cleanup).
     LoadLibraryApi { wide: bool, argc: u32 },
 
-    // --- x64 exception machinery (roadmap P4.3) ---------------------------
-    /// `RtlCaptureContext(ctx)` — fill the guest CONTEXT with the caller's
-    /// register state (RIP = return address, RSP = post-return stack).
     RtlCaptureContext,
-    /// `RtlLookupFunctionEntry(pc, *base, *hist)` — return the guest VA of the
-    /// RUNTIME_FUNCTION covering `pc`, or 0; write the image base out.
     RtlLookupFunctionEntry,
-    /// `RtlVirtualUnwind(type, base, pc, fn, ctx, *data, *frame, ptrs)` — unwind
-    /// `ctx` one frame; return the frame's language handler (or 0), writing the
-    /// establisher frame and handler-data pointers out.
     RtlVirtualUnwind,
-    /// `RtlPcToFileHeader(pc, *base)` — return the image base if `pc` is inside
-    /// the image (write it out too), else 0.
     RtlPcToFileHeader,
-    /// `LdrGetDllHandle(DllPath, DllCharacteristics, DllName, *DllHandle)` —
-    /// the NT loader's "is this module already loaded?" query (roadmap W5.1).
-    ///
-    /// Serviced natively because on the WoW64 boot path **exemu is the loader**:
-    /// it maps the module set and builds the process, so it — not Wine's
-    /// `LdrGetDllHandleEx` (which walks a hash table only `loader_init` fills) —
-    /// is what knows the answer. `wow64cpu!BTCpuProcessInit` calls this first
-    /// thing to find the 64-bit `ntdll` it then resolves
-    /// `__wine_unix_call_dispatcher` out of.
     LdrGetDllHandle,
-    /// `LdrLoadDll(DllPath, DllCharacteristics, DllName, *DllHandle)` — the NT
-    /// loader's "map this module" entry (roadmap W5.7).
-    ///
-    /// Serviced natively for the **WoW64 module set only**. `wow64.dll`'s
-    /// process init loads `wow64cpu.dll` and `wow64win.dll` through this call
-    /// (its own `load_dll` helper, rva 0x4180, builds a system-directory path
-    /// and hands it to `LdrLoadDll`), but the WoW64 boot deliberately does not
-    /// run Wine's 64-bit `loader_init`, so Wine's own `LdrLoadDll` has no
-    /// module list to add to. exemu has already mapped both images, so this
-    /// hands back their bases. A name that is **not** part of the WoW64 set is
-    /// refused with `STATUS_DLL_NOT_FOUND` rather than quietly loaded from
-    /// somewhere else.
     LdrLoadDll,
-    /// `RaiseException(code, flags, nargs, args)` / `RtlRaiseException` — start
-    /// dispatch: build the record, capture context, walk frames offering the
-    /// exception to each guest language handler (roadmap P4.3c).
     RaiseException,
-    /// `RtlUnwindEx(target, ip, record, retval, ctx, hist)` — unwind to the
-    /// target frame (running termination handlers) and transfer control there.
     RtlUnwindEx,
-    /// `SetUnhandledExceptionFilter(filter)` — install the last-chance filter.
     SetUnhandledExceptionFilter,
-    /// `UnhandledExceptionFilter(info)` — the default last-chance filter; we
-    /// report "execute the handler" so the CRT terminates cleanly.
     UnhandledExceptionFilter,
-    /// Not an import: drives re-entrant exception-handler calls.
     ExceptionDriver,
 
-    // --- In-memory registry hive (roadmap P3.12, partial) -----------------
-    // In-memory registry hive (roadmap P3.12), see [`crate::reg`]. `wide`
-    // selects LPCWSTR (W) vs LPCSTR (A) name marshalling.
     RegCreate { wide: bool },
     RegOpen { wide: bool },
     RegSet { wide: bool },
@@ -503,25 +303,11 @@ pub enum Api {
     RegEnumValue { wide: bool },
     RegQueryInfoKey,
 
-    /// Not an import: the `__wine_unix_call` fast-path thunk (roadmap W2.4). The
-    /// loader stores this thunk's address in ntdll's `__wine_unix_call_dispatcher`
-    /// pointer; the guest's indirect `call` lands here with RCX = unixlib handle,
-    /// EDX = code, R8 = args pointer. See [`crate::unixlib`].
     WineUnixCall,
 
-    /// Not an import: the sentinel return address pushed under the entry
-    /// point. If the entry `ret`s here, terminate with the code in EAX.
     ReturnExit,
-    /// Not an import: a new thread's initial `rip` when the image has TLS
-    /// callbacks. Its interception fires the `DLL_THREAD_ATTACH` callbacks
-    /// before the thread's start routine (roadmap W0.3).
     ThreadTlsAttach,
-    /// Not an import: the target the TLS-attach callbacks drain to; seats the
-    /// real `start_routine(parameter)` frame (roadmap W0.3).
     ThreadStartEntry,
-    /// A recognized-by-shape but unimplemented import (`dll!name`). We still
-    /// record its stdcall argument count (from a table) so 32-bit stack
-    /// cleanup stays correct even though the behavior is a stub.
     Unsupported { sym: String, argc: u32 },
 }
 
@@ -551,8 +337,6 @@ impl Api {
                 Api::EncodeDecodePointer
             }
 
-            // x64 exception machinery (ntdll), called by the guest CRT's
-            // language handlers to walk and unwind frames (roadmap P4.3).
             "RtlCaptureContext" => Api::RtlCaptureContext,
             "RtlLookupFunctionEntry" => Api::RtlLookupFunctionEntry,
             "RtlVirtualUnwind" => Api::RtlVirtualUnwind,
@@ -571,14 +355,12 @@ impl Api {
             "IsDebuggerPresent" => Api::IsDebuggerPresent,
             "Sleep" => Api::SleepApi { ex: false },
             "SleepEx" => Api::SleepApi { ex: true },
-            // Threads + cooperative scheduler (roadmap P3.4).
             "CreateThread" | "_beginthreadex" => Api::CreateThread,
             "ExitThread" | "_endthreadex" => Api::ExitThread,
             "ResumeThread" => Api::ResumeThread,
             "SuspendThread" => Api::SuspendThread,
             "TerminateThread" => Api::TerminateThread,
             "GetExitCodeThread" => Api::GetExitCodeThread,
-            // Child processes (roadmap W3.5), see [`crate::process`].
             "CreateProcessW" => Api::CreateProcessApi { wide: true },
             "CreateProcessA" => Api::CreateProcessApi { wide: false },
             "GetExitCodeProcess" => Api::GetExitCodeProcessApi,
@@ -616,8 +398,6 @@ impl Api {
             "DisableThreadLibraryCalls" => Api::DisableThreadLibraryCalls,
             "GetProcAddress" => Api::GetProcAddress,
 
-            // Thread/Fiber Local Storage. FLS shares the TLS implementation
-            // (single-threaded); only the slot namespace differs.
             "TlsAlloc" => Api::TlsAlloc { fiber: false },
             "TlsSetValue" => Api::TlsSetValue { fiber: false },
             "TlsGetValue" => Api::TlsGetValue { fiber: false },
@@ -627,7 +407,6 @@ impl Api {
             "FlsGetValue" => Api::TlsGetValue { fiber: true },
             "FlsFree" => Api::TlsFree { fiber: true },
 
-            // msvcrt / UCRT C runtime.
             "malloc" => Api::Malloc,
             "calloc" => Api::Calloc,
             "realloc" => Api::Realloc,
@@ -640,19 +419,12 @@ impl Api {
             "__getmainargs" | "__wgetmainargs" => Api::GetMainArgs,
             "_initterm" | "_initterm_e" => Api::Initterm,
 
-            // MSVC 32-bit C++ SEH frame prolog helper. Builds an
-            // EXCEPTION_REGISTRATION frame, links it at fs:[0] and repoints ebp
-            // into it, then returns to the caller. The classic `__EH_prolog`
-            // pairs with an *inline* epilog (no helper call), so only the
-            // prolog needs a native implementation. x64 uses table-based
-            // unwind, so this never fires in 64-bit.
             "_EH_prolog" | "__EH_prolog" => Api::EhProlog,
             "fputs" => Api::Fputs,
             "fputc" | "putc" | "putchar" => Api::Fputc,
             "fwrite" => Api::Fwrite,
             "puts" => Api::Puts,
 
-            // Win32 string helpers.
             "CharNextA" => Api::CharNextA,
             "CharNextW" => Api::CharNextW,
             "CharPrevW" => Api::CharPrevW,
@@ -664,7 +436,6 @@ impl Api {
             "lstrcmpW" | "lstrcmpA" => Api::LstrcmpW,
             "lstrcmpiW" | "lstrcmpiA" => Api::LstrcmpiW,
 
-            // Filesystem.
             "CreateFileW" => Api::CreateFile { wide: true },
             "CreateFileA" => Api::CreateFile { wide: false },
             "ReadFile" => Api::ReadFileApi,
@@ -694,7 +465,6 @@ impl Api {
             "GetSystemDirectoryW" => Api::GetSystemDirectoryW,
             "GetWindowsDirectoryW" | "GetSystemWindowsDirectoryW" => Api::GetWindowsDirectoryW,
 
-            // GUI dialog driving.
             "CreateDialogParamW" => Api::CreateDialogParam { modal: false },
             "DialogBoxParamW" => Api::CreateDialogParam { modal: true },
             "SetDlgItemTextW" => Api::SetDlgItemTextW,
@@ -706,7 +476,6 @@ impl Api {
             "TranslateMessage" => Api::TranslateMessageApi,
             "SetWindowTextW" => Api::SetWindowTextApi,
             "GetWindowTextW" => Api::GetWindowTextApi,
-            // Real window-object queries (roadmap P5a.2).
             "GetWindowLongW" | "GetWindowLongA" | "GetWindowLongPtrW" | "GetWindowLongPtrA" => {
                 Api::WindowLong { set: false }
             }
@@ -724,13 +493,11 @@ impl Api {
             "GetPropA" => Api::GetPropApi { wide: false },
             "RemovePropW" => Api::RemovePropApi { wide: true },
             "RemovePropA" => Api::RemovePropApi { wide: false },
-            // Painting model (roadmap P5a.4).
             "InvalidateRect" => Api::InvalidateRectApi,
             "ValidateRect" => Api::ValidateRectApi,
             "GetUpdateRect" => Api::GetUpdateRectApi,
             "GetDC" | "GetWindowDC" => Api::GetDCApi,
             "ReleaseDC" => Api::ReleaseDCApi,
-            // Focus/capture/input + geometry (roadmap P5a.3).
             "SetFocus" => Api::SetFocusApi,
             "GetFocus" => Api::GetFocusApi,
             "SetCapture" => Api::SetCaptureApi,
@@ -759,18 +526,8 @@ impl Api {
             | "_configure_narrow_argv" | "_initialize_narrow_environment"
             | "_get_initial_narrow_environment" | "_set_app_type" => Api::CrtNoop,
 
-            // The CRT global-accessor family (`__p__fmode`, `__p___argc`, …):
-            // every such function returns a pointer to a runtime global.
             n if n.starts_with("__p_") => Api::CrtGlobalPtr { name: n.to_string() },
 
-            // Handle/pointer-returning Win32 functions: return a non-null
-            // fake handle so GUI setup "succeeds" and the program proceeds.
-            // BOOL-returning functions that must report success (non-zero)
-            // so callers don't treat setup as failed and bail/throw.
-            // HeapCreate must yield a non-null heap handle: the older MSVC CRT
-            // creates its own heap here and calls _amsg_exit ("Runtime Error!")
-            // if it fails. Our HeapAlloc ignores the handle and bump-allocates,
-            // so any non-null handle works.
             "HeapCreate"
             | "SetConsoleCtrlHandler" | "SetConsoleTitleW" | "SetConsoleTitleA"
             | "FlushConsoleInputBuffer"
@@ -779,10 +536,6 @@ impl Api {
             | "LoadImageW" | "LoadImageA"
             | "LoadBitmapW" | "GetSystemMenu" | "CreatePopupMenu" | "CreateBrushIndirect"
             | "FindWindowExW" | "SetTimer" | "GetModuleHandleExW"
-            // Window-station / desktop / window handles: a console app that
-            // probes its station (Total Commander does) treats a null result
-            // as "no interactive session" and exits with an error box, so hand
-            // back a non-null handle and let it proceed.
             | "GetProcessWindowStation" | "GetThreadDesktop" | "OpenDesktopW"
             | "OpenInputDesktopW" | "GetDesktopWindow" | "GetActiveWindow"
             | "GetForegroundWindow" | "GetShellWindow" | "GetCurrentThread"
@@ -790,7 +543,6 @@ impl Api {
                 Api::FakeHandle { sym: format!("{dll}!{name}"), argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
-            // Custom windows + GDI.
             "RegisterClassW" | "RegisterClassA" => Api::RegisterClassApi { ex: false },
             "RegisterClassExW" | "RegisterClassExA" => Api::RegisterClassApi { ex: true },
             "CreateWindowExW" | "CreateWindowExA" => Api::CreateWindowExApi,
@@ -817,7 +569,6 @@ impl Api {
             "MoveToEx" => Api::MoveToExApi,
             "LineTo" => Api::LineToApi,
             "SetPixel" | "SetPixelV" => Api::SetPixelApi,
-            // Accepted no-effect window/GDI stubs.
             "UpdateWindow" | "DeleteObject"
             | "GetSysColor" | "GetSystemMetrics" => {
                 let r = match name {
@@ -828,24 +579,14 @@ impl Api {
                 Api::WinStub { r, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
-            // Heap-management no-ops that must report success (the single bump
-            // arena is never actually destroyed or reconfigured).
             "HeapDestroy" | "HeapValidate" | "HeapSetInformation" | "HeapCompact" => {
                 Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
-            // DLL search-path setters (BOOL): we have a single flat module map,
-            // so these are no-ops — but they MUST report success. A FALSE return
-            // can push callers onto an error path, and (more importantly) the
-            // looked-up argc keeps the 32-bit stdcall stack balanced (each takes
-            // one DWORD/pointer arg; argc 0 leaked esp and crashed Firefox).
             "SetDefaultDllDirectories" | "SetDllDirectoryW" | "SetDllDirectoryA" => {
                 Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
-            // Critical sections / interlocked list heads: we run single-threaded,
-            // so these are no-ops — but the BOOL-returning ones must report
-            // success (the CRT aborts with "Runtime Error!" if lock init fails).
             "InitializeCriticalSection" | "InitializeCriticalSectionEx"
             | "InitializeCriticalSectionAndSpinCount" | "EnterCriticalSection"
             | "LeaveCriticalSection" | "DeleteCriticalSection" | "TryEnterCriticalSection"
@@ -853,25 +594,12 @@ impl Api {
                 Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
-            // SxS / activation-context stubs (W0.8).
-            //
-            // These are stubbed here to keep the stack balanced; real query
-            // semantics arrive in W3 when Wine's ntdll drives them as guest code.
-            //
-            // CreateActCtxW/A: returns a non-null fake handle so callers do not
-            // error out. The argc table already carries the right counts.
             "CreateActCtxA" | "CreateActCtxW" => {
                 Api::FakeHandle {
                     sym: format!("{dll}!{name}"),
                     argc: win32_argc(dll, name).unwrap_or(0),
                 }
             }
-            // ActivateActCtx(hActCtx, lpCookie) → BOOL TRUE; writes the cookie
-            // slot is a no-op (lpCookie may be null; we do not dereference it).
-            // DeactivateActCtx(dwFlags, ulCookie) → BOOL TRUE.
-            // AddRefActCtx / ZombifyActCtx / ReleaseActCtx → void (return 0).
-            // GetCurrentActCtx(lphActCtx) → BOOL FALSE (no active context yet).
-            // Find/Query → BOOL FALSE (section not found / query not serviced).
             "ActivateActCtx" | "DeactivateActCtx"
             | "AddRefActCtx" | "ZombifyActCtx" | "ReleaseActCtx" => {
                 Api::WinStub { r: TRUE, argc: win32_argc(dll, name).unwrap_or(0) }
@@ -883,8 +611,6 @@ impl Api {
                 Api::WinStub { r: FALSE, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
-            // Event/mutex/semaphore/waitable-timer objects with real signaling
-            // state (roadmap P3.6), see [`crate::sync`].
             "CreateEventA" | "CreateEventW" => Api::CreateSync { kind: SyncKind::Event, ex: false, wide: name.ends_with('W') },
             "CreateEventExA" | "CreateEventExW" => Api::CreateSync { kind: SyncKind::Event, ex: true, wide: name.ends_with('W') },
             "CreateMutexA" | "CreateMutexW" => Api::CreateSync { kind: SyncKind::Mutex, ex: false, wide: name.ends_with('W') },
@@ -905,13 +631,10 @@ impl Api {
             "WaitForMultipleObjects" => Api::WaitMultiple { ex: false },
             "WaitForMultipleObjectsEx" => Api::WaitMultiple { ex: true },
 
-            // wsprintf: real (subset) formatting — installers rely on it.
             "wsprintfW" | "wsprintfA" => Api::WsprintfApi { wide: name.ends_with('W') },
             "MessageBoxW" | "MessageBoxA" => Api::MessageBoxApi { wide: name.ends_with('W') },
             "GetUserObjectInformationW" | "GetUserObjectInformationA" => Api::GetUserObjectInfoApi,
 
-            // In-memory registry hive (roadmap P3.12): real round-trip +
-            // enumeration in both W and A variants (see [`crate::reg`]).
             "RegCreateKeyExW" | "RegCreateKeyW" => Api::RegCreate { wide: true },
             "RegCreateKeyExA" | "RegCreateKeyA" => Api::RegCreate { wide: false },
             "RegOpenKeyExW" | "RegOpenKeyW" => Api::RegOpen { wide: true },
@@ -930,13 +653,10 @@ impl Api {
             "RegEnumValueW" => Api::RegEnumValue { wide: true },
             "RegEnumValueA" => Api::RegEnumValue { wide: false },
             "RegQueryInfoKeyW" | "RegQueryInfoKeyA" => Api::RegQueryInfoKey,
-            // Lesser-used probes still stub: flush is a no-op success; change
-            // notification returns success (we never signal a change).
             "RegFlushKey" | "RegNotifyChangeKeyValue" => {
-                Api::WinStub { r: 0, argc: win32_argc(dll, name).unwrap_or(0) } // ERROR_SUCCESS
+                Api::WinStub { r: 0, argc: win32_argc(dll, name).unwrap_or(0) }
             }
 
-            // Directory enumeration against the sandbox (W and A variants).
             "FindFirstFileW" => Api::FindFirstFile { ex: false, wide: true },
             "FindFirstFileExW" => Api::FindFirstFile { ex: true, wide: true },
             "FindFirstFileA" => Api::FindFirstFile { ex: false, wide: false },
@@ -952,9 +672,6 @@ impl Api {
         }
     }
 
-    /// Number of 4-byte stack arguments to clean off in 32-bit stdcall mode
-    /// (the Win32 default: the callee pops its arguments). cdecl functions
-    /// (the C runtime) and internal thunks return 0. Ignored in 64-bit mode.
     pub(crate) fn argc(&self) -> u32 {
         match self {
             Api::GetStdHandle => 1,
@@ -972,15 +689,14 @@ impl Api {
             Api::VirtualFree => 3,
             Api::VirtualProtect => 4,
             Api::VirtualQuery => 3,
-            // Synchronization-object argc (stdcall cleanup in 32-bit mode).
             Api::CreateSync { kind, ex, .. } => match (kind, ex) {
-                (SyncKind::Event, _) => 4,           // Create/CreateEx both 4
-                (SyncKind::Mutex, false) => 3,       // (attr, owner, name)
-                (SyncKind::Mutex, true) => 4,        // (attr, name, flags, access)
-                (SyncKind::Semaphore, false) => 4,   // (attr, init, max, name)
-                (SyncKind::Semaphore, true) => 6,    // + flags, access
-                (SyncKind::Timer, false) => 3,       // (attr, manual, name)
-                (SyncKind::Timer, true) => 4,        // (attr, name, flags, access)
+                (SyncKind::Event, _) => 4,
+                (SyncKind::Mutex, false) => 3,
+                (SyncKind::Mutex, true) => 4,
+                (SyncKind::Semaphore, false) => 4,
+                (SyncKind::Semaphore, true) => 6,
+                (SyncKind::Timer, false) => 3,
+                (SyncKind::Timer, true) => 4,
             },
             Api::OpenSync { .. } => 3,
             Api::SignalSync { op } => match op {
@@ -989,30 +705,23 @@ impl Api {
             },
             Api::WaitSingle { ex } => if *ex { 3 } else { 2 },
             Api::WaitMultiple { ex } => if *ex { 5 } else { 4 },
-            // Threads (roadmap P3.4).
             Api::CreateThread => 6,
             Api::ExitThread => 1,
             Api::ThreadExit => 0,
             Api::ResumeThread | Api::SuspendThread => 1,
             Api::TerminateThread | Api::GetExitCodeThread | Api::GetExitCodeProcessApi => 2,
-            // CreateProcess[AW](appName, cmdLine, procAttr, threadAttr, inherit,
-            // flags, env, curDir, startupInfo, processInformation).
             Api::CreateProcessApi { .. } => 10,
             Api::SwitchToThread => 0,
             Api::SleepApi { ex } => if *ex { 2 } else { 1 },
-            // Message queue (roadmap P5a.1).
             Api::PostMessageApi | Api::PostThreadMessageApi => 4,
             Api::TranslateMessageApi => 1,
-            // Window-object queries (roadmap P5a.2).
             Api::IsWindowApi => 1,
             Api::WindowLong { set: false } | Api::GetWindowRectApi | Api::ShowWindowApi
             | Api::GetPropApi { .. } | Api::RemovePropApi { .. } => 2,
             Api::WindowLong { set: true } | Api::SetPropApi { .. } | Api::GetClassNameApi { .. } => 3,
-            // Painting model (roadmap P5a.4).
             Api::GetDCApi => 1,
             Api::ValidateRectApi | Api::ReleaseDCApi => 2,
             Api::InvalidateRectApi | Api::GetUpdateRectApi => 3,
-            // Focus/capture/input + geometry (roadmap P5a.3).
             Api::GetFocusApi | Api::GetCaptureApi | Api::ReleaseCaptureApi => 0,
             Api::SetFocusApi | Api::SetCaptureApi | Api::GetKeyStateApi | Api::GetCursorPosApi => 1,
             Api::MoveWindowApi => 6,
@@ -1041,21 +750,17 @@ impl Api {
             Api::FreeLibrary => 1,
             Api::DisableThreadLibraryCalls => 1,
             Api::GetProcAddress => 2,
-            // TlsAlloc() takes no args; FlsAlloc(callback) takes one.
             Api::TlsAlloc { fiber } => *fiber as u32,
             Api::TlsGetValue { .. } | Api::TlsFree { .. } => 1,
             Api::TlsSetValue { .. } => 2,
-            // cdecl C runtime and internal thunks: caller cleans up.
             Api::Malloc | Api::Calloc | Api::Realloc | Api::Free | Api::Memcpy | Api::Memset
             | Api::Memcmp | Api::Strlen | Api::CrtExit | Api::GetMainArgs | Api::Initterm
             | Api::CrtNoop | Api::CrtGlobalPtr { .. } | Api::InittermDriver | Api::ReturnExit
             | Api::WineUnixCall | Api::ThreadTlsAttach | Api::ThreadStartEntry
             | Api::Fputs | Api::Fputc | Api::Fwrite | Api::Puts | Api::EhProlog => 0,
-            // Win32 string helpers.
             Api::CharNextA | Api::CharNextW | Api::LstrlenA | Api::LstrlenW => 1,
             Api::CharPrevW | Api::LstrcpyW | Api::LstrcatW | Api::LstrcmpW | Api::LstrcmpiW => 2,
             Api::LstrcpynW => 3,
-            // Filesystem.
             Api::CloseHandle | Api::DeleteFile { .. } | Api::GetFileAttributes { .. } | Api::GlobalLock
             | Api::GlobalFreeUnlock | Api::FindClose => 1,
             Api::FindFirstFile { ex: false, .. } | Api::FindNextFile { .. } | Api::MoveFile { ex: false, .. } => 2,
@@ -1064,7 +769,6 @@ impl Api {
             Api::GetFullPathName { .. } | Api::SetFileTimeApi => 4,
             Api::GetVersion => 0,
             Api::GetVersionEx => 1,
-            // GUI.
             Api::CallbackDriver | Api::Win32kCbDriver => 0,
             Api::GetDlgItemApi | Api::GetWindowTextApi => 2,
             Api::SetWindowTextApi | Api::IsDialogMessageApi | Api::EndDialogApi => 2,
@@ -1080,7 +784,6 @@ impl Api {
             Api::SetFilePointerApi | Api::GetTempFileNameW => 4,
             Api::ReadFileApi => 5,
             Api::CreateFile { .. } => 7,
-            // Custom windows + GDI.
             Api::RegisterClassApi { .. } | Api::CreateSolidBrushApi | Api::GetStockObjectApi
             | Api::DispatchMessageApi | Api::CreateFontApi | Api::SaveDCApi => 1,
             Api::BeginPaintApi | Api::EndPaintApi | Api::GetClientRectApi | Api::SetTextColorApi
@@ -1089,18 +792,13 @@ impl Api {
             Api::DefWindowProcApi | Api::MoveToExApi | Api::SetPixelApi => 4,
             Api::RectangleApi | Api::TextOutApi => 5,
             Api::CreateWindowExApi => 12,
-            // Variadic cdecl — caller cleans up.
             Api::WsprintfApi { .. } => 0,
             Api::MessageBoxApi { .. } => 4,
             Api::GetUserObjectInfoApi => 5,
-            // x64-only ntdll exception APIs: no 32-bit stdcall footprint.
             Api::RtlCaptureContext | Api::RtlLookupFunctionEntry | Api::RtlVirtualUnwind
             | Api::RtlPcToFileHeader | Api::RaiseException | Api::RtlUnwindEx
             | Api::ExceptionDriver | Api::LdrGetDllHandle | Api::LdrLoadDll => 0,
-            // SetUnhandledExceptionFilter is stdcall(1) on 32-bit; the filter
-            // itself (UnhandledExceptionFilter) takes one pointer arg too.
             Api::SetUnhandledExceptionFilter | Api::UnhandledExceptionFilter => 1,
-            // Registry hive (roadmap P3.12).
             Api::RegClose => 1,
             Api::RegDeleteValue { .. } | Api::RegDeleteKey { .. } => 2,
             Api::RegOpen { .. } => 5,
@@ -1108,8 +806,6 @@ impl Api {
             Api::RegEnumKey { .. } | Api::RegEnumValue { .. } => 8,
             Api::RegCreate { .. } => 9,
             Api::RegQueryInfoKey => 12,
-            // Fake-handle, stub and unimplemented carry their looked-up
-            // stdcall footprint so the stack stays balanced.
             Api::WinStub { argc, .. }
             | Api::FakeHandle { argc, .. }
             | Api::Unsupported { argc, .. } => *argc,
@@ -1117,20 +813,14 @@ impl Api {
     }
 }
 
-/// Stdcall argument count (number of 4-byte stack parameters) for common
-/// Win32 functions, so 32-bit callee stack cleanup is correct even when the
-/// function is only a stub. `None` means unknown (caller-cleanup fallback).
-/// `wsprintf*` are intentionally cdecl (variadic) → 0.
 pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
-    // A few ordinal imports we recognize by (dll, ordinal).
     if let Some(ord) = name.strip_prefix("#ord") {
         return match (dll, ord) {
-            ("comctl32.dll", "17") => Some(0), // InitCommonControls
+            ("comctl32.dll", "17") => Some(0),
             _ => None,
         };
     }
     let n = match name {
-        // --- 0 args ---
         "GetCommandLineW" | "GetLastError" | "GetTickCount" | "GetVersion" | "GetCurrentProcess"
         | "CloseClipboard" | "CreatePopupMenu" | "EmptyClipboard" | "GetMessagePos"
         | "OleUninitialize" | "wsprintfW" | "wsprintfA"
@@ -1138,11 +828,9 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "GetForegroundWindow" | "GetShellWindow" | "GetCurrentThread"
         | "GetConsoleWindow" | "SetConsoleTitleA" => 0,
 
-        // --- 1 arg ---
         "SetConsoleTitleW" | "FlushConsoleInputBuffer" | "SetHandleCount"
         | "InitializeCriticalSection" | "DeleteCriticalSection" | "EnterCriticalSection"
         | "LeaveCriticalSection" | "TryEnterCriticalSection" | "InitializeSListHead"
-        // Event/sync state changers: BOOL SetEvent(HANDLE) etc. — one handle.
         | "SetEvent" | "ResetEvent" | "PulseEvent" | "ReleaseMutex"
         | "CloseHandle" | "FindClose" | "FreeLibrary" | "GetFileAttributesW" | "DeleteFileW"
         | "GlobalFree" | "GlobalLock" | "GlobalUnlock" | "RemoveDirectoryW"
@@ -1155,17 +843,11 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "SHBrowseForFolderW" | "SHFileOperationW" | "OleInitialize" | "CoTaskMemFree"
         | "ImageList_Destroy" | "GetThreadDesktop" | "LoadCursorA" | "LoadIconA"
         | "HeapDestroy"
-        // DLL search-path setters: each takes one DWORD/pointer argument.
-        // BOOL SetDefaultDllDirectories(DWORD); BOOL SetDllDirectory[AW](LPCTSTR).
         | "SetDefaultDllDirectories" | "SetDllDirectoryW" | "SetDllDirectoryA"
-        // SxS/activation-context (W0.8): 1-arg forms.
-        // CreateActCtxW(PCACTCTXW) -> HANDLE; ReleaseActCtx / AddRefActCtx /
-        // ZombifyActCtx / GetCurrentActCtx take or return one pointer/handle.
         | "CreateActCtxA" | "CreateActCtxW"
         | "ReleaseActCtx" | "AddRefActCtx" | "ZombifyActCtx"
         | "GetCurrentActCtx" => 1,
 
-        // --- 2 args ---
         "SetConsoleCtrlHandler" | "SetThreadPriority"
         | "CompareFileTime" | "CreateDirectoryW" | "GetFileSize" | "GlobalAlloc" | "MoveFileW"
         | "SetEnvironmentVariableW" | "SetFileAttributesW" | "WaitForSingleObject"
@@ -1179,15 +861,9 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "SHGetPathFromIDListW" | "lstrcatW" | "lstrcmpW" | "lstrcmpiA" | "lstrcmpiW"
         | "lstrcpyA" | "lstrcpyW" | "FindFirstFileW" | "FindFirstFileA" | "FindNextFileW"
         | "FindNextFileA" | "RegNotifyChangeKeyValue"
-        // Window property list (nsDialogs attaches state to the dialog HWND).
         | "GetPropW" | "GetPropA" | "RemovePropW" | "RemovePropA"
-        // SxS/activation-context (W0.8): 2-arg forms.
-        // ActivateActCtx(HANDLE, PULONG_PTR); DeactivateActCtx(DWORD, ULONG_PTR).
         | "ActivateActCtx" | "DeactivateActCtx" => 2,
 
-        // --- 3 args ---
-        // BOOL ReleaseSemaphore(HANDLE, LONG, LPLONG); CreateMutex[AW](attr,
-        // bInitialOwner, name); WaitForSingleObjectEx(handle, ms, alertable).
         "ReleaseSemaphore" | "CreateMutexA" | "CreateMutexW"
         | "WaitForSingleObjectEx"
         | "ExpandEnvironmentStringsW" | "CopyFileW" | "SetFileSecurityW" | "LoadLibraryExW"
@@ -1198,11 +874,6 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "OpenInputDesktopW" | "HeapCreate" | "HeapValidate"
         | "InitializeCriticalSectionEx" | "SetPropW" | "SetPropA" => 3,
 
-        // --- 4 args ---
-        // HANDLE CreateEvent[AW](attr, bManualReset, bInitialState, name) — 4;
-        // CreateSemaphore[AW](attr, init, max, name) — 4; the *Ex event/mutex
-        // forms (attr, name, flags, access) — 4; WaitForMultipleObjects(count,
-        // handles, waitAll, ms) — 4.
         "CreateEventA" | "CreateEventW" | "CreateEventExA" | "CreateEventExW"
         | "CreateMutexExA" | "CreateMutexExW"
         | "CreateSemaphoreA" | "CreateSemaphoreW"
@@ -1213,31 +884,21 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
         | "SetTimer" | "SystemParametersInfoW" | "DrawTextW" | "FillRect" | "RegEnumKeyW"
         | "OpenDesktopW" | "HeapSetInformation" | "MapWindowPoints" => 4,
 
-        // --- 5 args ---
         "WaitForMultipleObjectsEx"
         | "ReadFile" | "WriteFile" | "GetDiskFreeSpaceW" | "CallWindowProcW" | "CreateDialogParamW"
         | "DialogBoxParamW" | "PeekMessageW" | "RegOpenKeyExW" | "SHGetFileInfoW"
         | "CoCreateInstance" | "ImageList_Create"
-        // SxS/activation-context (W0.8): 5-arg forms.
-        // FindActCtxSectionStringW/GuidW(dwFlags, rGuid, ulSectionId,
-        //                               lpStringToFind, pvFindData) — 5 args.
         | "FindActCtxSectionStringW" | "FindActCtxSectionStringA"
         | "FindActCtxSectionGuidW" => 5,
 
-        // --- 6 args ---
         "GetPrivateProfileStringW" | "SearchPathW" | "MultiByteToWideChar" | "CreateThread"
         | "LoadImageW" | "LoadImageA" | "AdjustTokenPrivileges" | "RegQueryValueExW"
         | "RegSetValueExW" | "ShellExecuteW" | "FindFirstFileExW" => 6,
 
-        // --- 7 args ---
         "CreateFileW" | "CreateFileA" | "SetWindowPos" | "SendMessageTimeoutW" | "TrackPopupMenu"
         | "RegGetValueW"
-        // QueryActCtxW(dwFlags, hActCtx, pvSubInstance, ulInfoClass,
-        //              pvBuffer, cbBuffer, lpcbWrittenOrRequired) — 7 args.
-        // Stub returns FALSE (not-found); real consumers arrive in W3 via Wine ntdll.
         | "QueryActCtxW" => 7,
 
-        // --- 8, 9, 10, 12 args ---
         "WideCharToMultiByte" | "RegEnumValueW" | "RegEnumKeyExW" => 8,
         "RegCreateKeyExW" => 9,
         "CreateWindowExW" | "RegQueryInfoKeyW" => 12,
@@ -1247,17 +908,13 @@ pub(crate) fn win32_argc(dll: &str, name: &str) -> Option<u32> {
     Some(n)
 }
 
-/// Windows TRUE / FALSE as BOOL return values.
 const TRUE: u64 = 1;
 const FALSE: u64 = 0;
 
-/// A non-null sentinel returned by handle/pointer-returning stubs so callers
-/// treat the operation as having succeeded and keep running.
 pub(crate) const FAKE_HANDLE: u64 = 0x00CA_FE00;
 
-// Synthetic window handles and the window messages the GUI shim understands.
 const HWND_DIALOG: u64 = 0x00D1_A000;
-const HWND_CONTROL: u64 = 0x00C0_0000; // control handle = HWND_CONTROL | id
+const HWND_CONTROL: u64 = 0x00C0_0000;
 const WM_SETTEXT: u32 = 0x000C;
 const WM_GETTEXT: u32 = 0x000D;
 const WM_GETTEXTLENGTH: u32 = 0x000E;
@@ -1265,13 +922,11 @@ const WM_INITDIALOG: u64 = 0x0110;
 const WM_COMMAND: u64 = 0x0111;
 const IDOK: u32 = 1;
 const IDCANCEL: u32 = 2;
-// Progress-bar (msctls_progress32) messages.
 const PBM_SETRANGE: u32 = 0x0401;
 const PBM_SETPOS: u32 = 0x0402;
 const PBM_DELTAPOS: u32 = 0x0403;
 const PBM_SETRANGE32: u32 = 0x0406;
 
-/// Recover the control id from a synthetic control handle, if it is one.
 fn control_id(hwnd: u64) -> Option<u32> {
     if (HWND_CONTROL..HWND_CONTROL + 0x1_0000).contains(&hwnd) {
         Some((hwnd - HWND_CONTROL) as u32)
@@ -1280,11 +935,6 @@ fn control_id(hwnd: u64) -> Option<u32> {
     }
 }
 
-/// Read a NUL-terminated UTF-16 string as code units (no terminator).
-/// The lower-cased **base name** carried by a 64-bit `UNICODE_STRING`
-/// (`{Length u16, MaximumLength u16, pad, Buffer u64}`), or `None` for a null
-/// pointer. `Length` is a byte count, and the buffer is not NUL-terminated —
-/// which is why this reads exactly `Length/2` code units rather than scanning.
 fn read_unicode_string_base_name(mem: &dyn Memory, us: u64) -> Result<Option<String>> {
     if us == 0 {
         return Ok(None);
@@ -1319,8 +969,6 @@ pub(crate) fn read_wstr_units(mem: &dyn Memory, addr: u64) -> Result<Vec<u16>> {
     Ok(v)
 }
 
-/// Write UTF-16 code units + NUL into a guest buffer bounded by `max` units.
-/// Returns the number of units written (excluding the terminator).
 fn write_wstr_units(mem: &mut dyn Memory, addr: u64, units: &[u16], max: usize) -> Result<u64> {
     if addr == 0 || max == 0 {
         return Ok(0);
@@ -1333,7 +981,6 @@ fn write_wstr_units(mem: &mut dyn Memory, addr: u64, units: &[u16], max: usize) 
     Ok(n as u64)
 }
 
-/// Read a NUL-terminated UTF-16 string from guest memory into a `String`.
 pub(crate) fn read_wstr(mem: &dyn Memory, addr: u64) -> Result<String> {
     if addr == 0 {
         return Ok(String::new());
@@ -1351,7 +998,6 @@ pub(crate) fn read_wstr(mem: &dyn Memory, addr: u64) -> Result<String> {
     Ok(String::from_utf16_lossy(&units))
 }
 
-/// Read a NUL-terminated ANSI (byte) string from guest memory.
 pub(crate) fn read_astr(mem: &dyn Memory, addr: u64) -> Result<String> {
     if addr == 0 {
         return Ok(String::new());
@@ -1369,7 +1015,6 @@ pub(crate) fn read_astr(mem: &dyn Memory, addr: u64) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Read a path argument, wide (LPCWSTR) or ANSI (LPCSTR) per `wide`.
 pub(crate) fn read_path(mem: &dyn Memory, addr: u64, wide: bool) -> Result<String> {
     if wide {
         read_wstr(mem, addr)
@@ -1378,8 +1023,6 @@ pub(crate) fn read_path(mem: &dyn Memory, addr: u64, wide: bool) -> Result<Strin
     }
 }
 
-/// Write a NUL-terminated ANSI string (at most `max` bytes incl. terminator),
-/// returning the character count written (excluding the terminator).
 pub(crate) fn write_astr(mem: &mut dyn Memory, addr: u64, s: &str, max: usize) -> Result<u64> {
     if addr == 0 || max == 0 {
         return Ok(0);
@@ -1391,7 +1034,6 @@ pub(crate) fn write_astr(mem: &mut dyn Memory, addr: u64, s: &str, max: usize) -
     Ok(n as u64)
 }
 
-/// Write a path result, wide or ANSI per `wide`, returning the char count.
 fn write_path(mem: &mut dyn Memory, addr: u64, s: &str, max: usize, wide: bool) -> Result<u64> {
     if wide {
         WinOs::write_wstr(mem, addr, s, max)
@@ -1400,7 +1042,6 @@ fn write_path(mem: &mut dyn Memory, addr: u64, s: &str, max: usize, wide: bool) 
     }
 }
 
-/// Length of a NUL-terminated UTF-16 string in code units.
 fn wstrlen(mem: &dyn Memory, addr: u64) -> Result<usize> {
     let mut n = 0usize;
     while mem.read_u16(addr + (n as u64) * 2)? != 0 {
@@ -1412,7 +1053,6 @@ fn wstrlen(mem: &dyn Memory, addr: u64) -> Result<usize> {
     Ok(n)
 }
 
-/// Compare two NUL-terminated UTF-16 strings, optionally case-folding ASCII.
 fn wstrcmp(mem: &dyn Memory, a: u64, b: u64, fold: bool) -> Result<i32> {
     let f = |c: u16| if fold && (b'A' as u16..=b'Z' as u16).contains(&c) { c + 32 } else { c };
     let mut i = 0u64;
@@ -1443,12 +1083,10 @@ impl WinOs {
                 self.begin_process_exit(cpu, mem, code)
             }
             Api::ReturnExit => {
-                // The entry function returned; its exit code is in EAX.
                 let code = cpu.gpr_read(0, 4) as u32 as i32;
                 self.begin_process_exit(cpu, mem, code)
             }
             Api::TerminateProcess => {
-                // TerminateProcess is abrupt: no orderly DLL_PROCESS_DETACH.
                 let code = self.arg(cpu, mem, 1)? as u32 as i32;
                 Ok(Outcome::Exit(code))
             }
@@ -1464,7 +1102,6 @@ impl WinOs {
             }
 
             Api::WriteFile => {
-                // WriteFile(hFile, lpBuffer, nBytes, lpWritten, lpOverlapped)
                 let handle = self.arg(cpu, mem, 0)?;
                 let buf = self.arg(cpu, mem, 1)?;
                 let n = self.arg(cpu, mem, 2)? as usize;
@@ -1483,7 +1120,6 @@ impl WinOs {
                 ret(TRUE)
             }
             Api::WriteConsoleA => {
-                // WriteConsoleA(hConsole, lpBuffer, nChars, lpWritten, lpReserved)
                 let handle = self.arg(cpu, mem, 0)?;
                 let buf = self.arg(cpu, mem, 1)?;
                 let n = self.arg(cpu, mem, 2)? as usize;
@@ -1518,7 +1154,7 @@ impl WinOs {
             Api::GetModuleHandleA | Api::GetModuleHandleW => {
                 let name_ptr = self.arg(cpu, mem, 0)?;
                 if name_ptr == 0 {
-                    return ret(self.cfg.image_base); // this module
+                    return ret(self.cfg.image_base);
                 }
                 let name = if matches!(api, Api::GetModuleHandleW) {
                     read_wstr(mem, name_ptr)?
@@ -1532,26 +1168,16 @@ impl WinOs {
                 let name_ptr = self.arg(cpu, mem, 0)?;
                 let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
                 let argc = *argc;
-                // Hold the loader lock across the graph mutation (map, relocate,
-                // thread the Ldr lists) — the loader operation a real ntdll
-                // serializes on PEB.LoaderLock (roadmap W0.7).
                 self.enter_loader_lock(mem)?;
                 let handle = self.load_library(mem, &name)?;
                 let pending = std::mem::take(&mut self.dll.pending_dllmain);
                 self.leave_loader_lock(mem)?;
-                // Run each freshly loaded module's DllMain(base, ATTACH, 0)
-                // before returning the handle to the caller. A recursive
-                // dependency load queues the whole chain leaves-first, so the
-                // dependencies' DllMains run before the requested DLL's — the
-                // load order a real loader uses (roadmap W0.6/W0.7). Mark each as
-                // attached so a later FreeLibrary/exit fires exactly one matching
-                // DLL_PROCESS_DETACH.
                 if !pending.is_empty() {
                     let bases: Vec<u64> = pending.iter().map(|&(_, b)| b).collect();
                     self.mark_attached(&bases);
                     let calls: Vec<(u64, Vec<u64>)> = pending
                         .into_iter()
-                        .map(|(entry, base)| (entry, vec![base, 1 /* DLL_PROCESS_ATTACH */, 0]))
+                        .map(|(entry, base)| (entry, vec![base, 1 , 0]))
                         .collect();
                     return self.invoke_callbacks(cpu, mem, calls, handle, argc, false);
                 }
@@ -1560,20 +1186,14 @@ impl WinOs {
 
             Api::GetProcessHeap => ret(HANDLE_PROCESS_HEAP),
             Api::HeapAlloc => {
-                // HeapAlloc(hHeap, dwFlags, dwBytes)
                 let size = self.arg(cpu, mem, 2)?;
                 ret(self.heap_alloc(size))
             }
             Api::HeapReAlloc => {
-                // HeapReAlloc(hHeap, dwFlags, lpMem, dwBytes)
                 let old = self.arg(cpu, mem, 2)?;
                 let new_size = self.arg(cpu, mem, 3)?;
                 let new = self.heap_alloc(new_size);
                 if new != 0 && old != 0 {
-                    // Copy exactly min(old_size, new_size) bytes.  If the old
-                    // pointer is untracked (a foreign/pre-bridge allocation) fall
-                    // back to copying new_size bytes — the pre-P3.3 behaviour —
-                    // so callers that never went through heap_alloc still work.
                     let old_size = self.heap_sizes.get(&old).copied().unwrap_or(new_size);
                     let copy_len = old_size.min(new_size);
                     for i in 0..copy_len {
@@ -1584,16 +1204,9 @@ impl WinOs {
                 ret(new)
             }
             Api::HeapFree => {
-                // HeapFree(hHeap, dwFlags, lpMem)
-                // Remove the allocation record.  If this was the last block
-                // bumped onto the arena, roll heap_next back to reclaim it —
-                // simple "last-block free" that reduces arena exhaustion for
-                // programs that alloc/realloc/free in a tight loop.
-                // Always returns TRUE (lenient even for unknown/null pointers).
                 let ptr = self.arg(cpu, mem, 2)?;
                 if ptr != 0 {
                     if let Some(sz) = self.heap_sizes.remove(&ptr) {
-                        // heap_next was set to ptr + sz by heap_alloc.
                         if self.heap_next == ptr + sz {
                             self.heap_next = ptr;
                         }
@@ -1602,30 +1215,22 @@ impl WinOs {
                 ret(TRUE)
             }
 
-            // Virtual-memory manager (roadmap P3.2), see [`crate::vm`].
             Api::VirtualAlloc => self.virtual_alloc(cpu, mem),
             Api::VirtualFree => self.virtual_free(cpu, mem),
             Api::VirtualProtect => self.virtual_protect(cpu, mem),
             Api::VirtualQuery => self.virtual_query(cpu, mem),
 
-            // Synchronization objects (roadmap P3.6), see [`crate::sync`].
             Api::CreateSync { kind, ex, wide } => self.create_sync(cpu, mem, *kind, *ex, *wide),
             Api::OpenSync { wide } => self.open_sync(cpu, mem, *wide),
             Api::SignalSync { op } => self.signal_sync(cpu, mem, *op),
             Api::WaitSingle { .. } => self.wait_single(cpu, mem),
             Api::WaitMultiple { .. } => self.wait_multiple(cpu, mem),
             Api::EncodeDecodePointer => {
-                // Identity: Decode(Encode(p)) == p. Preserve the pointer so a
-                // later guarded call through it lands on real code, not null.
                 let p = self.arg(cpu, mem, 0)?;
                 ret(p)
             }
 
-            // --- x64 exception machinery (roadmap P4.3) -------------------
             Api::RtlCaptureContext => {
-                // Fill *ctx with the caller's state: RIP is the return address,
-                // RSP is the stack *after* this call returns (the ABI-visible
-                // caller frame), all other regs as-is.
                 let ctx_ptr = self.arg(cpu, mem, 0)?;
                 let ret_addr = mem.read_u64(cpu.rsp())?;
                 let mut snap = cpu.clone();
@@ -1635,7 +1240,6 @@ impl WinOs {
                 ret(0)
             }
             Api::RtlLookupFunctionEntry => {
-                // (ControlPc, *ImageBase, *HistoryTable) → RUNTIME_FUNCTION* | 0
                 let pc = self.arg(cpu, mem, 0)?;
                 let base_out = self.arg(cpu, mem, 1)?;
                 let image_base = self.cfg.image_base;
@@ -1659,8 +1263,6 @@ impl WinOs {
                 }
             }
             Api::RtlVirtualUnwind => {
-                // (HandlerType, ImageBase, ControlPc, FunctionEntry, ContextRecord,
-                //  *HandlerData, *EstablisherFrame, ContextPointers)
                 let handler_type = self.arg(cpu, mem, 0)? as u32;
                 let control_pc = self.arg(cpu, mem, 2)?;
                 let ctx_ptr = self.arg(cpu, mem, 4)?;
@@ -1669,8 +1271,6 @@ impl WinOs {
                 let image_base = self.cfg.image_base;
 
                 let mut state = crate::exc::read_context(mem, ctx_ptr)?;
-                // Honour the passed ControlPc (handlers may unwind a PC other
-                // than the context's current RIP on the first hop).
                 state.rip = control_pc;
                 let fu = exemu_core::unwind::virtual_unwind_typed(
                     &self.function_table,
@@ -1693,7 +1293,6 @@ impl WinOs {
                 ret(fu.handler_rva.map(|rva| image_base + rva as u64).unwrap_or(0))
             }
             Api::RtlPcToFileHeader => {
-                // (PcValue, *BaseOfImage) → image base if pc is in the image.
                 let pc = self.arg(cpu, mem, 0)?;
                 let base_out = self.arg(cpu, mem, 1)?;
                 let image_base = self.cfg.image_base;
@@ -1708,22 +1307,12 @@ impl WinOs {
                 ret(base)
             }
 
-            // `LdrGetDllHandle(DllPath, DllCharacteristics, &DllName, &Handle)`
-            // — `DllName` is a UNICODE_STRING {Length u16, MaximumLength u16,
-            // pad, Buffer}. Returns STATUS_DLL_NOT_FOUND when the module is not
-            // a real mapped guest image (rather than handing back a synthetic
-            // handle, which the caller would dereference as a PE header).
             Api::LdrGetDllHandle | Api::LdrLoadDll => {
                 let name_us = self.arg(cpu, mem, 2)?;
                 let handle_out = self.arg(cpu, mem, 3)?;
                 const STATUS_DLL_NOT_FOUND: u64 = 0xC000_0135;
                 let mut status = STATUS_DLL_NOT_FOUND;
                 if let Some(name) = read_unicode_string_base_name(mem, name_us)? {
-                    // The WoW64 module set first: on that boot path exemu — not
-                    // Wine's loader — mapped `wow64cpu`/`wow64win`, so they are
-                    // invisible to `module_base`'s loader table by design (the
-                    // process holds two `ntdll.dll`s; keeping the WoW64 set out
-                    // of the name table is what stops them being confused).
                     if let Some(base) = self.wow64_module(&name).or_else(|| self.module_base(&name)) {
                         if handle_out != 0 {
                             mem.write_u64(handle_out, base)?;
@@ -1738,15 +1327,8 @@ impl WinOs {
             Api::RtlUnwindEx => self.rtl_unwind_ex(cpu, mem),
             Api::ExceptionDriver => self.exc_advance(cpu, mem),
 
-            // The `__wine_unix_call` fast path (roadmap W2.4): dispatch to the
-            // native unixlib entry and return its NTSTATUS. An ordinary call —
-            // the intercept seam does the `ret` (see [`crate::unixlib`]).
             Api::WineUnixCall => {
                 let status = self.wine_unix_call(cpu, mem)?;
-                // A `wine_server_call` select that blocked has already switched
-                // `cpu` to another thread (roadmap W2.11): resume that thread
-                // as-is — writing RAX + `ret` here would corrupt it. The blocked
-                // thread re-runs this thunk when it is scheduled again.
                 if self.unix_call_blocked {
                     Ok(Outcome::Resume)
                 } else {
@@ -1758,9 +1340,6 @@ impl WinOs {
                 self.unhandled_filter = self.arg(cpu, mem, 0)?;
                 ret(old)
             }
-            // The default last-chance filter: report EXCEPTION_EXECUTE_HANDLER
-            // (1) so the CRT's __scrt path terminates the process cleanly
-            // rather than looping or continuing into undefined state.
             Api::UnhandledExceptionFilter => ret(1),
 
             Api::GetLastError => ret(self.last_error as u64),
@@ -1771,9 +1350,8 @@ impl WinOs {
 
             Api::GetCurrentProcessId => ret(0x1000),
             Api::GetCurrentThreadId => ret(self.current_tid as u64),
-            Api::GetCurrentProcess => ret(u64::MAX), // pseudo-handle (HANDLE)-1
+            Api::GetCurrentProcess => ret(u64::MAX),
             Api::IsDebuggerPresent => ret(FALSE),
-            // Threads + cooperative scheduler (roadmap P3.4), see [`crate::thread`].
             Api::CreateThread => self.create_thread(cpu, mem),
             Api::ExitThread => self.api_exit_thread(cpu, mem),
             Api::ThreadExit => self.thread_start_returned(cpu, mem),
@@ -1783,18 +1361,15 @@ impl WinOs {
             Api::SuspendThread => self.suspend_thread(cpu, mem),
             Api::TerminateThread => self.terminate_thread(cpu, mem),
             Api::GetExitCodeThread => self.get_exit_code_thread(cpu, mem),
-            // Child processes (roadmap W3.5), see [`crate::process`].
             Api::CreateProcessApi { wide } => self.win32_create_process(cpu, mem, *wide),
             Api::GetExitCodeProcessApi => self.win32_get_exit_code_process(cpu, mem),
             Api::SwitchToThread => self.switch_to_thread(cpu, mem),
             Api::SleepApi { ex } => self.sleep(cpu, mem, if *ex { 2 } else { 1 }),
 
-            // Message queue (roadmap P5a.1), see [`crate::msg`].
             Api::PostMessageApi => self.post_message(cpu, mem),
             Api::PostThreadMessageApi => self.post_thread_message(cpu, mem),
             Api::TranslateMessageApi => self.translate_message(cpu, mem),
 
-            // Window-object queries (roadmap P5a.2), see [`crate::win`].
             Api::WindowLong { set } => self.window_long(cpu, mem, *set),
             Api::IsWindowApi => self.is_window(cpu, mem),
             Api::GetWindowRectApi => self.get_window_rect(cpu, mem),
@@ -1804,41 +1379,34 @@ impl WinOs {
             Api::GetPropApi { wide } => self.get_prop(cpu, mem, *wide),
             Api::RemovePropApi { wide } => self.remove_prop(cpu, mem, *wide),
 
-            // Time/date backed by the host clock (roadmap P3.8), see [`crate::time`].
             Api::QueryPerformanceCounter => self.query_performance_counter(cpu, mem),
             Api::QueryPerformanceFrequency => self.query_performance_frequency(cpu, mem),
             Api::GetSystemTimeAsFileTime => self.get_system_time_as_filetime(cpu, mem),
             Api::GetSystemTime => self.get_system_time(cpu, mem),
             Api::GetTickCount => self.get_tick_count(),
-            Api::GetACP => ret(65001), // UTF-8 code page
+            Api::GetACP => ret(65001),
 
             Api::SetConsoleCP | Api::SetConsoleOutputCP => ret(TRUE),
             Api::GetConsoleMode => {
-                // GetConsoleMode(hConsole, lpMode): report a plausible mode.
                 let ptr = self.arg(cpu, mem, 1)?;
                 if ptr != 0 {
-                    mem.write_u32(ptr, 0x0003)?; // ENABLE_PROCESSED_OUTPUT | WRAP
+                    mem.write_u32(ptr, 0x0003)?;
                 }
                 ret(TRUE)
             }
             Api::SetConsoleMode => ret(TRUE),
 
             Api::GetStartupInfoA | Api::GetStartupInfoW => {
-                // Zero-fill a STARTUPINFO and set its cb field.
                 let ptr = self.arg(cpu, mem, 0)?;
                 if ptr != 0 {
                     for i in 0..104u64 {
                         mem.write_u8(ptr + i, 0)?;
                     }
-                    mem.write_u32(ptr, 104)?; // cb
+                    mem.write_u32(ptr, 104)?;
                 }
                 Ok(Outcome::Return(0))
             }
             Api::GetEnvironmentStrings { wide } => {
-                // Materialize the environment block into the heap and hand back
-                // a pointer. The CRT walks this to build `environ`/`_wenviron`;
-                // an empty or null block makes it abort ("R6009 - not enough
-                // space for environment"), so we always return a real block.
                 if *wide {
                     let units = self.env_block_utf16();
                     let ptr = self.heap_alloc(units.len() as u64 * 2);
@@ -1859,16 +1427,13 @@ impl WinOs {
             }
             Api::FreeEnvironmentStrings => ret(TRUE),
             Api::GetEnvironmentVariable { wide } => {
-                // GetEnvironmentVariable(name, buf, size). Returns chars copied
-                // (excl. NUL) on success, the required size (incl. NUL) if the
-                // buffer is too small, or 0 (ERROR_ENVVAR_NOT_FOUND) if absent.
                 let name_ptr = self.arg(cpu, mem, 0)?;
                 let buf = self.arg(cpu, mem, 1)?;
                 let size = self.arg(cpu, mem, 2)? as usize;
                 let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
                 match self.env_get(&name).map(str::to_owned) {
                     None => {
-                        self.last_error = 203; // ERROR_ENVVAR_NOT_FOUND
+                        self.last_error = 203;
                         ret(0)
                     }
                     Some(value) => {
@@ -1894,7 +1459,6 @@ impl WinOs {
                 }
             }
             Api::SetEnvironmentVariable { wide } => {
-                // SetEnvironmentVariable(name, value): value NULL removes it.
                 let name_ptr = self.arg(cpu, mem, 0)?;
                 let value_ptr = self.arg(cpu, mem, 1)?;
                 let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
@@ -1912,9 +1476,6 @@ impl WinOs {
                 ret(TRUE)
             }
             Api::ExpandEnvironmentStrings { wide } => {
-                // ExpandEnvironmentStrings(src, dst, size): replace %VAR% tokens
-                // (unknown ones are left verbatim, as Windows does). Returns the
-                // number of TCHARs stored including the NUL, or the size needed.
                 let src_ptr = self.arg(cpu, mem, 0)?;
                 let dst = self.arg(cpu, mem, 1)?;
                 let size = self.arg(cpu, mem, 2)? as usize;
@@ -1938,20 +1499,6 @@ impl WinOs {
                 }
             }
             Api::WideCharToMultiByte => {
-                // WideCharToMultiByte(cp, flags, wstr, cch, mbstr, cb, defChar,
-                //                     usedDefault).
-                //
-                // Codepages exemu implements as real single-byte tables
-                // (`nls::sbcs_encode` — 20127/28591/1252) are encoded through
-                // them, so this thunk and the Wine boot's kernelbase agree.
-                // Everything else is UTF-8, which is the *right* answer for the
-                // ones that actually arrive: `GetACP` reports 65001 here, so
-                // `CP_ACP`/`CP_OEMCP`/`CP_UTF8` are all UTF-8 by construction.
-                // (Measured: on the emulated corpus this API is reached 11,311
-                // times, every one of them with `CP_ACP`.)
-                //
-                // cch<0 ⇒ NUL-terminated input, terminator included in the
-                // output and count. cb==0 ⇒ return required byte count.
                 let cp = self.arg(cpu, mem, 0)? as u32;
                 let wstr = self.arg(cpu, mem, 2)?;
                 let cch = self.arg(cpu, mem, 3)? as i32;
@@ -1973,29 +1520,22 @@ impl WinOs {
                     None => (String::from_utf16_lossy(&units).into_bytes(), false),
                 };
                 if cch < 0 {
-                    bytes.push(0); // include the NUL terminator in the output
+                    bytes.push(0);
                 }
                 if used_default != 0 {
-                    // UTF-8 never substitutes; a single-byte codepage does, for
-                    // any character outside it.
                     mem.write_u8(used_default, u8::from(lossy))?;
                 }
                 if cb == 0 {
-                    return ret(bytes.len() as u64); // size query
+                    return ret(bytes.len() as u64);
                 }
                 if bytes.len() > cb as usize {
-                    self.last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                    self.last_error = 122;
                     return ret(0);
                 }
                 mem.write(mbstr, &bytes)?;
                 ret(bytes.len() as u64)
             }
             Api::MultiByteToWideChar => {
-                // MultiByteToWideChar(cp, flags, mbstr, cb, wstr, cch). cb<0 ⇒
-                // NUL-terminated input (terminator included); cch==0 ⇒ return
-                // the required count in wide chars. Codepage handling as in
-                // `WideCharToMultiByte` above: a real table where exemu has one,
-                // UTF-8 otherwise — which is what `CP_ACP` means here.
                 let cp = self.arg(cpu, mem, 0)? as u32;
                 let mbstr = self.arg(cpu, mem, 2)?;
                 let cb = self.arg(cpu, mem, 3)? as i32;
@@ -2012,13 +1552,13 @@ impl WinOs {
                 let mut units: Vec<u16> = crate::nls::sbcs_decode(cp, &bytes)
                     .unwrap_or_else(|| String::from_utf8_lossy(&bytes).encode_utf16().collect());
                 if cb < 0 {
-                    units.push(0); // include the NUL terminator
+                    units.push(0);
                 }
                 if cch == 0 {
-                    return ret(units.len() as u64); // size query
+                    return ret(units.len() as u64);
                 }
                 if units.len() > cch as usize {
-                    self.last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+                    self.last_error = 122;
                     return ret(0);
                 }
                 for (i, u) in units.iter().enumerate() {
@@ -2029,20 +1569,15 @@ impl WinOs {
 
             Api::FreeLibrary => {
                 let hmodule = self.arg(cpu, mem, 0)?;
-                // Under the loader lock, decrement the ref count; a drop to zero
-                // queues the module's DLL_PROCESS_DETACH (roadmap W0.7).
                 self.enter_loader_lock(mem)?;
                 let ok = self.free_library(hmodule);
                 let pending = std::mem::take(&mut self.dll.pending_detach);
                 self.leave_loader_lock(mem)?;
                 let result = if ok { TRUE } else { FALSE };
                 if !pending.is_empty() {
-                    // Drive DllMain(base, DLL_PROCESS_DETACH=0, lpvReserved=NULL)
-                    // for each module that just reached zero references, then
-                    // return TRUE/FALSE to the caller.
                     let calls: Vec<(u64, Vec<u64>)> = pending
                         .into_iter()
-                        .map(|(entry, base)| (entry, vec![base, 0 /* DLL_PROCESS_DETACH */, 0]))
+                        .map(|(entry, base)| (entry, vec![base, 0 , 0]))
                         .collect();
                     return self.invoke_callbacks(cpu, mem, calls, result, 1, false);
                 }
@@ -2067,8 +1602,6 @@ impl WinOs {
                 ret(addr)
             }
 
-            // Thread/Fiber Local Storage. FlsAlloc's callback argument is
-            // ignored (single-threaded: no thread/fiber ever exits to run it).
             Api::TlsAlloc { fiber } => ret(self.tls_alloc(*fiber)),
             Api::TlsSetValue { fiber } => {
                 let index = self.arg(cpu, mem, 0)?;
@@ -2077,8 +1610,6 @@ impl WinOs {
             }
             Api::TlsGetValue { fiber } => {
                 let index = self.arg(cpu, mem, 0)?;
-                // On success TlsGetValue clears the last error, so a caller that
-                // reads a legitimately-NULL slot doesn't see a stale failure.
                 self.last_error = 0;
                 ret(self.tls_get(*fiber, index))
             }
@@ -2087,13 +1618,11 @@ impl WinOs {
                 ret(self.tls_free(*fiber, index) as u64)
             }
 
-            // --- msvcrt C runtime --------------------------------------------
             Api::Malloc => {
                 let size = self.arg(cpu, mem, 0)?;
                 ret(self.heap_alloc(size))
             }
             Api::Calloc => {
-                // calloc(num, size): the arena is already zeroed.
                 let num = self.arg(cpu, mem, 0)?;
                 let size = self.arg(cpu, mem, 1)?;
                 ret(self.heap_alloc(num.saturating_mul(size)))
@@ -2113,7 +1642,6 @@ impl WinOs {
             Api::Free => ret(0),
 
             Api::Memcpy => {
-                // memcpy/memmove(dest, src, n) — return dest, overlap-safe.
                 let dest = self.arg(cpu, mem, 0)?;
                 let src = self.arg(cpu, mem, 1)?;
                 let n = self.arg(cpu, mem, 2)? as usize;
@@ -2123,7 +1651,6 @@ impl WinOs {
                 ret(dest)
             }
             Api::Memset => {
-                // memset(dest, c, n) — return dest.
                 let dest = self.arg(cpu, mem, 0)?;
                 let c = self.arg(cpu, mem, 1)? as u8;
                 let n = self.arg(cpu, mem, 2)? as usize;
@@ -2138,7 +1665,6 @@ impl WinOs {
                 for i in 0..n {
                     let (x, y) = (mem.read_u8(a + i)?, mem.read_u8(b + i)?);
                     if x != y {
-                        // Sign-extend the byte difference into the return.
                         result = (x as i32 - y as i32) as i64 as u64;
                         break;
                     }
@@ -2157,13 +1683,10 @@ impl WinOs {
             }
 
             Api::GetMainArgs => {
-                // int __getmainargs(int* argc, char*** argv, char*** env,
-                //                   int doWildCard, _startupinfo* startInfo)
-                // Populate a one-element argv from the command line pointer.
                 let argc_ptr = self.arg(cpu, mem, 0)?;
                 let argv_ptr = self.arg(cpu, mem, 1)?;
                 let env_ptr = self.arg(cpu, mem, 2)?;
-                let argv_arr = self.heap_alloc(16); // [arg0, NULL]
+                let argv_arr = self.heap_alloc(16);
                 if argv_arr != 0 {
                     mem.write_u64(argv_arr, self.cfg.cmdline_ptr_a)?;
                     mem.write_u64(argv_arr + 8, 0)?;
@@ -2175,20 +1698,13 @@ impl WinOs {
                     mem.write_u64(argv_ptr, argv_arr)?;
                 }
                 if env_ptr != 0 {
-                    let env_arr = self.heap_alloc(8); // just a NULL terminator
+                    let env_arr = self.heap_alloc(8);
                     mem.write_u64(env_ptr, env_arr)?;
                 }
                 ret(0)
             }
 
-            // _initterm(first, last): call each non-null function pointer in
-            // [first, last). We drive them as real guest calls (so C++ static
-            // constructors actually run) via the InittermDriver thunk.
             Api::Initterm => {
-                // _initterm(first, last): call each non-null function pointer in
-                // the table [first, last). Entries — and the return address on
-                // the stack — are pointer-sized, so this must respect bitness
-                // (a 32-bit table has 4-byte slots, not 8).
                 let first = self.arg(cpu, mem, 0)?;
                 let last = self.arg(cpu, mem, 1)?;
                 let saved_rsp = cpu.rsp();
@@ -2206,7 +1722,7 @@ impl WinOs {
                 }
 
                 match fns.pop_front() {
-                    None => Ok(Outcome::Return(0)), // nothing to initialize
+                    None => Ok(Outcome::Return(0)),
                     Some(first_fn) => {
                         self.initterm_stack.push(InittermFrame { remaining: fns, ret: ret_addr, saved_rsp });
                         let driver = self.initterm_driver;
@@ -2217,18 +1733,11 @@ impl WinOs {
             }
             Api::EhProlog => self.eh_prolog(cpu, mem),
 
-            // A constructor just returned to the driver thunk: run the next
-            // one, or return to _initterm's original caller when done.
             Api::InittermDriver => self.initterm_advance(cpu, mem),
-            // A guest callback (window/dialog proc) returned: advance the queue.
             Api::CallbackDriver => self.cb_advance(cpu, mem),
-            // A WndProc invoked from a win32k syscall returned: resume the syscall.
             Api::Win32kCbDriver => self.win32k_cb_advance(cpu, mem),
 
-            // --- GUI: drive the dialog procedure ---------------------------
             Api::CreateDialogParam { modal } => {
-                // CreateDialogParamW(hInst, lpTemplate, hWndParent, lpDlgProc,
-                //                    dwInitParam) / DialogBoxParamW(same).
                 let template_id = self.arg(cpu, mem, 1)?;
                 let dlgproc = self.arg(cpu, mem, 3)?;
                 let init_param = self.arg(cpu, mem, 4)?;
@@ -2239,8 +1748,6 @@ impl WinOs {
                     return ret(hwnd);
                 }
 
-                // Try to show a real window for any dialog whose template we
-                // parsed. `lpTemplate` is a MAKEINTRESOURCE id.
                 let mut interactive = false;
                 if template_id < 0x1_0000 {
                     if let Some(tpl) = self.dialogs.get(&(template_id as u32)).cloned() {
@@ -2250,18 +1757,11 @@ impl WinOs {
                 }
 
                 if interactive {
-                    // Run WM_INITDIALOG. A modeless dialog then returns its
-                    // hwnd and the app's own message loop drives it; a modal
-                    // dialog enters its own pump loop (see cb_advance) and
-                    // returns the EndDialog value.
                     self.dialog_result = None;
                     let calls = vec![(dlgproc, vec![hwnd, WM_INITDIALOG, 0, init_param])];
                     let result = if *modal { IDCANCEL as u64 } else { hwnd };
                     self.invoke_callbacks(cpu, mem, calls, result, 5, *modal)
                 } else {
-                    // Headless: WM_INITDIALOG then a synthetic click on the
-                    // default (IDOK) button so a dialog that gates work on it
-                    // proceeds without a user.
                     let result = if *modal { IDOK as u64 } else { hwnd };
                     let calls = vec![
                         (dlgproc, vec![hwnd, WM_INITDIALOG, 0, init_param]),
@@ -2282,7 +1782,6 @@ impl WinOs {
                 let id = self.arg(cpu, mem, 1)? as u32;
                 let buf = self.arg(cpu, mem, 2)?;
                 let max = self.arg(cpu, mem, 3)? as usize;
-                // Prefer any text the user edited in the real window.
                 let text = self
                     .gui
                     .get_text(id)
@@ -2292,7 +1791,6 @@ impl WinOs {
                 ret(write_wstr_units(mem, buf, &text, max)?)
             }
             Api::GetDlgItemApi => {
-                // Return a synthetic control handle encoding the id.
                 let id = self.arg(cpu, mem, 1)? as u32;
                 ret(HWND_CONTROL | id as u64)
             }
@@ -2300,7 +1798,7 @@ impl WinOs {
                 let hwnd = self.arg(cpu, mem, 0)?;
                 let text = read_wstr_units(mem, self.arg(cpu, mem, 1)?)?;
                 if let Some(w) = self.gdi.windows.get_mut(&hwnd) {
-                    w.title = text; // real top-level window (roadmap P5a.2)
+                    w.title = text;
                 } else if let Some(id) = control_id(hwnd) {
                     self.controls.insert(id, text);
                 }
@@ -2319,14 +1817,8 @@ impl WinOs {
                     .unwrap_or_default();
                 ret(write_wstr_units(mem, buf, &text, max)?)
             }
-            // GetMessageW(lpMsg, hWnd, min, max): hand back a WM_NULL message
-            // (return 1) a bounded number of times so a message loop's body
-            // runs (many installers defer real work to a loop iteration), then
-            // report WM_QUIT (return 0) to end the loop.
             Api::GetMessageApi => {
                 let lp = self.arg(cpu, mem, 0)?;
-                // Real per-thread message queue first (roadmap P5a.1): deliver a
-                // posted message, or a synthetic WM_QUIT (return 0) once drained.
                 if let Some(m) = self.msg_next() {
                     self.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
                     return ret((m.message != crate::msg::WM_QUIT) as u64);
@@ -2335,8 +1827,6 @@ impl WinOs {
                     self.quit_posted = false;
                     return ret(0);
                 }
-                // A custom (GDI-drawn) window: deliver WM_PAINT, then mouse
-                // input, as real messages the app dispatches to its WndProc.
                 if self.is_custom_window() {
                     let hwnd = self.gdi.active_hwnd;
                     if self.gdi.paint_pending {
@@ -2350,11 +1840,10 @@ impl WinOs {
                             self.write_msg_full(mem, lp, hwnd, crate::gdi::WM_LBUTTONDOWN, 0, lparam)?;
                             ret(1)
                         }
-                        _ => ret(0), // Close / nothing → WM_QUIT
+                        _ => ret(0),
                     };
                 }
                 if self.gui_active() {
-                    // Block on the window until the user acts.
                     return match self.gui.pump(true) {
                         Some(exemu_core::GuiEvent::Command(id)) => {
                             self.write_msg(mem, lp)?;
@@ -2365,7 +1854,7 @@ impl WinOs {
                             self.write_msg(mem, lp)?;
                             ret(1)
                         }
-                        _ => ret(0), // Close → WM_QUIT
+                        _ => ret(0),
                     };
                 }
                 if self.msg_pumps > 0 {
@@ -2376,11 +1865,8 @@ impl WinOs {
                     ret(0)
                 }
             }
-            // PeekMessageW(lpMsg, hWnd, min, max, wRemoveMsg): same budget.
             Api::PeekMessageApi => {
                 let lp = self.arg(cpu, mem, 0)?;
-                // Real message queue first (roadmap P5a.1). PM_REMOVE (arg4 & 1)
-                // dequeues; PM_NOREMOVE peeks without consuming.
                 let remove = self.arg(cpu, mem, 4)? & 1 != 0;
                 if let Some(m) = self.msg_peek(remove) {
                     self.write_msg_full(mem, lp, m.hwnd, m.message as u64, m.wparam, m.lparam)?;
@@ -2408,13 +1894,8 @@ impl WinOs {
                     ret(FALSE)
                 }
             }
-            // IsDialogMessageW: claim the message was handled so the loop
-            // skips Translate/Dispatch and proceeds to its own logic.
             Api::IsDialogMessageApi => ret(TRUE),
 
-            // CoCreateInstance(rclsid, pUnkOuter, ctx, riid, ppv): no COM, so
-            // null the out-pointer and return REGDB_E_CLASSNOTREG. Callers
-            // then take their failure path instead of dereferencing null.
             Api::CoCreateInstanceApi => {
                 let ppv = self.arg(cpu, mem, 4)?;
                 if ppv != 0 {
@@ -2424,7 +1905,7 @@ impl WinOs {
                         mem.write_u32(ppv, 0)?;
                     }
                 }
-                ret(0x8004_0154) // REGDB_E_CLASSNOTREG
+                ret(0x8004_0154)
             }
             Api::DestroyWindowApi => {
                 self.gui.close();
@@ -2432,7 +1913,6 @@ impl WinOs {
             }
             Api::PostQuitMessageApi => self.post_quit_message(cpu, mem),
             Api::EndDialogApi => {
-                // Ends a modal dialog with the given result; closes the window.
                 let result = self.arg(cpu, mem, 1)?;
                 self.dialog_result = Some(result);
                 self.gui.close();
@@ -2440,14 +1920,11 @@ impl WinOs {
                 ret(TRUE)
             }
 
-            // --- custom (CreateWindowEx) windows + GDI ---------------------
             Api::RegisterClassApi { ex } => {
                 let wc = self.arg(cpu, mem, 0)?;
                 ret(self.register_class(mem, wc, *ex)?)
             }
             Api::CreateWindowExApi => {
-                // CreateWindowEx(exStyle, class, name, style, x, y, w, h, parent,
-                //                menu, instance, param)
                 let ex_style = self.arg(cpu, mem, 0)? as u32;
                 let class_ptr = self.arg(cpu, mem, 1)?;
                 let name_ptr = self.arg(cpu, mem, 2)?;
@@ -2459,11 +1936,9 @@ impl WinOs {
                 let parent = self.arg(cpu, mem, 8)?;
                 let lp_param = self.arg(cpu, mem, 11)?;
                 let hwnd = self.create_window(mem, class_ptr, name_ptr, style, ex_style, x, y, w, h, parent)?;
-                // Unknown class (fake handle) → nothing to WM_CREATE.
                 if !self.gdi.windows.contains_key(&hwnd) {
                     return ret(hwnd);
                 }
-                // Deliver WM_CREATE with a minimal CREATESTRUCT (lpCreateParams).
                 let cs = self.heap_alloc(80);
                 if cs != 0 {
                     mem.write_u64(cs, lp_param)?;
@@ -2484,8 +1959,6 @@ impl WinOs {
             Api::DispatchMessageApi => {
                 let lp = self.arg(cpu, mem, 0)?;
                 let (hwnd, message, wparam, lparam) = self.read_msg(mem, lp)?;
-                // Route to the target window's WNDPROC (roadmap P5a.2); fall back
-                // to the legacy single WNDPROC (dialogs) for unknown/null HWNDs.
                 let wndproc = self.gdi.windows.get(&hwnd).map(|w| w.wndproc).unwrap_or(self.gdi.wndproc);
                 if wndproc == 0 {
                     return ret(0);
@@ -2497,7 +1970,6 @@ impl WinOs {
                 let ps = self.arg(cpu, mem, 1)?;
                 ret(self.begin_paint(mem, hwnd, ps)?)
             }
-            // Painting model (roadmap P5a.4), see [`crate::gdi`].
             Api::InvalidateRectApi => {
                 let hwnd = self.arg(cpu, mem, 0)?;
                 let lprect = self.arg(cpu, mem, 1)?;
@@ -2518,7 +1990,6 @@ impl WinOs {
             }
             Api::ReleaseDCApi => ret(TRUE),
 
-            // Focus/capture/input + geometry (roadmap P5a.3), see [`crate::win`].
             Api::SetFocusApi => self.set_focus(cpu, mem),
             Api::GetFocusApi => self.get_focus(),
             Api::SetCaptureApi => self.set_capture(cpu, mem),
@@ -2572,7 +2043,6 @@ impl WinOs {
                 let c = self.arg(cpu, mem, 2)? as u32;
                 ret(self.create_pen(c))
             }
-            // GDI device-context objects (roadmap P5b.1), see [`crate::gdi`].
             Api::CreateFontApi => {
                 let lplf = self.arg(cpu, mem, 0)?;
                 ret(self.create_font_indirect(mem, lplf)?)
@@ -2620,7 +2090,6 @@ impl WinOs {
                 self.gdi_set_pixel(x, y, c);
                 ret(c as u64)
             }
-            // In-memory registry hive (roadmap P3.12), see [`crate::reg`].
             Api::RegCreate { wide } => self.reg_create(cpu, mem, *wide),
             Api::RegOpen { wide } => self.reg_open(cpu, mem, *wide),
             Api::RegSet { wide } => self.reg_set(cpu, mem, *wide),
@@ -2640,9 +2109,6 @@ impl WinOs {
                 ret(n as u64)
             }
             Api::MessageBoxApi { wide } => {
-                // MessageBox(hWnd, lpText, lpCaption, uType). Surface the text
-                // on the console so the user sees what the program wanted to
-                // say, then answer IDOK.
                 let text_ptr = self.arg(cpu, mem, 1)?;
                 let caption_ptr = self.arg(cpu, mem, 2)?;
                 let text = if *wide { read_wstr(mem, text_ptr)? } else { read_astr(mem, text_ptr)? };
@@ -2653,7 +2119,6 @@ impl WinOs {
                 ret(IDOK as u64)
             }
             Api::GetUserObjectInfoApi => {
-                // GetUserObjectInformation(hObj, nIndex, pvInfo, nLength, lpnNeeded).
                 const UOI_FLAGS: u64 = 1;
                 const WSF_VISIBLE: u32 = 0x0001;
                 let nindex = self.arg(cpu, mem, 1)?;
@@ -2661,7 +2126,6 @@ impl WinOs {
                 let nlen = self.arg(cpu, mem, 3)?;
                 let needed = self.arg(cpu, mem, 4)?;
                 if nindex == UOI_FLAGS {
-                    // USEROBJECTFLAGS { BOOL fInherit; BOOL fReserved; DWORD dwFlags; }
                     if pv != 0 && nlen >= 12 {
                         mem.write_u32(pv, 0)?;
                         mem.write_u32(pv + 4, 0)?;
@@ -2677,7 +2141,6 @@ impl WinOs {
             }
 
             Api::SendMessageApi => {
-                // Handle the text messages against a control's store; else 0.
                 let hwnd = self.arg(cpu, mem, 0)?;
                 let msg = self.arg(cpu, mem, 1)? as u32;
                 let wparam = self.arg(cpu, mem, 2)?;
@@ -2696,7 +2159,6 @@ impl WinOs {
                     (WM_GETTEXTLENGTH, Some(id)) => {
                         ret(self.controls.get(&id).map(|t| t.len()).unwrap_or(0) as u64)
                     }
-                    // Progress-bar updates → drive the rendered bar.
                     (PBM_SETRANGE, Some(id)) => {
                         let (min, max) = (lparam as u16 as i64, (lparam >> 16) as u16 as i64);
                         self.progress.entry(id).or_insert((0, 100, 0));
@@ -2738,8 +2200,6 @@ impl WinOs {
                 ret(cell)
             }
 
-            // --- C stdio output → host console ------------------------------
-            // The FILE* stream (last arg) is opaque to us; route to stdout.
             Api::Fputs => {
                 let s = self.arg(cpu, mem, 0)?;
                 let bytes = mem.read_cstr(s, 1 << 20)?;
@@ -2752,7 +2212,6 @@ impl WinOs {
                 ret(c as u64)
             }
             Api::Fwrite => {
-                // fwrite(ptr, size, count, stream)
                 let ptr = self.arg(cpu, mem, 0)?;
                 let size = self.arg(cpu, mem, 1)?;
                 let count = self.arg(cpu, mem, 2)?;
@@ -2770,7 +2229,6 @@ impl WinOs {
                 ret(0)
             }
 
-            // --- Win32 string helpers ---------------------------------------
             Api::CharNextA => {
                 let p = self.arg(cpu, mem, 0)?;
                 ret(if mem.read_u8(p)? == 0 { p } else { p + 1 })
@@ -2803,7 +2261,6 @@ impl WinOs {
                 ret(dst)
             }
             Api::LstrcpynW => {
-                // lstrcpynW(dst, src, count): copy up to count-1 wchars, NUL-terminate.
                 let dst = self.arg(cpu, mem, 0)?;
                 let src = self.arg(cpu, mem, 1)?;
                 let count = self.arg(cpu, mem, 2)? as usize;
@@ -2817,7 +2274,6 @@ impl WinOs {
                         }
                         i += 1;
                     }
-                    // Ensure NUL termination at the last written slot.
                     let last = if i + 1 >= count { count - 1 } else { i };
                     if mem.read_u16(dst + (last as u64) * 2).unwrap_or(1) != 0 {
                         mem.write_u16(dst + (last as u64) * 2, 0)?;
@@ -2843,7 +2299,6 @@ impl WinOs {
                 ret(wstrcmp(mem, a, b, fold)? as u64)
             }
 
-            // --- Filesystem -------------------------------------------------
             Api::CreateFile { wide } => {
                 let name = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 let access = self.arg(cpu, mem, 1)?;
@@ -2873,7 +2328,6 @@ impl WinOs {
                 ret(self.create_directory(&name) as u64)
             }
             Api::GetTempPathW => {
-                // Report a guest temp directory that maps into the sandbox.
                 let len = self.arg(cpu, mem, 0)? as usize;
                 let buf = self.arg(cpu, mem, 1)?;
                 let n = WinOs::write_wstr(mem, buf, "C:\\Temp\\", len)?;
@@ -2912,9 +2366,6 @@ impl WinOs {
                 ret(self.delete_file(&name) as u64)
             }
             Api::FindFirstFile { ex, wide } => {
-                // FindFirstFile[A/W](lpFileName, lpFindFileData)
-                // FindFirstFileEx[A/W](lpFileName, fInfoLevelId, lpFindFileData, ...)
-                // Buffer pointer is arg1 for the plain form, arg2 for the Ex form.
                 let pattern = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 let buf_arg = if *ex { 2 } else { 1 };
                 let data_ptr = self.arg(cpu, mem, buf_arg)?;
@@ -2930,14 +2381,12 @@ impl WinOs {
                 ret(self.find_close(handle))
             }
             Api::GetFullPathName { wide } => {
-                // GetFullPathName(lpFileName, nBufferLength, lpBuffer, lpFilePart)
                 let name = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 let len = self.arg(cpu, mem, 1)? as usize;
                 let buf = self.arg(cpu, mem, 2)?;
                 let part_ptr = self.arg(cpu, mem, 3)?;
                 let full = self.full_path_name(&name);
                 let written = write_path(mem, buf, &full, len, *wide)?;
-                // lpFilePart → the final component within the written buffer.
                 if part_ptr != 0 {
                     let part = match full.rfind('\\') {
                         Some(pos) if buf != 0 => buf + (pos as u64 + 1) * if *wide { 2 } else { 1 },
@@ -2958,7 +2407,6 @@ impl WinOs {
                 let fail_if_exists = self.arg(cpu, mem, 2)? != 0;
                 ret(self.copy_file(&src, &dst, fail_if_exists) as u64)
             }
-            // SetFileTime(handle, ct, at, mt): accepted; host mtime is left as-is.
             Api::SetFileTimeApi => ret(TRUE),
             Api::GetModuleFileNameW => {
                 let buf = self.arg(cpu, mem, 1)?;
@@ -2968,17 +2416,11 @@ impl WinOs {
                 ret(n)
             }
 
-            // Global/Local memory: back it with the heap arena. Since we use
-            // GMEM_FIXED semantics, the "handle" is the pointer itself and
-            // GlobalLock is the identity.
             Api::GlobalAlloc => {
                 let size = self.arg(cpu, mem, 1)?;
                 ret(self.heap_alloc(size))
             }
             Api::GlobalReAlloc => {
-                // GlobalReAlloc(hMem, dwBytes, uFlags). GMEM_FIXED semantics:
-                // allocate a fresh block and copy. Returning 0 (the old stub)
-                // reads as an allocation failure and makes C++ callers throw.
                 let old = self.arg(cpu, mem, 0)?;
                 let size = self.arg(cpu, mem, 1)?;
                 let new = self.heap_alloc(size);
@@ -2995,19 +2437,15 @@ impl WinOs {
             }
             Api::GlobalFreeUnlock => ret(0),
 
-            // --- Environment / version -------------------------------------
-            // Report Windows 6.2 (build 9200): LOWORD = minor<<8 | major,
-            // HIWORD = build (top bit clear ⇒ build present).
             Api::GetVersion => ret(0x23F0_0206),
             Api::GetVersionEx => {
-                // Fill an OSVERSIONINFO(EX)W: major/minor/build/platform.
                 let p = self.arg(cpu, mem, 0)?;
                 if p != 0 {
-                    mem.write_u32(p + 4, 6)?; // dwMajorVersion
-                    mem.write_u32(p + 8, 2)?; // dwMinorVersion
-                    mem.write_u32(p + 12, 9200)?; // dwBuildNumber
-                    mem.write_u32(p + 16, 2)?; // VER_PLATFORM_WIN32_NT
-                    mem.write_u16(p + 20, 0)?; // szCSDVersion[0] = NUL
+                    mem.write_u32(p + 4, 6)?;
+                    mem.write_u32(p + 8, 2)?;
+                    mem.write_u32(p + 12, 9200)?;
+                    mem.write_u32(p + 16, 2)?;
+                    mem.write_u16(p + 20, 0)?;
                 }
                 ret(TRUE)
             }
@@ -3028,17 +2466,12 @@ impl WinOs {
                 if self.cfg.trace {
                     eprintln!("[exemu] unimplemented API {sym} -> returning 0");
                 }
-                // Remember it: this zero is the single most common cause of a
-                // fault somewhere else entirely, and the fault carries no trace
-                // of where it came from (see `WinOs::zero_returning_stubs`).
                 self.note_zero_returning_stub(sym);
                 ret(0)
             }
         }
     }
 
-    /// Route a byte buffer to the appropriate host stream based on the
-    /// Windows handle value.
     fn write_stream(&mut self, handle: u64, buf: u64, n: usize, mem: &dyn Memory) -> Result<()> {
         let mut bytes = vec![0u8; n];
         mem.read(buf, &mut bytes)?;
@@ -3047,11 +2480,6 @@ impl WinOs {
         Ok(())
     }
 
-    /// Begin an orderly process exit: run each still-attached loaded DLL's
-    /// `DllMain(DLL_PROCESS_DETACH)` (dependents before dependencies), then
-    /// terminate with `code` (roadmap W0.7). If no DLL needs a detach — or we
-    /// are already inside a guest-callback chain, where nesting a shutdown
-    /// sequence would race the drain hook — exit immediately.
     fn begin_process_exit(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, code: i32) -> Result<Outcome> {
         if !self.cb_stack.is_empty() {
             return Ok(Outcome::Exit(code));
@@ -3062,9 +2490,6 @@ impl WinOs {
         if targets.is_empty() {
             return Ok(Outcome::Exit(code));
         }
-        // The callback machinery reads the drain-return address from `[rsp]`;
-        // seat a return slot so the final frame is balanced. The value never
-        // executes — the drain hook returns `Exit(code)` before returning to it.
         let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
         let sp = cpu.rsp() - ptr;
         if self.cfg.is_64bit {
@@ -3076,15 +2501,11 @@ impl WinOs {
         self.pending_process_exit = Some(code);
         let calls: Vec<(u64, Vec<u64>)> = targets
             .into_iter()
-            .map(|(entry, base)| (entry, vec![base, 0 /* DLL_PROCESS_DETACH */, 0]))
+            .map(|(entry, base)| (entry, vec![base, 0 , 0]))
             .collect();
         self.invoke_callbacks(cpu, mem, calls, code as u64, 0, false)
     }
 
-    /// Invoke a sequence of guest callbacks, then return `result` to the
-    /// current API's caller. `argc` is the API's own stdcall footprint (for
-    /// 32-bit stack cleanup on the final return). Returns `Outcome::Resume`
-    /// once the first callback is set up, or `Return(result)` if empty.
     pub(crate) fn invoke_callbacks(
         &mut self,
         cpu: &mut CpuState,
@@ -3112,9 +2533,6 @@ impl WinOs {
         Ok(Outcome::Resume)
     }
 
-    /// Called when a guest callback returns to the callback driver thunk. Runs
-    /// the next queued callback, drives a modal dialog loop, or returns to the
-    /// original API's caller.
     fn cb_advance(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let next = self.cb_stack.last_mut().and_then(|f| f.remaining.pop_front());
         if let Some((func, args)) = next {
@@ -3124,8 +2542,6 @@ impl WinOs {
             return Ok(Outcome::Resume);
         }
 
-        // Queue drained. If this is a modal dialog loop that has not ended,
-        // pump the window for the next user action and dispatch it.
         let modal = self.cb_stack.last().map(|f| f.modal).unwrap_or(false);
         if modal && self.dialog_result.is_none() {
             match self.gui.pump(true) {
@@ -3138,17 +2554,12 @@ impl WinOs {
                     return Ok(Outcome::Resume);
                 }
                 _ => {
-                    // Close / no event → cancel the modal dialog.
                     self.dialog_result = Some(IDCANCEL as u64);
                 }
             }
         }
 
-        // Return to the API's caller. A modal dialog returns its EndDialog value.
         let f = self.cb_stack.pop().expect("cb driver without frame");
-        // Process shutdown: once the DLL_PROCESS_DETACH queue has fully drained
-        // (no callback frames remain), terminate rather than resuming guest code
-        // (roadmap W0.7).
         if self.cb_stack.is_empty() {
             if let Some(code) = self.pending_process_exit.take() {
                 return Ok(Outcome::Exit(code));
@@ -3165,13 +2576,6 @@ impl WinOs {
         Ok(Outcome::Resume)
     }
 
-    /// Dispatch a `WM_NCHITTEST` whose **answer** the kernel needs (roadmap W4.8
-    /// input routing): the callback runs on the guest stack exactly like any
-    /// other, but the frame carries a `pending` continuation that
-    /// [`win32k::finish_hit_test`] runs with its `LRESULT` before the syscall's
-    /// caller is resumed.
-    ///
-    /// [`win32k::finish_hit_test`]: crate::win32k::finish_hit_test
     pub(crate) fn call_hit_test_from_syscall(
         &mut self,
         cpu: &mut CpuState,
@@ -3187,105 +2591,32 @@ impl WinOs {
         Ok(())
     }
 
-    /// Queue another callback on the innermost win32k frame — used by a
-    /// continuation that needs a second round (a repeated `WM_NCHITTEST` after
-    /// an `HTTRANSPARENT`).
     pub(crate) fn win32k_cb_queue(&mut self, func: u64, args: Vec<u64>) {
         if let Some(frame) = self.win32k_cb.last_mut() {
             frame.remaining.push_back((func, args));
         }
     }
 
-    /// Attach a continuation to the innermost win32k frame.
     pub(crate) fn win32k_cb_set_then(&mut self, pending: crate::win32k::PendingHitTest) {
         if let Some(frame) = self.win32k_cb.last_mut() {
             frame.then = Some(pending);
         }
     }
 
-    /// Override what the innermost win32k frame leaves in rax when it drains.
     pub(crate) fn win32k_cb_set_result(&mut self, result: u64) {
         if let Some(frame) = self.win32k_cb.last_mut() {
             frame.result = Some(result);
         }
     }
 
-    /// Whether exemu may seat a **client (user-mode) callback** on the guest.
-    ///
-    /// Always true now that a WoW64 process has a route (roadmap W5.10): a
-    /// 64-bit process takes the direct call this module has always made, and a
-    /// WoW64 one goes out through `ntdll!KiUserCallbackDispatcher` — see
-    /// [`seat_client_win_proc`](Self::seat_client_win_proc). It stays as a named
-    /// predicate because the two call sites that consume it
-    /// (`win32k::arm_hit_test`, `win32k::dispatch_to_wndproc`) have to answer
-    /// *something* when no callback can be seated, and that is a real state for
-    /// a window whose class was never registered.
-    ///
-    /// **What it used to guard, kept because it is what the route exists to
-    /// avoid.** Calling a 32-bit WndProc directly failed three independent ways,
-    /// each fatal on its own, measured on `SteamSetup.exe`:
-    ///
-    /// * **Mode.** The win32k syscall arrives from `win32u.dll` in *long* mode,
-    ///   but the WndProc is 32-bit guest code. `NtUserCreateWindowEx`
-    ///   (`win32u+0x12680`, reached through
-    ///   `wow64win!wow64_NtUserCreateWindowEx+0x131`) seated combase's
-    ///   `OleMainThreadWndClass` procedure at `combase+0x1a630`, whose
-    ///   `ff 25 fc d4 e4 02` is `jmp dword ptr [0x2e4d4fc]` — an ordinary
-    ///   32-bit indirect jump through its own IAT — but decodes in 64-bit mode
-    ///   as `jmp qword ptr [rip+0x2e4d4fc]`, i.e. `0x5c67b73`. Unmapped, so
-    ///   `0xC0000005` at 6,460,140 instructions, followed by a cascade of
-    ///   `KiUserExceptionDispatcher` breakpoints.
-    /// * **ABI.** [`setup_call_args`](Self::setup_call_args) keys off
-    ///   `cfg.is_64bit`, which is `true` here because the *process* is 64-bit
-    ///   (that is the whole point of new-WoW64) — so it passed the four
-    ///   arguments in `RCX/RDX/R8/R9` over a Win64 shadow area to a `stdcall`
-    ///   procedure that expects them pushed, and wrote an 8-byte return address
-    ///   a 32-bit `ret` cannot pop. The return thunk itself is unreachable:
-    ///   the thunk arena is at `0x7EFF_0000_0000`, not representable in 32 bits.
-    /// * **State.** Even a mode- and ABI-correct direct call would be unsound,
-    ///   because the callee's *own* syscalls leave through the BOP into
-    ///   `wow64cpu+0x1110`, which `xchg rsp,r14` against register state only
-    ///   `BTCpuSimulate` establishes. Entering 32-bit code from the middle of a
-    ///   64-bit syscall leaves `r13`/`r14` holding 64-bit callee-saved values.
-    ///
-    /// The client-callback route fixes all three by not doing any of it in
-    /// exemu: the mode switch is `BTCpuSimulate`'s, the `stdcall` frame is
-    /// `wow64!Wow64KiUserCallbackDispatcher`'s, and the return address is one
-    /// Wine put on the 32-bit stack itself.
     pub(crate) fn can_call_client(&self) -> bool {
         !self.is_wow64() || self.client_cb_dispatcher != 0
     }
 
-    /// Is this process a **WoW64** process — a 32-bit guest running on the
-    /// 64-bit Wine PE set (roadmap W5.4)? True once `wow64_boot` has published
-    /// the 32-bit PEB, which is the one field only that boot sets.
-    ///
-    /// `cfg.is_64bit` deliberately cannot answer this: a WoW64 process *is* a
-    /// 64-bit NT process, and every kernel-facing structure in it is 64-bit.
-    /// Anything that needs to know the **guest code's** bitness has to ask here.
     pub(crate) fn is_wow64(&self) -> bool {
         self.wow64_peb32 != 0
     }
 
-    /// The general form of [`call_wndproc_from_syscall`](Self::call_wndproc_from_syscall):
-    /// run a **sequence** of guest callbacks from inside a win32k syscall
-    /// handler, then resume that syscall's caller with `result` in rax
-    /// (roadmap W6.2).
-    ///
-    /// This is what unblocks `NtUserCreateWindowEx`: it must call the class
-    /// WndProc twice (`WM_NCCREATE`, then `WM_CREATE`) **and** still return the
-    /// HWND to user32. The plain return-hijack cannot — it leaves whatever the
-    /// WndProc returned in rax. Passing `result = Some(hwnd)` makes the frame
-    /// carry the handler's own answer across the callbacks, the same shape
-    /// [`invoke_callbacks`](Self::invoke_callbacks) gives the intercepted-import
-    /// path (`_initterm`, TLS callbacks, `DllMain`).
-    ///
-    /// `stack_reserve` bytes below the interrupted syscall's guest rsp are left
-    /// untouched by the callback frames — room for a struct the callbacks are
-    /// handed by pointer (`CREATESTRUCTW`). Returns whether a callback was
-    /// installed; `false` (an empty queue, or a process this mechanism cannot
-    /// call back into — see [`can_call_client`](Self::can_call_client)) means
-    /// the caller should return its status normally.
     pub(crate) fn call_wndprocs_from_syscall(
         &mut self,
         cpu: &mut CpuState,
@@ -3301,13 +2632,8 @@ impl WinOs {
         let Some((func, args)) = remaining.pop_front() else {
             return Ok(false);
         };
-        // SYSCALL left the return rip in rcx and the flags in r11; the guest rsp
-        // was captured before the unix-stack switch. These are the resume state.
         let resume_rsp = self.syscall_guest_rsp;
         let call_base = resume_rsp.wrapping_sub(stack_reserve);
-        // A WoW64 process takes the client-callback route, and the register
-        // state the syscall must resume into has to be captured *now* — the
-        // callback leaves through `NtCallbackReturn`, not by returning.
         let client = self.is_wow64().then(|| Box::new(ClientCbState::capture(cpu)));
         self.win32k_cb.push(Win32kCbFrame {
             resume_rip: cpu.reg(Reg::Rcx),
@@ -3323,20 +2649,10 @@ impl WinOs {
             self.win32k_cb.pop();
             return Err(e);
         }
-        // dispatch_syscall must not restore/return: we've installed the WndProc.
         self.syscall_resume_as_is = true;
         Ok(true)
     }
 
-    /// A **sub-4 GiB** block of `size` bytes for by-pointer data this callback
-    /// nesting level hands a 32-bit client callback, or `None` if the low arena
-    /// is exhausted (roadmap W5.10).
-    ///
-    /// One page per nesting level, indexed by the depth of the win32k callback
-    /// stack, so a WndProc that creates another window during its own
-    /// `WM_CREATE` does not overwrite the `CREATESTRUCTW` it is still holding.
-    /// Beyond [`WOW64_CB_SCRATCH_DEPTH`] levels there is no block and the caller
-    /// skips the callback rather than aliasing one.
     pub(crate) fn wow64_callback_scratch(&mut self, mem: &mut dyn Memory, size: u64) -> Option<u64> {
         if self.wow64_cb_scratch == 0 {
             let bytes = WOW64_CB_SCRATCH_DEPTH * WOW64_CB_SCRATCH_BLOCK;
@@ -3348,8 +2664,6 @@ impl WinOs {
             .then(|| self.wow64_cb_scratch + depth * WOW64_CB_SCRATCH_BLOCK)
     }
 
-    /// Seat one queued win32k callback — the direct way in a 64-bit process,
-    /// through `ntdll!KiUserCallbackDispatcher` in a WoW64 one.
     fn seat_win32k_callback(
         &mut self,
         cpu: &mut CpuState,
@@ -3365,30 +2679,6 @@ impl WinOs {
         self.setup_call_args(cpu, mem, func, args, driver, call_base)
     }
 
-    /// Enter user mode at `ntdll!KiUserCallbackDispatcher` with an
-    /// `NtUserCallWinProc` callback for `func(hwnd, msg, wparam, lparam)`
-    /// (roadmap W5.10) — the one way a kernel calls a **32-bit** guest's window
-    /// procedure without pretending the CPU is in long mode.
-    ///
-    /// Everything below this point is Wine's own code, and it fixes all three
-    /// defects the direct call had at a stroke: the mode switch is
-    /// `BTCpuSimulate`'s, the `stdcall` frame is
-    /// `wow64!Wow64KiUserCallbackDispatcher`'s, and the return address a 32-bit
-    /// `ret` pops is one Wine put on the 32-bit stack.
-    ///
-    /// The kernel's whole contribution is this frame:
-    ///
-    /// ```text
-    ///   [rsp .. rsp+0x20)   the callee's shadow area
-    ///   [rsp+0x20]          args = &win_proc_params
-    ///   [rsp+0x28]          len  = 0x48
-    ///   [rsp+0x2c]          id   = NtUserCallWinProc
-    ///   rip                 ntdll!KiUserCallbackDispatcher
-    /// ```
-    ///
-    /// `rsp` is 16-byte aligned so that the dispatcher's own
-    /// `call [KernelCallbackTable + id*8]` leaves the callee at the alignment
-    /// the Win64 ABI promises it.
     fn seat_client_win_proc(
         &mut self,
         cpu: &mut CpuState,
@@ -3408,22 +2698,18 @@ impl WinOs {
         let (hwnd, msg) = (args.first().copied().unwrap_or(0), args.get(1).copied().unwrap_or(0));
         let (wparam, lparam) = (args.get(2).copied().unwrap_or(0), args.get(3).copied().unwrap_or(0));
 
-        // The parameter block sits above the frame, on the interrupted syscall's
-        // own 64-bit stack: `wow64win` rewrites it in place before copying the
-        // narrowed form down to the 32-bit stack, so it must be writable, and
-        // nothing below `frame` may be ours (the callee grows down from there).
         let params = (call_base - 0x100) & !0xf;
         mem.write_u64(params + p::FUNC, func)?;
         mem.write_u64(params + p::HWND, hwnd)?;
         mem.write_u32(params + p::MSG, msg as u32)?;
         mem.write_u64(params + p::WPARAM, wparam)?;
         mem.write_u64(params + p::LPARAM, lparam)?;
-        mem.write_u32(params + p::SIZE, 0)?; // nothing packed after the struct
-        mem.write_u32(params + p::ANSI, 0)?; // …so no A/W conversion either
+        mem.write_u32(params + p::SIZE, 0)?;
+        mem.write_u32(params + p::ANSI, 0)?;
         mem.write_u32(params + p::MAPPING, 0)?;
         mem.write_u32(params + p::DPI_CONTEXT, crate::wow64::NTUSER_DPI_UNAWARE)?;
         mem.write_u64(params + p::PROC_A, 0)?;
-        mem.write_u64(params + p::PROC_W, func)?; // the pointer user32 calls
+        mem.write_u64(params + p::PROC_W, func)?;
         mem.write_u64(params + p::RESULT, 0)?;
 
         let frame = (params - cb_frame::SIZE) & !0xf;
@@ -3435,14 +2721,6 @@ impl WinOs {
         Ok(())
     }
 
-    /// `NtCallbackReturn(ret_ptr, ret_len, status)` — the way out of a client
-    /// callback (roadmap W5.10).
-    ///
-    /// The syscall arrives on the *callback's* stack with the callback chain's
-    /// registers, so the kernel restores what it saved when it seated the
-    /// callback, publishes the callback's `LRESULT` in rax and then behaves
-    /// exactly as if the WndProc had returned to the driver thunk: run the next
-    /// queued callback, or resume the interrupted syscall's caller.
     pub(crate) fn client_callback_return(
         &mut self,
         cpu: &mut CpuState,
@@ -3451,15 +2729,10 @@ impl WinOs {
         ret_len: u32,
         _status: u32,
     ) -> Result<u32> {
-        /// `STATUS_NO_CALLBACK_ACTIVE` — the same answer `wow64.dll`'s own
-        /// slot-5 thunk gives when there is no frame at `TEB64+0x14a8`.
         const STATUS_NO_CALLBACK_ACTIVE: u32 = 0xC000_0258;
         if !self.win32k_cb.last().is_some_and(|f| f.client.is_some()) {
             return Ok(STATUS_NO_CALLBACK_ACTIVE);
         }
-        // The result buffer is whatever user32 handed back: 8 bytes on the
-        // 64-bit side, 4 sign-extended once `wow64win` has widened a 32-bit
-        // LRESULT (it does the `movsxd` itself, so both widths arrive here).
         let lresult = match ret_len {
             0 => 0,
             n if n >= 8 => mem.read_u64(ret_ptr)?,
@@ -3470,20 +2743,11 @@ impl WinOs {
         }
         cpu.set_reg(Reg::Rax, lresult);
         self.win32k_cb_advance(cpu, mem)?;
-        // The resume state is installed: dispatch_syscall must not restore the
-        // NtCallbackReturn frame over it.
         self.syscall_resume_as_is = true;
         Ok(0)
     }
 
-    /// A WndProc invoked from a win32k syscall returned to the driver thunk: run
-    /// the next queued callback, or resume the interrupted syscall's caller.
-    /// With no explicit `result` the WndProc's own return value stays in rax
-    /// (= the `DispatchMessage` LRESULT the loop ignores).
     fn win32k_cb_advance(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
-        // A continuation runs when the queue drains, with the callback's LRESULT
-        // — the `WM_NCHITTEST` answer that decides where a mouse message goes.
-        // It may queue a further round, so this comes before the pop below.
         let drained =
             self.win32k_cb.last().is_some_and(|f| f.remaining.is_empty() && f.then.is_some());
         if drained {
@@ -3509,10 +2773,6 @@ impl WinOs {
         Ok(Outcome::Resume)
     }
 
-    /// wsprintf(A/W): format `fmt_ptr` with the variadic args (which begin at
-    /// arg index 2) into `out`. Supports %s/%S, %d/%i, %u, %x/%X, %c, %p and
-    /// %% with optional width and `0`/`-` flags — the common installer cases.
-    /// Returns the number of characters written (excluding the NUL).
     fn wsprintf(&self, cpu: &CpuState, mem: &mut dyn Memory, out: u64, fmt_ptr: u64, wide: bool) -> Result<usize> {
         let fmt = if wide { read_wstr(mem, fmt_ptr)? } else { read_astr(mem, fmt_ptr)? };
         let mut result = String::new();
@@ -3599,8 +2859,6 @@ impl WinOs {
         }
     }
 
-    /// Push a progress control's current percentage to the GUI (rendered as
-    /// the bar fill).
     fn sync_progress(&mut self, id: u32) {
         if let Some(&(min, max, pos)) = self.progress.get(&id) {
             let span = (max - min).max(1) as f64;
@@ -3609,14 +2867,10 @@ impl WinOs {
         }
     }
 
-    /// Write a `WM_NULL` MSG struct (targeting the dialog) into a guest
-    /// buffer, for GetMessage/PeekMessage. Layout differs by bitness.
     fn write_msg(&self, mem: &mut dyn Memory, lp: u64) -> Result<()> {
-        // hwnd = the dialog; message = WM_NULL.
         self.write_msg_full(mem, lp, HWND_DIALOG, 0, 0, 0)
     }
 
-    /// Write a full MSG (hwnd, message, wParam, lParam) into a guest buffer.
     pub(crate) fn write_msg_full(&self, mem: &mut dyn Memory, lp: u64, hwnd: u64, message: u64, wparam: u64, lparam: u64) -> Result<()> {
         if lp == 0 {
             return Ok(());
@@ -3639,7 +2893,6 @@ impl WinOs {
         Ok(())
     }
 
-    /// Read a MSG (hwnd, message, wParam, lParam) from a guest buffer.
     pub(crate) fn read_msg(&self, mem: &dyn Memory, lp: u64) -> Result<(u64, u64, u64, u64)> {
         if self.cfg.is_64bit {
             Ok((mem.read_u64(lp)?, mem.read_u32(lp + 8)? as u64, mem.read_u64(lp + 16)?, mem.read_u64(lp + 24)?))
@@ -3653,9 +2906,6 @@ impl WinOs {
         }
     }
 
-    /// Set up a guest call to `func` with `args`, returning to `ret_thunk`.
-    /// 64-bit: first four args in RCX/RDX/R8/R9 over a 32-byte shadow.
-    /// 32-bit: args pushed right-to-left (stdcall; the callee cleans them).
     pub(crate) fn setup_call_args(
         &self,
         cpu: &mut CpuState,
@@ -3692,30 +2942,11 @@ impl WinOs {
         Ok(())
     }
 
-    /// Called when a `_initterm` callback returns to the driver thunk. Runs
-    /// the next callback, or unwinds back to `_initterm`'s original caller.
-    /// MSVC 32-bit C++ SEH frame prolog (`__EH_prolog`).
-    ///
-    /// The compiler emits `mov eax, <scopetable>` / `call __EH_prolog` at the
-    /// top of a function that uses structured/`try` exception handling. The
-    /// helper builds an `EXCEPTION_REGISTRATION` frame on the stack, links it
-    /// at `fs:[0]`, saves the caller's `ebp` and repoints `ebp` into the frame,
-    /// then returns to the caller. We compute the end state directly instead of
-    /// replaying its internal `push`/`ret` dance.
-    ///
-    /// Entry: `esp = S`, `mem[S] = retaddr`, `eax = scopetable`,
-    /// `ebp = caller_ebp`, `mem[fs:0] = old_head`.
-    /// Exit: `mem[S-4] = 0xFFFFFFFF` (trylevel −1), `mem[S-8] = scopetable`,
-    /// `mem[S-12] = old_head`, `mem[S] = caller_ebp` (retaddr slot repurposed),
-    /// `fs:[0] = S-12`, `ebp = S`, `esp = S-12`, `rip = retaddr`.
-    /// `eax` is left untouched (the no-op stub wrongly zeroed it).
     fn eh_prolog(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
-        // 64-bit uses table-based unwind; this helper is 32-bit only. If it is
-        // ever reached in 64-bit, fall back to a plain return.
         if self.cfg.is_64bit {
             return Ok(Outcome::Return(0));
         }
-        let s = cpu.rsp() & 0xFFFF_FFFF; // S
+        let s = cpu.rsp() & 0xFFFF_FFFF;
         let retaddr = mem.read_u32(s)? as u64;
         let scopetable = cpu.gpr_read(Reg::Rax as u8, 4) as u32;
         let caller_ebp = cpu.gpr_read(Reg::Rbp as u8, 4) as u32;
@@ -3725,15 +2956,15 @@ impl WinOs {
         let m4 = s.wrapping_sub(4) & 0xFFFF_FFFF;
         let m8 = s.wrapping_sub(8) & 0xFFFF_FFFF;
         let m12 = s.wrapping_sub(12) & 0xFFFF_FFFF;
-        mem.write_u32(m4, 0xFFFF_FFFF)?; // trylevel = -1
-        mem.write_u32(m8, scopetable)?; // scopetable / handler pointer
-        mem.write_u32(m12, old_head)?; // previous SEH frame head
-        mem.write_u32(s, caller_ebp)?; // retaddr slot now holds saved ebp
-        mem.write_u32(fs0, m12 as u32)?; // fs:[0] = new frame head (S-12)
+        mem.write_u32(m4, 0xFFFF_FFFF)?;
+        mem.write_u32(m8, scopetable)?;
+        mem.write_u32(m12, old_head)?;
+        mem.write_u32(s, caller_ebp)?;
+        mem.write_u32(fs0, m12 as u32)?;
 
-        cpu.gpr_write(Reg::Rbp as u8, 4, s); // ebp = S
-        cpu.set_rsp(m12); // esp = S-12
-        cpu.rip = retaddr; // return to caller
+        cpu.gpr_write(Reg::Rbp as u8, 4, s);
+        cpu.set_rsp(m12);
+        cpu.rip = retaddr;
         Ok(Outcome::Resume)
     }
 
@@ -3751,8 +2982,6 @@ impl WinOs {
                 Ok(Outcome::Resume)
             }
             None => {
-                // All callbacks done: return to _initterm's caller with 0,
-                // popping the pointer-sized return slot.
                 let ptr = if self.cfg.is_64bit { 8 } else { 4 };
                 let frame = self.initterm_stack.pop().expect("driver without frame");
                 cpu.set_rsp(frame.saved_rsp + ptr);
@@ -3768,11 +2997,6 @@ impl WinOs {
 mod tests {
     use super::*;
 
-    /// Regression: the DLL search-path setters are 32-bit stdcall functions
-    /// that each take one DWORD/pointer argument. If their stub reports argc 0
-    /// it fails to pop that argument, leaking 4 bytes of esp per call — the
-    /// corruption that made a later `ret` wild-jump and crashed the Firefox
-    /// installer. They must report argc 1 and return TRUE (BOOL success).
     #[test]
     fn dll_directory_setters_pop_one_arg_and_return_true() {
         for name in ["SetDefaultDllDirectories", "SetDllDirectoryW", "SetDllDirectoryA"] {
@@ -3786,10 +3010,6 @@ mod tests {
         }
     }
 
-    /// Every unimplemented stub that hands the guest a 0 must be remembered, so
-    /// a later NULL dereference can name its suspects instead of leaving the
-    /// reader to guess which of a few hundred stubs was the wrong one. Newest
-    /// first, one entry per symbol however often it is called, capped.
     #[test]
     fn unimplemented_stubs_that_return_zero_are_remembered() {
         use exemu_memory::VirtualMemory;
@@ -3806,12 +3026,9 @@ mod tests {
         call(&mut os, "kernel32.dll!Beta");
         assert_eq!(os.zero_returning_stubs(), ["kernel32.dll!Beta", "kernel32.dll!Alpha"], "newest first");
 
-        // Calling one again moves it to the front rather than duplicating it —
-        // a stub called in a loop must not crowd the others out of the trail.
         call(&mut os, "kernel32.dll!Alpha");
         assert_eq!(os.zero_returning_stubs(), ["kernel32.dll!Alpha", "kernel32.dll!Beta"]);
 
-        // The trail is bounded, and keeps the most recent.
         for i in 0..crate::ZERO_STUB_TRAIL + 5 {
             call(&mut os, &format!("kernel32.dll!Fill{i}"));
         }

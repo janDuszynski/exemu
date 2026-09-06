@@ -1,58 +1,29 @@
-//! CPUID leaf-fidelity + the "advertised ⊆ implemented" invariant (roadmap W1.3).
-//!
-//! CPUID honesty is a **correctness** requirement, not cosmetics: if exemu
-//! advertises a feature bit whose instructions the interpreter cannot execute,
-//! Wine's feature-detection branches straight into that unimplemented path and
-//! dies millions of instructions later. These tests do three things:
-//!
-//!  1. **Pin** the exact bytes of leaves 0 / 1 / 7.0 / 0xD.0 / 0x8000_0000 /
-//!     0x8000_0001 against what the interpreter implements at this point in W1
-//!     (x87 ON per W1.1, XSAVE ON per W1.2; SSSE3/SSE4/AVX/BMI still OFF).
-//!  2. **Soundness** — every advertised feature bit has a representative
-//!     instruction in `Interpreter::CPUID_FEATURES`, and each such probe decodes
-//!     and executes (no `Decode`/`Unsupported`).
-//!  3. **Completeness** — every bit set in a guarded feature-flag word
-//!     (`CPUID_FEATURE_WORDS`) is covered by a `CPUID_FEATURES` entry, so a
-//!     future step (W1.4–W1.6) cannot flip a CPUID bit on without also landing
-//!     its decoder support and adding its probe here. This is the anti-desync
-//!     latch the roadmap step calls for.
-
 use exemu_core::hooks::NoHooks;
 use exemu_core::{Cpu, EmuError, Exit, Memory, Perm, Region};
 use exemu_cpu::{Bits, CpuidReg, Interpreter};
 use exemu_memory::VirtualMemory;
 
 const CODE: u64 = 0x1000;
-const DATA: u64 = 0x2000; // 64-byte aligned: valid FXSAVE (16) / XSAVE (64) operand
+const DATA: u64 = 0x2000;
 
-/// Run a single instruction in 64-bit mode with RAX pointing at a mapped,
-/// readable+writable DATA region (so memory-operand probes like `FXSAVE [rax]`
-/// have a valid, aligned operand). Returns the raw step result so the caller can
-/// distinguish a *decoder* failure from a legitimate architectural outcome.
 fn step_probe(code: &[u8]) -> exemu_core::Result<Exit> {
     let mut m = VirtualMemory::new();
     m.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
     m.map(Region::new("data", DATA, 0x1000, Perm::RW)).unwrap();
-    // A valid, mostly-masked XSAVE image header so XRSTOR-adjacent forms are sane
-    // (unused by the FXSAVE/XSAVE probes, which only write).
     m.write(CODE, code).unwrap();
     let mut cpu = Interpreter::with_bits(Bits::B64);
     {
         let s = cpu.state_mut();
         s.rip = CODE;
-        s.gpr[0] = DATA; // RAX → the mapped operand
+        s.gpr[0] = DATA;
     }
     cpu.set_mxcsr(0x1F80);
     let mut hooks = NoHooks;
     cpu.step(&mut m, &mut hooks)
 }
 
-/// Read a CPUID word by executing `0F A2` with EAX/ECX seeded — exercises the
-/// same path the guest hits, and matches the pure `cpuid_leaf` helper.
 fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
     let pure = Interpreter::cpuid_leaf(leaf, sub);
-    // Cross-check the pure helper against the executed instruction so the two
-    // never drift.
     let mut m = VirtualMemory::new();
     m.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
     m.write(CODE, &[0x0F, 0xA2]).unwrap();
@@ -71,93 +42,67 @@ fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
     pure
 }
 
-// ---- (1) exact leaf pins ----------------------------------------------------
-
 #[test]
 fn leaf0_max_leaf_and_vendor() {
     let (eax, ebx, ecx, edx) = cpuid(0, 0);
-    // Max standard leaf is 0xD (XSAVE enumeration is the highest we answer).
     assert_eq!(eax, 0xD);
-    // "GenuineIntel" in EBX/EDX/ECX order.
-    assert_eq!(ebx, 0x756e_6547); // "Genu"
-    assert_eq!(edx, 0x4965_6e69); // "ineI"
-    assert_eq!(ecx, 0x6c65_746e); // "ntel"
+    assert_eq!(ebx, 0x756e_6547);
+    assert_eq!(edx, 0x4965_6e69);
+    assert_eq!(ecx, 0x6c65_746e);
 }
 
 #[test]
 fn leaf1_feature_words_exact() {
     let (_eax, _ebx, ecx, edx) = cpuid(1, 0);
-    // ECX: SSSE3(9) | CX16(13) | SSE4.1(19) | SSE4.2(20) | POPCNT(23) | XSAVE(26)
-    // | OSXSAVE(27) | AVX(28) | F16C(29) — and nothing else. SSSE3/SSE4.1/SSE4.2
-    // are ON after W1.4; AVX after W1.5; CMPXCHG16B + F16C after W1.6.
     assert_eq!(
         ecx,
         (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29)
     );
-    // EDX: FPU(0) | TSC(4) | CMOV(15) | MMX(23) | FXSR(24) | SSE(25) | SSE2(26).
-    // MMX is ON after W1.6 (bare-form MMX + EMMS).
     assert_eq!(edx, 1 | (1 << 4) | (1 << 15) | (1 << 23) | (1 << 24) | (1 << 25) | (1 << 26));
-    // x87 must be ON now (W1.1).
     assert_ne!(edx & 1, 0, "x87 (leaf1 EDX bit0) must be advertised after W1.1");
 }
 
 #[test]
 fn leaf1_withholds_unimplemented_bits() {
     let (_eax, _ebx, ecx, edx) = cpuid(1, 0);
-    // These stay OFF until their steps land — advertising any would send Wine
-    // into a decode-fault. (SSSE3/SSE4.1/SSE4.2 are ON as of W1.4 and AVX as of
-    // W1.5; see `leaf1_feature_words_exact`. SSE3 is still off — its handful of
-    // extra ops is a separate, not-yet-implemented feature bit.)
     assert_eq!(ecx & (1 << 0), 0, "SSE3 must be OFF");
     assert_eq!(ecx & (1 << 12), 0, "FMA must be OFF");
     assert_eq!(ecx & (1 << 25), 0, "AES must be OFF");
-    // MMX is ON as of W1.6 (bare-form MMX + EMMS); see leaf1_feature_words_exact.
     assert_ne!(edx & (1 << 23), 0, "MMX must be ON (W1.6)");
 }
 
 #[test]
 fn leaf7_bmi_avx2_adx() {
-    // Structured extended features: BMI1(3) | AVX2(5) | BMI2(8) | ADX(19). AVX2 is
-    // ON after W1.5; BMI1/BMI2/ADX after W1.6. Max sub-leaf (EAX) is 0.
     let (eax, ebx, ecx, edx) = cpuid(7, 0);
     assert_eq!(eax, 0, "max sub-leaf 0");
     assert_eq!(ebx, (1 << 3) | (1 << 5) | (1 << 8) | (1 << 19), "leaf 7 EBX = BMI1|AVX2|BMI2|ADX");
     assert_eq!(ecx, 0);
     assert_eq!(edx, 0);
-    // Sub-leaf variation stays zero.
     assert_eq!(cpuid(7, 1), (0, 0, 0, 0));
     assert_ne!(ebx & (1 << 5), 0, "AVX2 must be ON (W1.5)");
     assert_ne!(ebx & (1 << 3), 0, "BMI1 must be ON (W1.6)");
     assert_ne!(ebx & (1 << 8), 0, "BMI2 must be ON (W1.6)");
     assert_ne!(ebx & (1 << 19), 0, "ADX must be ON (W1.6)");
-    // AVX-512 foundation (EBX bit 16) stays OFF.
     assert_eq!(ebx & (1 << 16), 0, "AVX-512F must be OFF");
 }
 
 #[test]
 fn leafd_xsave_enumeration() {
-    // Sub-leaf 0: EAX/EDX = XCR0 valid-bit mask (x87|SSE|AVX = 0x7 after W1.5);
-    // EBX = size for the enabled features, ECX = max size for all supported —
-    // both 832 (512 legacy + 64 header + 256 AVX YMM_Hi component).
     let (eax, ebx, ecx, edx) = cpuid(0xD, 0);
     assert_eq!(eax, 0x7, "XCR0 valid-bit mask = x87|SSE|AVX");
     assert_eq!(edx, 0, "XCR0 high mask = 0");
     assert_eq!(ebx, 832);
     assert_eq!(ecx, 832);
     assert_ne!(eax & (1 << 2), 0, "AVX (YMM) XSAVE component must be ON (W1.5)");
-    // Sub-leaf 1 (XSAVEOPT/XSAVEC/XSAVES): none implemented ⇒ all zero.
     assert_eq!(cpuid(0xD, 1), (0, 0, 0, 0));
-    // Sub-leaf 2: the AVX (YMM upper-half) component — size 256 at offset 576.
     assert_eq!(cpuid(0xD, 2), (256, 576, 0, 0));
 }
 
 #[test]
 fn ext_max_leaf_and_features() {
-    // Highest extended leaf we answer honestly is the brand string 0x8000_0004.
     let (eax, ..) = cpuid(0x8000_0000, 0);
     assert_eq!(eax, 0x8000_0004);
     let (_e, _b, ecx, edx) = cpuid(0x8000_0001, 0);
-    // ECX: LZCNT/ABM (bit 5). EDX: SYSCALL (11) | RDTSCP (27) | Long Mode (29).
     assert_eq!(ecx, 1 << 5);
     assert_eq!(edx, (1 << 11) | (1 << 27) | (1 << 29));
     assert_eq!(edx & (1 << 29), 0x2000_0000, "Long Mode must be advertised");
@@ -166,7 +111,6 @@ fn ext_max_leaf_and_features() {
 
 #[test]
 fn brand_string_is_populated() {
-    // Concatenate 0x8000_0002..=0x8000_0004 into the 48-byte brand string.
     let mut bytes = Vec::new();
     for leaf in 0x8000_0002u32..=0x8000_0004 {
         let (a, b, c, d) = cpuid(leaf, 0);
@@ -180,18 +124,13 @@ fn brand_string_is_populated() {
 
 #[test]
 fn out_of_range_leaf_is_zero() {
-    // A standard leaf above the max (0xD) that we do not implement returns zero
-    // — exemu does not echo the max leaf, so no fabricated data leaks.
     assert_eq!(cpuid(0x40, 0), (0, 0, 0, 0));
     assert_eq!(cpuid(0x8000_00FF, 0), (0, 0, 0, 0));
 }
 
-// ---- (2) soundness: every probe decodes and executes ------------------------
-
 #[test]
 fn every_advertised_feature_probe_decodes() {
     for f in Interpreter::CPUID_FEATURES {
-        // The bit this probe claims to cover must actually be advertised.
         let word = f.reg.pick(Interpreter::cpuid_leaf(f.leaf, f.sub));
         assert_ne!(
             word & (1 << f.bit),
@@ -199,10 +138,6 @@ fn every_advertised_feature_probe_decodes() {
             "CPUID_FEATURES lists {} (leaf {:#x} {:?} bit {}) but that bit is NOT advertised",
             f.name, f.leaf, f.reg, f.bit
         );
-        // The representative instruction must not fault at the decoder /
-        // unimplemented-instruction level. A legitimate architectural outcome
-        // (Continue, or SYSCALL's Interrupt) is fine; only Decode/Unsupported is
-        // a broken advertisement.
         match step_probe(f.probe) {
             Err(EmuError::Decode { .. }) | Err(EmuError::Unsupported(_)) => {
                 panic!("advertised feature {} has an unimplemented probe {:02x?}", f.name, f.probe);
@@ -211,8 +146,6 @@ fn every_advertised_feature_probe_decodes() {
         }
     }
 }
-
-// ---- (3) completeness: no advertised bit is left un-probed -------------------
 
 #[test]
 fn every_advertised_feature_bit_is_covered() {
@@ -236,9 +169,6 @@ fn every_advertised_feature_bit_is_covered() {
 
 #[test]
 fn feature_words_are_only_feature_flags() {
-    // Guard against accidentally listing a structural word (max-leaf / vendor /
-    // sizes) as a feature word, which would make the completeness check demand a
-    // probe for a non-feature bit.
     for &(leaf, _sub, reg) in Interpreter::CPUID_FEATURE_WORDS {
         let is_flag_word = matches!(
             (leaf, reg),

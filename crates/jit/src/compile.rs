@@ -1,60 +1,11 @@
-//! The basic-block compiler: guest x86/x86-64 → ARM64 (roadmap W8.3).
-//!
-//! # What is compiled, and what is not
-//!
-//! The set below was chosen by *measuring* (`exemu run --opcode-profile`), not
-//! by guessing: on the 7-Zip reference run (496M instructions, Wine's DLLs
-//! included) these shapes are ~99% of the stream. Everything else — every rare
-//! opcode, every SSE/x87/VEX instruction, `syscall`, `call`/`ret`, the string
-//! ops, `adc`/`sbb`, rotates, the `LOCK`/`REP` prefixes — **ends the block**, and
-//! the interpreter executes that instruction. Deferring is always safe;
-//! compiling something whose flag semantics are not proven is not.
-//!
-//! Compiled today:
-//!
-//! | Shape | Notes |
-//! | ----- | ----- |
-//! | `add`/`or`/`and`/`sub`/`xor`/`cmp`, all six operand forms | sizes 1/2/4/8; `adc`/`sbb` deliberately excluded (the carry-in makes the sub-64-bit flag lowering a different problem) |
-//! | group 1 (`80`/`81`/`83`) | same six operations |
-//! | `test` (`84`/`85`/`a8`/`a9`) | |
-//! | `mov` (`88`/`89`/`8a`/`8b`/`b0`–`bf`/`c6`/`c7`) | |
-//! | `lea`, `movzx`, `movsx`, `movsxd` | |
-//! | `imul` (`0f af`, `69`, `6b`) | CF/OF only, exactly like the interpreter |
-//! | `shl`/`shr`/`sar` with a **constant** count (`c0`/`c1`/`d0`/`d1`) | `d2`/`d3` (CL count) and the rotates side-exit |
-//! | `inc`/`dec`, `neg`, `not` | |
-//! | `cmov<cc>` | including the "write the destination even when not taken" rule |
-//! | `push r`/`pop r` | |
-//! | `j<cc>`/`jmp` rel8/rel32 | **block terminators**: the branch is compiled and `rip` is left correct, so the hot loop never returns to the interpreter |
-//! | `nop` | |
-//!
-//! # The two rules that make faults exact
-//!
-//! 1. **Nothing is committed before a faulting access.** Results live in scratch
-//!    registers; the guest register file and the live `rflags` are updated only
-//!    after every access of that instruction has succeeded.
-//! 2. **A fault rewinds.** `rip` is set back to the start of the faulting
-//!    instruction and the block returns with the fault bit set. The caller
-//!    re-executes that one instruction on the interpreter, which raises the real
-//!    error — including whatever partial state the interpreter itself would
-//!    leave behind. The JIT never constructs an `EmuError`.
-//!
-//! Self-modifying code is handled by the same mechanism from the other side: the
-//! store helper reports (via [`crate::rt::status::WROTE_CODE`]) when a store
-//! landed in executable memory, and the block commits that instruction and stops
-//! rather than running instructions that may have just been rewritten.
-
 use crate::a64::{Asm, Cond, Label, ZR};
 use crate::rt::{ctx_off, status, tlb_off, TLB_PAGE_BITS, TLB_SLOT_BITS};
 use exemu_core::cpu::CpuState;
 use exemu_core::Memory;
 
-/// Guest CPU mode. Mirrors `exemu_cpu::Bits` without depending on it (the JIT
-/// stays a sibling of the interpreter, both pointing inward at `exemu-core`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// 32-bit protected mode.
     Protected,
-    /// 64-bit long mode.
     Long,
 }
 
@@ -63,7 +14,6 @@ impl Mode {
     fn is64(self) -> bool {
         self == Mode::Long
     }
-    /// Address mask: 32-bit mode truncates every effective address.
     #[inline]
     fn addr_mask(self) -> u64 {
         match self {
@@ -71,7 +21,6 @@ impl Mode {
             Mode::Protected => 0xFFFF_FFFF,
         }
     }
-    /// Stack slot width in bytes.
     #[inline]
     fn stack_width(self) -> u8 {
         match self {
@@ -81,42 +30,21 @@ impl Mode {
     }
 }
 
-// --- ARM64 register roles inside a block ------------------------------------
+const R_STATE: u32 = 19;
+const R_CTX: u32 = 20;
+const R_FLAGS: u32 = 21;
+const R_PARITY: u32 = 22;
+const R_FA: u32 = 23;
+const R_FB: u32 = 24;
+const R_FR: u32 = 25;
+const R_VAL: u32 = 26;
+const R_ADDR: u32 = 27;
+const R_MASK: u32 = 28;
 
-const R_STATE: u32 = 19; // *mut CpuState
-const R_CTX: u32 = 20; // *mut BlockCtx
-const R_FLAGS: u32 = 21; // rflags — as of *before* any pending flag operation
-const R_PARITY: u32 = 22; // parity table base
-const R_FA: u32 = 23; // pending flag operand a (survives helper calls)
-const R_FB: u32 = 24; // pending flag operand b (survives helper calls)
-const R_FR: u32 = 25; // pending flag result — also the ALU result
-const R_VAL: u32 = 26; // value to store / commit (survives helper calls)
-const R_ADDR: u32 = 27; // effective address (survives helper calls)
-const R_MASK: u32 = 28; // 0x8D5 = CF|PF|AF|ZF|SF|OF
-
-/// `log2` of a [`crate::rt::TlbEntry`]'s size, as the shift folded into the
-/// address of a slot. Checked against the real layout in `emit_tlb_probe`.
 const TLB_ENTRY_SHIFT: u32 = 5;
 
-/// Scratch registers, dead across any helper call.
-/// The block's stack frame, in bytes. 80 of it is the ten callee-saved role
-/// registers plus `x30`; the last 32 are [`FSPILL`], the rewind's scratch.
-/// 16-byte aligned, as AAPCS64 requires.
 const FRAME: i32 = 128;
 
-/// Frame offset of the four-register **flag spill** (roadmap W8.4 + W9.3).
-///
-/// A guest store can fault *after* its instruction has already computed its
-/// flags — the store is the last thing an RMW does — and the rewind must show
-/// the flags as of the instruction's **start**. Those live only in registers the
-/// instruction has by then overwritten, so a flag-setting instruction with a
-/// memory operand parks all four here first: `R_FLAGS`/`R_FR` in the low pair,
-/// `R_FA`/`R_FB` in the high one, two `stp`s in all.
-///
-/// The cold path reloads them and the ordinary rewind machinery then works
-/// unchanged, including for an instruction whose *entry* flag state was itself
-/// deferred (roadmap W8.4) — which is precisely the case that cannot be
-/// reconstructed from anything else.
 const FSPILL: i32 = 96;
 
 const T0: u32 = 9;
@@ -124,19 +52,14 @@ const T1: u32 = 10;
 const T2: u32 = 11;
 const T3: u32 = 12;
 
-/// x86 flag bit positions.
 const F_CF: u32 = 0;
 const F_PF: u32 = 2;
 const F_AF: u32 = 4;
 const F_ZF: u32 = 6;
 const F_SF: u32 = 7;
 const F_OF: u32 = 11;
-/// The six status flags a normal arithmetic instruction defines.
 const ARITH_MASK: u64 = (1 << F_CF) | (1 << F_PF) | (1 << F_AF) | (1 << F_ZF) | (1 << F_SF) | (1 << F_OF);
 
-/// Byte offsets into [`CpuState`], taken from the real layout rather than
-/// assumed: `offset_of!` is evaluated by the compiler against the same type
-/// definition the interpreter uses.
 mod st {
     use super::CpuState;
     pub const GPR: u32 = std::mem::offset_of!(CpuState, gpr) as u32;
@@ -151,66 +74,28 @@ fn gpr_off(i: u8) -> u32 {
     st::GPR + 8 * (i as u32 & 15)
 }
 
-/// Why the block stopped growing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StopReason {
-    /// An instruction the compiler does not implement. The interpreter runs it,
-    /// then the next block starts after it. `esc` distinguishes the `0F` map, so
-    /// `0F B1` (cmpxchg) is not reported as `B1` (mov r8, imm8).
     Unsupported { rip: u64, opcode: u8, esc: bool },
-    /// The instruction bytes could not be fetched — the interpreter will raise
-    /// the fetch fault.
     FetchFailed { rip: u64 },
-    /// The block hit the instruction cap.
     Full,
-    /// The block ended on a compiled branch; `rip` is left correct by the code.
     Terminator,
-    /// The last instruction ended on the top of the address space, so the next
-    /// one is at a *lower* address than the block's first. A block is a
-    /// contiguous byte range — that is what the store helper's two-compare
-    /// self-modification check and the engine's two-page generation check are
-    /// built on — so the block stops here rather than becoming two ranges.
     Wrapped,
-    /// The next instruction is at an address with an **armed breakpoint**
-    /// (roadmap W9.3). The block ends *before* it, so the debugger's one
-    /// decision point — the caller's run-loop head — sees `rip` sitting on the
-    /// armed address instead of the block running straight through it.
-    ///
-    /// A breakpoint at what would have been a block *entry* stops the loop on
-    /// its first turn and yields `insns == 0`, which is already defined as
-    /// "nothing here could be compiled and the caller must interpret". So
-    /// arming **splits** a block; it never de-optimises one.
     Breakpoint { rip: u64 },
 }
 
-/// A compiled block, before it is written into the code buffer.
 pub struct BlockPlan {
-    /// Guest address of the first instruction.
     pub start: u64,
-    /// Number of guest instructions compiled.
     pub insns: u32,
-    /// Guest address just past the last compiled instruction.
     pub end_rip: u64,
-    /// Total guest instruction bytes covered.
     pub bytes: u64,
-    /// The ARM64 words.
     pub code: Vec<u32>,
     pub stop: StopReason,
-    /// Word offset of the **chain entry**: the first instruction past the
-    /// prologue. A block reached by a native link jumps here rather than to word
-    /// 0, because the chain has already built the frame and loaded the pinned
-    /// registers, and doing it again would grow the stack without bound
-    /// (roadmap W8.5).
     pub chain_off: u32,
-    /// Guest address each link slot this block took points at, in slot order.
-    /// Empty when the engine gave the block no slots.
     pub links: Vec<u64>,
 }
 
-/// Maximum guest instructions in one block.
 pub const MAX_INSNS: u32 = 64;
-
-// --- decode -----------------------------------------------------------------
 
 #[derive(Clone, Copy, Default)]
 struct Pfx {
@@ -239,8 +124,6 @@ impl Pfx {
     }
 }
 
-/// A decoded memory operand. `abs` is `Some` when the address is a compile-time
-/// constant (RIP-relative, or a bare `disp32` in 32-bit mode).
 #[derive(Clone, Copy, Default)]
 struct MemOp {
     base: Option<u8>,
@@ -264,11 +147,9 @@ struct Insn {
     reg: u8,
     rm: Rm,
     imm: u64,
-    /// Length in bytes.
     len: u8,
 }
 
-/// A tiny byte cursor over the prefetched instruction window.
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -319,7 +200,6 @@ fn mask_of(size: u8) -> u64 {
     }
 }
 
-/// The x86 operations of the regular ALU family, by opcode `>> 3`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Alu {
     Add,
@@ -339,8 +219,6 @@ impl Alu {
             5 => Some(Alu::Sub),
             6 => Some(Alu::Xor),
             7 => Some(Alu::Cmp),
-            // 2 = adc, 3 = sbb: the carry-in makes the <64-bit flag lowering a
-            // separate problem, so they are not compiled (yet).
             _ => None,
         }
     }
@@ -349,129 +227,65 @@ impl Alu {
     }
 }
 
-/// What has to be written to guest state once every access of an instruction has
-/// succeeded. Emitted twice (hot path and the "store hit code" stub), so it is
-/// kept to one or two instructions.
 #[derive(Clone, Copy)]
 enum Commit {
     None,
-    /// `rflags = R_FA` — the eagerly-computed flags of a shift, which have to
-    /// survive the store call before they may be committed.
     Flags,
     Gpr { idx: u8, size: u8, has_rex: bool },
 }
 
-/// The flag state at a point in the emitted code (roadmap W8.4).
-///
-/// Computing x86's six status flags eagerly costs ~16 ARM64 instructions per ALU
-/// operation, and the overwhelming majority of those results are dead: pointer
-/// arithmetic, index updates and the `add`/`sub` inside an addressing sequence
-/// have their flags overwritten by the *next* flag-writing instruction without
-/// anything ever reading them. So an ALU instruction emits only its **result**
-/// and records here how its flags could be derived; the derivation is emitted at
-/// the first point that can observe them, and never at all when a later
-/// instruction supersedes it first.
-///
-/// The invariant that makes this exact: while a state other than [`Flags::Live`]
-/// is outstanding, `R_FLAGS` holds the architectural `rflags` from *before* that
-/// operation, and `R_FA`/`R_FB`/`R_FR` hold its masked operands and result. So
-/// materialising is always `R_FLAGS = (R_FLAGS & !defined) | computed` — which
-/// is also why the flags an operation leaves *undefined* (INC/DEC's CF) come out
-/// right for free.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Flags {
-    /// `R_FLAGS` is the architectural `rflags`; nothing is pending.
     Live,
-    /// An ADD/SUB-shaped result is pending. `keep_cf` marks INC/DEC, which
-    /// define every status flag except CF.
     Arith { size: u8, sub: bool, keep_cf: bool },
-    /// AND/OR/XOR/TEST: CF, OF and AF are cleared, SF/ZF/PF come from `R_FR`.
     Logic { size: u8 },
 }
 
-/// A deferred fault exit (rewind to the start of instruction `retired`).
 struct FaultStub {
     label: Label,
     retired: u32,
     rip: u64,
-    /// The flag state as of the *start* of the faulting instruction — what the
-    /// rewound state must show.
     flags: Flags,
 }
 
-/// A deferred "the store completed but landed in code" exit.
 struct StoreStub {
     label: Label,
     retired: u32,
     rip: u64,
     next_rip: u64,
-    /// Register holding the guest address to stop at, when the instruction is an
-    /// indirect `call` and its stop point is therefore not a constant. `None`
-    /// uses `next_rip`.
     next_reg: Option<u32>,
     commit: Commit,
-    /// Flag state as of the start of this instruction (the rewind path) …
     before: Flags,
-    /// … and as of after it (the "committed, now stop" path).
     after: Flags,
-    /// Did this instruction park the four flag registers in [`FSPILL`] before
-    /// touching them? Then the rewind reloads them first, because `before` is
-    /// expressed in terms of registers the instruction has since overwritten.
     spilled: bool,
 }
 
-/// The block being built.
 pub struct Compiler {
     asm: Asm,
     mode: Mode,
-    /// Instructions compiled so far.
     insns: u32,
-    /// Guest address of the instruction being compiled.
     rip: u64,
-    /// Flag state right here in the emitted stream.
     flags: Flags,
-    /// Flag state as of the start of the instruction being lowered. A faulting
-    /// access rewinds to exactly that point, so its stub must restore this one
-    /// rather than whatever the instruction has computed so far.
     insn_flags: Flags,
-    /// Whether the instruction being lowered should leave its flags pending.
-    /// Purely a cost decision — either answer is correct.
     defer: bool,
-    /// Whether the instruction being lowered has parked the flag registers in
-    /// [`FSPILL`]. See that constant: it is what makes a **store** fault rewind
-    /// to the right flags, as a load fault already did.
     spilled: bool,
     fault_stubs: Vec<FaultStub>,
     store_stubs: Vec<StoreStub>,
-    /// Branches to the shared epilogue.
     exits: Vec<Label>,
-    /// First link slot this block may use, if the engine gave it any
-    /// (roadmap W8.5). `None` compiles a block that always returns to Rust.
     slot_base: Option<u32>,
-    /// Guest address each slot this block took points at, in slot order.
     link_targets: Vec<u64>,
 }
 
-/// Outgoing native links one block may hold: a conditional branch has two edges,
-/// and no terminator this compiler accepts has more.
 pub const MAX_LINKS: u32 = 2;
 
-/// Bytes per [`crate::rt::LinkSlot`], which the emitter indexes by hand.
 pub const SLOT_BYTES: u32 = std::mem::size_of::<crate::rt::LinkSlot>() as u32;
 
-/// Recorded in [`BlockPlan::links`] for a slot whose target is not known until
-/// the block runs.
 pub const INDIRECT_TARGET: u64 = u64::MAX;
 
-/// How a block leaves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ExitKind {
-    /// Return to the engine, which decides what runs next.
     Return,
-    /// Return having rewound onto a faulting access.
     Fault,
-    /// `rip` is a compile-time constant with a block of its own, so the exit may
-    /// jump straight into that block's code instead of returning (roadmap W8.5).
     Link,
 }
 
@@ -485,26 +299,9 @@ impl ExitKind {
     }
 }
 
-/// Bit set in the block's return value when it exited by rewinding to a
-/// faulting instruction. The instruction *count* is no longer in the return
-/// value: a natively linked chain accumulates it in `BlockCtx::retired`, so the
-/// engine reads it from there and a block returns only a status word.
 pub const RET_FAULT: u64 = 1 << 32;
 
 impl Compiler {
-    /// Compile a straight-line block starting at `start`. A plan with
-    /// `insns == 0` means nothing here could be compiled and the caller must
-    /// interpret.
-    ///
-    /// `stop_before` is the lowest guest address the block may **not** compile
-    /// (roadmap W9.3): the engine computes it once per block from
-    /// [`DebugControl::next_break_at_or_after`], and `u64::MAX` — the value a
-    /// detached handle yields — is "no such address", which no instruction can
-    /// start at. It costs the loop below one integer compare per instruction
-    /// and the emitted code nothing at all.
-    ///
-    /// [`DebugControl::next_break_at_or_after`]:
-    ///     exemu_core::debug::DebugControl::next_break_at_or_after
     pub fn compile<M: Memory + ?Sized>(
         mem: &M,
         mode: Mode,
@@ -529,18 +326,6 @@ impl Compiler {
             link_targets: Vec::new(),
         };
         c.prologue();
-        // --- the chain entry ---------------------------------------------
-        //
-        // Where a natively linked predecessor jumps in: past the frame the chain
-        // already built, but *before* the body — because the one thing a block
-        // must publish on every entry, however it was entered, is the guest byte
-        // range it was compiled from. The store helper tests every store against
-        // it, and with linking there is no Rust between blocks to set it.
-        //
-        // The block's length is not known until it has stopped growing, so the
-        // `add` that derives the end from the start is emitted as a placeholder
-        // and patched below. It is a plain `Vec<u32>` at this point; nothing here
-        // touches executable memory.
         let chain_off = c.asm.len() as u32;
         c.asm.mov_imm64(T0, start);
         let bytes_at = c.asm.len();
@@ -549,30 +334,14 @@ impl Compiler {
         let mut stop = StopReason::Full;
         let mut rip = start;
         while c.insns < max_insns {
-            // The debugger's one negative guarantee (roadmap W9.3): a compiled
-            // block never contains an armed breakpoint's instruction, so a
-            // chain cannot run past one. The *decision* to stop is not made
-            // here and is not made by this crate at all — the block simply ends
-            // with `rip` on the armed address, and the caller's run-loop head,
-            // which is where the interpreter path and the chain path converge,
-            // is the single place that sees it.
             if rip == stop_before {
                 stop = StopReason::Breakpoint { rip };
                 break;
             }
             c.rip = rip;
             let mut window = [0u8; 16];
-            // How many bytes of `window` are really guest memory. The rest are
-            // zeros this function put there, and **decoding them would fabricate
-            // an instruction**: at the tail of an executable region the
-            // interpreter faults fetching the byte after the last mapped one,
-            // so a compiler that read its own padding would run something the
-            // reference CPU never reaches. `decode` is therefore handed only the
-            // prefix that was fetched, and refuses anything longer.
             let mut valid = window.len();
             if mem.fetch(rip, &mut window).is_err() {
-                // Short window near a region's tail: fetch what we can, byte by
-                // byte, so an instruction that fits still compiles.
                 let mut n = 0;
                 while n < 16 {
                     let mut b = [0u8; 1];
@@ -596,26 +365,11 @@ impl Compiler {
                 }
             };
             let next = rip.wrapping_add(insn.len as u64) & mode.addr_mask();
-            // Deferring this instruction's flags only pays when a later one
-            // overwrites them first (roadmap W8.4); either answer is correct.
             let sets_flags = flag_effect(&insn) != FlagEffect::Neutral;
             c.defer = sets_flags && defer_pays(mem, mode, next, DEFER_SCAN);
-            // An instruction that both touches memory and moves the flags may
-            // have to be *rewound* after it has already moved them: its store
-            // is the last thing it does, and a store can fault (a read-only
-            // page, or an armed data watchpoint — roadmap W9.3). Park the flag
-            // state where the rewind can find it. Two `stp`s, and only for the
-            // instructions that can actually need it. See `FSPILL`.
             c.spilled = sets_flags && matches!(insn.rm, Rm::Mem(_));
             if c.spilled {
                 c.asm.stp(R_FLAGS, R_FR, crate::a64::SP, FSPILL);
-                // The pending operands only matter when there *is* a pending
-                // state to rewind to — one `stp` in the common case, two in the
-                // rare one. (Today `overwriter_settles` happens to keep a
-                // deferred state from ever reaching a memory-destination RMW,
-                // so this second pair is belt to that heuristic's braces: it
-                // makes the rewind correct by construction rather than by a
-                // property of a cost decision.)
                 if c.flags != Flags::Live {
                     c.asm.stp(R_FA, R_FB, crate::a64::SP, FSPILL + 16);
                 }
@@ -624,13 +378,6 @@ impl Compiler {
                 Lowered::Ok => {
                     c.insns += 1;
                     rip = next;
-                    // Addresses only ever rise from `start`, so `next < start`
-                    // can only mean this instruction ended on the top of the
-                    // address space and the next one is back at the bottom.
-                    // Carrying on would make the block two disjoint byte
-                    // ranges, and everything downstream — the store helper's
-                    // `code_lo..code_hi` self-modification test, the engine's
-                    // two-page generation check — assumes exactly one.
                     if next < start {
                         stop = StopReason::Wrapped;
                         break;
@@ -650,30 +397,13 @@ impl Compiler {
         }
         let end_rip = rip;
         let insns = c.insns;
-        // Fallthrough exit: rip = end of the block, no fault.
         if stop != StopReason::Terminator {
-            // Only a block that stopped because it was *full* (or wrapped past
-            // the top of the address space) has a compiled successor to link to.
-            // The other three reasons — an opcode this compiler declines, a
-            // fetch that failed, and an armed breakpoint — are precisely the
-            // addresses where nothing can be compiled, so the chain has to hand
-            // that instruction back rather than jump into it. For a breakpoint
-            // that is the whole point: a native link is exactly the path that
-            // would carry a chain past the caller's run-loop head.
             let linkable = matches!(stop, StopReason::Full | StopReason::Wrapped);
             c.exit_to(c.flags, end_rip, insns, ExitKind::of(linkable));
         }
         c.emit_stubs();
         c.epilogue();
-        // Masked, because `end_rip` is: a 32-bit block that ends on the 4 GiB
-        // boundary has `end_rip == 0`, and a plain 64-bit subtraction would call
-        // that a 2^64-sized block instead of the handful of bytes it is.
         let bytes = end_rip.wrapping_sub(start) & mode.addr_mask();
-        // Patch the chain entry's `add T1, T0, #bytes`. A block holds at most
-        // `MAX_INSNS` instructions of at most 15 bytes, so the length always
-        // fits the 12-bit immediate — asserted rather than assumed, because a
-        // silently truncated length would under-report the block's own range and
-        // let a store into it go unnoticed.
         assert!(bytes < 4096, "block byte length {bytes} does not fit an add immediate");
         {
             let mut patch = Asm::new();
@@ -692,8 +422,6 @@ impl Compiler {
         }
     }
 
-    // ---- frame -----------------------------------------------------------
-
     fn prologue(&mut self) {
         let a = &mut self.asm;
         a.stp_pre(19, 20, crate::a64::SP, -FRAME);
@@ -710,7 +438,6 @@ impl Compiler {
     }
 
     fn epilogue(&mut self) {
-        // Every exit branches here with x0 already holding the return value.
         let labels: Vec<Label> = std::mem::take(&mut self.exits);
         for l in labels {
             self.asm.bind(l);
@@ -726,10 +453,6 @@ impl Compiler {
         a.ret();
     }
 
-    /// Take the next link slot this block is allowed, for a jump to `target`.
-    /// `None` when the engine gave the block no slots, or when it has used them
-    /// all — either way the exit falls back to returning to Rust, which is
-    /// always correct and only slower.
     fn take_slot(&mut self, target: u64) -> Option<u32> {
         let base = self.slot_base?;
         let n = self.link_targets.len() as u32;
@@ -740,33 +463,6 @@ impl Compiler {
         Some(base + n)
     }
 
-    /// Leave the block for guest address `rip`, having retired `retired`
-    /// instructions here. The flag state is passed in rather than taken from
-    /// `self` because a stub exits with the state of the point it rewinds to,
-    /// not the state of the emission cursor.
-    ///
-    /// # What a linkable exit emits, and why in this order
-    ///
-    /// Every exit settles the flags, publishes `rip` and adds this block's
-    /// instructions to the chain's running total. An [`ExitKind::Link`] exit then
-    /// tries to continue **without returning to Rust** (roadmap W8.5):
-    ///
-    /// 1. **Budget first.** The chain stops at the first block boundary at which
-    ///    the running total has reached the budget — the same boundary the
-    ///    caller's block-at-a-time loop stopped at, which is what keeps
-    ///    preemption, the `KUSER_SHARED_DATA` refresh and the step cap firing at
-    ///    the *identical* guest instruction. This test is what makes native
-    ///    linking safe to do at all.
-    /// 2. **Then the slot.** A cached successor is taken only while the slot's
-    ///    epoch still matches the engine's, so invalidating every link in the
-    ///    process is one increment (see [`crate::rt::LinkSlot`]).
-    /// 3. **Then the trail.** The caller's loop cannot see a linked block, so
-    ///    compiled code records the entry address itself, and the fault reporter
-    ///    keeps printing a real history instead of one address per chain.
-    ///
-    /// If either test fails the exit records *which* slot it wanted in
-    /// `BlockCtx::pending` and returns; the engine fills that slot once it has
-    /// compiled and validated the block the chain landed on.
     fn exit_to(&mut self, flags: Flags, rip: u64, retired: u32, kind: ExitKind) {
         self.emit_flags(flags);
         self.asm.mov_imm64(T2, rip);
@@ -774,14 +470,6 @@ impl Compiler {
         self.emit_exit_tail(retired, kind == ExitKind::Fault, slot, false);
     }
 
-    /// Leave the block for the guest address in `target`, computed at run time.
-    ///
-    /// The only difference from [`Compiler::exit_to`] is that the slot has to
-    /// prove it cached a block for *that* address before the link can be taken —
-    /// the inline cache an indirect branch needs (roadmap W8.5). A branch that
-    /// keeps going to the same place (which is what a jump table, a virtual call
-    /// or a tail call through a thunk does most of the time) then costs one
-    /// extra load and compare; one that does not simply returns to the engine.
     fn exit_indirect(&mut self, flags: Flags, target: u32, retired: u32) {
         self.emit_flags(flags);
         self.asm.mov_reg(true, T2, target);
@@ -789,9 +477,6 @@ impl Compiler {
         self.emit_exit_tail(retired, false, slot, true);
     }
 
-    /// The part every exit shares: publish `rip` (already in `T2`), add this
-    /// block's instructions to the chain's running total, then either link on or
-    /// branch to the epilogue.
     fn emit_exit_tail(&mut self, retired: u32, fault: bool, slot: Option<u32>, indirect: bool) {
         self.asm.str(8, T2, R_STATE, st::RIP);
         self.asm.ldr(8, T0, R_CTX, ctx_off::RETIRED);
@@ -800,16 +485,9 @@ impl Compiler {
             self.asm.str(8, T0, R_CTX, ctx_off::RETIRED);
         }
         if let Some(slot) = slot {
-            // Budget first: the chain stops at the first block boundary at which
-            // the running total has reached it, which is the boundary the
-            // block-at-a-time loop stopped at.
             self.asm.ldr(8, T1, R_CTX, ctx_off::BUDGET);
             self.asm.cmp_reg(true, T0, T1);
             let spent = self.asm.b_cond_forward(Cond::Cs);
-            // The slot, addressed off the array base in the context. An `ldr`'s
-            // scaled immediate reaches 32 760 bytes; past that, one page-granular
-            // `add` gets the base within range, which covers every slot the
-            // engine can hand out.
             let off = slot * SLOT_BYTES;
             self.asm.ldr(8, T1, R_CTX, ctx_off::LINKS);
             let bias = if off + 16 <= 32_760 { 0 } else { off & !0xFFF };
@@ -821,15 +499,12 @@ impl Compiler {
             self.asm.ldr(8, T0, R_CTX, ctx_off::LINK_EPOCH);
             self.asm.cmp_reg(true, T3, T0);
             let stale = self.asm.b_cond_forward(Cond::Ne);
-            // The inline cache's compare: did this slot cache a block for the
-            // address the guest actually computed?
             let missed = indirect.then(|| {
                 self.asm.ldr(8, T3, T1, at + 8);
                 self.asm.cmp_reg(true, T3, T2);
                 self.asm.b_cond_forward(Cond::Ne)
             });
             self.asm.ldr(8, T1, T1, at + 16);
-            // The block trail, for the fault reporter.
             self.asm.ldr(8, T3, R_CTX, ctx_off::TRAIL_AT);
             self.asm.add_imm(true, T0, T3, 1, false);
             self.asm.str(8, T0, R_CTX, ctx_off::TRAIL_AT);
@@ -855,28 +530,18 @@ impl Compiler {
         let stores = std::mem::take(&mut self.store_stubs);
         for s in stores {
             self.asm.bind(s.label);
-            // status 1 = fault (rewind), status 2 = store completed into code.
             self.asm.subs_imm(true, ZR, 0, status::FAULT as u32, false);
             let is_fault = self.asm.b_cond_forward(Cond::Eq);
             self.emit_commit(s.commit);
-            // Never linked: the store landed on a page some compiled block was
-            // built from, so the engine has to look at it before anything else
-            // runs — including any block this one is linked to.
             match s.next_reg {
                 None => self.exit_to(s.after, s.next_rip, s.retired + 1, ExitKind::Return),
                 Some(r) => {
-                    // An indirect `call` whose pushed return address landed in
-                    // code: the instruction has fully retired, and where it goes
-                    // is in a register rather than in the encoding.
                     self.emit_flags(s.after);
                     self.asm.mov_reg(true, T2, r);
                     self.emit_exit_tail(s.retired + 1, false, None, false);
                 }
             }
             self.asm.bind(is_fault);
-            // The store faulted, so the instruction never happened — but it had
-            // already computed its flags into the very registers `s.before` is
-            // written in terms of. Put them back before rewinding.
             if s.spilled {
                 self.asm.ldp(R_FLAGS, R_FR, crate::a64::SP, FSPILL);
                 if s.before != Flags::Live {
@@ -892,9 +557,6 @@ impl Compiler {
         }
     }
 
-    // ---- guest register access -------------------------------------------
-
-    /// Is this a legacy high-byte register access (AH/CH/DH/BH)?
     #[inline]
     fn high8(size: u8, has_rex: bool, idx: u8) -> bool {
         size == 1 && !has_rex && (4..8).contains(&idx)
@@ -908,23 +570,16 @@ impl Compiler {
         }
     }
 
-    /// Store `src` (already masked to `size`) into guest register `idx`,
-    /// reproducing `CpuState::gpr_write`: a 4-byte write zero-extends, 1- and
-    /// 2-byte writes preserve the upper bits.
     fn store_gpr(&mut self, src: u32, idx: u8, size: u8, has_rex: bool) {
         if Self::high8(size, has_rex, idx) {
             self.asm.str(1, src, R_STATE, gpr_off(idx & 3) + 1);
         } else if size == 4 {
-            // The value is masked, so a full 8-byte store *is* the zero-extend.
             self.asm.str(8, src, R_STATE, gpr_off(idx));
         } else {
             self.asm.str(size, src, R_STATE, gpr_off(idx));
         }
     }
 
-    // ---- memory operands --------------------------------------------------
-
-    /// Emit the effective-address computation for `m` into [`R_ADDR`].
     fn emit_addr(&mut self, m: &MemOp) {
         if let Some(abs) = m.abs {
             self.asm.mov_imm64(R_ADDR, abs & self.mode.addr_mask());
@@ -947,8 +602,6 @@ impl Compiler {
         if !have {
             self.asm.mov_imm64(R_ADDR, 0);
         }
-        // Segment base (fs:/gs:). The 64-bit `fs` base is a fixed constant the
-        // interpreter keeps outside CpuState, so that form is not compiled.
         match m.seg {
             0x65 => {
                 self.asm.ldr(8, T0, R_STATE, st::GS_BASE);
@@ -977,63 +630,23 @@ impl Compiler {
         }
     }
 
-    /// Probe the guest-memory TLB for a `size`-byte access at [`R_ADDR`]
-    /// (roadmap W8.6) and return the label a **miss** branches to. On a hit the
-    /// page's host base is left in [`T3`], so the access itself is one
-    /// `ldr`/`str` with `T3` as the base and `R_ADDR` as the (unscaled) offset.
-    ///
-    /// Seven instructions (six for a byte access), no call, and nothing spilled
-    /// — against a call into the helper, a region lookup, a permission test and
-    /// a 40-byte `Result` returned through memory. `off` selects the read or the
-    /// write half of the entry; they are separate so a store can never take an
-    /// entry a load filled.
-    ///
-    /// **A hit cannot be wrong, and that is a property of what filled it plus
-    /// one detail of this sequence.** An entry exists only where the backend
-    /// handed out a span covering the whole page, so any access that stays
-    /// *inside* the page is in one region with the right permission and can
-    /// neither fault nor run off the end. What keeps the access inside the page
-    /// is that the tag compared is the page of its **last** byte
-    /// (`(addr + size - 1) >> 12`) while the slot is indexed by the page of its
-    /// **first** (`addr >> 12`): a straddling access looks for a tag one page
-    /// above the one that indexed the slot, and only pages congruent modulo
-    /// [`TLB_SLOTS`] ever live in the same slot, so it can never match. It
-    /// misses and takes the helper — which is also what makes a wrap of the
-    /// 64-bit add (or of a masked 32-bit address) safe, for the same reason.
-    ///
-    /// *This is what replaced the seven bytes of slack an entry used to need.*
-    /// The slack made the probe a bare tag compare, but it also meant the
-    /// **last page of every region was uncacheable** — and a stack is used from
-    /// the top down, so that page is the hottest one in the process. Folding
-    /// `lsr` into the compare pays for the `add`, so the check is now free
-    /// rather than absent.
-    ///
-    /// Nothing is ever filled for a store into executable memory, so the
-    /// self-modification checks in `jit_write` stay in the path of every store
-    /// that could reach compiled code; and nothing at all is filled while a data
-    /// watchpoint is armed, so an armed watchpoint still sees every access.
     fn emit_tlb_probe(&mut self, off: u32, size: u8) -> Label {
         debug_assert_eq!(tlb_off::SIZE, 1 << TLB_ENTRY_SHIFT);
         debug_assert!(matches!(size, 1 | 2 | 4 | 8));
         self.asm.ldr(8, T0, R_CTX, ctx_off::TLB);
-        // The last byte the access touches. For a byte access that is `R_ADDR`
-        // itself, so the `add` disappears.
         let last = if size == 1 {
             R_ADDR
         } else {
             self.asm.add_imm(true, T1, R_ADDR, size as u32 - 1, false);
             T1
         };
-        self.asm.ubfx(true, T2, R_ADDR, TLB_PAGE_BITS, TLB_SLOT_BITS); // slot
-        self.asm.add_reg(true, T0, T0, T2, TLB_ENTRY_SHIFT); // &tlb[slot]
-        self.asm.ldp(T2, T3, T0, off as i32); // tag, host base
+        self.asm.ubfx(true, T2, R_ADDR, TLB_PAGE_BITS, TLB_SLOT_BITS);
+        self.asm.add_reg(true, T0, T0, T2, TLB_ENTRY_SHIFT);
+        self.asm.ldp(T2, T3, T0, off as i32);
         self.asm.cmp_reg_lsr(true, T2, last, TLB_PAGE_BITS);
         self.asm.b_cond_forward(Cond::Ne)
     }
 
-    /// Emit a guest load of `size` bytes from [`R_ADDR`] into `dst`.
-    /// Clobbers x0..x8 and the scratch registers; `dst` must be a callee-saved
-    /// role register.
     fn emit_load(&mut self, dst: u32, size: u8) {
         let miss = self.emit_tlb_probe(tlb_off::READ, size);
         self.asm.ldr_reg(size, dst, T3, R_ADDR);
@@ -1051,20 +664,10 @@ impl Compiler {
             rip: self.rip,
             flags: self.insn_flags,
         });
-        // The fault branch is taken *before* this write, so `dst` may be one of
-        // the pending flag registers without disturbing the rewind path.
         self.asm.mov_reg(true, dst, 0);
         self.asm.bind(done);
     }
 
-    /// Emit a guest store of `size` bytes from `src` to [`R_ADDR`], then the
-    /// instruction's commit. Clobbers x0..x8 and the scratch registers.
-    ///
-    /// The commit is emitted **after** the two paths join, so it happens exactly
-    /// once and identically either way. The store stub — the rewind, and the
-    /// "this store rewrote compiled code" exit — hangs off the helper path
-    /// alone, which is sound because the fast path is only ever taken for a
-    /// store that can neither fault nor land in executable memory.
     fn emit_store(&mut self, src: u32, size: u8, commit: Commit, next_rip: u64) {
         let miss = self.emit_tlb_probe(tlb_off::WRITE, size);
         self.asm.str_reg(size, src, T3, R_ADDR);
@@ -1100,8 +703,6 @@ impl Compiler {
         }
     }
 
-    /// Read the r/m operand into `dst` (memory operands go through the helper;
-    /// the address is left in [`R_ADDR`] for a later store).
     fn read_rm(&mut self, rm: &Rm, dst: u32, size: u8, has_rex: bool) {
         match rm {
             Rm::Reg(i) => self.load_gpr(dst, *i, size, has_rex),
@@ -1109,12 +710,9 @@ impl Compiler {
         }
     }
 
-    // ---- flags ------------------------------------------------------------
-
-    /// SF/ZF/PF from the masked result in `res`, ORed into `dst`.
     fn flags_szp_into(&mut self, dst: u32, res: u32, size: u8) {
         let bits = size as u32 * 8;
-        self.asm.subs_imm(true, ZR, res, 0, false); // cmp res, #0
+        self.asm.subs_imm(true, ZR, res, 0, false);
         self.asm.cset(true, T3, Cond::Eq);
         self.asm.orr_reg(true, dst, dst, T3, F_ZF);
         self.asm.ubfx(true, T3, res, bits - 1, 1);
@@ -1125,21 +723,14 @@ impl Compiler {
         self.asm.orr_reg(true, dst, dst, T3, F_PF);
     }
 
-    /// Fold `flags` into [`R_FLAGS`], leaving it architecturally correct.
-    /// Emits nothing for [`Flags::Live`] — which is the whole point: most
-    /// pending states are superseded before any of this is ever reached.
     fn emit_flags(&mut self, flags: Flags) {
         match flags {
             Flags::Live => {}
             Flags::Logic { size } => {
-                // CF, OF and AF are all cleared by a logic operation.
                 self.asm.bic_reg(true, R_FLAGS, R_FLAGS, R_MASK, 0);
                 self.flags_szp_into(R_FLAGS, R_FR, size);
             }
             Flags::Arith { size, sub, keep_cf } => {
-                // Re-derive NZCV with one compare of the saved operands: then
-                // ARM's C and V *are* x86's CF and OF for this width. Widths
-                // below 32 bits are shifted up so the sign bit lands in bit 63.
                 match size {
                     8 => {
                         if sub {
@@ -1166,8 +757,6 @@ impl Compiler {
                         }
                     }
                 }
-                // NZCV is live from here to the last `cset`; `mov`, `bic`,
-                // `orr`, `eor` and `ubfx` do not disturb it.
                 if keep_cf {
                     self.asm.mov_imm64(T2, ARITH_MASK & !(1 << F_CF));
                     self.asm.bic_reg(true, R_FLAGS, R_FLAGS, T2, 0);
@@ -1178,7 +767,6 @@ impl Compiler {
                 }
                 self.asm.cset(true, T3, Cond::Vs);
                 self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_OF);
-                // AF = (a ^ b ^ result) bit 4, from the masked operands.
                 self.asm.eor_reg(true, T3, R_FA, R_FB, 0);
                 self.asm.eor_reg(true, T3, T3, R_FR, 0);
                 self.asm.ubfx(true, T3, T3, 4, 1);
@@ -1188,12 +776,6 @@ impl Compiler {
         }
     }
 
-    /// Settle whatever is pending, so `R_FLAGS` may be read (or the pending
-    /// registers reused).
-    ///
-    /// Only ever called **before** the current instruction's memory accesses —
-    /// which is what lets it also declare the instruction-start state settled,
-    /// and therefore what lets that instruction's fault stubs emit nothing.
     fn materialize(&mut self) {
         if self.flags != Flags::Live {
             self.emit_flags(self.flags);
@@ -1202,7 +784,6 @@ impl Compiler {
         self.insn_flags = Flags::Live;
     }
 
-    /// `R_FR = R_FA ∓ R_FB`, masked to `size`. Flags are only *recorded*.
     fn emit_arith_value(&mut self, size: u8, sub: bool) {
         match size {
             8 | 4 => {
@@ -1224,13 +805,6 @@ impl Compiler {
         }
     }
 
-    /// One of the six compiled ALU operations, `R_FA` op `R_FB` → `R_FR`.
-    ///
-    /// Deferring is only *free* when a later instruction in this block
-    /// overwrites the flags first — settling later costs one instruction more
-    /// than computing now, because the operation has to be repeated to get
-    /// NZCV back. `self.defer` carries that decision, taken by scanning
-    /// forward from the next instruction ([`defer_pays`]).
     fn emit_alu(&mut self, op: Alu, size: u8) {
         if self.defer {
             match op {
@@ -1260,14 +834,7 @@ impl Compiler {
         }
     }
 
-    /// `R_FR = R_FA ∓ R_FB` **and** the flags it defines, straight into
-    /// `R_FLAGS` — NZCV comes from the operation itself rather than from a
-    /// repeat of it, which is what makes this one instruction cheaper than
-    /// deferring plus settling. `keep_cf` is INC/DEC.
     fn emit_arith_eager(&mut self, size: u8, sub: bool, keep_cf: bool) {
-        // Sub-64-bit widths are handled by shifting both operands up so the
-        // sign bit lands in bit 63: then ARM's N/Z/C/V are exactly x86's
-        // SF/ZF/CF/OF for that width, with no extra masking.
         match size {
             8 | 4 => {
                 let sf = size == 8;
@@ -1289,7 +856,6 @@ impl Compiler {
                 self.asm.lsr_imm(true, R_FR, R_FR, sh);
             }
         }
-        // NZCV is live here; `mov`, `bic`, `orr`, `eor` and `ubfx` leave it be.
         if keep_cf {
             self.asm.mov_imm64(T2, ARITH_MASK & !(1 << F_CF));
             self.asm.bic_reg(true, R_FLAGS, R_FLAGS, T2, 0);
@@ -1300,7 +866,6 @@ impl Compiler {
         }
         self.asm.cset(true, T3, Cond::Vs);
         self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_OF);
-        // AF = (a ^ b ^ result) bit 4, from the *unshifted* masked operands.
         self.asm.eor_reg(true, T3, R_FA, R_FB, 0);
         self.asm.eor_reg(true, T3, T3, R_FR, 0);
         self.asm.ubfx(true, T3, T3, 4, 1);
@@ -1309,8 +874,6 @@ impl Compiler {
         self.flags = Flags::Live;
     }
 
-    /// `R_FR = R_FA op R_FB` for AND/OR/XOR. The operands are already masked,
-    /// so a 64-bit operation leaves a result that is masked too.
     fn emit_logic_value(&mut self, op: Alu) {
         match op {
             Alu::And => self.asm.and_reg(true, R_FR, R_FA, R_FB, 0),
@@ -1319,7 +882,6 @@ impl Compiler {
         }
     }
 
-    /// Branch when the x86 condition `cc` holds.
     fn branch_if_cond(&mut self, cc: u8) -> Label {
         match cc & 0xf {
             0x0 => self.asm.tbnz_forward(R_FLAGS, F_OF),
@@ -1333,14 +895,12 @@ impl Compiler {
             0xA => self.asm.tbnz_forward(R_FLAGS, F_PF),
             0xB => self.asm.tbz_forward(R_FLAGS, F_PF),
             other => {
-                // Two-flag conditions: build the boolean, then branch on it.
                 self.emit_cond_value(other, T0);
                 self.asm.cbnz_forward(true, T0)
             }
         }
     }
 
-    /// Materialise the x86 condition `cc` as 0/1 in `dst`.
     fn emit_cond_value(&mut self, cc: u8, dst: u32) {
         match cc & 0xf {
             0x0 => self.asm.ubfx(true, dst, R_FLAGS, F_OF, 1),
@@ -1358,7 +918,6 @@ impl Compiler {
                 self.asm.ubfx(true, dst, R_FLAGS, F_ZF, 1);
                 self.flip(dst);
             }
-            // BE = CF | ZF
             0x6 | 0x7 => {
                 self.asm.ubfx(true, dst, R_FLAGS, F_CF, 1);
                 self.asm.ubfx(true, T3, R_FLAGS, F_ZF, 1);
@@ -1377,7 +936,6 @@ impl Compiler {
                 self.asm.ubfx(true, dst, R_FLAGS, F_PF, 1);
                 self.flip(dst);
             }
-            // L = SF != OF ; GE = SF == OF
             0xC | 0xD => {
                 self.asm.ubfx(true, dst, R_FLAGS, F_SF, 1);
                 self.asm.ubfx(true, T3, R_FLAGS, F_OF, 1);
@@ -1386,7 +944,6 @@ impl Compiler {
                     self.flip(dst);
                 }
             }
-            // LE = ZF | (SF != OF) ; G = !ZF & (SF == OF)
             _ => {
                 self.asm.ubfx(true, dst, R_FLAGS, F_SF, 1);
                 self.asm.ubfx(true, T3, R_FLAGS, F_OF, 1);
@@ -1412,11 +969,6 @@ enum Lowered {
     Unsupported,
 }
 
-// --- decoding ---------------------------------------------------------------
-
-/// Decode one instruction from `window`. `None` means "this compiler does not
-/// handle it" — which includes prefixes it refuses (LOCK, REP, address-size
-/// override) and any instruction whose encoding runs past the window.
 fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
     let mut c = Cursor { buf: window, pos: 0 };
     let mut pfx = Pfx::default();
@@ -1426,8 +978,6 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
             0x66 => pfx.p66 = true,
             0x2E | 0x36 | 0x3E | 0x26 => {}
             0x64 | 0x65 => pfx.seg = b,
-            // Refused: LOCK, REP/REPNE (and the SSE mandatory prefixes), and the
-            // address-size override.
             0xF0 | 0xF2 | 0xF3 | 0x67 => return None,
             0x40..=0x4F if mode.is64() => {
                 pfx.rex = b;
@@ -1449,7 +999,6 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
         }
     };
 
-    // Which instructions take a ModRM byte.
     let has_modrm = if esc {
         matches!(opcode, 0x1F | 0x40..=0x4F | 0xAF | 0xB6 | 0xB7 | 0xBE | 0xBF)
     } else {
@@ -1512,11 +1061,6 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
             rm = Rm::Mem(m);
         }
     }
-    // In 64-bit mode the interpreter resolves `fs:` against a fixed constant
-    // that does not live in `CpuState` (Windows guests use `gs:` for the TEB and
-    // never touch the 64-bit `fs` base), so compiled code has nothing correct to
-    // read. Refuse rather than reach for the 32-bit TEB base sitting in
-    // `CpuState::fs_base`, which is what a naive lowering would do.
     if mode.is64() {
         if let Rm::Mem(m) = rm {
             if m.seg == 0x64 {
@@ -1525,8 +1069,6 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
         }
     }
 
-    // Immediates, read *after* the ModRM/SIB/disp so RIP-relative resolves past
-    // the whole instruction (the same ordering rule the interpreter follows).
     let mut imm = 0u64;
     if esc {
         if let 0x80..=0x8F = opcode {
@@ -1543,9 +1085,6 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
             }
             0x6A => imm = c.u8()? as i8 as i64 as u64,
             0x68 => imm = c.u32()? as i32 as i64 as u64,
-            // MOV AL/eAX <-> moffs: the offset is an *address*-size immediate,
-            // not an operand-size one (and the address-size override is refused
-            // above, so the mode alone decides its width).
             0xA0..=0xA3 => imm = if mode.is64() { c.u64()? } else { c.u32()? as u64 },
             0x70..=0x7F | 0xEB => imm = c.u8()? as i8 as i64 as u64,
             0xE8 | 0xE9 => imm = c.u32()? as i32 as i64 as u64,
@@ -1589,10 +1128,7 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
     }
 
     let len = c.pos as u8;
-    // Resolve RIP-relative now that the length is known.
     if let Some(disp) = rip_rel_disp {
-        // RIP-relative *with* a segment override is rare enough that refusing it
-        // is cheaper than getting it subtly wrong.
         if pfx.seg != 0 {
             return None;
         }
@@ -1603,23 +1139,10 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
     Some(Insn { pfx, opcode, esc, reg, rm, imm, len })
 }
 
-/// What an instruction does to the six status flags, as far as the deferral
-/// decision cares.
-///
-/// Only ever consulted to choose between two *equally correct* lowerings, so a
-/// misclassification costs instructions and never meaning. Everything the
-/// classifier does not recognise — including every instruction the compiler
-/// declines, which ends the block — answers [`FlagEffect::Reads`], the
-/// conservative side.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FlagEffect {
-    /// Leaves every status flag alone, and reads none of them.
     Neutral,
-    /// Defines all six from its own operands, reading none — this is what makes
-    /// an earlier flag computation dead.
     Overwrites,
-    /// Reads them, or defines only some of them (which amounts to the same
-    /// thing: the bits it does not define have to be there already).
     Reads,
 }
 
@@ -1631,30 +1154,18 @@ fn flag_effect(insn: &Insn) -> FlagEffect {
         };
     }
     match insn.opcode {
-        // The regular ALU family; `adc`/`sbb` (forms 2 and 3) read CF.
         0x00..=0x3D if insn.opcode & 7 < 6 => match Alu::from_op(insn.opcode >> 3) {
             Some(_) => FlagEffect::Overwrites,
             None => FlagEffect::Reads,
         },
-        // 32-bit INC/DEC preserve CF (and in 64-bit mode these bytes are a REX
-        // prefix followed by something this compiler declines).
         0x40..=0x4F => FlagEffect::Reads,
         0x50..=0x5F | 0x63 | 0x88..=0x8B | 0x8D | 0x90 | 0xB0..=0xBF => FlagEffect::Neutral,
         0x68 | 0x6A | 0xA0..=0xA3 | 0xC6 | 0xC7 | 0xC9 => FlagEffect::Neutral,
-        // A branch touches no flag, but it is deliberately *not* `Neutral`:
-        // this classification is also what `defer_pays` scans with, and that
-        // scan walks addresses in order. Past a branch the next address is not
-        // the next instruction, so letting the scan continue through one would
-        // decide whether deferring pays by reading bytes the guest will not
-        // execute. `Reads` stops the scan, which is the conservative answer and
-        // the one that was measured. (Making them `Neutral` cost ~1% on 7-Zip.)
         0x80 | 0x81 | 0x83 => match Alu::from_op(insn.reg & 7) {
             Some(_) => FlagEffect::Overwrites,
             None => FlagEffect::Reads,
         },
         0x84 | 0x85 | 0xA8 | 0xA9 => FlagEffect::Overwrites,
-        // group 3: /0,/1 test → overwrites; /2 not → neutral; /3 neg →
-        // overwrites; mul/div are not compiled at all.
         0xF6 | 0xF7 => match insn.reg & 7 {
             0 | 1 | 3 => FlagEffect::Overwrites,
             2 => FlagEffect::Neutral,
@@ -1664,9 +1175,6 @@ fn flag_effect(insn: &Insn) -> FlagEffect {
     }
 }
 
-/// Would an [`FlagEffect::Overwrites`] instruction have to settle a pending
-/// state before it could run? A memory *destination* would: by the time its
-/// store can fault, the pending registers hold its own operands.
 fn overwriter_settles(insn: &Insn) -> bool {
     if insn.esc || !matches!(insn.rm, Rm::Mem(_)) {
         return false;
@@ -1676,22 +1184,13 @@ fn overwriter_settles(insn: &Insn) -> bool {
             Alu::from_op(insn.opcode >> 3).is_some_and(|o| o.writes_back())
         }
         0x80 | 0x81 | 0x83 => Alu::from_op(insn.reg & 7).is_some_and(|o| o.writes_back()),
-        0xF6 | 0xF7 => insn.reg & 7 == 3, // neg
+        0xF6 | 0xF7 => insn.reg & 7 == 3,
         _ => false,
     }
 }
 
-/// How far ahead the deferral scan looks. Long enough to see across an
-/// addressing sequence, short enough that compiling stays cheap.
 const DEFER_SCAN: u32 = 12;
 
-/// Does leaving this instruction's flags pending actually pay?
-///
-/// It does exactly when some later instruction in this block overwrites all six
-/// status flags before anything can read them — then the computation is skipped
-/// outright. Otherwise settling later costs one instruction *more* than
-/// computing now (the operation has to be repeated to recover NZCV), so the
-/// answer is no.
 fn defer_pays<M: Memory + ?Sized>(mem: &M, mode: Mode, mut rip: u64, budget: u32) -> bool {
     for _ in 0..budget {
         let mut window = [0u8; 16];
@@ -1722,18 +1221,14 @@ impl Compiler {
         }
     }
 
-    /// Lower one decoded instruction. `next` is the guest address after it.
     fn lower(&mut self, insn: &Insn, next: u64) -> Lowered {
         let p = insn.pfx;
         let has_rex = p.has_rex;
-        // A faulting access rewinds to here, so this is the flag state every
-        // stub of this instruction has to restore.
         self.insn_flags = self.flags;
         if insn.esc {
             return self.lower_0f(insn, next);
         }
         match insn.opcode {
-            // ---- regular ALU family ------------------------------------
             0x00..=0x3D if insn.opcode & 7 < 6 => {
                 let Some(op) = Alu::from_op(insn.opcode >> 3) else {
                     return Lowered::Unsupported;
@@ -1742,7 +1237,6 @@ impl Compiler {
                 let size = if form % 2 == 0 && form != 5 { 1 } else { self.opsize(&p) };
                 match form {
                     0 | 1 => {
-                        // dst = r/m, src = reg
                         self.settle_for_rm_dest(&insn.rm, op);
                         if let Rm::Mem(m) = insn.rm {
                             self.emit_addr(&m);
@@ -1753,7 +1247,6 @@ impl Compiler {
                         self.finish_rm_dest(insn, op, size, has_rex, next)
                     }
                     2 | 3 => {
-                        // dst = reg, src = r/m
                         if let Rm::Mem(m) = insn.rm {
                             self.emit_addr(&m);
                         }
@@ -1766,7 +1259,6 @@ impl Compiler {
                         Lowered::Ok
                     }
                     _ => {
-                        // dst = al/eax, src = imm
                         self.load_gpr(R_FA, 0, size, has_rex);
                         self.asm.mov_imm64(R_FB, insn.imm & mask_of(size));
                         self.emit_alu(op, size);
@@ -1778,7 +1270,6 @@ impl Compiler {
                 }
             }
 
-            // ---- INC/DEC r32 (32-bit mode only) -------------------------
             0x40..=0x4F if !self.mode.is64() => {
                 let r = insn.opcode & 7;
                 let size = self.opsize(&p);
@@ -1789,12 +1280,9 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- PUSH/POP r ---------------------------------------------
             0x50..=0x57 => {
                 let r = (insn.opcode & 7) | (p.b() << 3);
                 let w = self.mode.stack_width();
-                // Value first (a `push rsp` pushes the *old* rsp), then the new
-                // stack pointer; rsp is only committed once the store succeeds.
                 self.asm.ldr(8, R_VAL, R_STATE, gpr_off(r));
                 self.asm.ldr(8, T0, R_STATE, gpr_off(4));
                 self.asm.sub_imm(true, R_ADDR, T0, w as u32, false);
@@ -1814,8 +1302,6 @@ impl Compiler {
                     debug_assert!(ok);
                 }
                 self.emit_load(R_VAL, w);
-                // rsp += w (masked), then the destination — in that order, so
-                // `pop rsp` ends up holding the popped value.
                 self.asm.add_imm(true, T0, R_ADDR, w as u32, false);
                 if !self.mode.is64() {
                     let ok = self.asm.and_imm(true, T0, T0, 0xffff_ffff);
@@ -1828,10 +1314,6 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- PUSH imm8 / imm32 --------------------------------------
-            //
-            // The 0x66 form pushes two bytes and adjusts rsp by two, which is
-            // a different shape; it is not compiled.
             0x68 | 0x6A if !p.p66 => {
                 let w = self.mode.stack_width();
                 self.asm.mov_imm64(R_VAL, insn.imm);
@@ -1845,7 +1327,6 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- MOVSXD r64, r/m32 --------------------------------------
             0x63 if self.mode.is64() => {
                 let size = self.opsize(&p);
                 if let Rm::Mem(m) = insn.rm {
@@ -1858,7 +1339,6 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- IMUL r, r/m, imm ---------------------------------------
             0x69 | 0x6B => {
                 let size = self.opsize(&p);
                 self.materialize();
@@ -1872,13 +1352,11 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- Jcc rel8 -----------------------------------------------
             0x70..=0x7F => {
                 let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
                 self.emit_jcc(insn.opcode & 0xF, target, next)
             }
 
-            // ---- group 1: r/m, imm --------------------------------------
             0x80 | 0x81 | 0x83 => {
                 let size = if insn.opcode == 0x80 { 1 } else { self.opsize(&p) };
                 let Some(op) = Alu::from_op(insn.reg & 7) else {
@@ -1894,7 +1372,6 @@ impl Compiler {
                 self.finish_rm_dest(insn, op, size, has_rex, next)
             }
 
-            // ---- TEST r/m, r --------------------------------------------
             0x84 | 0x85 => {
                 let size = if insn.opcode == 0x84 { 1 } else { self.opsize(&p) };
                 if let Rm::Mem(m) = insn.rm {
@@ -1906,7 +1383,6 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- MOV r/m <-> r ------------------------------------------
             0x88 | 0x89 => {
                 let size = if insn.opcode == 0x88 { 1 } else { self.opsize(&p) };
                 if let Rm::Mem(m) = insn.rm {
@@ -1934,7 +1410,6 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- LEA -----------------------------------------------------
             0x8D => {
                 let Rm::Mem(m) = insn.rm else {
                     return Lowered::Unsupported;
@@ -1947,22 +1422,14 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- NOP -----------------------------------------------------
             0x90 if p.b() == 0 => Lowered::Ok,
 
-            // ---- MOV AL/eAX <-> moffs (absolute address) ----------------
             0xA0..=0xA3 => {
-                // In 64-bit mode the interpreter resolves `fs:` against a fixed
-                // constant that does not live in `CpuState`, so compiled code
-                // has nothing correct to read — the same refusal the ModRM path
-                // makes.
                 if self.mode.is64() && p.seg == 0x64 {
                     return Lowered::Unsupported;
                 }
                 let size = if insn.opcode & 1 == 0 { 1 } else { self.opsize(&p) };
                 self.asm.mov_imm64(R_ADDR, insn.imm);
-                // The **live** per-thread segment bases, in the interpreter's
-                // order: base first, then the address mask (roadmap W5.7).
                 match p.seg {
                     0x65 => {
                         self.asm.ldr(8, T0, R_STATE, st::GS_BASE);
@@ -1991,7 +1458,6 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- TEST al/eax, imm ---------------------------------------
             0xA8 | 0xA9 => {
                 let size = if insn.opcode == 0xA8 { 1 } else { self.opsize(&p) };
                 self.load_gpr(R_FA, 0, size, has_rex);
@@ -2000,7 +1466,6 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- MOV r, imm ---------------------------------------------
             0xB0..=0xB7 => {
                 let r = (insn.opcode & 7) | (p.b() << 3);
                 self.asm.mov_imm64(R_VAL, insn.imm & 0xff);
@@ -2015,14 +1480,12 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- shifts with a constant count ---------------------------
             0xC0 | 0xC1 | 0xD0 | 0xD1 => {
                 let size = if insn.opcode & 1 == 0 { 1 } else { self.opsize(&p) };
                 let count = if insn.opcode < 0xD0 { insn.imm } else { 1 };
                 self.emit_shift(insn, size, count, next, has_rex)
             }
 
-            // ---- MOV r/m, imm -------------------------------------------
             0xC6 | 0xC7 => {
                 if insn.reg & 7 != 0 {
                     return Lowered::Unsupported;
@@ -2044,11 +1507,6 @@ impl Compiler {
                 }
             }
 
-            // ---- LEAVE ---------------------------------------------------
-            //
-            // `mov rsp, rbp ; pop rbp`, in the interpreter's exact order: the
-            // transient `rsp = rbp` is masked by the pop's own read, and the
-            // committed rsp is `(rbp + width)` masked.
             0xC9 => {
                 let w = self.mode.stack_width();
                 self.asm.ldr(8, R_ADDR, R_STATE, gpr_off(5));
@@ -2067,11 +1525,6 @@ impl Compiler {
                 Lowered::Ok
             }
 
-            // ---- CALL rel32 ----------------------------------------------
-            //
-            // A direct branch that happens to push: the target is in the
-            // encoding, so it takes an ordinary link slot rather than an inline
-            // cache, and the chain runs straight on into the callee.
             0xE8 if !p.p66 => {
                 let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
                 let w = self.mode.stack_width();
@@ -2082,16 +1535,12 @@ impl Compiler {
                     let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
                     debug_assert!(ok);
                 }
-                // If the pushed return address lands in guest code the call has
-                // still fully retired, so the stub's stop point is the call's
-                // *target*, not the byte after it.
                 self.emit_store_push(w, target, None);
                 let f = self.flags;
                 self.exit_to(f, target, self.insns + 1, ExitKind::Link);
                 Lowered::Terminated
             }
 
-            // ---- JMP rel -------------------------------------------------
             0xE9 | 0xEB => {
                 let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
                 let f = self.flags;
@@ -2099,12 +1548,10 @@ impl Compiler {
                 Lowered::Terminated
             }
 
-            // ---- group 3: NOT / NEG --------------------------------------
             0xF6 | 0xF7 => {
                 let size = if insn.opcode == 0xF6 { 1 } else { self.opsize(&p) };
                 match insn.reg & 7 {
                     2 => {
-                        // NOT — no flags.
                         if let Rm::Mem(m) = insn.rm {
                             self.emit_addr(&m);
                         }
@@ -2123,7 +1570,6 @@ impl Compiler {
                         }
                     }
                     3 => {
-                        // NEG — 0 - v, full arithmetic flags.
                         self.settle_for_rm_dest(&insn.rm, Alu::Sub);
                         if let Rm::Mem(m) = insn.rm {
                             self.emit_addr(&m);
@@ -2137,26 +1583,9 @@ impl Compiler {
                 }
             }
 
-            // ---- group 5: CALL / JMP r/m --------------------------------
-            //
-            // The indirect branches: a call through the import table, a virtual
-            // call, a tail jump through a thunk, a switch table. The target is
-            // not known until the block runs, so the exit goes through an inline
-            // cache (roadmap W8.5) — one load and one compare against the
-            // address the slot cached, which is enough for a branch that keeps
-            // going to the same place, and no worse than before when it does not.
-            //
-            // 16-bit operand forms are refused: they truncate `rip` to 16 bits,
-            // which nothing in a Windows guest does and which nothing here is
-            // written to reproduce.
             0xFF if matches!(insn.reg & 7, 2 | 4) && !p.p66 => {
-                // The branch target lives in `R_FA` across the push's helper
-                // call, so any pending flag state — whose operands live in the
-                // same register — has to be settled before it is overwritten.
                 self.materialize();
                 let size = if self.mode.is64() { 8 } else { 4 };
-                // x86 reads the operand *before* the push, which is visible when
-                // the operand is stack-relative.
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                     self.emit_load(R_FA, size);
@@ -2178,11 +1607,10 @@ impl Compiler {
                 Lowered::Terminated
             }
 
-            // ---- group 4/5: INC/DEC r/m ---------------------------------
             0xFE | 0xFF => {
                 let sub = insn.reg & 7;
                 if sub > 1 {
-                    return Lowered::Unsupported; // push r/m, far call/jmp
+                    return Lowered::Unsupported;
                 }
                 let size = if insn.opcode == 0xFE { 1 } else { self.opsize(&p) };
                 self.materialize();
@@ -2211,32 +1639,25 @@ impl Compiler {
         let p = insn.pfx;
         let has_rex = p.has_rex;
         match insn.opcode {
-            // multi-byte NOP
             0x1F => Lowered::Ok,
-            // CMOVcc
             0x40..=0x4F => {
                 let size = self.opsize(&p);
                 self.materialize();
                 if let Rm::Mem(m) = insn.rm {
                     self.emit_addr(&m);
                 }
-                // `R_FA` is free once the pending state is settled above.
                 self.read_rm(&insn.rm, R_FA, size, has_rex);
                 self.load_gpr(R_VAL, insn.reg, size, has_rex);
                 self.emit_cond_value(insn.opcode & 0xF, T0);
                 self.asm.subs_imm(true, ZR, T0, 0, false);
-                // The destination is written unconditionally — that is what
-                // zero-extends a 32-bit CMOV even when the condition is false.
                 self.asm.csel(true, R_VAL, R_FA, R_VAL, Cond::Ne);
                 self.store_gpr(R_VAL, insn.reg, size, has_rex);
                 Lowered::Ok
             }
-            // Jcc rel32
             0x80..=0x8F => {
                 let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
                 self.emit_jcc(insn.opcode & 0xF, target, next)
             }
-            // IMUL r, r/m
             0xAF => {
                 let size = self.opsize(&p);
                 self.materialize();
@@ -2249,7 +1670,6 @@ impl Compiler {
                 self.store_gpr(R_VAL, insn.reg, size, has_rex);
                 Lowered::Ok
             }
-            // MOVZX / MOVSX
             0xB6 | 0xB7 | 0xBE | 0xBF => {
                 let src = if insn.opcode & 1 == 0 { 1u8 } else { 2 };
                 let size = self.opsize(&p);
@@ -2268,7 +1688,6 @@ impl Compiler {
         }
     }
 
-    /// Mask a value in `r` down to `size` bytes.
     fn mask_to(&mut self, r: u32, size: u8) {
         if size == 8 {
             return;
@@ -2277,21 +1696,12 @@ impl Compiler {
         debug_assert!(ok);
     }
 
-    /// An instruction whose destination is a **memory** operand and which also
-    /// defines flags has to settle anything pending before it starts: by the
-    /// time its store can fault, the pending registers hold *this*
-    /// instruction's operands, so the rewind path could no longer reconstruct
-    /// the previous instruction's flags. (A `cmp`/`test` against memory writes
-    /// nothing back, so it keeps the deferral.)
     fn settle_for_rm_dest(&mut self, rm: &Rm, op: Alu) {
         if matches!(rm, Rm::Mem(_)) && op.writes_back() {
             self.materialize();
         }
     }
 
-    /// Commit an instruction whose destination is the r/m operand. The flags
-    /// stay pending: on the store's rewind path `R_FLAGS` is still the
-    /// pre-instruction value, which is exactly what a rewind wants.
     fn finish_rm_dest(
         &mut self,
         insn: &Insn,
@@ -2316,9 +1726,6 @@ impl Compiler {
         }
     }
 
-    /// INC/DEC: add/sub 1 with CF preserved. The operand is in [`R_FA`], and
-    /// the caller has already settled any pending flags — so `R_FLAGS` holds
-    /// the incoming CF that materialising will keep.
     fn emit_incdec(&mut self, size: u8, is_inc: bool) {
         self.asm.mov_imm64(R_FB, 1);
         if self.defer {
@@ -2329,16 +1736,11 @@ impl Compiler {
         }
     }
 
-    /// Two-operand signed multiply truncated to `size`; CF = OF = "the full
-    /// product did not fit", every other flag untouched (exactly the
-    /// interpreter's `imul_trunc`). Operands in [`R_FA`]/[`R_FB`], result in
-    /// [`R_VAL`]; the caller has settled the flags, so this writes them directly.
     fn emit_imul(&mut self, size: u8) {
         let bits = size as u32 * 8;
         if size == 8 {
             self.asm.mul(true, R_VAL, R_FA, R_FB);
             self.asm.smulh(T1, R_FA, R_FB);
-            // Overflow iff the high half is not the sign extension of the low.
             self.asm.cmp_reg_asr(true, T1, R_VAL, 63);
             self.asm.cset(true, T3, Cond::Ne);
         } else {
@@ -2357,16 +1759,8 @@ impl Compiler {
         self.asm.orr_reg(true, R_FLAGS, R_FLAGS, T3, F_OF);
     }
 
-    /// SHL/SHR/SAR with a compile-time count. The rotates and the CL-count
-    /// forms are not compiled.
-    ///
-    /// A shift *preserves* AF (and OF unless the count is 1), so it reads the
-    /// incoming flags and computes eagerly rather than deferring — into
-    /// [`R_FA`], which is free once the pending state is settled and which
-    /// survives the store of a memory destination.
     fn emit_shift(&mut self, insn: &Insn, size: u8, count: u64, next: u64, has_rex: bool) -> Lowered {
         let kind = insn.reg & 7;
-        // 0=rol 1=ror 2=rcl 3=rcr 4=shl 5=shr 6=shl(alias) 7=sar
         let (is_shl, is_sar) = match kind {
             4 | 6 => (true, false),
             5 => (false, false),
@@ -2376,8 +1770,6 @@ impl Compiler {
         let bits = size as u32 * 8;
         let count = (count & if size == 8 { 0x3f } else { 0x1f }) as u32;
         if count == 0 {
-            // Identity, and — crucially — flags are left completely untouched,
-            // including anything still pending, so nothing is settled here.
             if let Rm::Mem(m) = insn.rm {
                 self.emit_addr(&m);
             }
@@ -2397,10 +1789,7 @@ impl Compiler {
         if let Rm::Mem(m) = insn.rm {
             self.emit_addr(&m);
         }
-        // `R_FB` is free once the pending state is settled, and it survives the
-        // store of a memory destination.
         self.read_rm(&insn.rm, R_FB, size, has_rex);
-        // CF, then the result; both from the pre-shift value.
         if is_shl {
             if count <= bits {
                 self.asm.ubfx(true, T3, R_FB, bits - count, 1);
@@ -2418,24 +1807,19 @@ impl Compiler {
             self.asm.ubfx(true, T3, R_FB, count - 1, 1);
             self.asm.lsr_imm(true, R_VAL, R_FB, count.min(63));
         }
-        // Clear CF/SF/ZF/PF (plus OF when the count is 1, the only case in which
-        // the architecture defines it), then rebuild them.
         let clear = (1u64 << F_CF) | (1 << F_SF) | (1 << F_ZF) | (1 << F_PF) | if count == 1 { 1 << F_OF } else { 0 };
         self.asm.mov_imm64(T0, clear);
         self.asm.bic_reg(true, R_FA, R_FLAGS, T0, 0);
         self.asm.orr_reg(true, R_FA, R_FA, T3, F_CF);
         if count == 1 {
             if is_shl {
-                // OF = MSB(result) XOR CF
                 self.asm.ubfx(true, T0, R_VAL, bits - 1, 1);
                 self.asm.eor_reg(true, T0, T0, T3, 0);
                 self.asm.orr_reg(true, R_FA, R_FA, T0, F_OF);
             } else if !is_sar {
-                // SHR: OF = MSB(original)
                 self.asm.ubfx(true, T0, R_FB, bits - 1, 1);
                 self.asm.orr_reg(true, R_FA, R_FA, T0, F_OF);
             }
-            // SAR: OF = 0, already cleared.
         }
         self.flags_szp_into(R_FA, R_VAL, size);
         match insn.rm {
@@ -2451,24 +1835,16 @@ impl Compiler {
         }
     }
 
-    /// The store half of `push`: the address in [`R_ADDR`] *is* the new rsp and
-    /// the value is in [`R_VAL`]; rsp is committed only after the store
-    /// succeeds.
     fn emit_store_push(&mut self, w: u8, next: u64, next_reg: Option<u32>) {
         let miss = self.emit_tlb_probe(tlb_off::WRITE, w);
         self.asm.str_reg(w, R_VAL, T3, R_ADDR);
-        // Same handover as the helper path below, so both arrive at the commit
-        // with the new rsp in R_VAL.
         self.asm.mov_reg(true, R_VAL, R_ADDR);
         let done = self.asm.b_forward();
         self.asm.bind(miss);
         self.asm.mov_reg(true, 0, R_CTX);
         self.asm.mov_reg(true, 1, R_ADDR);
         self.asm.mov_imm64(2, w as u64);
-        self.asm.mov_reg(true, 3, R_VAL); // the value being pushed
-        // The pending commit is the *new rsp*, so move it into R_VAL now that
-        // the pushed value is safely in an argument register — both the hot path
-        // and the "store hit code" stub then commit the same register.
+        self.asm.mov_reg(true, 3, R_VAL);
         self.asm.mov_reg(true, R_VAL, R_ADDR);
         self.asm.ldr(8, T0, R_CTX, ctx_off::WRITE);
         self.asm.blr(T0);
@@ -2488,13 +1864,7 @@ impl Compiler {
         self.store_gpr(R_VAL, 4, 8, true);
     }
 
-    /// A conditional branch: both edges are compiled, so the block leaves with
-    /// `rip` already correct and never returns to the interpreter for the jump.
     fn emit_jcc(&mut self, cc: u8, target: u64, fallthrough: u64) -> Lowered {
-        // The condition reads `R_FLAGS`, and both edges leave the block — and
-        // both are compile-time constants, so both get a link slot. A loop whose
-        // body and exit are each one block therefore runs entirely as native
-        // code once both slots are filled.
         self.materialize();
         let taken = self.branch_if_cond(cc);
         self.exit_to(Flags::Live, fallthrough, self.insns + 1, ExitKind::Link);

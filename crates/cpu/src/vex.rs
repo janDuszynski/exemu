@@ -1,50 +1,20 @@
-//! AVX / AVX2 support via the VEX prefix (`0xC5` two-byte, `0xC4` three-byte).
-//!
-//! The VEX prefix re-encodes the SSE map with:
-//!   * an inverted R/X/B (register-extension) field, so `xmm8..15` and 32-bit
-//!     mode both fall out naturally,
-//!   * a non-destructive third source register `vvvv` (inverted), turning the
-//!     two-operand SSE `dst op= src` into `dst = vvvv op src`,
-//!   * a vector-length bit `L` (0 = 128-bit `xmm`, 1 = 256-bit `ymm`),
-//!   * a compressed mandatory prefix `pp` (0/66/F3/F2) and opcode-map selector
-//!     `mmmmm` (1 = `0F`, 2 = `0F38`, 3 = `0F3A`).
-//!
-//! **The zero-upper rule.** Every VEX-encoded instruction with a 128-bit
-//! destination *zeroes* the upper 128 bits of the target `ymm` register, whereas
-//! the legacy (non-VEX) SSE form *preserves* them. That asymmetry is the single
-//! biggest correctness trap in this decoder, so all 128-bit destination writes go
-//! through [`CpuState::set_xmm_zero_upper`] and all 256-bit writes through
-//! [`CpuState::set_ymm`]; the legacy SSE unit keeps using the preserve path.
-//!
-//! Provenance: Intel SDM Vol. 2 (VEX encoding, §2.3) and the per-instruction
-//! reference pages. The differential oracle (`crates/oracle`, VEX category)
-//! verifies every op here against a black-box reference, full 256-bit lanes.
-
 use super::*;
 use crate::sse;
 use exemu_core::cpu::flags;
 
-/// A decoded VEX prefix.
 #[derive(Clone, Copy)]
 pub(crate) struct Vex {
-    /// REX-equivalent bits (already de-inverted): R/X/B extend ModRM.reg,
-    /// SIB.index, ModRM.rm/base respectively; W is the operand-size/opcode bit.
     r: u8,
     x: u8,
     b: u8,
     w: bool,
-    /// The non-destructive source register (already de-inverted, 0..=15).
     vvvv: u8,
-    /// Vector length: false = 128-bit, true = 256-bit.
     l: bool,
-    /// Compressed mandatory prefix: 0 = none, 1 = 66, 2 = F3, 3 = F2.
     pp: u8,
-    /// Opcode map: 1 = 0F, 2 = 0F38, 3 = 0F3A.
     mmmmm: u8,
 }
 
 impl Vex {
-    /// The SSE "flavor" implied by `pp`, reusing the legacy naming.
     #[inline]
     fn pd(&self) -> bool {
         self.pp == 1
@@ -60,27 +30,18 @@ impl Vex {
 }
 
 impl Interpreter {
-    /// Entry point from `execute_one` for a `0xC4`/`0xC5` byte. In 32-bit mode
-    /// these bytes are `LES`/`LDS`; the caller only routes here when the byte
-    /// that follows has ModRM.mod == 11 (a register form), matching how a real
-    /// CPU disambiguates VEX from LES/LDS. `cur` points just past the `0xC4`/
-    /// `0xC5` byte.
     pub(crate) fn exec_vex(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, two_byte: bool) -> Result<()> {
         let vex = self.decode_vex(ctx, mem, two_byte)?;
         let op = ctx.u8_at_op;
-        // VZEROUPPER / VZEROALL (VEX.128/256 0F 77) have NO ModRM byte.
         if vex.mmmmm == 1 && op == 0x77 {
             if vex.l {
-                // VZEROALL: zero the whole YMM register file.
                 self.state.xmm = [0u128; 16];
                 self.state.ymm_hi = [0u128; 16];
             } else {
-                // VZEROUPPER: zero only the upper 128 bits of every YMM register.
                 self.state.ymm_hi = [0u128; 16];
             }
             return Ok(());
         }
-        // Read ModRM with the VEX-supplied R/X/B in place of REX.
         self.read_modrm_vex(ctx, mem, &vex)?;
         match vex.mmmmm {
             1 => self.vex_0f(ctx, mem, &vex, op),
@@ -90,11 +51,8 @@ impl Interpreter {
         }
     }
 
-    /// Consume the VEX payload byte(s) and the opcode. Stores the opcode in
-    /// `ctx.u8_at_op` and leaves `ctx.cur` pointing at the ModRM byte.
     fn decode_vex(&self, ctx: &mut Ctx, mem: &dyn Memory, two_byte: bool) -> Result<Vex> {
         let vex = if two_byte {
-            // 0xC5: [R vvvv L pp]. Implied W=0, mmmmm=1 (0F), X=B=0.
             let b1 = ctx.u8(mem)?;
             Vex {
                 r: (!(b1 >> 7)) & 1,
@@ -107,7 +65,6 @@ impl Interpreter {
                 mmmmm: 1,
             }
         } else {
-            // 0xC4: [R X B mmmmm][W vvvv L pp].
             let b1 = ctx.u8(mem)?;
             let b2 = ctx.u8(mem)?;
             Vex {
@@ -121,8 +78,6 @@ impl Interpreter {
                 mmmmm: b1 & 0x1F,
             }
         };
-        // In 32-bit mode the R/X/B/vvvv high bits still decode but there are only
-        // 8 architectural registers; masking keeps register indices in range.
         let mut vex = vex;
         if ctx.bits == Bits::B32 {
             vex.r = 0;
@@ -130,25 +85,16 @@ impl Interpreter {
             vex.b = 0;
             vex.vvvv &= 7;
         }
-        // Read the opcode byte and stash it.
         ctx.u8_at_op = ctx.u8(mem)?;
         Ok(vex)
     }
 
-    /// ModRM read using the VEX R/X/B fields as the register-extension source
-    /// (mirrors `read_modrm`, which uses REX). Shares the memory-operand math.
     fn read_modrm_vex(&self, ctx: &mut Ctx, mem: &dyn Memory, vex: &Vex) -> Result<()> {
-        // Splice the VEX R/X/B into the prefix so the shared `read_modrm` path
-        // resolves the operand identically to a REX-prefixed instruction.
         ctx.pfx.rex = 0x40 | ((vex.w as u8) << 3) | (vex.r << 2) | (vex.x << 1) | vex.b;
         ctx.pfx.has_rex = ctx.bits == Bits::B64;
         self.read_modrm(ctx, mem)
     }
 
-    // ---- operand access --------------------------------------------------
-
-    /// Read the r/m operand as a 128-bit value (low lane of a `ymm`, or `n`
-    /// bytes from memory zero-extended).
     fn vrm128(&self, ctx: &Ctx, mem: &dyn Memory, n: usize) -> Result<u128> {
         match ctx.rm {
             Rm::Reg(i) => Ok(self.state.xmm(i)),
@@ -160,7 +106,6 @@ impl Interpreter {
         }
     }
 
-    /// Read the r/m operand as a full 256-bit value `(low, high)`.
     fn vrm256(&self, ctx: &Ctx, mem: &dyn Memory) -> Result<(u128, u128)> {
         match ctx.rm {
             Rm::Reg(i) => Ok((self.state.xmm(i), self.state.ymm_hi(i))),
@@ -177,7 +122,6 @@ impl Interpreter {
         }
     }
 
-    /// Store a 128-bit destination: register (zero-upper) or 16 bytes of memory.
     fn vstore128(&mut self, ctx: &Ctx, mem: &mut dyn Memory, val: u128) -> Result<()> {
         match ctx.rm {
             Rm::Reg(i) => {
@@ -188,7 +132,6 @@ impl Interpreter {
         }
     }
 
-    /// Store a 256-bit destination: register or 32 bytes of memory.
     fn vstore256(&mut self, ctx: &Ctx, mem: &mut dyn Memory, lo: u128, hi: u128) -> Result<()> {
         match ctx.rm {
             Rm::Reg(i) => {
@@ -204,12 +147,9 @@ impl Interpreter {
         }
     }
 
-    /// Store the low `n` bytes of `val` to the r/m operand (scalar VMOV store).
     fn vstore_low(&mut self, ctx: &Ctx, mem: &mut dyn Memory, n: usize, val: u128) -> Result<()> {
         match ctx.rm {
             Rm::Reg(i) => {
-                // A VEX scalar store to a register zeroes the upper lanes above
-                // the written bytes (128-bit dst) and the whole upper 128.
                 let mask = if n >= 16 { u128::MAX } else { (1u128 << (n * 8)) - 1 };
                 self.state.set_xmm_zero_upper(i, val & mask);
                 Ok(())
@@ -218,8 +158,6 @@ impl Interpreter {
         }
     }
 
-    /// Write a full 256/128-bit result to the ModRM.reg destination, applying
-    /// the length-dependent zero-upper rule.
     #[inline]
     fn vdst(&mut self, reg: u8, l: bool, lo: u128, hi: u128) {
         if l {
@@ -229,30 +167,24 @@ impl Interpreter {
         }
     }
 
-    /// The `vvvv` source register's low/high halves.
     #[inline]
     fn vsrc(&self, vex: &Vex) -> (u128, u128) {
         (self.state.xmm(vex.vvvv), self.state.ymm_hi(vex.vvvv))
     }
 
-    // ---- 0F map ----------------------------------------------------------
-
     fn vex_0f(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, op: u8) -> Result<()> {
         let reg = ctx.reg;
         match op {
-            // ---- VMOVUPS/VMOVUPD/VMOVAPS/VMOVAPD (aligned/unaligned load) ---
             0x10 | 0x28 => {
                 if vex.f3() || vex.f2() {
-                    // VMOVSS / VMOVSD.
-                    return self.vex_movss_sd(ctx, mem, vex, reg, /*store=*/ false);
+                    return self.vex_movss_sd(ctx, mem, vex, reg,  false);
                 }
                 let (lo, hi) = self.vload_rm(ctx, mem, vex)?;
                 self.vdst(reg, vex.l, lo, hi);
             }
-            // ---- VMOVUPS/VMOVUPD/VMOVAPS/VMOVAPD (store) --------------------
             0x11 | 0x29 => {
                 if vex.f3() || vex.f2() {
-                    return self.vex_movss_sd(ctx, mem, vex, reg, /*store=*/ true);
+                    return self.vex_movss_sd(ctx, mem, vex, reg,  true);
                 }
                 let (lo, hi) = (self.state.xmm(reg), self.state.ymm_hi(reg));
                 if vex.l {
@@ -262,12 +194,11 @@ impl Interpreter {
                 }
             }
 
-            // ---- VMOVLPS/VMOVHLPS (0x12), VMOVHPS/VMOVLHPS (0x16) ----------
             0x12 => {
                 let dst = self.state.xmm(vex.vvvv);
                 let lo = match ctx.rm {
-                    Rm::Reg(i) => (dst & !sse::LOW64) | (self.state.xmm(i) >> 64), // VMOVHLPS
-                    Rm::Mem { .. } => (dst & !sse::LOW64) | (self.vrm128(ctx, mem, 8)? & sse::LOW64), // VMOVLPS
+                    Rm::Reg(i) => (dst & !sse::LOW64) | (self.state.xmm(i) >> 64),
+                    Rm::Mem { .. } => (dst & !sse::LOW64) | (self.vrm128(ctx, mem, 8)? & sse::LOW64),
                 };
                 self.state.set_xmm_zero_upper(reg, lo);
             }
@@ -278,8 +209,8 @@ impl Interpreter {
             0x16 => {
                 let dst = self.state.xmm(vex.vvvv);
                 let lo = match ctx.rm {
-                    Rm::Reg(i) => (dst & sse::LOW64) | (self.state.xmm(i) << 64), // VMOVLHPS
-                    Rm::Mem { .. } => (dst & sse::LOW64) | (self.vrm128(ctx, mem, 8)? << 64), // VMOVHPS
+                    Rm::Reg(i) => (dst & sse::LOW64) | (self.state.xmm(i) << 64),
+                    Rm::Mem { .. } => (dst & sse::LOW64) | (self.vrm128(ctx, mem, 8)? << 64),
                 };
                 self.state.set_xmm_zero_upper(reg, lo);
             }
@@ -288,16 +219,10 @@ impl Interpreter {
                 self.vstore_low(ctx, mem, 8, v)?;
             }
 
-            // ---- VMOVDDUP / VMOVSLDUP / VMOVSHDUP --------------------------
-            // (F2 0F 12 / F3 0F 12 / F3 0F 16) — kept minimal; only the
-            // common F2 VMOVDDUP is emitted by CRTs. Fall through otherwise.
-
-            // ---- VMOVDQA / VMOVDQU (load) ---------------------------------
             0x6F => {
                 let (lo, hi) = self.vload_rm(ctx, mem, vex)?;
                 self.vdst(reg, vex.l, lo, hi);
             }
-            // ---- VMOVDQA / VMOVDQU (store) --------------------------------
             0x7F => {
                 let (lo, hi) = (self.state.xmm(reg), self.state.ymm_hi(reg));
                 if vex.l {
@@ -307,16 +232,13 @@ impl Interpreter {
                 }
             }
 
-            // ---- VMOVD / VMOVQ (66 0F 6E: GP->xmm) ------------------------
             0x6E => {
                 let size = if vex.w { 8 } else { 4 };
                 let v = self.read_rm(ctx, &*mem, size)? as u128 & sse::low_mask(size as usize);
                 self.state.set_xmm_zero_upper(reg, v);
             }
-            // ---- VMOVD / VMOVQ (66 0F 7E: xmm->GP)  or F3 0F 7E VMOVQ xmm<-xmm
             0x7E => {
                 if vex.f3() {
-                    // VMOVQ xmm, xmm/m64: low 64 bits, zero the rest.
                     let v = self.vrm128(ctx, mem, 8)? & sse::LOW64;
                     self.state.set_xmm_zero_upper(reg, v);
                 } else {
@@ -325,33 +247,27 @@ impl Interpreter {
                     self.write_rm(ctx, mem, size, v as u64)?;
                 }
             }
-            // ---- VMOVQ store (66 0F D6: xmm/m64 <- xmm low 64) ------------
             0xD6 => {
                 let v = self.state.xmm(reg) & sse::LOW64;
                 self.vstore_low(ctx, mem, 8, v)?;
             }
 
-            // ---- packed float arithmetic ----------------------------------
             0x58 => self.vex_farith(ctx, mem, vex, reg, |a, b| a + b)?,
             0x59 => self.vex_farith(ctx, mem, vex, reg, |a, b| a * b)?,
             0x5C => self.vex_farith(ctx, mem, vex, reg, |a, b| a - b)?,
             0x5D => self.vex_farith(ctx, mem, vex, reg, sse_min)?,
             0x5E => self.vex_farith(ctx, mem, vex, reg, |a, b| a / b)?,
             0x5F => self.vex_farith(ctx, mem, vex, reg, sse_max)?,
-            // VSQRT — unary.
             0x51 => self.vex_funary(ctx, mem, vex, reg, f64::sqrt)?,
 
-            // ---- packed float logic (AND/ANDN/OR/XOR) ---------------------
             0x54 => self.vex_logic(ctx, mem, vex, reg, |a, b| a & b)?,
             0x55 => self.vex_logic(ctx, mem, vex, reg, |a, b| !a & b)?,
             0x56 => self.vex_logic(ctx, mem, vex, reg, |a, b| a | b)?,
             0x57 => self.vex_logic(ctx, mem, vex, reg, |a, b| a ^ b)?,
 
-            // ---- VUNPCKLPS/PD (0x14), VUNPCKHPS/PD (0x15) -----------------
             0x14 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, if vex.pd() { 8 } else { 4 }, false))?,
             0x15 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, if vex.pd() { 8 } else { 4 }, true))?,
 
-            // ---- VSHUFPS/PD (0xC6) with imm8 ------------------------------
             0xC6 => {
                 let (sl, sh) = self.vsrc(vex);
                 let (bl, bh) = self.vload_rm(ctx, mem, vex)?;
@@ -363,10 +279,8 @@ impl Interpreter {
                 }
             }
 
-            // ---- VCMPPS/PD/SS/SD (0xC2) with imm8 predicate ---------------
             0xC2 => self.vex_cmp(ctx, mem, vex, reg)?,
 
-            // ---- VCOMISS/SD (0x2F), VUCOMISS/SD (0x2E) --------------------
             0x2E | 0x2F => {
                 let src = self.vrm128(ctx, mem, if vex.pd() { 8 } else { 4 })?;
                 let dst = self.state.xmm(reg);
@@ -378,62 +292,58 @@ impl Interpreter {
                 self.set_compare_flags(a, b);
             }
 
-            // ---- integer add/sub/logic/compare (AVX2, lane-wise) ----------
-            0xD4 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 8, true))?, // VPADDQ
-            0xFB => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 8, false))?, // VPSUBQ
-            0xFC => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 1, true))?, // VPADDB
-            0xFD => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 2, true))?, // VPADDW
-            0xFE => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 4, true))?, // VPADDD
-            0xF8 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 1, false))?, // VPSUBB
-            0xF9 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 2, false))?, // VPSUBW
-            0xFA => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 4, false))?, // VPSUBD
-            0xDB => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| a & b)?,  // VPAND
-            0xDF => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| !a & b)?, // VPANDN
-            0xEB => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| a | b)?,  // VPOR
-            0xEF => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| a ^ b)?,  // VPXOR
-            0x74 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 1, false))?, // VPCMPEQB
-            0x75 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 2, false))?, // VPCMPEQW
-            0x76 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 4, false))?, // VPCMPEQD
-            0x64 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 1, true))?, // VPCMPGTB
-            0x65 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 2, true))?, // VPCMPGTW
-            0x66 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 4, true))?, // VPCMPGTD
-            0xD5 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmullw)?, // VPMULLW
-            0xE5 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pmulh(a, b, true))?, // VPMULHW
-            0xE4 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pmulh(a, b, false))?, // VPMULHUW
-            0xF4 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmuludq)?, // VPMULUDQ
-            0xF5 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmaddwd)?, // VPMADDWD
-            0xF6 => self.vex_lane_bin(ctx, mem, vex, reg, sse::psadbw)?, // VPSADBW
-            0xDC => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 1, true, false))?, // VPADDUSB
-            0xDD => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 2, true, false))?, // VPADDUSW
-            0xEC => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 1, true, true))?, // VPADDSB
-            0xED => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 2, true, true))?, // VPADDSW
-            0xD8 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 1, false, false))?, // VPSUBUSB
-            0xD9 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 2, false, false))?, // VPSUBUSW
-            0xE8 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 1, false, true))?, // VPSUBSB
-            0xE9 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 2, false, true))?, // VPSUBSW
-            0xDA => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::byte_minmax(a, b, false))?, // VPMINUB
-            0xDE => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::byte_minmax(a, b, true))?, // VPMAXUB
-            0xEA => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 2, true, false))?, // VPMINSW
-            0xEE => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 2, true, true))?, // VPMAXSW
-            0xE0 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pavg(a, b, 1))?, // VPAVGB
-            0xE3 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pavg(a, b, 2))?, // VPAVGW
+            0xD4 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 8, true))?,
+            0xFB => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 8, false))?,
+            0xFC => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 1, true))?,
+            0xFD => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 2, true))?,
+            0xFE => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 4, true))?,
+            0xF8 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 1, false))?,
+            0xF9 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 2, false))?,
+            0xFA => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub(a, b, 4, false))?,
+            0xDB => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| a & b)?,
+            0xDF => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| !a & b)?,
+            0xEB => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| a | b)?,
+            0xEF => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| a ^ b)?,
+            0x74 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 1, false))?,
+            0x75 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 2, false))?,
+            0x76 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 4, false))?,
+            0x64 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 1, true))?,
+            0x65 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 2, true))?,
+            0x66 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 4, true))?,
+            0xD5 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmullw)?,
+            0xE5 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pmulh(a, b, true))?,
+            0xE4 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pmulh(a, b, false))?,
+            0xF4 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmuludq)?,
+            0xF5 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmaddwd)?,
+            0xF6 => self.vex_lane_bin(ctx, mem, vex, reg, sse::psadbw)?,
+            0xDC => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 1, true, false))?,
+            0xDD => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 2, true, false))?,
+            0xEC => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 1, true, true))?,
+            0xED => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 2, true, true))?,
+            0xD8 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 1, false, false))?,
+            0xD9 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 2, false, false))?,
+            0xE8 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 1, false, true))?,
+            0xE9 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::add_sub_sat(a, b, 2, false, true))?,
+            0xDA => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::byte_minmax(a, b, false))?,
+            0xDE => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::byte_minmax(a, b, true))?,
+            0xEA => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 2, true, false))?,
+            0xEE => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 2, true, true))?,
+            0xE0 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pavg(a, b, 1))?,
+            0xE3 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pavg(a, b, 2))?,
 
-            // ---- VPUNPCK{L,H}{BW,WD,DQ,QDQ} -------------------------------
-            0x60 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 1, false))?, // VPUNPCKLBW
-            0x61 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 2, false))?, // VPUNPCKLWD
-            0x62 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 4, false))?, // VPUNPCKLDQ
-            0x6C => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 8, false))?, // VPUNPCKLQDQ
-            0x68 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 1, true))?, // VPUNPCKHBW
-            0x69 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 2, true))?, // VPUNPCKHWD
-            0x6A => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 4, true))?, // VPUNPCKHDQ
-            0x6D => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 8, true))?, // VPUNPCKHQDQ
+            0x60 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 1, false))?,
+            0x61 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 2, false))?,
+            0x62 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 4, false))?,
+            0x6C => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 8, false))?,
+            0x68 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 1, true))?,
+            0x69 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 2, true))?,
+            0x6A => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 4, true))?,
+            0x6D => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::punpck(a, b, 8, true))?,
 
-            // ---- VPACKSSWB/DW, VPACKUSWB (2-source pack) ------------------
-            0x63 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pack(a, b, 2, true))?, // VPACKSSWB
-            0x6B => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pack(a, b, 4, true))?, // VPACKSSDW
-            0x67 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pack(a, b, 2, false))?, // VPACKUSWB
+            0x63 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pack(a, b, 2, true))?,
+            0x6B => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pack(a, b, 4, true))?,
+            0x67 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pack(a, b, 2, false))?,
 
-            // ---- VPSHUFD (66), VPSHUFLW (F2), VPSHUFHW (F3) with imm8 -----
             0x70 => {
                 let (bl, bh) = self.vload_rm(ctx, mem, vex)?;
                 let imm = ctx.u8(mem)?;
@@ -447,7 +357,6 @@ impl Interpreter {
                 self.vdst(reg, vex.l, f(bl, imm), if vex.l { f(bh, imm) } else { 0 });
             }
 
-            // ---- VPMOVMSKB (66 0F D7) -> GP -------------------------------
             0xD7 => {
                 let lo = sse::pmovmskb(self.vrm128(ctx, mem, 16)?);
                 let mask = if vex.l {
@@ -458,7 +367,6 @@ impl Interpreter {
                 };
                 self.state.gpr_write(reg, 4, mask as u64);
             }
-            // ---- VMOVMSKPS/PD (0F 50) -> GP -------------------------------
             0x50 => {
                 let esz = if vex.pd() { 8 } else { 4 };
                 let per = 16 / esz;
@@ -476,20 +384,17 @@ impl Interpreter {
                 self.state.gpr_write(reg, 4, mask);
             }
 
-            // ---- variable/imm shifts (VPSLL/VPSRL/VPSRA) ------------------
             0x71..=0x73 => self.vex_shift_imm(ctx, mem, vex, op)?,
-            0xD1 => self.vex_shift_var(ctx, mem, vex, reg, 2, false, false)?, // VPSRLW
-            0xD2 => self.vex_shift_var(ctx, mem, vex, reg, 4, false, false)?, // VPSRLD
-            0xD3 => self.vex_shift_var(ctx, mem, vex, reg, 8, false, false)?, // VPSRLQ
-            0xE1 => self.vex_shift_var(ctx, mem, vex, reg, 2, true, false)?,  // VPSRAW
-            0xE2 => self.vex_shift_var(ctx, mem, vex, reg, 4, true, false)?,  // VPSRAD
-            0xF1 => self.vex_shift_var(ctx, mem, vex, reg, 2, false, true)?,  // VPSLLW
-            0xF2 => self.vex_shift_var(ctx, mem, vex, reg, 4, false, true)?,  // VPSLLD
-            0xF3 => self.vex_shift_var(ctx, mem, vex, reg, 8, false, true)?,  // VPSLLQ
+            0xD1 => self.vex_shift_var(ctx, mem, vex, reg, 2, false, false)?,
+            0xD2 => self.vex_shift_var(ctx, mem, vex, reg, 4, false, false)?,
+            0xD3 => self.vex_shift_var(ctx, mem, vex, reg, 8, false, false)?,
+            0xE1 => self.vex_shift_var(ctx, mem, vex, reg, 2, true, false)?,
+            0xE2 => self.vex_shift_var(ctx, mem, vex, reg, 4, true, false)?,
+            0xF1 => self.vex_shift_var(ctx, mem, vex, reg, 2, false, true)?,
+            0xF2 => self.vex_shift_var(ctx, mem, vex, reg, 4, false, true)?,
+            0xF3 => self.vex_shift_var(ctx, mem, vex, reg, 8, false, true)?,
 
-            // ---- VCVT* (packed dq<->ps) -----------------------------------
             0x5B => {
-                // 0F 5B: VCVTDQ2PS (NP), VCVTPS2DQ (66), VCVTTPS2DQ (F3).
                 let (lo, hi) = self.vload_rm(ctx, mem, vex)?;
                 let f: fn(u128) -> u128 = if vex.pd() {
                     |v| sse::cvtps2dq(v, false)
@@ -500,7 +405,6 @@ impl Interpreter {
                 };
                 self.vdst(reg, vex.l, f(lo), if vex.l { f(hi) } else { 0 });
             }
-            // VCVTSI2SS/SD (F3/F2 0F 2A): GP -> scalar float.
             0x2A => {
                 let size = if vex.w { 8 } else { 4 };
                 let src = alu::sext(self.read_rm(ctx, &*mem, size)?, size) as i64;
@@ -512,7 +416,6 @@ impl Interpreter {
                 };
                 self.state.set_xmm_zero_upper(reg, v);
             }
-            // VCVT(T)SS2SI / VCVT(T)SD2SI (F3/F2 0F 2C/2D): scalar float -> GP.
             0x2C | 0x2D => {
                 let truncate = op == 0x2C;
                 let size = if vex.w { 8 } else { 4 };
@@ -521,15 +424,12 @@ impl Interpreter {
                 let r = sse::cvt_f_to_int(f, truncate, size);
                 self.write_reg_field(ctx, size, r);
             }
-            // VCVTSS2SD / VCVTSD2SS (F3/F2 0F 5A).
             0x5A => {
                 let src = self.vrm128(ctx, mem, 8)?;
                 let base = self.state.xmm(vex.vvvv);
                 let v = if vex.f2() {
-                    // sd2ss
                     (base & !sse::LOW32) | ((f64::from_bits(src as u64) as f32).to_bits() as u128)
                 } else {
-                    // ss2sd
                     (base & !sse::LOW64) | ((f32::from_bits(src as u32) as f64).to_bits() as u128)
                 };
                 self.state.set_xmm_zero_upper(reg, v);
@@ -540,141 +440,114 @@ impl Interpreter {
         Ok(())
     }
 
-    // ---- 0F38 map --------------------------------------------------------
-
     fn vex_0f38(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, op: u8) -> Result<()> {
         let reg = ctx.reg;
-        // ---- BMI1 / BMI2 GP-register ops (VEX.LZ.0F38) -------------------
-        // These are integer ops on general-purpose registers, not vectors, so
-        // they short-circuit before the packed-op dispatch. Operand size is
-        // 64-bit when VEX.W, else 32-bit. Semantics: Intel SDM Vol. 2.
         match op {
             0xF2 => return self.bmi_andn(ctx, mem, vex),
-            0xF3 => return self.bmi_group17(ctx, mem, vex), // BLSR/BLSMSK/BLSI (/reg)
-            0xF5 => return self.bmi_f5(ctx, mem, vex),      // BZHI / PEXT / PDEP
-            0xF6 => return self.bmi_mulx(ctx, mem, vex),    // MULX (F2 prefix)
-            0xF7 => return self.bmi_f7(ctx, mem, vex),      // BEXTR / SHLX / SARX / SHRX
-            0x13 if vex.pp == 1 => return self.vex_cvtph2ps(ctx, mem, vex, reg), // VCVTPH2PS (F16C)
+            0xF3 => return self.bmi_group17(ctx, mem, vex),
+            0xF5 => return self.bmi_f5(ctx, mem, vex),
+            0xF6 => return self.bmi_mulx(ctx, mem, vex),
+            0xF7 => return self.bmi_f7(ctx, mem, vex),
+            0x13 if vex.pp == 1 => return self.vex_cvtph2ps(ctx, mem, vex, reg),
             _ => {}
         }
         match op {
-            0x00 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pshufb)?, // VPSHUFB
-            0x01 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, false, false, false))?, // VPHADDW
-            0x02 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 4, false, false, false))?, // VPHADDD
-            0x05 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, true, false, false))?, // VPHSUBW
-            0x06 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 4, true, false, false))?, // VPHSUBD
-            0x03 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, false, true, false))?, // VPHADDSW
-            0x07 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, true, true, false))?, // VPHSUBSW
-            0x04 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmaddubsw)?, // VPMADDUBSW
-            0x08 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::psign(a, b, 1))?, // VPSIGNB
-            0x09 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::psign(a, b, 2))?, // VPSIGNW
-            0x0A => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::psign(a, b, 4))?, // VPSIGND
-            0x0B => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmulhrsw)?, // VPMULHRSW
-            0x1C => self.vex_unary_lane(ctx, mem, vex, reg, |v| sse::pabs(v, 1))?, // VPABSB
-            0x1D => self.vex_unary_lane(ctx, mem, vex, reg, |v| sse::pabs(v, 2))?, // VPABSW
-            0x1E => self.vex_unary_lane(ctx, mem, vex, reg, |v| sse::pabs(v, 4))?, // VPABSD
-            0x28 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmuldq)?, // VPMULDQ
-            0x29 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 8, false))?, // VPCMPEQQ
-            0x37 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 8, true))?, // VPCMPGTQ
-            0x2B => self.vex_lane_bin(ctx, mem, vex, reg, sse::packusdw)?, // VPACKUSDW
-            0x40 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmulld)?, // VPMULLD
-            0x38 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 1, true, false))?, // VPMINSB
-            0x3C => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 1, true, true))?, // VPMAXSB
-            0x39 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 4, true, false))?, // VPMINSD
-            0x3D => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 4, true, true))?, // VPMAXSD
-            0x3A => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 2, false, false))?, // VPMINUW
-            0x3E => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 2, false, true))?, // VPMAXUW
-            0x3B => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 4, false, false))?, // VPMINUD
-            0x3F => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 4, false, true))?, // VPMAXUD
+            0x00 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pshufb)?,
+            0x01 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, false, false, false))?,
+            0x02 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 4, false, false, false))?,
+            0x05 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, true, false, false))?,
+            0x06 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 4, true, false, false))?,
+            0x03 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, false, true, false))?,
+            0x07 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::phaddsub(a, b, 2, true, true, false))?,
+            0x04 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmaddubsw)?,
+            0x08 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::psign(a, b, 1))?,
+            0x09 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::psign(a, b, 2))?,
+            0x0A => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::psign(a, b, 4))?,
+            0x0B => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmulhrsw)?,
+            0x1C => self.vex_unary_lane(ctx, mem, vex, reg, |v| sse::pabs(v, 1))?,
+            0x1D => self.vex_unary_lane(ctx, mem, vex, reg, |v| sse::pabs(v, 2))?,
+            0x1E => self.vex_unary_lane(ctx, mem, vex, reg, |v| sse::pabs(v, 4))?,
+            0x28 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmuldq)?,
+            0x29 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 8, false))?,
+            0x37 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::pcmp(a, b, 8, true))?,
+            0x2B => self.vex_lane_bin(ctx, mem, vex, reg, sse::packusdw)?,
+            0x40 => self.vex_lane_bin(ctx, mem, vex, reg, sse::pmulld)?,
+            0x38 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 1, true, false))?,
+            0x3C => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 1, true, true))?,
+            0x39 => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 4, true, false))?,
+            0x3D => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 4, true, true))?,
+            0x3A => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 2, false, false))?,
+            0x3E => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 2, false, true))?,
+            0x3B => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 4, false, false))?,
+            0x3F => self.vex_lane_bin(ctx, mem, vex, reg, |a, b| sse::int_minmax(a, b, 4, false, true))?,
 
-            // ---- VPMOVSX/ZX (128-bit only src widened to dst) -------------
-            0x20 => self.vex_pmovx(ctx, mem, vex, reg, 1, 2, true)?, // VPMOVSXBW
-            0x21 => self.vex_pmovx(ctx, mem, vex, reg, 1, 4, true)?, // VPMOVSXBD
-            0x22 => self.vex_pmovx(ctx, mem, vex, reg, 1, 8, true)?, // VPMOVSXBQ
-            0x23 => self.vex_pmovx(ctx, mem, vex, reg, 2, 4, true)?, // VPMOVSXWD
-            0x24 => self.vex_pmovx(ctx, mem, vex, reg, 2, 8, true)?, // VPMOVSXWQ
-            0x25 => self.vex_pmovx(ctx, mem, vex, reg, 4, 8, true)?, // VPMOVSXDQ
-            0x30 => self.vex_pmovx(ctx, mem, vex, reg, 1, 2, false)?, // VPMOVZXBW
-            0x31 => self.vex_pmovx(ctx, mem, vex, reg, 1, 4, false)?, // VPMOVZXBD
-            0x32 => self.vex_pmovx(ctx, mem, vex, reg, 1, 8, false)?, // VPMOVZXBQ
-            0x33 => self.vex_pmovx(ctx, mem, vex, reg, 2, 4, false)?, // VPMOVZXWD
-            0x34 => self.vex_pmovx(ctx, mem, vex, reg, 2, 8, false)?, // VPMOVZXWQ
-            0x35 => self.vex_pmovx(ctx, mem, vex, reg, 4, 8, false)?, // VPMOVZXDQ
+            0x20 => self.vex_pmovx(ctx, mem, vex, reg, 1, 2, true)?,
+            0x21 => self.vex_pmovx(ctx, mem, vex, reg, 1, 4, true)?,
+            0x22 => self.vex_pmovx(ctx, mem, vex, reg, 1, 8, true)?,
+            0x23 => self.vex_pmovx(ctx, mem, vex, reg, 2, 4, true)?,
+            0x24 => self.vex_pmovx(ctx, mem, vex, reg, 2, 8, true)?,
+            0x25 => self.vex_pmovx(ctx, mem, vex, reg, 4, 8, true)?,
+            0x30 => self.vex_pmovx(ctx, mem, vex, reg, 1, 2, false)?,
+            0x31 => self.vex_pmovx(ctx, mem, vex, reg, 1, 4, false)?,
+            0x32 => self.vex_pmovx(ctx, mem, vex, reg, 1, 8, false)?,
+            0x33 => self.vex_pmovx(ctx, mem, vex, reg, 2, 4, false)?,
+            0x34 => self.vex_pmovx(ctx, mem, vex, reg, 2, 8, false)?,
+            0x35 => self.vex_pmovx(ctx, mem, vex, reg, 4, 8, false)?,
 
-            // ---- VPBROADCASTB/W/D/Q (AVX2) --------------------------------
-            0x78 => self.vex_broadcast(ctx, mem, vex, reg, 1)?, // VPBROADCASTB
-            0x79 => self.vex_broadcast(ctx, mem, vex, reg, 2)?, // VPBROADCASTW
-            0x58 => self.vex_broadcast(ctx, mem, vex, reg, 4)?, // VPBROADCASTD
-            0x59 => self.vex_broadcast(ctx, mem, vex, reg, 8)?, // VPBROADCASTQ
-            // VBROADCASTSS (4) / VBROADCASTSD (8, 256-only)
-            0x18 => self.vex_broadcast(ctx, mem, vex, reg, 4)?, // VBROADCASTSS
-            0x19 => self.vex_broadcast(ctx, mem, vex, reg, 8)?, // VBROADCASTSD
+            0x78 => self.vex_broadcast(ctx, mem, vex, reg, 1)?,
+            0x79 => self.vex_broadcast(ctx, mem, vex, reg, 2)?,
+            0x58 => self.vex_broadcast(ctx, mem, vex, reg, 4)?,
+            0x59 => self.vex_broadcast(ctx, mem, vex, reg, 8)?,
+            0x18 => self.vex_broadcast(ctx, mem, vex, reg, 4)?,
+            0x19 => self.vex_broadcast(ctx, mem, vex, reg, 8)?,
 
-            // ---- VPTEST (sets flags) --------------------------------------
             0x17 => self.vex_ptest(ctx, mem, vex, reg)?,
 
-            // ---- VINSERTI128 handled in 0F3A; VPERMD (0x36) ---------------
-            0x36 => self.vex_permd(ctx, mem, vex, reg)?, // VPERMD (256-bit, dword)
-            0x16 => self.vex_permps(ctx, mem, vex, reg)?, // VPERMPS
+            0x36 => self.vex_permd(ctx, mem, vex, reg)?,
+            0x16 => self.vex_permps(ctx, mem, vex, reg)?,
 
-            // ---- VPSLLVD/Q, VPSRLVD/Q, VPSRAVD (per-element var shift) ----
-            0x47 => self.vex_var_shift(ctx, mem, vex, reg, if vex.w { 8 } else { 4 }, false, true)?, // VPSLLV
-            0x45 => self.vex_var_shift(ctx, mem, vex, reg, if vex.w { 8 } else { 4 }, false, false)?, // VPSRLV
-            0x46 => self.vex_var_shift(ctx, mem, vex, reg, 4, true, false)?, // VPSRAVD
+            0x47 => self.vex_var_shift(ctx, mem, vex, reg, if vex.w { 8 } else { 4 }, false, true)?,
+            0x45 => self.vex_var_shift(ctx, mem, vex, reg, if vex.w { 8 } else { 4 }, false, false)?,
+            0x46 => self.vex_var_shift(ctx, mem, vex, reg, 4, true, false)?,
 
             _ => return Err(EmuError::Unsupported(format!("VEX 0F38 {op:#04x}"))),
         }
         Ok(())
     }
 
-    // ---- 0F3A map --------------------------------------------------------
-
     fn vex_0f3a(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, op: u8) -> Result<()> {
         let reg = ctx.reg;
-        // ---- BMI2 RORX (VEX.LZ.F2.0F3A.W F0 /r ib) and F16C VCVTPS2PH ----
         match op {
             0xF0 if vex.f2() => return self.bmi_rorx(ctx, mem, vex),
-            0x1D if vex.pp == 1 => return self.vex_cvtps2ph(ctx, mem, vex, reg), // VCVTPS2PH (F16C)
+            0x1D if vex.pp == 1 => return self.vex_cvtps2ph(ctx, mem, vex, reg),
             _ => {}
         }
         match op {
-            // ---- VPALIGNR (0x0F) ------------------------------------------
             0x0F => {
-                // Read the trailing imm8 BEFORE the memory operand so a
-                // RIP-relative r/m resolves against the end of the whole
-                // instruction (imm included). Applies to every 0F3A form below.
                 let imm = ctx.u8(mem)?;
                 let (sl, sh) = self.vsrc(vex);
                 let (bl, bh) = self.vload_rm(ctx, mem, vex)?;
                 self.vdst(reg, vex.l, sse::palignr(sl, bl, imm), if vex.l { sse::palignr(sh, bh, imm) } else { 0 });
             }
-            // ---- VPBLENDW (0x0E), VBLENDPS (0x0C), VBLENDPD (0x0D) --------
             0x0E => self.vex_blend_imm(ctx, mem, vex, reg, 2)?,
             0x0C => self.vex_blend_imm(ctx, mem, vex, reg, 4)?,
             0x0D => self.vex_blend_imm(ctx, mem, vex, reg, 8)?,
-            // ---- VPBLENDD (0x02, AVX2 dword blend) ------------------------
             0x02 => self.vex_blend_imm(ctx, mem, vex, reg, 4)?,
 
-            // ---- VSHUFPS/PD imm variants live at C6 (0F map) --------------
-
-            // ---- VROUNDPS/PD (0x08/0x09), VROUNDSS/SD (0x0A/0x0B) ---------
             0x08 => self.vex_round_packed(ctx, mem, vex, reg, false)?,
             0x09 => self.vex_round_packed(ctx, mem, vex, reg, true)?,
             0x0A => self.vex_round_scalar(ctx, mem, vex, reg, false)?,
             0x0B => self.vex_round_scalar(ctx, mem, vex, reg, true)?,
 
-            // ---- VPERMQ / VPERMPD (0x00 / 0x01, 256-bit, imm8) -----------
             0x00 => self.vex_permq(ctx, mem, vex, reg)?,
             0x01 => self.vex_permpd(ctx, mem, vex, reg)?,
 
-            // ---- VEXTRACTI128 / VEXTRACTF128 (0x39 / 0x19) ---------------
             0x39 | 0x19 => {
                 let imm = ctx.u8(mem)?;
                 let (lo, hi) = (self.state.xmm(reg), self.state.ymm_hi(reg));
                 let sel = if imm & 1 != 0 { hi } else { lo };
                 self.vstore128(ctx, mem, sel)?;
             }
-            // ---- VINSERTI128 / VINSERTF128 (0x38 / 0x18) -----------------
             0x38 | 0x18 => {
                 let imm = ctx.u8(mem)?;
                 let (dl, dh) = self.vsrc(vex);
@@ -682,18 +555,14 @@ impl Interpreter {
                 let (lo, hi) = if imm & 1 != 0 { (dl, ins) } else { (ins, dh) };
                 self.state.set_ymm(reg, lo, hi);
             }
-            // ---- VPERM2I128 / VPERM2F128 (0x46 / 0x06) -------------------
             0x46 | 0x06 => self.vex_perm2i128(ctx, mem, vex, reg)?,
 
-            // ---- VPEXTRB/W/D/Q (0x14/0x15/0x16/0x22) ---------------------
             0x14 => self.vex_pextr(ctx, mem, vex, reg, 1)?,
             0x15 => self.vex_pextr(ctx, mem, vex, reg, 2)?,
             0x16 => self.vex_pextr(ctx, mem, vex, reg, if vex.w { 8 } else { 4 })?,
-            // ---- VPINSRB/W/D/Q (0x20/../0x22) ----------------------------
             0x20 => self.vex_pinsr(ctx, mem, vex, reg, 1)?,
             0x22 => self.vex_pinsr(ctx, mem, vex, reg, if vex.w { 8 } else { 4 })?,
 
-            // ---- VMPSADBW (0x42) ------------------------------------------
             0x42 => {
                 let imm = ctx.u8(mem)?;
                 let (sl, _sh) = self.vsrc(vex);
@@ -706,9 +575,6 @@ impl Interpreter {
         Ok(())
     }
 
-    // ---- shared op helpers ----------------------------------------------
-
-    /// Load the r/m operand honoring the vector length (128 or 256 bits).
     fn vload_rm(&self, ctx: &Ctx, mem: &dyn Memory, vex: &Vex) -> Result<(u128, u128)> {
         if vex.l {
             self.vrm256(ctx, mem)
@@ -721,21 +587,9 @@ impl Interpreter {
         self.vload_rm(ctx, mem, vex)
     }
 
-    /// Read the trailing imm8 after a ModRM+possible-memory operand (used for the
-    /// 0F3A forms that touch memory then read an immediate — the immediate is
-    /// after the whole operand, so this must be called after `rm_addr()` is used
-    /// or the value cached first).
     fn imm_after_rm(&self, ctx: &mut Ctx, mem: &dyn Memory) -> Result<u8> {
         ctx.u8(mem)
     }
-
-    // ---- BMI1 / BMI2 general-purpose ops --------------------------------
-    //
-    // Operand size: 64-bit when VEX.W, else 32-bit (BMI is 32/64 only). The
-    // destination is ModRM.reg, the source(s) come from r/m and the `vvvv`
-    // field per op. Flag semantics follow the Intel SDM exactly — several of
-    // these deliberately touch *no* flags (MULX, PDEP/PEXT, the SARX/SHLX/SHRX
-    // shifts, RORX), which is a common correctness trap.
 
     #[inline]
     fn bmi_size(vex: &Vex) -> u8 {
@@ -746,8 +600,6 @@ impl Interpreter {
         }
     }
 
-    /// Set SF/ZF from a BMI result and clear OF; the caller sets CF; AF/PF
-    /// (architecturally undefined for these ops) are left untouched.
     #[inline]
     fn bmi_szf(&mut self, res: u64, size: u8) {
         let sb = 1u64 << (size * 8 - 1);
@@ -756,7 +608,6 @@ impl Interpreter {
         self.state.set_flag(flags::OF, false);
     }
 
-    /// ANDN dst, vvvv, r/m — `dst = ~vvvv & rm`. Sets SF/ZF; clears CF/OF.
     fn bmi_andn(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
         let size = Self::bmi_size(vex);
         let vvvv = self.state.gpr_read(vex.vvvv, size);
@@ -768,23 +619,19 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Group-17 (VEX.0F38.pp=none F3 /reg): BLSR (/1), BLSMSK (/2), BLSI (/3).
-    /// Destination is `vvvv` (NDD), source is r/m. SDM flag rules per op.
     fn bmi_group17(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
         let size = Self::bmi_size(vex);
         let m = alu::mask(size);
         let src = self.read_rm(ctx, &*mem, size)? & m;
         let digit = ctx.reg & 7;
         let (res, cf) = match digit {
-            1 => (src & src.wrapping_sub(1) & m, src == 0),        // BLSR:  x & (x-1); CF = (x==0)
-            2 => ((src.wrapping_sub(1) ^ src) & m, src == 0),      // BLSMSK:(x-1) ^ x; CF = (x==0)
-            3 => (src.wrapping_neg() & src & m, src != 0),         // BLSI:  (-x) & x;  CF = (x!=0)
+            1 => (src & src.wrapping_sub(1) & m, src == 0),
+            2 => ((src.wrapping_sub(1) ^ src) & m, src == 0),
+            3 => (src.wrapping_neg() & src & m, src != 0),
             _ => return Err(EmuError::Unsupported(format!("VEX 0F38 F3 /{digit}"))),
         };
         self.state.gpr_write(vex.vvvv, size, res);
         self.state.set_flag(flags::CF, cf);
-        // BLSMSK leaves ZF cleared (result always non-zero when src arbitrary?
-        // No — the SDM specifies ZF=0 for BLSMSK regardless). SF from msb.
         if digit == 2 {
             let sb = 1u64 << (size * 8 - 1);
             self.state.set_flag(flags::SF, res & sb != 0);
@@ -796,22 +643,18 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VEX.0F38 F5: BZHI (pp=none), PEXT (F3), PDEP (F2).
     fn bmi_f5(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
         let size = Self::bmi_size(vex);
         let m = alu::mask(size);
         let opbits = (size * 8) as u32;
         if vex.pp == 0 {
-            // BZHI dst, r/m, vvvv — zero bits [opsize-1 : idx] of r/m; idx=vvvv[7:0].
             let src = self.read_rm(ctx, &*mem, size)? & m;
             let idx = (self.state.gpr_read(vex.vvvv, size) & 0xFF) as u32;
             let res = if idx >= opbits { src } else { src & ((1u64 << idx) - 1) };
             self.write_reg_field(ctx, size, res & m);
-            // CF set when the index was >= operand size (no bits cleared).
             self.state.set_flag(flags::CF, idx >= opbits);
             self.bmi_szf(res & m, size);
         } else if vex.pp == 2 {
-            // PEXT dst, vvvv, r/m(mask) — gather masked bits of vvvv, packed low.
             let val = self.state.gpr_read(vex.vvvv, size) & m;
             let mask = self.read_rm(ctx, &*mem, size)? & m;
             let mut res = 0u64;
@@ -824,9 +667,8 @@ impl Interpreter {
                     k += 1;
                 }
             }
-            self.write_reg_field(ctx, size, res & m); // PEXT/PDEP touch no flags
+            self.write_reg_field(ctx, size, res & m);
         } else if vex.pp == 3 {
-            // PDEP dst, vvvv, r/m(mask) — deposit low bits of vvvv into mask positions.
             let val = self.state.gpr_read(vex.vvvv, size) & m;
             let mask = self.read_rm(ctx, &*mem, size)? & m;
             let mut res = 0u64;
@@ -846,9 +688,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// MULX dst_hi(reg), dst_lo(vvvv), r/m (VEX.F2.0F38 F6). Unsigned
-    /// EDX/RDX × r/m → 128-bit product; low half to `vvvv`, high half to `reg`.
-    /// **Affects no flags.** If reg == vvvv, only the high half is written.
     fn bmi_mulx(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
         if !vex.f2() {
             return Err(EmuError::Unsupported("VEX 0F38 F6 non-F2".into()));
@@ -856,27 +695,23 @@ impl Interpreter {
         let size = Self::bmi_size(vex);
         let m = alu::mask(size);
         let src = self.read_rm(ctx, &*mem, size)? & m;
-        let edx = self.state.gpr_read(2, size) & m; // implicit rDX
+        let edx = self.state.gpr_read(2, size) & m;
         let prod = (edx as u128) * (src as u128);
         let bits = (size * 8) as u32;
         let lo = (prod as u64) & m;
         let hi = ((prod >> bits) as u64) & m;
-        // Write the low half first, then the high half, so that when reg==vvvv the
-        // high half wins (per the SDM: the destination registers may be equal).
         self.state.gpr_write(vex.vvvv, size, lo);
         self.write_reg_field(ctx, size, hi);
         Ok(())
     }
 
-    /// VEX.0F38 F7: BEXTR (pp=none), SHLX (66), SARX (F3), SHRX (F2).
     fn bmi_f7(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
         let size = Self::bmi_size(vex);
         let m = alu::mask(size);
         let opbits = (size * 8) as u32;
-        let src = self.read_rm(ctx, &*mem, size)? & m; // r/m is the source for all four
+        let src = self.read_rm(ctx, &*mem, size)? & m;
         match vex.pp {
             0 => {
-                // BEXTR dst, r/m, vvvv — start=vvvv[7:0], len=vvvv[15:8].
                 let ctrl = self.state.gpr_read(vex.vvvv, size);
                 let start = (ctrl & 0xFF) as u32;
                 let len = ((ctrl >> 8) & 0xFF) as u32;
@@ -889,20 +724,16 @@ impl Interpreter {
                     shifted & ((1u64 << len) - 1)
                 };
                 self.write_reg_field(ctx, size, res & m);
-                // ZF from result; CF/OF cleared; SF/AF/PF undefined (leave SF via szf? SDM: undefined).
                 self.state.set_flag(flags::ZF, res & m == 0);
                 self.state.set_flag(flags::CF, false);
                 self.state.set_flag(flags::OF, false);
             }
-            // SHLX/SARX/SHRX dst, r/m, vvvv — shift r/m by (vvvv & (opsize-1)).
-            // These are flag-untouched shifts (the whole reason they exist).
             1..=3 => {
                 let cnt = (self.state.gpr_read(vex.vvvv, size) & (opbits as u64 - 1)) as u32;
                 let res = match vex.pp {
-                    1 => (src << cnt) & m,                                 // SHLX
-                    3 => src >> cnt,                                       // SHRX (logical)
+                    1 => (src << cnt) & m,
+                    3 => src >> cnt,
                     _ => {
-                        // SARX: arithmetic right shift at the operand width.
                         let sb = 1u64 << (opbits - 1);
                         let sext = if src & sb != 0 { src | !m } else { src };
                         ((sext as i64) >> cnt) as u64 & m
@@ -915,7 +746,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// RORX dst, r/m, imm8 (VEX.LZ.F2.0F3A.W F0). Rotate right by imm8; no flags.
     fn bmi_rorx(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex) -> Result<()> {
         let size = Self::bmi_size(vex);
         let m = alu::mask(size);
@@ -928,14 +758,8 @@ impl Interpreter {
         Ok(())
     }
 
-    // ---- F16C (half-precision <-> single-precision conversion) -----------
-
-    /// VCVTPH2PS (VEX.128/256.66.0F38.W0 13): unpack packed FP16 → packed FP32.
-    /// 128-bit dst: 4 halfs from the low 64 bits of the source; 256-bit dst: 8
-    /// halfs from the 128-bit source. No `vvvv`, zero-upper.
     fn vex_cvtph2ps(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
-        let n = if vex.l { 8 } else { 4 }; // number of fp16 lanes converted
-        // Source is n×2 bytes: 8 bytes for 128-bit dst, 16 for 256-bit dst.
+        let n = if vex.l { 8 } else { 4 };
         let src = self.vrm128(ctx, mem, n * 2)?;
         let mut lo = 0u128;
         let mut hi = 0u128;
@@ -956,22 +780,10 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VCVTPS2PH (VEX.128/256.66.0F3A.W0 1D /r ib): pack FP32 → FP16, storing to
-    /// the r/m operand (reg is the SOURCE). imm8[2]=1 selects MXCSR rounding,
-    /// else imm8[1:0] is the rounding mode. Zero-upper on a register destination.
     fn vex_cvtps2ph(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
-        // The imm8 follows the ModRM (+ any SIB/disp), so cache the source and
-        // resolve the store address before reading it — but here the store target
-        // *is* the r/m operand, so read imm8 after computing rm_addr via a peek.
-        // Simpler: compute the FP16 result from the reg source, then read imm8,
-        // then store. Order matters for a RIP-relative memory destination, so read
-        // imm8 first (it sits at ctx.cur) to advance `cur` past the whole insn.
         let n = if vex.l { 8 } else { 4 };
         let (sl, sh) = (self.state.xmm(reg), self.state.ymm_hi(reg));
         let imm = self.imm_after_rm(ctx, mem)?;
-        // Rounding: round-to-nearest-even is the default and the only mode the
-        // f16 conversion here implements; imm/MXCSR RC selection is honored only
-        // insofar as RNE is used (documented approximation, matching MXCSR reset).
         let _ = imm;
         let mut packed = 0u128;
         for i in 0..n {
@@ -979,12 +791,9 @@ impl Interpreter {
             let h = f32_to_f16(f32::from_bits(bits32));
             packed |= (h as u128) << (i * 16);
         }
-        // Destination width: 128-bit src → 64-bit (8 bytes) fp16; 256-bit src →
-        // 128-bit (16 bytes) fp16.
         let nbytes = n * 2;
         match ctx.rm {
             Rm::Reg(i) => {
-                // Register destination: zero the upper (128 or 256) bits.
                 self.state.set_xmm_zero_upper(i, packed);
             }
             Rm::Mem { .. } => {
@@ -995,7 +804,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// `dst = f(vvvv, rm)` applied per 128-bit lane (AVX2 integer / lane-wise).
     fn vex_lane_bin(
         &mut self,
         ctx: &Ctx,
@@ -1012,7 +820,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// `dst = f(rm)` applied per 128-bit lane (unary AVX2 integer).
     fn vex_unary_lane(
         &mut self,
         ctx: &Ctx,
@@ -1028,7 +835,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Packed float logic (`dst = f(vvvv, rm)` on raw bits).
     fn vex_logic(
         &mut self,
         ctx: &Ctx,
@@ -1040,7 +846,6 @@ impl Interpreter {
         self.vex_lane_bin(ctx, mem, vex, reg, f)
     }
 
-    /// Packed/scalar float arithmetic `dst = f(vvvv, rm)`.
     fn vex_farith(
         &mut self,
         ctx: &Ctx,
@@ -1059,7 +864,6 @@ impl Interpreter {
             self.vload_rm(ctx, mem, vex)?
         };
         if scalar {
-            // Scalar: operate on the low element, take the rest from vvvv (al).
             let lo = if dbl {
                 (al & !sse::LOW64) | (f(f64::from_bits(al as u64), f64::from_bits(bl as u64)).to_bits() as u128)
             } else {
@@ -1074,7 +878,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Packed/scalar float unary `dst = f(rm)` (VSQRT).
     fn vex_funary(
         &mut self,
         ctx: &Ctx,
@@ -1104,8 +907,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VMOVSS / VMOVSD in the two 3-operand register forms and the 2-operand
-    /// memory forms.
     fn vex_movss_sd(
         &mut self,
         ctx: &Ctx,
@@ -1117,7 +918,6 @@ impl Interpreter {
         let n = if vex.f2() { 8 } else { 4 };
         let mask = if n == 8 { sse::LOW64 } else { sse::LOW32 };
         if store {
-            // 0x11: r/m <- reg. Register form merges vvvv; memory form writes n.
             match ctx.rm {
                 Rm::Reg(_) => {
                     let merged = (self.state.xmm(vex.vvvv) & !mask) | (self.state.xmm(reg) & mask);
@@ -1129,14 +929,12 @@ impl Interpreter {
                 }
             }
         } else {
-            // 0x10: reg <- r/m.
             match ctx.rm {
                 Rm::Reg(i) => {
                     let merged = (self.state.xmm(vex.vvvv) & !mask) | (self.state.xmm(i) & mask);
                     self.state.set_xmm_zero_upper(reg, merged);
                 }
                 Rm::Mem { .. } => {
-                    // Memory scalar load zero-extends into the full register.
                     let v = self.vrm128(ctx, mem, n)? & mask;
                     self.state.set_xmm_zero_upper(reg, v);
                 }
@@ -1145,7 +943,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VCMPPS/PD/SS/SD — imm8 predicate compare producing an all-ones/zero mask.
     fn vex_cmp(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
         let scalar = vex.f2() || vex.f3();
         let dbl = vex.pd() || vex.f2();
@@ -1174,8 +971,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VPMOVSX/ZX: widen the low `dst_bytes/src*count` elements of the 128-bit
-    /// source. The 256-bit form reads a 128-bit source and widens into 256 bits.
     #[allow(clippy::too_many_arguments)]
     fn vex_pmovx(
         &mut self,
@@ -1188,25 +983,19 @@ impl Interpreter {
         sign: bool,
     ) -> Result<()> {
         if vex.l {
-            // 256-bit: source is 128 bits; each lane of output takes half the
-            // source elements. Read the full 128-bit source.
             let src = self.vrm128(ctx, mem, 16)?;
-            // Number of output elements total = 16/dst_sz * 2 lanes; but a
-            // 256-bit pmovx widens (32/dst_sz) elements from the 128-bit source.
             let per_lane = 16 / dst_sz;
             let lo = pmovx_from(src, 0, per_lane, src_sz, dst_sz, sign);
             let hi = pmovx_from(src, per_lane, per_lane, src_sz, dst_sz, sign);
             self.state.set_ymm(reg, lo, hi);
         } else {
-            let n = (16 / dst_sz) * src_sz; // bytes of source consumed
+            let n = (16 / dst_sz) * src_sz;
             let src = self.vrm128(ctx, mem, n)?;
             self.state.set_xmm_zero_upper(reg, sse::pmovx(src, src_sz, dst_sz, sign));
         }
         Ok(())
     }
 
-    /// VPBROADCAST* / VBROADCASTSS/SD — replicate the low element of the source
-    /// (register low lane, or memory) across the destination.
     fn vex_broadcast(&mut self, ctx: &Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8, esz: usize) -> Result<()> {
         let src = self.vrm128(ctx, mem, esz)?;
         let elem = src & sse::emask(esz);
@@ -1219,7 +1008,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VPTEST — set ZF from `dst AND src`, CF from `dst ANDN src` (per SDM).
     fn vex_ptest(&mut self, ctx: &Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
         let (al, ah) = (self.state.xmm(reg), self.state.ymm_hi(reg));
         let (bl, bh) = self.vload_rm(ctx, mem, vex)?;
@@ -1237,21 +1025,19 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VPSHUFD-style imm shift group (0F 71/72/73 /reg).
     fn vex_shift_imm(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, op: u8) -> Result<()> {
         let (esz, ext) = match op {
             0x71 => (2usize, ctx.reg & 7),
             0x72 => (4usize, ctx.reg & 7),
             _ => (8usize, ctx.reg & 7),
         };
-        // r/m is the source; the destination is vvvv.
         let (sl, sh) = self.vload_rm(ctx, mem, vex)?;
         let count = ctx.u8(mem)? as u64;
         let dst = vex.vvvv;
         let f: Box<dyn Fn(u128) -> u128> = match ext {
-            2 => Box::new(move |v| sse::shift_r(v, esz, count, false)), // PSRL
-            4 => Box::new(move |v| sse::shift_r(v, esz, count, true)),  // PSRA
-            6 => Box::new(move |v| sse::shift_l(v, esz, count)),        // PSLL
+            2 => Box::new(move |v| sse::shift_r(v, esz, count, false)),
+            4 => Box::new(move |v| sse::shift_r(v, esz, count, true)),
+            6 => Box::new(move |v| sse::shift_l(v, esz, count)),
             _ => return Err(EmuError::Unsupported(format!("VEX shift-imm /{ext}"))),
         };
         let lo = f(sl);
@@ -1260,8 +1046,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VPSRLW/D/Q, VPSRAW/D, VPSLLW/D/Q — shift by the low 64 bits of the xmm
-    /// r/m operand (a single scalar count broadcast to all elements).
     #[allow(clippy::too_many_arguments)]
     fn vex_shift_var(
         &mut self,
@@ -1282,7 +1066,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VPSLLVD/Q, VPSRLVD/Q, VPSRAVD — per-element variable shift (AVX2).
     #[allow(clippy::too_many_arguments)]
     fn vex_var_shift(
         &mut self,
@@ -1302,15 +1085,11 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VBLENDPS/PD/VPBLENDW/VPBLENDD imm8 blend.
     fn vex_blend_imm(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8, esz: usize) -> Result<()> {
         let (al, ah) = self.vsrc(vex);
         let (bl, bh) = self.vload_rm(ctx, mem, vex)?;
         let imm = ctx.u8(mem)?;
-        // For a 256-bit VPBLENDD the imm8 covers all 8 dwords; VBLENDPS 8 lanes;
-        // for the others the same imm8 applies to both 128-bit lanes.
         let (lo, hi) = if vex.l && esz == 4 {
-            // 8 dword/float selectors across the full 256 bits.
             (blend_imm_wide(al, bl, imm & 0x0F, esz), blend_imm_wide(ah, bh, imm >> 4, esz))
         } else {
             (sse::blend_imm(al, bl, imm, esz), if vex.l { sse::blend_imm(ah, bh, imm, esz) } else { 0 })
@@ -1319,7 +1098,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VROUNDPS/PD — packed round with imm8 mode.
     fn vex_round_packed(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8, dbl: bool) -> Result<()> {
         let (bl, bh) = self.vload_rm(ctx, mem, vex)?;
         let imm = ctx.u8(mem)?;
@@ -1331,7 +1109,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VROUNDSS/SD — scalar round; upper elements from vvvv.
     fn vex_round_scalar(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8, dbl: bool) -> Result<()> {
         let src = self.vrm128(ctx, mem, if dbl { 8 } else { 4 })?;
         let imm = ctx.u8(mem)?;
@@ -1346,7 +1123,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VPERMQ / VPERMPD — imm8 selects each of 4 qwords from the 256-bit source.
     fn vex_permq(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, _vex: &Vex, reg: u8) -> Result<()> {
         let (sl, sh) = self.vrm256(ctx, mem)?;
         let imm = ctx.u8(mem)?;
@@ -1359,13 +1135,11 @@ impl Interpreter {
     }
 
     fn vex_permpd(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
-        // Same lane selection as VPERMQ (both operate on 64-bit lanes).
         self.vex_permq(ctx, mem, vex, reg)
     }
 
-    /// VPERMD — 8 dword selectors from vvvv indexing the 256-bit source.
     fn vex_permd(&mut self, ctx: &Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
-        let (il, ih) = self.vsrc(vex); // index vector
+        let (il, ih) = self.vsrc(vex);
         let (sl, sh) = self.vrm256(ctx, mem)?;
         let s = [dwords(sl), dwords(sh)];
         let all: [u32; 8] = [s[0][0], s[0][1], s[0][2], s[0][3], s[1][0], s[1][1], s[1][2], s[1][3]];
@@ -1380,11 +1154,9 @@ impl Interpreter {
     }
 
     fn vex_permps(&mut self, ctx: &Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
-        // VPERMPS has the same dword-permute semantics as VPERMD.
         self.vex_permd(ctx, mem, vex, reg)
     }
 
-    /// VPERM2I128 / VPERM2F128 — imm8 selects a 128-bit lane per output half.
     fn vex_perm2i128(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8) -> Result<()> {
         let (al, ah) = self.vsrc(vex);
         let (bl, bh) = self.vrm256(ctx, mem)?;
@@ -1403,7 +1175,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VPEXTRB/W/D/Q — extract an element to a GP register or memory.
     fn vex_pextr(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8, esz: usize) -> Result<()> {
         let src = self.state.xmm(reg);
         let imm = self.imm_after_rm(ctx, mem)?;
@@ -1422,7 +1193,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// VPINSRB/D/Q — insert a GP/memory element into a lane; base from vvvv.
     fn vex_pinsr(&mut self, ctx: &mut Ctx, mem: &mut dyn Memory, vex: &Vex, reg: u8, esz: usize) -> Result<()> {
         let src = self.read_rm(ctx, &*mem, esz as u8)?;
         let imm = self.imm_after_rm(ctx, mem)?;
@@ -1437,11 +1207,7 @@ impl Interpreter {
     }
 }
 
-// ---- free helpers ----------------------------------------------------------
-
 fn sse_min(a: f64, b: f64) -> f64 {
-    // x86 MINPS/MINPD: if either operand is NaN, or they are equal (incl. ±0),
-    // return the second (src) operand.
     if a.is_nan() || b.is_nan() || a == b {
         b
     } else if a < b {
@@ -1461,7 +1227,6 @@ fn sse_max(a: f64, b: f64) -> f64 {
     }
 }
 
-/// Packed float binary op over a 128-bit lane.
 fn pfloat(a: u128, b: u128, dbl: bool, f: &impl Fn(f64, f64) -> f64) -> u128 {
     let mut out = 0u128;
     if dbl {
@@ -1496,34 +1261,28 @@ fn pfloat_un(a: u128, dbl: bool, f: &impl Fn(f64) -> f64) -> u128 {
     out
 }
 
-/// Evaluate an SSE/AVX compare predicate (imm8 low 5 bits) on two f64s.
-/// Only the eight legacy (VEX) predicates plus the common extended ones needed
-/// by CRTs are decoded; the rest fall back to the legacy 3-bit interpretation.
 fn cmp_pred(a: f64, b: f64, imm: u8) -> bool {
     match imm & 0x1F {
-        0x00 => a == b,                       // EQ_OQ
-        0x01 => a < b,                        // LT_OS
-        0x02 => a <= b,                       // LE_OS
-        0x03 => a.is_nan() || b.is_nan(),     // UNORD_Q
-        0x04 => a != b || a.is_nan() || b.is_nan(), // NEQ_UQ
-        0x05 => a >= b || a.is_nan() || b.is_nan(), // NLT_US = !(a<b), unordered→true
-        0x06 => a > b || a.is_nan() || b.is_nan(),  // NLE_US = !(a<=b), unordered→true
-        0x07 => !a.is_nan() && !b.is_nan(),   // ORD_Q
-        0x08 => a == b,                       // EQ_UQ (unordered-eq): treat NaN below
-        0x09 => a < b || a.is_nan() || b.is_nan(), // NGE_US = !(a>=b), unordered→true
-        0x0A => a <= b || a.is_nan() || b.is_nan(), // NGT_US = !(a>b), unordered→true
-        0x0B => false,                        // FALSE_OQ
-        0x0C => a != b && !a.is_nan() && !b.is_nan(),  // NEQ_OQ
-        0x0D => a >= b,                        // GE_OS
-        0x0E => a > b,                         // GT_OS
-        0x0F => true,                          // TRUE_UQ
-        // Extended set (0x10..0x1F) mirror 0x00..0x0F signalling variants; the
-        // ordered/unordered result is identical for quiet operands.
+        0x00 => a == b,
+        0x01 => a < b,
+        0x02 => a <= b,
+        0x03 => a.is_nan() || b.is_nan(),
+        0x04 => a != b || a.is_nan() || b.is_nan(),
+        0x05 => a >= b || a.is_nan() || b.is_nan(),
+        0x06 => a > b || a.is_nan() || b.is_nan(),
+        0x07 => !a.is_nan() && !b.is_nan(),
+        0x08 => a == b,
+        0x09 => a < b || a.is_nan() || b.is_nan(),
+        0x0A => a <= b || a.is_nan() || b.is_nan(),
+        0x0B => false,
+        0x0C => a != b && !a.is_nan() && !b.is_nan(),
+        0x0D => a >= b,
+        0x0E => a > b,
+        0x0F => true,
         v => cmp_pred(a, b, v & 0x07),
     }
 }
 
-/// The unordered-equal predicate (0x08) must be true when either is NaN.
 pub(crate) fn pcmp_float(a: u128, b: u128, dbl: bool, imm: u8) -> u128 {
     let mut out = 0u128;
     if dbl {
@@ -1546,10 +1305,9 @@ pub(crate) fn pcmp_float(a: u128, b: u128, dbl: bool, imm: u8) -> u128 {
     out
 }
 
-/// Compare predicate with correct unordered handling for the 0x08 (EQ_UQ) case.
 pub(crate) fn cmp_pred_full(a: f64, b: f64, imm: u8) -> bool {
     match imm & 0x1F {
-        0x08 => a == b || a.is_nan() || b.is_nan(), // EQ_UQ
+        0x08 => a == b || a.is_nan() || b.is_nan(),
         _ => cmp_pred(a, b, imm),
     }
 }
@@ -1566,7 +1324,6 @@ fn pack_dwords(w: &[u32]) -> u128 {
     v
 }
 
-/// Per-element variable shift (VPSLLV/VPSRLV/VPSRAV) over a 128-bit lane.
 fn var_shift_lane(v: u128, counts: u128, esz: usize, arith: bool, left: bool) -> u128 {
     let bits = esz * 8;
     let mask = sse::emask(esz);
@@ -1576,7 +1333,6 @@ fn var_shift_lane(v: u128, counts: u128, esz: usize, arith: bool, left: bool) ->
         let c = ((counts >> (i * bits)) & mask) as u64;
         let r = if c >= bits as u64 {
             if arith && !left {
-                // arithmetic right shift by >= width → sign fill
                 if (x >> (bits - 1)) & 1 != 0 { mask } else { 0 }
             } else {
                 0
@@ -1599,7 +1355,6 @@ fn sign_extend(x: u128, bits: usize) -> i128 {
     ((x << shift) as i128) >> shift
 }
 
-/// 256-bit dword/float blend where `sel4` (4 bits) chooses per-lane src/dst.
 fn blend_imm_wide(dst: u128, src: u128, sel4: u8, esz: usize) -> u128 {
     let bits = esz * 8;
     let mask = sse::emask(esz);
@@ -1612,7 +1367,6 @@ fn blend_imm_wide(dst: u128, src: u128, sel4: u8, esz: usize) -> u128 {
     out
 }
 
-/// Packed round of an f32x4 / f64x2 lane using the resolved MXCSR-style mode.
 fn round_packed(v: u128, dbl: bool, mode: u8) -> u128 {
     let mut out = 0u128;
     if dbl {
@@ -1629,7 +1383,6 @@ fn round_packed(v: u128, dbl: bool, mode: u8) -> u128 {
     out
 }
 
-/// Widen `count` elements starting at element `start` of the 128-bit source.
 fn pmovx_from(src: u128, start: usize, count: usize, src_sz: usize, dst_sz: usize, sign: bool) -> u128 {
     let sbits = src_sz * 8;
     let dbits = dst_sz * 8;
@@ -1648,9 +1401,6 @@ fn pmovx_from(src: u128, start: usize, count: usize, src_sz: usize, dst_sz: usiz
     out
 }
 
-/// Convert an IEEE-754 binary16 (half) to binary32 (single). Exact — half is a
-/// strict subset of single's dynamic range, so no rounding is needed (F16C
-/// VCVTPH2PS never rounds). Handles subnormals, zeros, Inf and NaN.
 fn f16_to_f32(h: u16) -> u32 {
     let sign = (h as u32 & 0x8000) << 16;
     let exp = (h >> 10) & 0x1F;
@@ -1658,22 +1408,20 @@ fn f16_to_f32(h: u16) -> u32 {
     match exp {
         0 => {
             if mant == 0 {
-                sign // +/- 0
+                sign
             } else {
-                // Subnormal half → normalized single. Normalize the mantissa.
                 let mut m = mant;
                 let mut e: i32 = -1;
                 while m & 0x400 == 0 {
                     m <<= 1;
                     e -= 1;
                 }
-                m &= 0x3FF; // drop the implicit leading bit
+                m &= 0x3FF;
                 let exp32 = (127 - 15 + 1 + e) as u32;
                 sign | (exp32 << 23) | (m << 13)
             }
         }
         0x1F => {
-            // Inf / NaN: exponent all-ones.
             sign | 0x7F80_0000 | (mant << 13)
         }
         _ => {
@@ -1683,10 +1431,6 @@ fn f16_to_f32(h: u16) -> u32 {
     }
 }
 
-/// Convert an IEEE-754 binary32 (single) to binary16 (half) with round-to-
-/// nearest-even (the F16C default; MXCSR-RC / imm rounding modes are documented
-/// as approximated to RNE — see `vex_cvtps2ph`). Handles overflow→Inf,
-/// underflow→subnormal/0, and NaN.
 fn f32_to_f16(f: f32) -> u16 {
     let bits = f.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -1694,29 +1438,22 @@ fn f32_to_f16(f: f32) -> u16 {
     let mant = bits & 0x007F_FFFF;
 
     if exp == 0xFF {
-        // Inf or NaN.
         return if mant != 0 {
-            // NaN: keep it quiet, preserve a non-zero payload.
             sign | 0x7E00
         } else {
             sign | 0x7C00
         };
     }
-    // Unbiased exponent for half.
     let e = exp - 127 + 15;
     if e >= 0x1F {
-        // Overflow → Inf.
         return sign | 0x7C00;
     }
     if e <= 0 {
-        // Subnormal or zero half.
         if e < -10 {
-            return sign; // too small even for a subnormal → signed zero
+            return sign;
         }
-        // Add the implicit leading 1, then shift into the subnormal position with
-        // round-to-nearest-even.
         let m = mant | 0x0080_0000;
-        let shift = 14 - e; // 14 = 23 - 10 + 1
+        let shift = 14 - e;
         let half_shifted = m >> shift;
         let remainder = m & ((1 << shift) - 1);
         let halfway = 1u32 << (shift - 1);
@@ -1726,19 +1463,17 @@ fn f32_to_f16(f: f32) -> u16 {
         }
         return sign | r;
     }
-    // Normalized half. Round the 23-bit mantissa to 10 bits (RNE).
     let mut half_exp = e as u16;
-    let round_bits = mant & 0x1FFF; // low 13 bits dropped
+    let round_bits = mant & 0x1FFF;
     let mut half_mant = (mant >> 13) as u16;
     let halfway = 0x1000u32;
     if round_bits > halfway || (round_bits == halfway && (half_mant & 1) != 0) {
         half_mant += 1;
         if half_mant == 0x400 {
-            // Mantissa overflow carries into the exponent.
             half_mant = 0;
             half_exp += 1;
             if half_exp >= 0x1F {
-                return sign | 0x7C00; // → Inf
+                return sign | 0x7C00;
             }
         }
     }

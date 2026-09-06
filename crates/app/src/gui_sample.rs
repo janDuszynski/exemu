@@ -1,24 +1,3 @@
-//! Generates a tiny but real **GUI** PE: it registers a window class, creates
-//! a custom (non-dialog) window, shows it, paints its client area with the
-//! emulated GDI (a framed rectangle + a line of text via a direct
-//! GetDC→TextOutW→Rectangle→ReleaseDC), then runs a message loop. It is the
-//! counterpart to [`crate::sample`], exercising the `CreateWindowEx` + GDI
-//! surface/present path rather than a console.
-//!
-//! The direct paint after `ShowWindow` is the honest W4.3 gate: it renders the
-//! first frame without a message pump. With a live input channel (W4.6), the
-//! message loop's `GetMessage` synthesizes an initial `WM_PAINT` for the shown
-//! window and `DispatchMessageW` routes it through `NtUserDispatchMessage` into
-//! the `WM_PAINT` arm of `wndproc` below, which repaints via BeginPaint →
-//! Rectangle → TextOutW → EndPaint (a second present). A native mouse click
-//! arrives as `WM_LBUTTONDOWN` and the `wndproc` click arm repaints again
-//! (GetDC → Rectangle → ReleaseDC). Without an input channel `GetMessage`
-//! returns `WM_QUIT` immediately and only the direct paint runs — either way the
-//! surface/present pipeline is fully exercised, so both stay green.
-//!
-//! The code is hand-assembled x86-64 with a small local assembler (`Asm`) so
-//! branch targets and RIP-relative references stay correct.
-
 use std::collections::HashMap;
 
 const IMAGE_BASE: u64 = 0x1_4000_0000;
@@ -34,7 +13,6 @@ const WINDOW_TITLE: &str = "exemu — real GUI window";
 const PAINT_LINE1: &str = "Hello from a real GUI window!";
 const PAINT_LINE2: &str = "Drawn by exemu's emulated Win32 GDI.";
 
-/// Build the GUI sample executable.
 pub fn build() -> Vec<u8> {
     let r = Rdata::build();
     let text = build_text(&r);
@@ -73,7 +51,7 @@ pub fn build() -> Vec<u8> {
     put_u16(&mut f, opt + 48, 6);
     put_u32(&mut f, opt + 56, image_size);
     put_u32(&mut f, opt + 60, headers_raw as u32);
-    put_u16(&mut f, opt + 68, 2); // Subsystem = WINDOWS_GUI
+    put_u16(&mut f, opt + 68, 2);
     put_u64(&mut f, opt + 72, 0x10_0000);
     put_u64(&mut f, opt + 80, 0x1000);
     put_u64(&mut f, opt + 88, 0x10_0000);
@@ -95,7 +73,6 @@ pub fn build() -> Vec<u8> {
     f
 }
 
-/// The imports, grouped by DLL and in IAT order.
 fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (
@@ -126,9 +103,7 @@ struct Rdata {
     import_dir_size: u32,
     iat_off: u32,
     iat_size: u32,
-    /// Import name → its IAT slot RVA.
     iat: HashMap<String, u32>,
-    /// Wide-string RVAs.
     class_name: u32,
     window_title: u32,
     line1: u32,
@@ -141,10 +116,8 @@ impl Rdata {
         let n_dlls = plan.len();
         let total_funcs: usize = plan.iter().map(|(_, fs)| fs.len()).sum();
 
-        // Layout within .rdata.
         let import_dir_off = 0u32;
         let import_dir_size = ((n_dlls + 1) * 20) as u32;
-        // Each DLL gets an ILT and IAT of (funcs+1) qwords.
         let thunks_qwords: usize = plan.iter().map(|(_, fs)| fs.len() + 1).sum();
         let ilt_off = import_dir_off + import_dir_size;
         let ilt_size = (thunks_qwords * 8) as u32;
@@ -153,7 +126,6 @@ impl Rdata {
 
         let mut pos = iat_off + iat_size;
 
-        // IMAGE_IMPORT_BY_NAME blobs (hint u16 + asciiz).
         let mut ibn_rva: Vec<u32> = Vec::with_capacity(total_funcs);
         for (_, funcs) in &plan {
             for f in funcs {
@@ -162,13 +134,11 @@ impl Rdata {
                 pos += 2 + f.len() as u32 + 1;
             }
         }
-        // DLL name strings.
         let mut dll_name_rva: Vec<u32> = Vec::with_capacity(n_dlls);
         for (dll, _) in &plan {
             dll_name_rva.push(RDATA_RVA + pos);
             pos += dll.len() as u32 + 1;
         }
-        // Wide strings.
         let wide = |s: &str| -> Vec<u8> {
             let mut v: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
             v.extend_from_slice(&[0, 0]);
@@ -186,16 +156,15 @@ impl Rdata {
 
         let mut b = vec![0u8; pos as usize];
 
-        // Import descriptors + ILT/IAT + IBN.
         let mut iat = HashMap::new();
         let mut ilt_cursor = ilt_off;
         let mut iat_cursor = iat_off;
         let mut ibn_i = 0usize;
         for (d, (_dll, funcs)) in plan.iter().enumerate() {
             let desc = import_dir_off as usize + d * 20;
-            put_u32(&mut b, desc, ilt_cursor + RDATA_RVA); // OriginalFirstThunk
-            put_u32(&mut b, desc + 12, dll_name_rva[d]); // Name
-            put_u32(&mut b, desc + 16, iat_cursor + RDATA_RVA); // FirstThunk
+            put_u32(&mut b, desc, ilt_cursor + RDATA_RVA);
+            put_u32(&mut b, desc + 12, dll_name_rva[d]);
+            put_u32(&mut b, desc + 16, iat_cursor + RDATA_RVA);
             for f in funcs {
                 let rva = ibn_rva[ibn_i];
                 put_u64(&mut b, ilt_cursor as usize, rva as u64);
@@ -205,13 +174,10 @@ impl Rdata {
                 iat_cursor += 8;
                 ibn_i += 1;
             }
-            // Null-terminate this DLL's ILT/IAT.
             ilt_cursor += 8;
             iat_cursor += 8;
         }
-        // Descriptor terminator is already zero.
 
-        // IBN blobs.
         ibn_i = 0;
         for (_, funcs) in &plan {
             for f in funcs {
@@ -220,12 +186,10 @@ impl Rdata {
                 ibn_i += 1;
             }
         }
-        // DLL names.
         for (d, (dll, _)) in plan.iter().enumerate() {
             let off = (dll_name_rva[d] - RDATA_RVA) as usize;
             b[off..off + dll.len()].copy_from_slice(dll.as_bytes());
         }
-        // Wide strings.
         for (rva, s) in [(class_name, CLASS_NAME), (window_title, WINDOW_TITLE), (line1, PAINT_LINE1), (line2, PAINT_LINE2)] {
             let off = (rva - RDATA_RVA) as usize;
             let w = wide(s);
@@ -240,8 +204,6 @@ impl Rdata {
     }
 }
 
-/// UTF-16 code-unit count including the terminating NUL — the `c` count that
-/// TextOutW would use is the visible length, which we pass explicitly.
 fn wlen(s: &str) -> u32 {
     s.encode_utf16().count() as u32
 }
@@ -249,68 +211,54 @@ fn wlen(s: &str) -> u32 {
 fn build_text(r: &Rdata) -> Vec<u8> {
     let mut a = Asm::new();
 
-    // ---- entry / WinMain --------------------------------------------------
-    // Frame: [0x00..0x60] shadow + outgoing stack args (CreateWindowEx),
-    //        [0x60..0xB0] WNDCLASSW, [0xB0..0xE0] MSG.
     a.sub_rsp(0xE8);
     a.lea_label(RAX, "wndproc");
-    a.mov_at_rsp_reg(0x68, RAX); // wc.lpfnWndProc  (0x60 + 8)
+    a.mov_at_rsp_reg(0x68, RAX);
     a.lea_rip(RAX, r.class_name);
-    a.mov_at_rsp_reg(0xA0, RAX); // wc.lpszClassName (0x60 + 0x40)
-    a.lea_rsp(RCX, 0x60); // &wc
+    a.mov_at_rsp_reg(0xA0, RAX);
+    a.lea_rsp(RCX, 0x60);
     a.call_iat(r.slot("RegisterClassW"));
 
-    a.xor32(RCX); // exStyle
+    a.xor32(RCX);
     a.lea_rip(RDX, r.class_name);
     a.lea_rip(R8, r.window_title);
-    a.mov32(R9, 0x00CF_0000); // WS_OVERLAPPEDWINDOW
-    a.mov_at_rsp_imm(0x20, 120); // X
-    a.mov_at_rsp_imm(0x28, 120); // Y
-    a.mov_at_rsp_imm(0x30, 480); // nWidth
-    a.mov_at_rsp_imm(0x38, 260); // nHeight
-    a.mov_at_rsp_imm(0x40, 0); // hWndParent
-    a.mov_at_rsp_imm(0x48, 0); // hMenu
-    a.mov_at_rsp_imm(0x50, 0); // hInstance
-    a.mov_at_rsp_imm(0x58, 0); // lpParam
+    a.mov32(R9, 0x00CF_0000);
+    a.mov_at_rsp_imm(0x20, 120);
+    a.mov_at_rsp_imm(0x28, 120);
+    a.mov_at_rsp_imm(0x30, 480);
+    a.mov_at_rsp_imm(0x38, 260);
+    a.mov_at_rsp_imm(0x40, 0);
+    a.mov_at_rsp_imm(0x48, 0);
+    a.mov_at_rsp_imm(0x50, 0);
+    a.mov_at_rsp_imm(0x58, 0);
     a.call_iat(r.slot("CreateWindowExW"));
-    a.mov_reg_reg(RBX, RAX); // save hwnd
+    a.mov_reg_reg(RBX, RAX);
 
     a.mov_reg_reg(RCX, RAX);
-    a.mov32(RDX, 5); // SW_SHOW
+    a.mov32(RDX, 5);
     a.call_iat(r.slot("ShowWindow"));
 
-    // ---- direct paint (W4.3) ----------------------------------------------
-    // The WndProc paint code below only runs on a WM_PAINT the message loop
-    // never delivers in this build (GetMessage returns WM_QUIT immediately;
-    // callback delivery is W4.6). To exercise the *surface/present* pipeline
-    // now, paint the client area directly here: GetDC → TextOutW → Rectangle →
-    // ReleaseDC. hwnd is live in RBX; the WNDCLASS scratch at [rsp+0x60] is free
-    // after RegisterClassW so it stashes the hdc; [rsp+0x20] is the 5th-arg home
-    // slot for the count/bottom.
-    a.mov_reg_reg(RCX, RBX); // hwnd
+    a.mov_reg_reg(RCX, RBX);
     a.call_iat(r.slot("GetDC"));
-    a.mov_at_rsp_reg(0x60, RAX); // save hdc
-    // TextOutW(hdc, 12, 12, line1, wlen(PAINT_LINE1))
+    a.mov_at_rsp_reg(0x60, RAX);
     a.mov_reg_reg(RCX, RAX);
     a.mov32(RDX, 12);
     a.mov32(R8, 12);
     a.lea_rip(R9, r.line1);
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE1) as i32);
     a.call_iat(r.slot("TextOutW"));
-    // Rectangle(hdc, 8, 8, 200, 60)
     a.mov_reg_at_rsp(RCX, 0x60);
     a.mov32(RDX, 8);
     a.mov32(R8, 8);
     a.mov32(R9, 200);
     a.mov_at_rsp_imm(0x20, 60);
     a.call_iat(r.slot("Rectangle"));
-    // ReleaseDC(hwnd, hdc) — the present point for the direct paint.
     a.mov_reg_reg(RCX, RBX);
     a.mov_reg_at_rsp(RDX, 0x60);
     a.call_iat(r.slot("ReleaseDC"));
 
     a.label("loop");
-    a.lea_rsp(RCX, 0xB0); // &msg
+    a.lea_rsp(RCX, 0xB0);
     a.xor32(RDX);
     a.xor32(R8);
     a.xor32(R9);
@@ -325,19 +273,15 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.call_iat(r.slot("ExitProcess"));
     a.int3();
 
-    // ---- wndproc(hwnd=rcx, msg=rdx, wparam=r8, lparam=r9) -----------------
-    // Frame: [0x00..0x20] shadow + 5th-arg slot at 0x20, ps @0x30, hwnd@0x70,
-    //        hdc@0x78.
     a.label("wndproc");
     a.sub_rsp(0x88);
-    a.mov_at_rsp_reg(0x70, RCX); // save hwnd
-    a.cmp_rdx_imm8(0x0F); // WM_PAINT
+    a.mov_at_rsp_reg(0x70, RCX);
+    a.cmp_rdx_imm8(0x0F);
     a.je("paint");
-    a.cmp_rdx_imm32(0x0201); // WM_LBUTTONDOWN
+    a.cmp_rdx_imm32(0x0201);
     a.je("click");
-    a.cmp_rdx_imm8(0x02); // WM_DESTROY
+    a.cmp_rdx_imm8(0x02);
     a.je("destroy");
-    // default: DefWindowProcW(hwnd,msg,wparam,lparam) — regs already set.
     a.call_iat(r.slot("DefWindowProcW"));
     a.jmp("wp_ret");
 
@@ -347,25 +291,18 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.xor32(RAX);
     a.jmp("wp_ret");
 
-    // WM_LBUTTONDOWN: repaint on click — GetCursorPos → GetDC → Rectangle →
-    // ReleaseDC, a fresh present driven by real input (W4.6/W4.7). The rectangle's
-    // top-left tracks the cursor, so the frame lands where the click landed —
-    // proving GetCursorPos returns the position the input carried. hwnd is at
-    // [rsp+0x70], hdc stashes at [rsp+0x78], the POINT at [rsp+0x80].
     a.label("click");
-    a.lea_rsp(RCX, 0x80); // &pt
+    a.lea_rsp(RCX, 0x80);
     a.call_iat(r.slot("GetCursorPos"));
-    a.mov_reg_at_rsp(RCX, 0x70); // hwnd
+    a.mov_reg_at_rsp(RCX, 0x70);
     a.call_iat(r.slot("GetDC"));
-    a.mov_at_rsp_reg(0x78, RAX); // save hdc
-    // Rectangle(hdc, pt.x, pt.y, 460, 250) — top-left = the cursor position.
+    a.mov_at_rsp_reg(0x78, RAX);
     a.mov_reg_reg(RCX, RAX);
-    a.mov_reg32_at_rsp(RDX, 0x80); // pt.x
-    a.mov_reg32_at_rsp(R8, 0x84); // pt.y
+    a.mov_reg32_at_rsp(RDX, 0x80);
+    a.mov_reg32_at_rsp(R8, 0x84);
     a.mov32(R9, 460);
     a.mov_at_rsp_imm(0x20, 250);
     a.call_iat(r.slot("Rectangle"));
-    // ReleaseDC(hwnd, hdc) — the present point for the click repaint.
     a.mov_reg_at_rsp(RCX, 0x70);
     a.mov_reg_at_rsp(RDX, 0x78);
     a.call_iat(r.slot("ReleaseDC"));
@@ -373,32 +310,28 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.jmp("wp_ret");
 
     a.label("paint");
-    a.mov_reg_at_rsp(RCX, 0x70); // hwnd
-    a.lea_rsp(RDX, 0x30); // &ps
+    a.mov_reg_at_rsp(RCX, 0x70);
+    a.lea_rsp(RDX, 0x30);
     a.call_iat(r.slot("BeginPaint"));
-    a.mov_at_rsp_reg(0x78, RAX); // save hdc
-    // Rectangle(hdc, 30, 40, 450, 210)
+    a.mov_at_rsp_reg(0x78, RAX);
     a.mov_reg_reg(RCX, RAX);
     a.mov32(RDX, 30);
     a.mov32(R8, 40);
     a.mov32(R9, 450);
     a.mov_at_rsp_imm(0x20, 210);
     a.call_iat(r.slot("Rectangle"));
-    // TextOutW(hdc, 60, 80, line1, wlen)
     a.mov_reg_at_rsp(RCX, 0x78);
     a.mov32(RDX, 60);
     a.mov32(R8, 80);
     a.lea_rip(R9, r.line1);
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE1) as i32);
     a.call_iat(r.slot("TextOutW"));
-    // TextOutW(hdc, 60, 130, line2, wlen)
     a.mov_reg_at_rsp(RCX, 0x78);
     a.mov32(RDX, 60);
     a.mov32(R8, 130);
     a.lea_rip(R9, r.line2);
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE2) as i32);
     a.call_iat(r.slot("TextOutW"));
-    // EndPaint(hwnd, &ps)
     a.mov_reg_at_rsp(RCX, 0x70);
     a.lea_rsp(RDX, 0x30);
     a.call_iat(r.slot("EndPaint"));
@@ -411,8 +344,6 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.finish()
 }
 
-// ============================ mini assembler ==============================
-
 const RAX: u8 = 0;
 const RCX: u8 = 1;
 const RDX: u8 = 2;
@@ -423,7 +354,6 @@ const R9: u8 = 9;
 struct Asm {
     code: Vec<u8>,
     labels: HashMap<String, usize>,
-    /// (position of rel32 field, target label) for .text-internal references.
     fixups: Vec<(usize, String)>,
 }
 
@@ -436,23 +366,20 @@ impl Asm {
         self.labels.insert(name.to_string(), self.code.len());
     }
 
-    /// Emit `[rsp+disp]` addressing (SIB, base=rsp) after the opcode; `reg` is
-    /// the ModRM.reg field.
     fn modrm_rsp(&mut self, reg: u8, disp: i32) {
         let reg = reg & 7;
         if (-128..=127).contains(&disp) {
-            self.code.push(0x40 | (reg << 3) | 0x04); // mod=01, rm=100
-            self.code.push(0x24); // SIB: base=rsp, no index
+            self.code.push(0x40 | (reg << 3) | 0x04);
+            self.code.push(0x24);
             self.code.push(disp as u8);
         } else {
-            self.code.push(0x80 | (reg << 3) | 0x04); // mod=10
+            self.code.push(0x80 | (reg << 3) | 0x04);
             self.code.push(0x24);
             self.code.extend_from_slice(&disp.to_le_bytes());
         }
     }
 
     fn rex(&mut self, r: u8, b: u8) {
-        // REX.W + optional REX.R (reg>=8) + REX.B (base/rm>=8).
         let mut rex = 0x48;
         if r >= 8 {
             rex |= 0x04;
@@ -473,7 +400,7 @@ impl Asm {
     }
 
     fn mov_at_rsp_reg(&mut self, disp: i32, reg: u8) {
-        self.rex(reg, RBX /* rsp base doesn't set REX.B */);
+        self.rex(reg, RBX );
         self.code.push(0x89);
         self.modrm_rsp(reg, disp);
     }
@@ -482,12 +409,9 @@ impl Asm {
         self.code.push(0x8B);
         self.modrm_rsp(reg, disp);
     }
-    /// 32-bit `mov reg32, [rsp+disp]` — loads a `LONG`/`DWORD` (e.g. a `POINT`
-    /// field) without sign/zero-extending the whole qword. The destination is the
-    /// ModRM.reg field, so r8..r15 need REX.R (0x44), not REX.B.
     fn mov_reg32_at_rsp(&mut self, reg: u8, disp: i32) {
         if reg >= 8 {
-            self.code.push(0x44); // REX.R extends ModRM.reg to r8..r15
+            self.code.push(0x44);
         }
         self.code.push(0x8B);
         self.modrm_rsp(reg, disp);
@@ -504,7 +428,6 @@ impl Asm {
     }
 
     fn mov_reg_reg(&mut self, dst: u8, src: u8) {
-        // mov dst, src  (REX.W 89 /r, reg=src, rm=dst)
         let mut rex = 0x48;
         if src >= 8 {
             rex |= 0x04;
@@ -562,12 +485,11 @@ impl Asm {
     fn lea_label(&mut self, reg: u8, label: &str) {
         self.rex(reg, RBX);
         self.code.push(0x8D);
-        self.code.push(0x05 | ((reg & 7) << 3)); // mod=00, rm=101 (RIP)
+        self.code.push(0x05 | ((reg & 7) << 3));
         self.fixups.push((self.code.len(), label.to_string()));
         self.code.extend_from_slice(&[0, 0, 0, 0]);
     }
 
-    /// `lea reg, [rip+disp]` to an absolute .rdata RVA (known now).
     fn lea_rip(&mut self, reg: u8, target_rva: u32) {
         self.rex(reg, RBX);
         self.code.push(0x8D);
@@ -577,7 +499,6 @@ impl Asm {
         self.code.extend_from_slice(&(disp as i32).to_le_bytes());
     }
 
-    /// `call [rip+disp]` to an IAT slot (known now).
     fn call_iat(&mut self, slot_rva: u32) {
         self.code.extend_from_slice(&[0xFF, 0x15]);
         let next = TEXT_RVA as i64 + self.code.len() as i64 + 4;
@@ -594,8 +515,6 @@ impl Asm {
         self.code
     }
 }
-
-// ---- byte helpers (mirrors sample.rs) --------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn write_section(f: &mut [u8], at: usize, name: &[u8], vsize: u32, vaddr: u32, raw_size: u32, raw_ptr: u32, chars: u32) {

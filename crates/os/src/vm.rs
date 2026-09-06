@@ -1,58 +1,25 @@
-//! The `VirtualAlloc` family: a small user-space virtual-memory manager.
-//!
-//! `VirtualAlloc`/`VirtualFree`/`VirtualProtect`/`VirtualQuery` back real,
-//! distinct regions in the guest address space (via the [`Memory`] mapping
-//! primitives added for this purpose) while tracking each reservation's nominal
-//! `PAGE_*` protection and commit state here. That lets `VirtualQuery` and
-//! `VirtualProtect` report honest values even though the backing pages are
-//! mapped permissively (RWX) — the emulator's deliberate DEP-relaxed stance
-//! that lets packers/JITs execute pages they allocated writable.
-
 use exemu_core::{CpuState, Memory, Perm, Result};
 
 use crate::api::Outcome;
 use crate::WinOs;
 
-// flAllocationType bits.
 const MEM_COMMIT: u32 = 0x0000_1000;
-// dwFreeType bits.
 const MEM_DECOMMIT: u32 = 0x0000_4000;
 const MEM_RELEASE: u32 = 0x0000_8000;
-// MEMORY_BASIC_INFORMATION.State values.
 const MEM_STATE_COMMIT: u32 = 0x0000_1000;
 const MEM_STATE_RESERVE: u32 = 0x0000_2000;
 const MEM_STATE_FREE: u32 = 0x0001_0000;
-// MEMORY_BASIC_INFORMATION.Type values.
 const MEM_PRIVATE: u32 = 0x0002_0000;
-// MEM_MAPPED (data/file-backed) and MEM_IMAGE (SEC_IMAGE) label a section view's
-// `VmAlloc.mtype`; the section code (roadmap W2.7) sets them. Defined here so the
-// type-value vocabulary lives beside MEM_PRIVATE and `write_mbi` reports them.
-#[allow(dead_code)] // first setter is the W2.7 section code.
+#[allow(dead_code)]
 pub(crate) const MEM_MAPPED: u32 = 0x0004_0000;
-#[allow(dead_code)] // first setter is the W2.7 section code.
+#[allow(dead_code)]
 pub(crate) const MEM_IMAGE: u32 = 0x0100_0000;
 
-const PAGE: u64 = 0x1000; // 4 KiB page
-const GRAN: u64 = 0x1_0000; // 64 KiB allocation granularity
+const PAGE: u64 = 0x1000;
+const GRAN: u64 = 0x1_0000;
 
-/// Lowest address a user-space allocation may occupy: the first 64 KiB is the
-/// permanently-reserved null-dereference guard window. Used as the search origin
-/// when [`WinOs::vm_alloc_region_below`] has to place an allocation under an
-/// address ceiling, which the ordinary bump hint sits far above.
 const LOW_ARENA_BASE: u64 = 0x1_0000;
 
-/// The highest address an allocation may occupy, from `NtAllocateVirtualMemory`'s
-/// `ZeroBits` argument (roadmap W5.3).
-///
-/// Public NT semantics: `0` means "no constraint"; `1..=31` is the number of
-/// high-order bits of the returned address that must be **zero**; a larger value
-/// is instead a **mask giving the highest acceptable address**. The second form
-/// is the one that matters for WoW64 — `wow64.dll`'s `NtAllocateVirtualMemory`
-/// thunk substitutes its own `0x7fffffff` whenever a 32-bit guest passes
-/// `ZeroBits = 0` (recovered from the pinned binary: it loads the constant from
-/// its `.data` and puts it in `R8`). That is what keeps the 64-bit result inside
-/// the low 2 GiB so the thunk can narrow it back into the guest's 32-bit
-/// `*BaseAddress` cell without truncating it into an unmapped pointer.
 fn zero_bits_ceiling(zero_bits: u64) -> u64 {
     match zero_bits {
         0 => u64::MAX,
@@ -61,20 +28,11 @@ fn zero_bits_ceiling(zero_bits: u64) -> u64 {
     }
 }
 
-/// One `VirtualAlloc` reservation.
 pub(crate) struct VmAlloc {
-    /// 64 KiB-aligned allocation base (the `AllocationBase` for every page).
     pub base: u64,
-    /// Reserved size in bytes (page-aligned).
     pub size: u64,
-    /// Nominal `PAGE_*` protection last requested for the region.
     pub protect: u32,
-    /// Committed (MEM_COMMIT) vs reserve-only.
     pub committed: bool,
-    /// `MEMORY_BASIC_INFORMATION.Type` reported for the region: `MEM_PRIVATE`
-    /// for an ordinary `VirtualAlloc`/`NtAllocateVirtualMemory` reservation,
-    /// `MEM_IMAGE` for a `SEC_IMAGE` section view, `MEM_MAPPED` for a
-    /// data/file-backed section view (both filled in by the section code, W2.7).
     pub mtype: u32,
 }
 
@@ -83,22 +41,18 @@ fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) & !(a - 1)
 }
 
-/// Map a coarse access permission to the `PAGE_*` constant that best describes
-/// it (used only to report protection for pre-existing, non-VirtualAlloc
-/// regions such as the image, stack and heap).
 fn protect_from_perm(p: Perm) -> u32 {
     match (p.contains(Perm::EXEC), p.contains(Perm::WRITE), p.contains(Perm::READ)) {
-        (true, true, _) => 0x40,      // PAGE_EXECUTE_READWRITE
-        (true, false, true) => 0x20,  // PAGE_EXECUTE_READ
-        (true, false, false) => 0x10, // PAGE_EXECUTE
-        (false, true, _) => 0x04,     // PAGE_READWRITE
-        (false, false, true) => 0x02, // PAGE_READONLY
-        (false, false, false) => 0x01, // PAGE_NOACCESS
+        (true, true, _) => 0x40,
+        (true, false, true) => 0x20,
+        (true, false, false) => 0x10,
+        (false, true, _) => 0x04,
+        (false, false, true) => 0x02,
+        (false, false, false) => 0x01,
     }
 }
 
 impl WinOs {
-    /// VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect).
     pub(crate) fn virtual_alloc(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let addr_req = self.arg(cpu, mem, 0)?;
         let size_req = self.arg(cpu, mem, 1)?;
@@ -108,7 +62,6 @@ impl WinOs {
         Ok(Outcome::Return(base))
     }
 
-    /// VirtualFree(lpAddress, dwSize, dwFreeType).
     pub(crate) fn virtual_free(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let addr = self.arg(cpu, mem, 0)?;
         let free_type = self.arg(cpu, mem, 2)? as u32;
@@ -116,7 +69,6 @@ impl WinOs {
         Ok(Outcome::Return(1))
     }
 
-    /// VirtualProtect(lpAddress, dwSize, flNewProtect, lpflOldProtect).
     pub(crate) fn virtual_protect(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let addr = self.arg(cpu, mem, 0)?;
         let new_protect = self.arg(cpu, mem, 2)? as u32;
@@ -128,22 +80,12 @@ impl WinOs {
         Ok(Outcome::Return(1))
     }
 
-    /// VirtualQuery(lpAddress, lpBuffer, dwLength) → bytes written (0 on fail).
     pub(crate) fn virtual_query(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Outcome> {
         let addr = self.arg(cpu, mem, 0)?;
         let buf = self.arg(cpu, mem, 1)?;
         self.vm_query_region(mem, addr, buf)
     }
 
-    // --- Shared region-mutation core (the Win32 `Virtual*` and the NT
-    // `Nt*VirtualMemory` syscalls, W2.6, both drive these). Plain-argument
-    // helpers that own the `vm_allocs`/mapping logic; the outer wrappers only
-    // marshal the ABI (registers / `Outcome` vs NTSTATUS + IN/OUT pointers). ---
-
-    /// Reserve and/or commit a region, returning its page-aligned base (0 on
-    /// out-of-memory, with `last_error` set). Shared by `VirtualAlloc` and
-    /// `NtAllocateVirtualMemory`. `addr_req == 0` picks a free window; a nonzero
-    /// address commits inside a prior reservation or fixes a fresh map there.
     pub(crate) fn vm_alloc_region(
         &mut self,
         mem: &mut dyn Memory,
@@ -155,14 +97,6 @@ impl WinOs {
         self.vm_alloc_region_below(mem, addr_req, size_req, alloc_type, protect, u64::MAX)
     }
 
-    /// [`WinOs::vm_alloc_region`] with an **address ceiling**: a kernel-picked
-    /// base (`addr_req == 0`) is placed so the whole region ends at or below
-    /// `max_addr`. `u64::MAX` means unconstrained (the ordinary bump arena).
-    ///
-    /// The constrained search starts low ([`LOW_ARENA_BASE`]) rather than at the
-    /// bump hint, because the hint lives far above any realistic ceiling. This
-    /// is what makes a WoW64 32-bit guest's allocations land where its 32-bit
-    /// pointers can address them — see [`zero_bits_ceiling`].
     pub(crate) fn vm_alloc_region_below(
         &mut self,
         mem: &mut dyn Memory,
@@ -176,22 +110,18 @@ impl WinOs {
         let size = align_up(size_req.max(1), PAGE);
 
         if addr_req == 0 {
-            // Fresh reservation: find a free, 64 KiB-aligned window and back it
-            // permissively (the tracked `protect` carries the nominal value).
             let Some(base) = self.vm_find_free_below(mem, size, max_addr) else {
-                self.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+                self.last_error = 8;
                 return Ok(0);
             };
             if mem.map_fixed(base, size, Perm::RWX, "valloc").is_err() {
-                self.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+                self.last_error = 8;
                 return Ok(0);
             }
             self.vm_insert(VmAlloc { base, size, protect, committed, mtype: MEM_PRIVATE });
             return Ok(base);
         }
 
-        // Explicit address: committing inside a prior reservation, or a new
-        // fixed map.
         let base = addr_req & !(PAGE - 1);
         if let Some(a) = self.vm_allocs.iter_mut().find(|a| base >= a.base && base < a.base + a.size) {
             a.committed = a.committed || committed;
@@ -200,8 +130,6 @@ impl WinOs {
             }
             return Ok(base);
         }
-        // Not ours: map it fixed if the range is free, else treat the commit as
-        // already satisfied (the address falls inside image/stack/heap).
         let free_here = mem.next_region(base).map_or(true, |(rb, _, _)| rb >= base + size);
         if free_here && mem.map_fixed(base, size, Perm::RWX, "valloc").is_ok() {
             self.vm_insert(VmAlloc { base, size, protect, committed, mtype: MEM_PRIVATE });
@@ -209,9 +137,6 @@ impl WinOs {
         Ok(base)
     }
 
-    /// Release (unmap) or decommit a region. Shared by `VirtualFree` and
-    /// `NtFreeVirtualMemory`. `MEM_RELEASE` unmaps the whole reservation;
-    /// `MEM_DECOMMIT` just clears its commit state.
     pub(crate) fn vm_free_region(&mut self, mem: &mut dyn Memory, addr: u64, free_type: u32) {
         let base = addr & !(PAGE - 1);
         if free_type & MEM_RELEASE != 0 {
@@ -226,12 +151,8 @@ impl WinOs {
         }
     }
 
-    /// Set a region's nominal protection and return the previous value (0x40 /
-    /// PAGE_EXECUTE_READWRITE for a pre-existing non-`VirtualAlloc` region).
-    /// Shared by `VirtualProtect` and `NtProtectVirtualMemory`.
     pub(crate) fn vm_protect_region(&mut self, addr: u64, new_protect: u32) -> u32 {
         let base = addr & !(PAGE - 1);
-        // Report the previous nominal protection (RWX for pre-existing regions).
         let old = self
             .vm_allocs
             .iter()
@@ -243,13 +164,9 @@ impl WinOs {
         old
     }
 
-    /// Resolve the region containing `addr` and write a `MEMORY_BASIC_INFORMATION`
-    /// into `buf`, returning the bytes written (0 on a null buffer). Shared by
-    /// `VirtualQuery` and `NtQueryVirtualMemory(MemoryBasicInformation)`.
     pub(crate) fn vm_query_region(&mut self, mem: &mut dyn Memory, addr: u64, buf: u64) -> Result<Outcome> {
         let page_base = addr & !(PAGE - 1);
 
-        // 1) One of our own reservations: report its tracked protection/state.
         if let Some(a) = self.vm_allocs.iter().find(|a| addr >= a.base && addr < a.base + a.size) {
             let (base, size, prot, comm, mtype) = (a.base, a.size, a.protect, a.committed, a.mtype);
             let region_size = base + size - page_base;
@@ -258,8 +175,6 @@ impl WinOs {
             return self.write_mbi(mem, buf, page_base, base, prot, region_size, state, prot_out, mtype);
         }
 
-        // 2) Another mapped region (image/stack/heap/teb/…): committed.
-        // 3) Otherwise a free gap up to the next region (or the top of space).
         match mem.next_region(addr) {
             Some((rb, rsize, rperm)) if rb <= addr => {
                 let prot = protect_from_perm(rperm);
@@ -271,20 +186,11 @@ impl WinOs {
         }
     }
 
-    /// Reserve and back a fresh region of `size` bytes somewhere free in the
-    /// VirtualAlloc arena, returning its base — used for thread stacks (P3.4)
-    /// as well as `VirtualAlloc(NULL, …)`. `None` if the mapping fails.
     pub(crate) fn map_anywhere(&mut self, mem: &mut dyn Memory, size: u64, perm: exemu_core::Perm, name: &str) -> Option<u64> {
         let base = self.vm_find_free(mem, size);
         mem.map_fixed(base, size, perm, name).ok().map(|()| base)
     }
 
-    /// [`WinOs::map_anywhere`] with a 4 GiB ceiling — the placement a **32-bit**
-    /// image needs in a WoW64 process (roadmap W5.7). `wow64.dll`'s
-    /// `NtMapViewOfSection` thunk narrows the base it gets back into the guest's
-    /// 32-bit `*BaseAddress` cell without checking, so a view placed above 4 GiB
-    /// is silently truncated into an unmapped pointer — which is exactly what a
-    /// 32-bit `RtlImageNtHeader` then faults on.
     pub(crate) fn map_anywhere_low(
         &mut self,
         mem: &mut dyn Memory,
@@ -296,12 +202,6 @@ impl WinOs {
         mem.map_fixed(base, size, perm, name).ok().map(|()| base)
     }
 
-    /// Find a free, 64 KiB-aligned base for at least `size` bytes ending at or
-    /// below `max_addr`, or `None` if the constrained space is exhausted.
-    /// Unconstrained requests take the ordinary bump arena; a ceiling makes the
-    /// scan start at [`LOW_ARENA_BASE`] and walk up over the already-mapped
-    /// regions (each successful allocation maps its own region, so the scan
-    /// naturally steps past prior ones without a second hint).
     fn vm_find_free_below(&mut self, mem: &dyn Memory, size: u64, max_addr: u64) -> Option<u64> {
         if max_addr == u64::MAX {
             return Some(self.vm_find_free(mem, size));
@@ -323,8 +223,6 @@ impl WinOs {
         }
     }
 
-    /// Find a free, 64 KiB-aligned base for at least `size` bytes at/above the
-    /// bump hint, then advance the hint past it.
     fn vm_find_free(&mut self, mem: &dyn Memory, size: u64) -> u64 {
         let mut base = align_up(self.valloc_next, GRAN);
         loop {
@@ -342,26 +240,19 @@ impl WinOs {
         base
     }
 
-    /// Insert a reservation, keeping `vm_allocs` sorted by base.
     fn vm_insert(&mut self, a: VmAlloc) {
         let pos = self.vm_allocs.partition_point(|x| x.base < a.base);
         self.vm_allocs.insert(pos, a);
     }
 
-    /// Insert a section-view reservation (`NtMapViewOfSection`, W2.7) so the
-    /// mapped view queries as a real committed region with the section's `Type`.
     pub(crate) fn vm_insert_view(&mut self, a: VmAlloc) {
         self.vm_insert(a);
     }
 
-    /// The base of the reservation that *starts exactly* at `addr`, if any — used
-    /// by `NtUnmapViewOfSection` (W2.7) to validate a view base before releasing.
     pub(crate) fn vm_view_base(&self, addr: u64) -> Option<u64> {
         self.vm_allocs.iter().find(|a| a.base == addr).map(|a| a.base)
     }
 
-    /// Write a `MEMORY_BASIC_INFORMATION` (32- or 64-bit layout) into guest
-    /// memory and return the number of bytes written.
     #[allow(clippy::too_many_arguments)]
     fn write_mbi(
         &self,
@@ -402,42 +293,13 @@ impl WinOs {
     }
 }
 
-// ---------------------------------------------------------------------------
-// NT memory syscalls (roadmap W2.6) — the NTSTATUS / IN-OUT-pointer face of the
-// same VM manager the Win32 `Virtual*` APIs drive.
-//
-// Wine's PE `ntdll.dll` reaches these through a raw `SYSCALL` (the SSDT index in
-// EAX, recovered from the pinned guest stubs' `mov eax,N`): NtAllocateVirtualMemory
-// = 0x18, NtFreeVirtualMemory = 0x1e, NtProtectVirtualMemory = 0x50,
-// NtQueryVirtualMemory = 0x23. The W2.3 dispatcher has already saved the context
-// and switched to the unix stack; each handler reads its arguments via
-// [`WinOs::syscall_arg`] (arg0=R10, arg1=RDX, arg2=R8, arg3=R9, args 5+ on the
-// guest stack) and returns an NTSTATUS the dispatcher places in RAX.
-//
-// The IN/OUT pointer contract (public `winternl.h` / ntifs.h): `*BaseAddress`
-// and `*RegionSize` are read on entry and written back with the actual base /
-// size; `NtProtect` writes `*OldProtect`; `NtQuery` writes the buffer and the
-// optional `*ReturnLength`. Clean-room Class B: signatures from the public NT
-// headers, indices from the pinned guest binary — no Wine `.c` was read.
-
-/// `STATUS_SUCCESS`.
 const STATUS_SUCCESS: u32 = 0x0000_0000;
-/// `STATUS_INVALID_PARAMETER` — a required pointer argument was NULL, or an
-/// unsupported memory-information class was requested.
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-/// `STATUS_NO_MEMORY` — the reservation could not be backed.
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
 
-/// `MEMORY_INFORMATION_CLASS::MemoryBasicInformation` (value 0) — the class
-/// backing `VirtualQuery`. `MemoryWineUnixFuncs` (1000) is handled separately in
-/// [`crate::unixlib`].
 pub(crate) const MEMORY_BASIC_INFORMATION: u32 = 0;
 
 impl WinOs {
-    /// `NtAllocateVirtualMemory(ProcessHandle, *BaseAddress, ZeroBits,
-    /// *RegionSize, AllocationType, Protect)`. arg0=process (ignored — the
-    /// current-process pseudo-handle at the gate), arg1=&BaseAddress,
-    /// arg2=ZeroBits, arg3=&RegionSize, arg4=AllocationType, arg5=Protect.
     pub(crate) fn nt_allocate_virtual_memory(
         &mut self,
         cpu: &mut CpuState,
@@ -451,26 +313,19 @@ impl WinOs {
         if base_ptr == 0 || size_ptr == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        // IN/OUT: the caller's requested base (may be 0 = "you pick") and size.
         let addr_req = mem.read_u64(base_ptr)?;
         let size_req = mem.read_u64(size_ptr)?;
-        // `ZeroBits` caps where a kernel-picked base may land. WoW64 leans on
-        // this: `wow64.dll` passes `0x7fffffff` so the 64-bit result still fits
-        // the 32-bit guest's `*BaseAddress` cell (roadmap W5.3).
         let max_addr = zero_bits_ceiling(zero_bits);
         let base =
             self.vm_alloc_region_below(mem, addr_req, size_req, alloc_type, protect, max_addr)?;
         if base == 0 {
             return Ok(STATUS_NO_MEMORY);
         }
-        // Write back the actual base and the page-rounded size.
         mem.write_u64(base_ptr, base)?;
         mem.write_u64(size_ptr, align_up(size_req.max(1), PAGE))?;
         Ok(STATUS_SUCCESS)
     }
 
-    /// `NtFreeVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize, FreeType)`.
-    /// arg0=process, arg1=&BaseAddress, arg2=&RegionSize, arg3=FreeType.
     pub(crate) fn nt_free_virtual_memory(
         &mut self,
         cpu: &mut CpuState,
@@ -485,8 +340,6 @@ impl WinOs {
         let addr = mem.read_u64(base_ptr)?;
         let region = self.vm_region_bounds(addr);
         self.vm_free_region(mem, addr, free_type);
-        // On a full release the actual base/size freed are the reservation's;
-        // fall back to the page-aligned request otherwise.
         if let Some((base, size)) = region {
             mem.write_u64(base_ptr, base)?;
             if size_ptr != 0 {
@@ -496,9 +349,6 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
-    /// `NtProtectVirtualMemory(ProcessHandle, *BaseAddress, *RegionSize,
-    /// NewProtect, *OldProtect)`. arg0=process, arg1=&BaseAddress,
-    /// arg2=&RegionSize, arg3=NewProtect, arg4=&OldProtect.
     pub(crate) fn nt_protect_virtual_memory(
         &mut self,
         cpu: &mut CpuState,
@@ -518,11 +368,6 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
-    /// `NtQueryVirtualMemory(ProcessHandle, BaseAddress, MemoryInformationClass,
-    /// Buffer, Length, *ReturnLength)`. The `MemoryWineUnixFuncs` class is served
-    /// in [`crate::unixlib`]; W2.6 adds `MemoryBasicInformation` (the
-    /// `VirtualQuery` payload). arg0=process, arg1=base, arg2=class, arg3=buffer,
-    /// arg4=length, arg5=&ReturnLength.
     pub(crate) fn nt_query_virtual_memory_basic(
         &mut self,
         cpu: &mut CpuState,
@@ -546,9 +391,6 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
-    /// The reservation bounds (`base`, `size`) containing `addr`, if it is one of
-    /// our own `vm_allocs` regions. Used by `NtFreeVirtualMemory` to report the
-    /// actual base/size freed before the reservation is dropped.
     fn vm_region_bounds(&self, addr: u64) -> Option<(u64, u64)> {
         self.vm_allocs
             .iter()
@@ -557,7 +399,6 @@ impl WinOs {
     }
 }
 
-/// SSDT thunk for `NtAllocateVirtualMemory` (index 0x18).
 pub(crate) fn ssdt_nt_allocate_virtual_memory(
     os: &mut WinOs,
     cpu: &mut CpuState,
@@ -566,7 +407,6 @@ pub(crate) fn ssdt_nt_allocate_virtual_memory(
     os.nt_allocate_virtual_memory(cpu, mem)
 }
 
-/// SSDT thunk for `NtFreeVirtualMemory` (index 0x1e).
 pub(crate) fn ssdt_nt_free_virtual_memory(
     os: &mut WinOs,
     cpu: &mut CpuState,
@@ -575,7 +415,6 @@ pub(crate) fn ssdt_nt_free_virtual_memory(
     os.nt_free_virtual_memory(cpu, mem)
 }
 
-/// SSDT thunk for `NtProtectVirtualMemory` (index 0x50).
 pub(crate) fn ssdt_nt_protect_virtual_memory(
     os: &mut WinOs,
     cpu: &mut CpuState,
@@ -584,7 +423,6 @@ pub(crate) fn ssdt_nt_protect_virtual_memory(
     os.nt_protect_virtual_memory(cpu, mem)
 }
 
-/// SSDT indices, recovered from the pinned guest `ntdll.dll` stubs' `mov eax,N`.
 pub(crate) const SSDT_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x18;
 pub(crate) const SSDT_NT_FREE_VIRTUAL_MEMORY: u32 = 0x1e;
 pub(crate) const SSDT_NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x50;
@@ -595,32 +433,23 @@ mod tests {
     use crate::WinConfig;
     use exemu_memory::VirtualMemory;
 
-    /// The two documented `ZeroBits` forms: a leading-zero-bit *count* below 32,
-    /// a highest-acceptable-*address* mask at or above it (the WoW64 form).
     #[test]
     fn zero_bits_ceiling_covers_both_documented_forms() {
         assert_eq!(zero_bits_ceiling(0), u64::MAX, "0 = unconstrained");
         assert_eq!(zero_bits_ceiling(32), 32, "≥32 is a highest-address mask, not a bit count");
-        // The value wow64.dll substitutes for a 32-bit guest's ZeroBits = 0.
         assert_eq!(zero_bits_ceiling(0x7fff_ffff), 0x7fff_ffff, "the WoW64 low-2 GiB ceiling");
-        // A bit count: 33 leading zeros ⇒ the address fits in 31 bits.
         assert_eq!(zero_bits_ceiling(33) >> 31, 0, "33 leading zero bits ⇒ a 31-bit address");
         assert_eq!(zero_bits_ceiling(1), u64::MAX >> 1, "1 leading zero bit");
     }
 
-    /// A `ZeroBits` ceiling moves a kernel-picked base out of the 256 GiB bump
-    /// arena and into the low address space — the allocation a WoW64 32-bit
-    /// guest can actually address (roadmap W5.3).
     #[test]
     fn zero_bits_ceiling_places_the_allocation_low() {
         let mut mem = VirtualMemory::new();
         let mut os = WinOs::new(WinConfig { is_64bit: true, echo: false, ..WinConfig::default() });
 
-        // Unconstrained: the ordinary arena, far above 4 GiB.
         let high = os.vm_alloc_region(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04).unwrap();
         assert!(high > u32::MAX as u64, "the default arena is above 4 GiB (got {high:#x})");
 
-        // Constrained the way wow64.dll constrains it.
         let low = os
             .vm_alloc_region_below(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04, 0x7fff_ffff)
             .unwrap();
@@ -630,14 +459,12 @@ mod tests {
         assert_eq!(low & (GRAN - 1), 0, "64 KiB aligned");
         mem.write_u32(low, 0xC0FFEE).unwrap();
 
-        // A second constrained allocation steps past the first, never overlaps.
         let low2 = os
             .vm_alloc_region_below(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04, 0x7fff_ffff)
             .unwrap();
         assert!(low2 >= low + 0x2000 || low2 + 0x2000 <= low, "the two regions are disjoint");
         assert_eq!(mem.read_u32(low).unwrap(), 0xC0FFEE, "the first region survived");
 
-        // A ceiling nothing fits under is out-of-memory, not a bogus base.
         assert_eq!(
             os.vm_alloc_region_below(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04, 0x1000).unwrap(),
             0,

@@ -1,19 +1,3 @@
-//! # exemu-cpu — an x86-64 interpreter
-//!
-//! A decode-and-execute interpreter for a practical subset of x86-64. Each
-//! [`Interpreter::step`] fetches one instruction, decodes its prefixes,
-//! opcode, ModRM/SIB/displacement and immediate, then executes it against
-//! the supplied [`Memory`].
-//!
-//! Design notes:
-//! * RIP-relative addressing is resolved *after* the whole instruction
-//!   (including any immediate) has been consumed, because it is relative to
-//!   the address of the next instruction — see [`Ctx::rm_addr`].
-//! * The regular ALU opcodes (`0x00..=0x3D`) share one handler driven by the
-//!   opcode's high bits (operation) and low bits (operand form).
-//! * Before decoding, the OS layer gets a chance to intercept the current
-//!   `rip` via [`Hooks`]; that is how emulated API calls are serviced.
-
 #![forbid(unsafe_code)]
 
 mod alu;
@@ -21,52 +5,23 @@ mod alu;
 use exemu_core::cpu::flags;
 use exemu_core::{Cpu, CpuState, EmuError, Exit, GuestClock, Hooks, Memory, Result};
 
-/// Processor operating mode: 32-bit (protected/IA-32) or 64-bit (long mode).
-/// Selects default operand/address size, REX-vs-inc/dec decoding, stack
-/// width and RIP-relative-vs-absolute addressing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Bits {
     B32,
     B64,
 }
 
-/// The interpreter. Owns nothing but the architectural state and the CPU
-/// mode; memory and OS hooks are passed in per step so the same CPU can
-/// drive different worlds.
 pub struct Interpreter {
     state: CpuState,
     bits: Bits,
-    /// Monotonic time-stamp counter backing `RDTSC` on the **host-clock**
-    /// (default) path. Advanced on each read so spin loops that wait for the TSC
-    /// to change make progress. Unused once [`Interpreter::clock`] is
-    /// virtualised, where the TSC is derived from the retired-instruction count
-    /// instead (see [`GuestClock::tsc`]).
     tsc: u64,
-    /// The process clock (roadmap W9.6). Default [`GuestClock::host`], in which
-    /// case the interpreter neither counts instructions nor changes `RDTSC`'s
-    /// behaviour. When the deterministic clock is installed, [`Cpu::step`]
-    /// retires one instruction into it per step and `RDTSC`/`RDTSCP` read it —
-    /// which is what makes the guest's whole notion of time a function of its
-    /// own instruction stream.
     clock: GuestClock,
-    /// SSE control/status register (`MXCSR`), round-tripped by `LDMXCSR`/
-    /// `STMXCSR`/`FXSAVE`/`FXRSTOR`. Default 0x1F80 (all exceptions masked,
-    /// round-to-nearest). Only the round-nearest default currently affects
-    /// float→int conversions.
     mxcsr: u32,
-    /// Extended-control register `XCR0` (read by `XGETBV`, written by `XSETBV`).
-    /// The state components the interpreter implements: bit 0 (x87, always 1),
-    /// bit 1 (SSE) and bit 2 (AVX/YMM upper halves). Default 0x7.
     xcr0: u64,
 }
 
-/// The bits of `MXCSR` that are defined (reserved bits 16..31 read as 0).
 const MXCSR_MASK: u32 = 0x0000_FFFF;
 
-/// `XCR0` state components the interpreter implements: bit 0 = x87 (mandatory,
-/// always set), bit 1 = SSE, bit 2 = AVX (the YMM upper halves — implemented in
-/// `vex.rs`). Beyond bit 2 (AVX-512 etc.) is not implemented, so `XSETBV`
-/// rejects any attempt to enable those.
 const XCR0_SUPPORTED: u64 = 0b111;
 
 impl Default for Interpreter {
@@ -76,12 +31,10 @@ impl Default for Interpreter {
 }
 
 impl Interpreter {
-    /// A fresh 64-bit interpreter.
     pub fn new() -> Self {
         Interpreter::with_bits(Bits::B64)
     }
 
-    /// A fresh interpreter in the given mode.
     pub fn with_bits(bits: Bits) -> Self {
         Interpreter {
             state: CpuState::new(),
@@ -101,36 +54,18 @@ impl Interpreter {
         self.bits
     }
 
-    /// Put the CPU in `bits` mode without touching the register file.
-    ///
-    /// Normally the mode changes only through a far transfer whose CS selector
-    /// picks it (the WoW64 mechanism, roadmap W5.2). This is for the *process
-    /// bootstrap*, which must seat a freshly built thread in the mode its first
-    /// instruction is encoded for — e.g. the WoW64 bring-up trampoline, which is
-    /// 64-bit code even though the image being run is a PE32 (roadmap W5.4).
     pub fn set_bits(&mut self, bits: Bits) {
         self.bits = bits;
     }
 
-    /// Install the process clock (roadmap W9.6). Called once at load time with
-    /// the same handle the OS layer holds, so `RDTSC` and the Win32/NT time APIs
-    /// report one consistent notion of "now".
     pub fn set_clock(&mut self, clock: GuestClock) {
         self.clock = clock;
     }
 
-    /// The process clock this interpreter retires instructions into.
     pub fn clock(&self) -> &GuestClock {
         &self.clock
     }
 
-    /// The next `RDTSC`/`RDTSCP` value, and the side-effect of reading it.
-    ///
-    /// Virtualised: a fixed multiple of the retired-instruction count, so two
-    /// reads separated by *n* instructions differ by exactly *n* × 100 ticks —
-    /// deterministic, and still strictly increasing because the `RDTSC` is
-    /// itself an instruction. Host-clock (default): the legacy free-running
-    /// counter that advances 64 per read.
     #[inline]
     fn read_tsc(&mut self) -> u64 {
         match self.clock.tsc() {
@@ -143,23 +78,18 @@ impl Interpreter {
         }
     }
 
-    /// The SSE control/status register (`MXCSR`).
     pub fn mxcsr(&self) -> u32 {
         self.mxcsr
     }
 
-    /// Overwrite `MXCSR` (used by the differential oracle to seed state; masked
-    /// to the defined bits just as `LDMXCSR` would).
     pub fn set_mxcsr(&mut self, v: u32) {
         self.mxcsr = v & MXCSR_MASK;
     }
 
-    /// The extended-control register `XCR0`.
     pub fn xcr0(&self) -> u64 {
         self.xcr0
     }
 
-    /// Address-space mask: full 64-bit, or 32-bit in protected mode.
     #[inline]
     fn addr_mask(&self) -> u64 {
         match self.bits {
@@ -168,7 +98,6 @@ impl Interpreter {
         }
     }
 
-    /// Stack slot / push-pop width in bytes.
     #[inline]
     fn stack_width(&self) -> u8 {
         match self.bits {
@@ -187,18 +116,10 @@ impl Cpu for Interpreter {
     }
 
     fn step(&mut self, mem: &mut dyn Memory, hooks: &mut dyn Hooks) -> Result<Exit> {
-        // Retire this step into the process clock (roadmap W9.6) BEFORE anything
-        // else, so an intercepted API thunk costs exactly the one instruction the
-        // run loop also counts for it, and so a handler that reads the clock sees
-        // its own call included. A no-op on the default host-clock path.
         self.clock.retire_one();
-        // Give the OS layer first refusal on this address (API thunks).
         if let Some(exit) = hooks.intercept(self.state.rip, &mut self.state, mem)? {
             return Ok(exit);
         }
-        // A native SYSCALL (0F 05) is executed by `execute_one` (which applies
-        // the hardware side-effects and reads the SSDT index) and then routed to
-        // the OS layer's syscall seam here (roadmap W2.2).
         match self.execute_one(mem)? {
             Exit::Syscall(index) => hooks.syscall(index, &mut self.state, mem),
             other => Ok(other),
@@ -206,27 +127,13 @@ impl Cpu for Interpreter {
     }
 }
 
-// --- Prefix / decode context -------------------------------------------------
-
-/// Decoded legacy + REX prefixes for the current instruction.
 #[derive(Default, Clone, Copy)]
 struct Prefixes {
     rex: u8,
     has_rex: bool,
-    /// 0x66 operand-size override.
     p66: bool,
-    /// 0xF3 / 0xF2 repeat (or mandatory SSE) prefix, 0 if none.
     rep: u8,
-    /// Segment override (0x64 = FS, 0x65 = GS), 0 if none.
     seg: u8,
-    /// 0xF0 LOCK prefix seen on this instruction. The interpreter is
-    /// single-threaded and cooperatively scheduled (guest threads switch only
-    /// at explicit block/yield points, never mid-instruction), so every
-    /// read-modify-write handler is already indivisible with respect to other
-    /// guest threads. We still *recognize and honor* the prefix instead of
-    /// silently dropping it so that (a) the atomicity contract is explicit and
-    /// (b) a future preemptive/JIT change that would break it is caught by the
-    /// pinned cross-thread LOCK CMPXCHG test in crates/os/tests.
     lock: bool,
 }
 
@@ -249,46 +156,23 @@ impl Prefixes {
     }
 }
 
-/// Where the ModRM r/m operand lives.
 #[derive(Clone, Copy)]
 enum Rm {
-    /// A register, by (already REX-extended) index.
     Reg(u8),
-    /// A memory operand. If `rip_rel` is set, `disp` is added to the address
-    /// of the following instruction; otherwise `base` is the final address.
     Mem { base: u64, disp: i64, rip_rel: bool },
 }
 
-/// How many instruction bytes are prefetched in one go. x86-64 caps an
-/// instruction at 15 bytes, so a 16-byte window covers every legal encoding
-/// (and the byte-at-a-time fallback covers the illegal over-long ones).
 pub(crate) const IBUF_LEN: usize = 16;
 
-/// Mutable per-instruction decode state threaded through the handlers.
 struct Ctx {
     pfx: Prefixes,
-    /// Current fetch pointer; ends up at the first byte past the instruction.
     cur: u64,
-    /// ModRM `reg` field, REX.R-extended.
     reg: u8,
-    /// Decoded r/m location (valid once ModRM has been read).
     rm: Rm,
-    /// Processor mode for this instruction.
     bits: Bits,
-    /// The opcode byte captured by a VEX prefix decode (the VEX payload is
-    /// consumed before the ModRM, so the opcode is stashed here). Unused by the
-    /// legacy decode path.
     u8_at_op: u8,
-    /// Prefetched instruction bytes covering `[ibuf_base, ibuf_base + ibuf_n)`
-    /// (roadmap W8.1). Decoding an instruction used to issue one `Memory::fetch`
-    /// — a dynamic dispatch plus a region lookup plus a permission test — *per
-    /// byte*; a 4-byte instruction paid for it four times. One window fetch per
-    /// instruction serves the prefixes, opcode, ModRM/SIB, displacement and
-    /// immediate out of registers instead.
     ibuf: [u8; IBUF_LEN],
-    /// Guest address `ibuf[0]` came from.
     ibuf_base: u64,
-    /// Valid bytes in `ibuf`; `0` means "no window, fetch byte by byte".
     ibuf_n: u8,
 }
 
@@ -303,15 +187,6 @@ impl Ctx {
 }
 
 impl Ctx {
-    /// Prefetch the instruction window for an instruction starting at `addr`.
-    ///
-    /// A failure is *not* an error: it just leaves the window empty so every
-    /// byte is fetched individually, exactly as before roadmap W8.1. That is
-    /// what makes the window observationally invisible — a fault is raised only
-    /// by the per-byte path, at the same byte, with the same `EmuError`, so an
-    /// instruction sitting in the last 15 bytes of an executable region (where
-    /// the wide fetch would overrun the region) behaves identically, just
-    /// slower.
     #[inline]
     fn prefetch(mem: &dyn Memory, addr: u64) -> ([u8; IBUF_LEN], u8) {
         let mut buf = [0u8; IBUF_LEN];
@@ -322,12 +197,9 @@ impl Ctx {
         }
     }
 
-    /// Take the next `N` instruction bytes from the prefetch window, or `None`
-    /// if they are not (entirely) in it.
     #[inline]
     fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
         let off = self.cur.wrapping_sub(self.ibuf_base);
-        // `off + N <= ibuf_n`, written so it cannot overflow for any `off`.
         if off < (self.ibuf_n as u64).saturating_sub(N as u64 - 1) {
             let i = off as usize;
             let mut out = [0u8; N];
@@ -339,10 +211,6 @@ impl Ctx {
         }
     }
 
-    /// Look at the next instruction byte **without consuming it**, or `None`
-    /// when it is not in the prefetch window. Used only by the opcode profiler
-    /// (roadmap W8.3) to read a group opcode's ModRM `reg` field before the
-    /// handler decodes it; a window miss simply loses that one sample.
     #[cfg(feature = "profile")]
     #[inline]
     fn peek(&self) -> Option<u8> {
@@ -362,8 +230,6 @@ impl Ctx {
         }
     }
 
-    /// The byte lies outside the prefetch window (over-long instruction, or no
-    /// window at all): go to memory for it, exactly as the pre-W8.1 decoder did.
     #[cold]
     #[inline(never)]
     fn u8_slow(&mut self, mem: &dyn Memory) -> Result<u8> {
@@ -403,9 +269,6 @@ impl Ctx {
         Ok(u64::from_le_bytes(v))
     }
 
-    /// Final address of a memory r/m operand, resolving RIP-relative against
-    /// the end of the instruction (`cur` must already point past it) and
-    /// masking to the address width of the current mode.
     #[inline]
     fn rm_addr(&self) -> u64 {
         let a = match self.rm {
@@ -422,11 +285,7 @@ impl Ctx {
     }
 }
 
-// --- The interpreter proper --------------------------------------------------
-
 impl Interpreter {
-    /// Operand size in bytes: default 4, `0x66` → 2, and REX.W → 8 in 64-bit
-    /// mode (there is no REX in 32-bit mode).
     #[inline]
     fn opsize(ctx: &Ctx) -> u8 {
         if ctx.bits == Bits::B64 && ctx.pfx.w() {
@@ -443,24 +302,17 @@ impl Interpreter {
             let b = ctx.u8(mem)?;
             match b {
                 0x66 => ctx.pfx.p66 = true,
-                0x67 => {} // address-size override: handled per-mode elsewhere
-                // LOCK: record the prefix. The cooperative interpreter never
-                // switches threads mid-instruction, so the RMW handlers are
-                // already atomic; tracking the flag makes that contract explicit
-                // (see `Prefixes::lock`) rather than silently discarding 0xF0.
+                0x67 => {}
                 0xF0 => ctx.pfx.lock = true,
                 0xF2 | 0xF3 => ctx.pfx.rep = b,
-                0x2E | 0x36 | 0x3E | 0x26 => {} // CS/SS/DS/ES overrides: flat model
-                0x64 | 0x65 => ctx.pfx.seg = b, // FS/GS
-                // 0x40..=0x4F are REX prefixes only in 64-bit mode; in 32-bit
-                // mode they are inc/dec r32 opcodes, so fall through to decode.
+                0x2E | 0x36 | 0x3E | 0x26 => {}
+                0x64 | 0x65 => ctx.pfx.seg = b,
                 0x40..=0x4F if ctx.bits == Bits::B64 => {
                     ctx.pfx.rex = b;
                     ctx.pfx.has_rex = true;
                     return Ok(());
                 }
                 _ => {
-                    // Not a prefix: step back so the opcode read sees it.
                     ctx.cur -= 1;
                     return Ok(());
                 }
@@ -468,7 +320,6 @@ impl Interpreter {
         }
     }
 
-    /// Read the ModRM byte (and SIB/displacement) into `ctx`.
     fn read_modrm(&self, ctx: &mut Ctx, mem: &dyn Memory) -> Result<()> {
         let modrm = ctx.u8(mem)?;
         let mod_ = modrm >> 6;
@@ -481,24 +332,19 @@ impl Interpreter {
             return Ok(());
         }
 
-        // Memory operand. Handle SIB and RIP-relative special cases.
         let (mut base, mut rip_rel) = (0u64, false);
 
         if rm == 4 {
-            // SIB byte follows.
             let sib = ctx.u8(mem)?;
             let scale = 1u64 << (sib >> 6);
             let index = ((sib >> 3) & 7) | (ctx.pfx.x() << 3);
             let base_reg = (sib & 7) | (ctx.pfx.b() << 3);
 
-            // index == 4 (rsp) means "no index".
             if (sib >> 3) & 7 != 4 || ctx.pfx.x() != 0 {
                 base = base.wrapping_add(self.state.reg_at(index).wrapping_mul(scale));
             }
 
             if sib & 7 == 5 && mod_ == 0 {
-                // No base register; disp32 follows. Still honor a segment
-                // override (e.g. `gs:[disp32]` for TEB / stack-probe access).
                 let disp = ctx.u32(mem)? as i32 as i64;
                 if ctx.pfx.seg == 0x65 {
                     base = base.wrapping_add(self.state.gs_base);
@@ -511,7 +357,6 @@ impl Interpreter {
                 base = base.wrapping_add(self.state.reg_at(base_reg));
             }
         } else if rm == 5 && mod_ == 0 {
-            // 64-bit: RIP-relative disp32. 32-bit: absolute disp32.
             let disp = ctx.u32(mem)? as i32 as i64;
             let rip_rel = ctx.bits == Bits::B64;
             let mut base = 0u64;
@@ -533,10 +378,6 @@ impl Interpreter {
             _ => ctx.u32(mem)? as i32 as i64,
         };
 
-        // FS/GS segment bases: we place the TEB at a fixed address and let
-        // the OS layer expose it, so treat `gs:[x]` as an absolute offset
-        // from a per-thread base the OS installs at reg-slot None. For the
-        // common `gs:[0x60]` PEB probe the OS maps a page at GS_BASE.
         if ctx.pfx.seg == 0x65 {
             base = base.wrapping_add(self.state.gs_base);
         } else if ctx.pfx.seg == 0x64 {
@@ -546,8 +387,6 @@ impl Interpreter {
         ctx.rm = Rm::Mem { base, disp, rip_rel: false };
         Ok(())
     }
-
-    // ---- operand access --------------------------------------------------
 
     fn read_rm(&self, ctx: &Ctx, mem: &dyn Memory, size: u8) -> Result<u64> {
         match ctx.rm {
@@ -576,8 +415,6 @@ impl Interpreter {
         self.write_gpr(ctx.reg, size, ctx.pfx.has_rex, val);
     }
 
-    /// GPR read honoring 8-bit high-byte registers (AH/CH/DH/BH) when no REX
-    /// prefix is present.
     #[inline]
     fn read_gpr(&self, index: u8, size: u8, has_rex: bool) -> u64 {
         if size == 1 && !has_rex && (4..8).contains(&index) {
@@ -596,11 +433,6 @@ impl Interpreter {
         }
     }
 
-    // ---- stack -----------------------------------------------------------
-    //
-    // The slot width follows the CPU mode: 8 bytes in long mode, 4 in
-    // protected mode. `rsp`/`esp` arithmetic is masked to the address width.
-
     fn push_stack(&mut self, mem: &mut dyn Memory, val: u64) -> Result<()> {
         let w = self.stack_width();
         let sp = self.state.rsp().wrapping_sub(w as u64) & self.addr_mask();
@@ -616,10 +448,6 @@ impl Interpreter {
         Ok(v)
     }
 
-    // ---- immediates ------------------------------------------------------
-
-    /// Immediate of the "Z" form: imm16 for 16-bit operands, otherwise imm32,
-    /// sign-extended to the operand size.
     fn imm_z(&self, ctx: &mut Ctx, mem: &dyn Memory, size: u8) -> Result<u64> {
         Ok(if size == 2 {
             alu::sext(ctx.u16(mem)? as u64, 2)
@@ -627,8 +455,6 @@ impl Interpreter {
             alu::sext(ctx.u32(mem)? as u64, 4)
         } & alu::mask(size))
     }
-
-    // ---- condition codes -------------------------------------------------
 
     fn cond(&self, tttn: u8) -> bool {
         let s = &self.state;
@@ -660,28 +486,11 @@ impl Interpreter {
     }
 }
 
-/// Fixed virtual bases for the GS/FS segment overrides. In 64-bit mode the
-/// TEB lives at [`GS_BASE`] (`gs:[0x30]`/`gs:[0x60]`); in 32-bit mode it lives
-/// at [`FS_BASE_32`] (`fs:[0x18]`/`fs:[0x30]`), which must be a 32-bit
-/// address. The OS layer maps matching pages. All are public so it can.
-///
-/// These are the process's **initial** bases. The `gs` base (64-bit TEB) and
-/// the 32-bit `fs` base are **per-thread** as of roadmap W2.9: they live on
-/// [`CpuState::gs_base`]/[`CpuState::fs_base`] so the scheduler saves/loads
-/// them across a context switch and each thread reads its own TEB. `GS_BASE`
-/// mirrors [`exemu_core::cpu::DEFAULT_GS_BASE`]; `FS_BASE_32` mirrors
-/// [`exemu_core::cpu::DEFAULT_FS_BASE`] (kept in sync by a debug assertion in
-/// [`Interpreter::fs_base`]). `FS_BASE` (the 64-bit `fs` base) is unused by
-/// Windows guests and stays a fixed const.
 pub const GS_BASE: u64 = exemu_core::cpu::DEFAULT_GS_BASE;
 pub const FS_BASE: u64 = 0x0000_7FFE_0000_0000;
 pub const FS_BASE_32: u64 = exemu_core::cpu::DEFAULT_FS_BASE;
 
 impl Interpreter {
-    /// The FS segment base for the current mode. In 32-bit mode this is the
-    /// current thread's TEB — a per-thread value carried on
-    /// [`CpuState::fs_base`] (roadmap W2.9). In 64-bit mode `fs` is unused by
-    /// Windows guests, so it stays the fixed [`FS_BASE`] const.
     #[inline]
     fn fs_base(&self, bits: Bits) -> u64 {
         match bits {
@@ -691,7 +500,6 @@ impl Interpreter {
     }
 }
 
-/// Convenience accessor used by the SIB/base math above.
 trait RegAt {
     fn reg_at(&self, index: u8) -> u64;
 }
@@ -712,16 +520,10 @@ mod x87;
 
 pub use exec::{CpuidFeature, CpuidReg, SEL_CS32, SEL_CS64, SEL_DATA};
 
-/// True if `op2` (the byte after a `0F` escape) is a two-byte opcode the SSE
-/// unit decodes. Exposed for out-of-crate decode-coverage tooling (e.g. the W1
-/// ntdll `.text` decode sweep) so it can tell an implemented vector family from
-/// a privileged/system/undefined `0F` opcode.
 pub fn is_sse_opcode(op2: u8) -> bool {
     sse::is_sse(op2)
 }
 
-/// True if `op2` (the byte after a `0F` escape) is a two-byte opcode the MMX
-/// unit decodes (bare-form MMX). Companion to [`is_sse_opcode`].
 pub fn is_mmx_opcode(op2: u8) -> bool {
     mmx::is_mmx(op2)
 }

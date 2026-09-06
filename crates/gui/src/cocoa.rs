@@ -1,30 +1,3 @@
-//! The live macOS display path (W4.4): a from-scratch AppKit/Metal presenter.
-//!
-//! Wine's real USER/GDI kernel logic lives in exemu's win32k SSDT handlers,
-//! which draw into a per-HWND top-down **BGRA32** surface (design §5). This
-//! module turns that surface into pixels on screen:
-//!
-//! * [`CocoaWindow`] — one `NSWindow` + `NSView` + `CAMetalLayer` per top-level
-//!   HWND. `present` uploads the BGRA surface into a `BGRA8Unorm` `MTLTexture`
-//!   and blits it to the layer's drawable. It owns AppKit objects
-//!   (`NSApplication`/`NSWindow`/`NSView`), which are `MainThreadOnly` and thus
-//!   `!Send` — so it must be built and driven on the **main thread**. The
-//!   interpreter-thread ↔ main-thread channel that lets a guest drive it is
-//!   W4.5; W4.4 exercises it through the `cocoa-demo` CLI subcommand.
-//!
-//! * [`CocoaPresenter`] — the `Send` driver-side [`Presenter`]. It renders the
-//!   surface headlessly (the shared [`crate::bgra_to_rgba`] transform → PNG /
-//!   retained last frame), holding **no** AppKit or Metal handles so it stays
-//!   `Send` and usable on the interpreter thread today. In W4.5 it gains a
-//!   `Sender` to a main-thread [`CocoaWindow`]; for now it is the headless half
-//!   and the subject of the "PNG parity vs Offscreen" gate.
-//!
-//! * [`metal_bgra_roundtrip`] — uploads a BGRA buffer into a `BGRA8Unorm`
-//!   `MTLTexture` and reads it back, proving the live Metal path reproduces the
-//!   surface pixels bit-for-bit. The parity gate compares its output (swapped to
-//!   RGBA) against `bgra_to_rgba`, tying the live pipeline to the headless one.
-//!   Returns `None` when no GPU is available (headless CI), so callers skip.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -55,7 +28,6 @@ use exemu_core::{InputEvent, MouseButton, TextBitmap, UserDriver, WindowParams};
 
 use crate::{bgra_to_rgba, Presenter};
 
-/// The full BGRA region of a `w × h` surface, origin `(0,0)`.
 fn full_region(w: u32, h: u32) -> MTLRegion {
     MTLRegion {
         origin: MTLOrigin { x: 0, y: 0, z: 0 },
@@ -63,13 +35,7 @@ fn full_region(w: u32, h: u32) -> MTLRegion {
     }
 }
 
-// ============================ CocoaWindow (live) =============================
-
-/// A live macOS window backed by a `CAMetalLayer`. **Main-thread only** — every
-/// field below AppKit's `MainThreadOnly` types makes this `!Send`.
 pub struct CocoaWindow {
-    // `_app` is kept alive for the process; dropping it early would tear down the
-    // shared application. The leading underscore documents "owned, not read".
     _app: Retained<NSApplication>,
     window: Retained<NSWindow>,
     layer: Retained<CAMetalLayer>,
@@ -78,12 +44,6 @@ pub struct CocoaWindow {
 }
 
 impl CocoaWindow {
-    /// Create a titled, resizable window of `w × h` points with a Metal layer
-    /// ready to receive BGRA frames.
-    ///
-    /// Returns `None` off the main thread or when no Metal device exists
-    /// (headless CI) — the live path then fails cleanly and callers fall back to
-    /// the headless [`CocoaPresenter`].
     pub fn open(w: u32, h: u32, title: &str) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;
 
@@ -114,9 +74,6 @@ impl CocoaWindow {
         let layer = CAMetalLayer::new();
         layer.setDevice(Some(&device));
         layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
-        // Must be false: we blit *into* the drawable's texture, and a
-        // framebuffer-only drawable rejects a blit destination (the classic
-        // "black window" bug).
         layer.setFramebufferOnly(false);
         layer.setDrawableSize(NSSize::new(w as f64, h as f64));
         let ca: &CALayer = &layer;
@@ -124,7 +81,6 @@ impl CocoaWindow {
 
         window.setContentView(Some(&view));
         window.setTitle(&NSString::from_str(title));
-        // Deliver WM_MOUSEMOVE-worthy moves even when no button is down (W4.6).
         window.setAcceptsMouseMovedEvents(true);
         window.center();
         window.makeKeyAndOrderFront(None);
@@ -133,11 +89,6 @@ impl CocoaWindow {
         Some(CocoaWindow { _app: app, window, layer, device, queue })
     }
 
-    /// Blit one top-down BGRA8 frame (`stride = w * 4`) to the window. A frame
-    /// whose dimensions don't match the layer is presented as-is at its own
-    /// size (the surface is the source of truth; window resize tracking is
-    /// W4.5). Silently returns if the buffer is short or a drawable can't be
-    /// acquired this tick.
     pub fn present(&mut self, bgra: &[u8], w: u32, h: u32) {
         if bgra.len() < (w as usize) * (h as usize) * 4 {
             return;
@@ -186,43 +137,28 @@ impl CocoaWindow {
         cmd.commit();
     }
 
-    /// Borrow the underlying window (e.g. to check `isVisible` in a demo).
     pub fn window(&self) -> &NSWindow {
         &self.window
     }
 
-    /// Update the window's title-bar text.
     pub fn set_title(&self, title: &str) {
         self.window.setTitle(&NSString::from_str(title));
     }
 
-    /// Whether the window is still on screen. Becomes `false` once the user
-    /// clicks the close button (the host turns that into a guest `WM_QUIT`).
     pub fn is_visible(&self) -> bool {
         self.window.isVisible()
     }
 
-    /// Run the current thread's run loop for `seconds`, letting the window draw
-    /// and process events.
     pub fn pump(&self, seconds: f64) {
         pump_runloop(seconds);
     }
 }
 
-/// Run the current thread's run loop for `seconds` (must be the main thread).
-/// The single place the AppKit run loop is ticked — used by the `cocoa-demo`
-/// runner and by [`run_live`]'s window host.
 fn pump_runloop(seconds: f64) {
     let until = NSDate::dateWithTimeIntervalSinceNow(seconds);
     NSRunLoop::currentRunLoop().runUntilDate(&until);
 }
 
-/// Open a live window, blit `bgra` (top-down BGRA8, `stride = w*4`) into it, and
-/// keep it on screen for `hold_secs`, re-presenting as the run loop ticks. The
-/// manual "window appears" runner for W4.4 (`exemu cocoa-demo`).
-///
-/// Errors when there is no main thread / no Metal device (headless), so the CLI
-/// prints a clean message instead of silently doing nothing.
 pub fn run_demo(w: u32, h: u32, title: &str, bgra: &[u8], hold_secs: f64) -> Result<(), String> {
     let mut win = CocoaWindow::open(w, h, title)
         .ok_or("cannot open a Cocoa window (not the main thread, or no Metal device)")?;
@@ -234,11 +170,6 @@ pub fn run_demo(w: u32, h: u32, title: &str, bgra: &[u8], hold_secs: f64) -> Res
     Ok(())
 }
 
-// ============================ native input tap (W4.6) =======================
-
-/// The client-area point (top-left origin, pixels) of a mouse `NSEvent`, mapping
-/// AppKit's bottom-left window coordinates into the guest's top-down space. `None`
-/// when the event has no window (e.g. a system event).
 fn event_client_pos(event: &NSEvent, mtm: MainThreadMarker) -> Option<(i32, i32)> {
     let win = event.window(mtm)?;
     let view = win.contentView()?;
@@ -246,15 +177,10 @@ fn event_client_pos(event: &NSEvent, mtm: MainThreadMarker) -> Option<(i32, i32)
     let p = view.convertPoint_fromView(loc, None);
     let bounds = view.bounds();
     let x = p.x.round() as i32;
-    let y = (bounds.size.height - p.y).round() as i32; // flip bottom-left → top-left
+    let y = (bounds.size.height - p.y).round() as i32;
     Some((x, y))
 }
 
-/// The Windows virtual-key code for a key `NSEvent`, or `None` for a key exemu
-/// does not map. Alphanumerics derive from the character (VK_A..VK_Z = 0x41..0x5A,
-/// VK_0..VK_9 = 0x30..0x39 == the uppercase ASCII code); control/navigation keys
-/// come from the macOS virtual keycode. Unmapped keys are dropped rather than
-/// delivered with a wrong code.
 fn event_vk(event: &NSEvent) -> Option<u32> {
     if let Some(s) = event.charactersIgnoringModifiers() {
         if let Some(c) = s.to_string().chars().next() {
@@ -265,22 +191,20 @@ fn event_vk(event: &NSEvent) -> Option<u32> {
         }
     }
     let vk = match event.keyCode() {
-        0x24 => 0x0D, // Return   → VK_RETURN
-        0x30 => 0x09, // Tab      → VK_TAB
-        0x31 => 0x20, // Space    → VK_SPACE
-        0x33 => 0x08, // Delete   → VK_BACK
-        0x35 => 0x1B, // Escape   → VK_ESCAPE
-        0x7B => 0x25, // Left     → VK_LEFT
-        0x7C => 0x27, // Right    → VK_RIGHT
-        0x7D => 0x28, // Down     → VK_DOWN
-        0x7E => 0x26, // Up       → VK_UP
+        0x24 => 0x0D,
+        0x30 => 0x09,
+        0x31 => 0x20,
+        0x33 => 0x08,
+        0x35 => 0x1B,
+        0x7B => 0x25,
+        0x7C => 0x27,
+        0x7D => 0x28,
+        0x7E => 0x26,
         _ => return None,
     };
     Some(vk)
 }
 
-/// Translate one native `NSEvent` into the [`InputEvent`] the guest pump expects,
-/// or `None` for events exemu does not forward (window drags, system events, …).
 fn translate_event(event: &NSEvent, mtm: MainThreadMarker) -> Option<InputEvent> {
     let mouse = |button, down| {
         event_client_pos(event, mtm).map(|(x, y)| InputEvent::MouseButton { button, down, x, y })
@@ -299,21 +223,12 @@ fn translate_event(event: &NSEvent, mtm: MainThreadMarker) -> Option<InputEvent>
     }
 }
 
-/// Pump native `NSEvent`s for up to `seconds`: block for the first event, then
-/// drain the rest without blocking. Each is translated and forwarded to the guest
-/// over `input_tx` (so its `NtUserGetMessage` wakes and its WndProc sees the
-/// input) and then handed to AppKit via `sendEvent` so the window keeps its normal
-/// behaviour (dragging, the close button, key focus). This *is* the run-loop tick
-/// for the live host — it replaces a bare `runUntilDate` so no event slips past
-/// the tap. Off the main thread (no `NSApplication`) it falls back to a plain
-/// run-loop pump. (roadmap W4.6)
 fn pump_events(input_tx: &Sender<InputEvent>, seconds: f64) {
     let Some(mtm) = MainThreadMarker::new() else {
         pump_runloop(seconds);
         return;
     };
     let app = NSApplication::sharedApplication(mtm);
-    // Block up to `seconds` for the first event; poll (distantPast) thereafter.
     let mut until = NSDate::dateWithTimeIntervalSinceNow(seconds);
     loop {
         let event = unsafe {
@@ -333,29 +248,20 @@ fn pump_events(input_tx: &Sender<InputEvent>, seconds: f64) {
     }
 }
 
-// ============================ main → window host ============================
-
-/// The main-thread consumer of [`WindowCommand`]s: it owns one [`CocoaWindow`]
-/// per guest HWND and applies each command as it arrives. **Main-thread only**
-/// (holds `CocoaWindow`s). This is the receiving half of the W4.5 split; the
-/// interpreter thread produces commands via [`CocoaPresenter::with_channel`].
 #[derive(Default)]
 pub struct WindowHost {
     windows: HashMap<u32, CocoaWindow>,
 }
 
 impl WindowHost {
-    /// A host owning no windows yet.
     pub fn new() -> Self {
         WindowHost::default()
     }
 
-    /// True once every window has been destroyed (nothing left to keep alive).
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty()
     }
 
-    /// Ensure a window exists for `hwnd`, opening one of `w × h` if not.
     fn ensure(&mut self, hwnd: u32, w: u32, h: u32, title: &str) {
         if let std::collections::hash_map::Entry::Vacant(slot) = self.windows.entry(hwnd) {
             if let Some(win) = CocoaWindow::open(w.max(1), h.max(1), title) {
@@ -364,7 +270,6 @@ impl WindowHost {
         }
     }
 
-    /// Apply one command to the live windows.
     pub fn apply(&mut self, cmd: WindowCommand) {
         match cmd {
             WindowCommand::Create { hwnd, w, h, ref title, .. } => self.ensure(hwnd, w, h, title),
@@ -373,8 +278,6 @@ impl WindowHost {
                     win.set_title(title);
                 }
             }
-            // The window is ordered front on open; explicit resize/reposition is
-            // W4.7. Show/Pos are accepted and inert for now.
             WindowCommand::Show { .. } | WindowCommand::Pos { .. } => {}
             WindowCommand::Present { hwnd, w, h, bgra } => {
                 self.ensure(hwnd, w, h, "exemu");
@@ -388,8 +291,6 @@ impl WindowHost {
         }
     }
 
-    /// Drop any window the user has closed, sending a [`InputEvent::Close`] to
-    /// the guest for each so its message pump can quit. Called each host tick.
     pub fn reap_closed(&mut self, input_tx: &Sender<InputEvent>) {
         let closed: Vec<u32> =
             self.windows.iter().filter(|(_, w)| !w.is_visible()).map(|(h, _)| *h).collect();
@@ -400,20 +301,6 @@ impl WindowHost {
     }
 }
 
-/// The main-thread window host loop (roadmap W4.5). Drain `cmd_rx`, applying
-/// each [`WindowCommand`] to native windows, tick the AppKit run loop between
-/// polls, and forward window-close back to the guest over `input_tx` (so a
-/// blocking `NtUserGetMessage` wakes and the guest quits). Returns once the
-/// command sender is dropped — the interpreter thread finished — after showing
-/// any surviving window for up to `linger_secs`.
-///
-/// A live GUI guest blocks in its message loop until its window is closed, so
-/// this loop runs for the lifetime of the on-screen window. Set
-/// `EXEMU_COCOA_MAX_MS` to auto-close after that many milliseconds — a safety
-/// valve for headless/CI runs where no one clicks the close button.
-///
-/// MUST be called on the main thread; `CocoaWindow::open` yields `None`
-/// otherwise and the host quietly draws nothing.
 pub fn run_live(
     cmd_rx: std::sync::mpsc::Receiver<WindowCommand>,
     input_tx: Sender<InputEvent>,
@@ -440,25 +327,15 @@ pub fn run_live(
                     }
                 }
             }
-            Err(TryRecvError::Disconnected) => break, // the guest exited
+            Err(TryRecvError::Disconnected) => break,
         }
     }
-    // The guest has exited; keep its window(s) visible briefly.
     let linger_start = std::time::Instant::now();
     while !host.is_empty() && linger_start.elapsed().as_secs_f64() < linger_secs {
         pump_runloop(0.02);
     }
 }
 
-// ============================ metal round-trip ==============================
-
-/// Upload `bgra` (top-down BGRA8, `stride = w*4`) into a `BGRA8Unorm`
-/// `MTLTexture` and read it straight back, returning the round-tripped BGRA
-/// bytes. Proves the live Metal texture path is pixel-lossless — the parity gate
-/// swaps this to RGBA and compares against [`bgra_to_rgba`].
-///
-/// Returns `None` when no Metal device is available (headless CI) so the gate
-/// can skip rather than fail.
 pub fn metal_bgra_roundtrip(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     let n = (w as usize) * (h as usize) * 4;
     if bgra.len() < n {
@@ -474,8 +351,6 @@ pub fn metal_bgra_roundtrip(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
             false,
         )
     };
-    // Shared storage keeps the texture CPU-readable so getBytes works on both
-    // Apple-silicon and Intel GPUs.
     desc.setStorageMode(MTLStorageMode::Shared);
     desc.setUsage(MTLTextureUsage::ShaderRead);
     let tex = device.newTextureWithDescriptor(&desc)?;
@@ -503,60 +378,30 @@ pub fn metal_bgra_roundtrip(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     Some(out)
 }
 
-// ============================ interp → main channel =========================
-
-/// A window-lifecycle command sent from the interpreter thread (where the
-/// win32k handlers run) to the main thread (which owns AppKit). This is the
-/// `Send` half of the W4.5 split: [`CocoaPresenter`] emits these as a guest
-/// drives windows; the main-thread window host (W4.5b) applies them to
-/// [`CocoaWindow`]s. Every variant is plain data — no AppKit/Metal handle
-/// crosses the channel.
 #[derive(Debug, Clone)]
 pub enum WindowCommand {
-    /// A top-level window was created at `(x, y)` with a `w × h` window rect.
     Create { hwnd: u32, x: i32, y: i32, w: u32, h: u32, title: String },
-    /// The window's title bar text changed.
     SetTitle { hwnd: u32, title: String },
-    /// `ShowWindow(hwnd, cmd)` — `cmd` is the `SW_*` constant.
     Show { hwnd: u32, cmd: i32 },
-    /// The window moved/resized to `rect` = `[x, y, cx, cy]`.
     Pos { hwnd: u32, rect: [i32; 4] },
-    /// Present one top-down BGRA8 frame (`stride = w*4`) — fire-and-forget.
     Present { hwnd: u32, w: u32, h: u32, bgra: Vec<u8> },
-    /// The window was destroyed; the host should drop its `CocoaWindow`.
     Destroy { hwnd: u32 },
 }
 
-// ============================ CocoaPresenter (Send) =========================
-
-/// One retained frame: RGBA8, tightly packed, plus its dimensions.
 struct Frame {
     w: u32,
     h: u32,
     rgba: Vec<u8>,
 }
 
-/// The `Send` driver-side presenter for the Cocoa path.
-///
-/// Holds no AppKit/Metal handles, so it stays `Send` and runs on the
-/// interpreter thread. It renders each surface with the shared
-/// [`bgra_to_rgba`] transform — the identical pixels a [`CocoaWindow`] would
-/// show — retaining the last RGBA frame per HWND and, when a directory is set,
-/// writing it to PNG. This is the headless half of the W4.5 split (which adds
-/// the channel to a main-thread window) and the subject of the parity gate.
 pub struct CocoaPresenter {
     dir: Option<PathBuf>,
     frame_count: u64,
     last: HashMap<u32, Frame>,
-    /// When set (the live W4.5 path), window-lifecycle calls are forwarded to
-    /// the main-thread window host as [`WindowCommand`]s instead of, or in
-    /// addition to, the headless PNG/last-frame behaviour.
     tx: Option<Sender<WindowCommand>>,
 }
 
 impl CocoaPresenter {
-    /// Build a presenter. When `dir` is `Some`, each flushed frame is written as
-    /// a PNG; the last frame is always retained in memory for inspection.
     pub fn with_dir(dir: Option<impl Into<PathBuf>>) -> Self {
         let dir = dir.map(|d| {
             let p = d.into();
@@ -566,25 +411,18 @@ impl CocoaPresenter {
         CocoaPresenter { dir, frame_count: 0, last: HashMap::new(), tx: None }
     }
 
-    /// Build a presenter that forwards every window-lifecycle event to a
-    /// main-thread window host over `tx` (the W4.5 live path). No PNGs are
-    /// written; the last RGBA frame is still retained for inspection.
     pub fn with_channel(tx: Sender<WindowCommand>) -> Self {
         CocoaPresenter { dir: None, frame_count: 0, last: HashMap::new(), tx: Some(tx) }
     }
 
-    /// Total frames flushed across all HWNDs.
     pub fn frame_count(&self) -> u64 {
         self.frame_count
     }
 
-    /// The last presented frame for `hwnd` as `(rgba, w, h)`, if any.
     pub fn last_rgba(&self, hwnd: u32) -> Option<(&[u8], u32, u32)> {
         self.last.get(&hwnd).map(|f| (f.rgba.as_slice(), f.w, f.h))
     }
 
-    /// Forward a command to the main-thread host, ignoring a dropped receiver
-    /// (the window host having gone away just means "nothing to draw to").
     fn send(&self, cmd: WindowCommand) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(cmd);
@@ -618,10 +456,6 @@ impl Presenter for CocoaPresenter {
     }
 }
 
-/// Adapt a [`CocoaPresenter`] to a full [`UserDriver`]. Headless (no channel):
-/// only the surface half matters — `flush_surface` writes a PNG / retains the
-/// frame. Live (with a channel): every window-lifecycle call is forwarded to
-/// the main-thread host as a [`WindowCommand`].
 impl UserDriver for CocoaPresenter {
     fn create_window(&mut self, hwnd: u32, params: &WindowParams) {
         self.send(WindowCommand::Create {
@@ -652,12 +486,10 @@ impl UserDriver for CocoaPresenter {
 
     fn flush_surface(&mut self, hwnd: u32, pixels: &[u8], w: u32, h: u32) {
         if self.tx.is_some() {
-            // Live path: hand the pixels to the main thread; fire-and-forget.
             self.frame_count += 1;
             self.send(WindowCommand::Present { hwnd, w, h, bgra: pixels.to_vec() });
             self.last.insert(hwnd, Frame { w, h, rgba: bgra_to_rgba(pixels) });
         } else {
-            // Headless: Presenter::flush writes the PNG and bumps frame_count.
             <Self as Presenter>::flush(self, hwnd, pixels, w, h);
         }
     }
@@ -667,15 +499,6 @@ impl UserDriver for CocoaPresenter {
     }
 }
 
-/// Rasterize `text` at `px` pixels with CoreText into a top-down 8-bit alpha
-/// coverage mask (roadmap W4.8). Lays the run out in the system "Helvetica" at
-/// `px`, maps characters→glyphs, draws them white-on-black into a grayscale
-/// `CGBitmapContext`, and reads the buffer back (flipped, since CG is bottom-up)
-/// as the coverage the win32k text path composites in the text colour. Returns
-/// `None` on any failure so the caller falls back to the font8x8 stub.
-///
-/// CoreText/CoreGraphics objects here are process-global and thread-safe (no
-/// AppKit `MainThreadOnly` types), so this runs on the interpreter thread.
 fn coretext_rasterize(text: &str, px: u32) -> Option<TextBitmap> {
     if text.is_empty() || px == 0 {
         return None;
@@ -686,7 +509,6 @@ fn coretext_rasterize(text: &str, px: u32) -> Option<TextBitmap> {
     let name = CFString::from_static_str("Helvetica");
     let font = unsafe { CTFont::with_name(&name, px as f64, std::ptr::null()) };
 
-    // Characters → glyph ids (missing glyphs come back as 0 = .notdef; still drawn).
     let mut glyphs = vec![0u16; n];
     unsafe {
         font.glyphs_for_characters(
@@ -696,7 +518,6 @@ fn coretext_rasterize(text: &str, px: u32) -> Option<TextBitmap> {
         );
     }
 
-    // Per-glyph advances → total width; ascent/descent → height + baseline.
     let mut advances = vec![CGSize { width: 0.0, height: 0.0 }; n];
     unsafe {
         font.advances_for_glyphs(
@@ -712,14 +533,11 @@ fn coretext_rasterize(text: &str, px: u32) -> Option<TextBitmap> {
     let width = (total_w.ceil() as usize).max(1);
     let height = ((ascent + descent).ceil() as usize).max(1);
 
-    // Grayscale, 8-bit, no alpha; CG allocates + zero-fills (black) the buffer.
     let space = CGColorSpace::new_device_gray()?;
     let ctx = unsafe {
         CGBitmapContextCreate(std::ptr::null_mut(), width, height, 8, width, Some(&space), 0)
     }?;
 
-    // Positions: CG origin is bottom-left, so the baseline sits `descent` up;
-    // glyphs advance along x from the pen.
     let mut positions = Vec::with_capacity(n);
     let mut pen = 0.0f64;
     for a in &advances {
@@ -727,7 +545,6 @@ fn coretext_rasterize(text: &str, px: u32) -> Option<TextBitmap> {
         pen += a.width;
     }
 
-    // White glyphs on the black ground → the buffer is the coverage directly.
     CGContext::set_gray_fill_color(Some(&ctx), 1.0, 1.0);
     unsafe {
         font.draw_glyphs(
@@ -738,10 +555,6 @@ fn coretext_rasterize(text: &str, px: u32) -> Option<TextBitmap> {
         );
     }
 
-    // Read the coverage out. The bitmap context's buffer is already top-down
-    // (row 0 = the top of the drawn image; CG applies its bottom-left→buffer flip
-    // internally), matching the DIB, so no manual flip. `bytesPerRow == width`
-    // was requested and honoured (a mismatch would skew, not just invert).
     let data = CGBitmapContextGetData(Some(&ctx)) as *const u8;
     if data.is_null() {
         return None;
@@ -755,9 +568,6 @@ mod tests {
     use super::*;
     use crate::OffscreenPresenter;
 
-    /// CoreText rasterizes a real run into non-empty alpha coverage (roadmap
-    /// W4.8): sensible dimensions and at least some covered pixels — proving the
-    /// win32k text path gets true glyphs, not the font8x8 fallback.
     #[test]
     fn coretext_rasterizes_a_run_to_coverage() {
         let tb = coretext_rasterize("Hi!", 16).expect("CoreText rasterizes on macOS");
@@ -766,31 +576,25 @@ mod tests {
         assert_eq!(tb.coverage.len(), (tb.width * tb.height) as usize);
         let covered = tb.coverage.iter().filter(|&&a| a > 0).count();
         assert!(covered > 0, "the glyphs cover some pixels ({covered})");
-        // Anti-aliased edges mean partial (non-0/255) coverage — a real rasterizer,
-        // not the binary font8x8 stub.
         assert!(
             tb.coverage.iter().any(|&a| a > 0 && a < 255),
             "CoreText anti-aliases glyph edges"
         );
-        // Empty string / zero size are rejected (the caller then draws nothing).
         assert!(coretext_rasterize("", 16).is_none());
         assert!(coretext_rasterize("x", 0).is_none());
     }
 
-    /// A 2×2 BGRA frame exercising a non-grayscale colour (so the B/R swap
-    /// actually matters): blue, red, green, gray.
     fn test_frame() -> (Vec<u8>, u32, u32) {
         #[rustfmt::skip]
         let px = vec![
-            255, 0,   0,   255,   // blue  (B=255)
-            0,   0,   255, 255,   // red   (R=255)
-            0,   255, 0,   255,   // green (G=255)
-            60,  60,  60,  255,   // gray
+            255, 0,   0,   255,
+            0,   0,   255, 255,
+            0,   255, 0,   255,
+            60,  60,  60,  255,
         ];
         (px, 2, 2)
     }
 
-    /// Read the single PNG written into `dir`.
     fn only_png(dir: &std::path::Path) -> Vec<u8> {
         let entry = std::fs::read_dir(dir)
             .unwrap()
@@ -813,13 +617,11 @@ mod tests {
         cocoa.flush(1, &bgra, w, h);
         off.flush(1, &bgra, w, h);
 
-        // The literal "PNG parity vs Offscreen" gate: byte-identical files.
         assert_eq!(
             only_png(&cdir),
             only_png(&odir),
             "CocoaPresenter and OffscreenPresenter must write byte-identical PNGs"
         );
-        // …and both equal the ground-truth BGRA→RGBA transform.
         assert_eq!(cocoa.last_rgba(1).unwrap().0, bgra_to_rgba(&bgra).as_slice());
 
         let _ = std::fs::remove_dir_all(&base);
@@ -847,15 +649,14 @@ mod tests {
         };
         p.create_window(7, &params);
         p.set_window_text(7, "world");
-        p.show_window(7, 5); // SW_SHOW
+        p.show_window(7, 5);
         p.window_pos_changed(7, [120, 130, 480, 260]);
         let (bgra, w, h) = test_frame();
         p.flush_surface(7, &bgra, w, h);
         p.destroy_window(7);
 
-        // The live path still retains the last frame (as RGBA) for inspection.
         assert_eq!(p.last_rgba(7).unwrap().0, bgra_to_rgba(&bgra).as_slice());
-        drop(p); // close the sender so the receiver iterator terminates
+        drop(p);
 
         let cmds: Vec<_> = rx.iter().collect();
         assert!(matches!(
@@ -879,9 +680,7 @@ mod tests {
         match metal_bgra_roundtrip(&bgra, w, h) {
             None => eprintln!("SKIP: MTLCreateSystemDefaultDevice returned None (headless/no GPU)"),
             Some(rt) => {
-                // A BGRA8Unorm texture round-trips the surface bit-for-bit…
                 assert_eq!(rt, bgra, "BGRA8Unorm MTLTexture upload/readback is lossless");
-                // …so the pixels a live CocoaWindow shows equal the offscreen PNG.
                 assert_eq!(bgra_to_rgba(&rt), bgra_to_rgba(&bgra));
             }
         }

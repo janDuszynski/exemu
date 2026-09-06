@@ -1,27 +1,8 @@
-//! The interception seam between the CPU and the emulated operating system.
-//!
-//! When the guest calls an imported function (say `kernel32!WriteFile`),
-//! there is no real DLL behind it. The loader instead points the import
-//! table at synthetic "thunk" addresses. Before executing the instruction
-//! at `rip`, the interpreter asks its [`Hooks`] whether that address is one
-//! of those thunks; if so the OS layer services the call natively and
-//! returns to the caller, and the interpreter never decodes anything there.
-
 use crate::cpu::{CpuState, Exit};
 use crate::memory::Memory;
 use crate::Result;
 
-/// Implemented by the OS layer (`exemu-os`). Kept in the domain so the
-/// interpreter can depend on the abstraction rather than the implementation.
 pub trait Hooks {
-    /// Called with the current instruction pointer *before* the interpreter
-    /// decodes anything.
-    ///
-    /// * `Ok(None)` — not intercepted; the interpreter should decode and run
-    ///   the instruction at `rip` normally.
-    /// * `Ok(Some(exit))` — the call was serviced (registers/memory may have
-    ///   been mutated and `rip` advanced past the thunk). The interpreter
-    ///   propagates `exit`.
     fn intercept(
         &mut self,
         rip: u64,
@@ -29,68 +10,21 @@ pub trait Hooks {
         mem: &mut dyn Memory,
     ) -> Result<Option<Exit>>;
 
-    /// Called when the guest executes a native `SYSCALL` (`0F 05`). This is the
-    /// NT-syscall seam: Wine's PE ntdll `Nt*` stubs issue a raw `SYSCALL` whose
-    /// `eax` holds the SSDT index (`index` here); the OS layer indexes the
-    /// service table and runs the native handler (roadmap W2.2/W2.3).
-    ///
-    /// By the time this is called the interpreter has already applied the
-    /// hardware side-effects: return `rip` is in `rcx`, `rflags` is in `r11`,
-    /// and `cpu.rip` points at the instruction *after* the `SYSCALL`. The
-    /// handler reads its arguments from `r10`/`rdx`/`r8`/`r9` (+ the stack for
-    /// args 5+), writes its NTSTATUS to `rax`, and returns an [`Exit`] (normally
-    /// [`Exit::Continue`], which resumes the guest at `rcx`).
-    ///
-    /// The default surfaces the syscall unserviced so a bare CPU (with no OS)
-    /// still terminates cleanly rather than silently swallowing it.
     fn syscall(&mut self, index: u32, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<Exit> {
         let _ = index;
         Ok(Exit::Interrupt(0x80))
     }
 
-    /// Account for `n` guest instructions that ran **without** passing through
-    /// [`Hooks::intercept`] — which is what a compiled JIT block does (roadmap
-    /// W8.3): it executes a whole basic block natively and reports the count
-    /// afterwards.
-    ///
-    /// It exists because `intercept` is not only the thunk seam: the OS layer
-    /// also uses "called once per instruction" as its **timeslice clock**, and a
-    /// JIT that skipped it would let a compute-bound guest thread run
-    /// indefinitely without yielding — the JIT would change *scheduling*, not
-    /// just speed. Callers that run instructions outside the interpreter must
-    /// call this with the number they ran; the accounting is then identical,
-    /// only its granularity is a block instead of an instruction.
-    ///
-    /// Returns `Some(exit)` when the OS layer took an action the caller must
-    /// propagate (a thread switch reports [`Exit::Continue`]). Default: no-op,
-    /// which is correct for any hook with no notion of time.
     fn retire(&mut self, n: u64, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Option<Exit>> {
         let _ = (n, cpu, mem);
         Ok(None)
     }
 
-    /// How many guest instructions may retire before [`Hooks::retire`] *must* be
-    /// called again — the budget a block-chaining JIT (roadmap W8.5) is allowed
-    /// to run without checking in.
-    ///
-    /// This exists so that chaining changes only *speed*, never *when the OS
-    /// layer acts*. The JIT runs compiled blocks back to back and stops at the
-    /// first block boundary at which it has retired this many instructions;
-    /// because that is the same boundary the old block-at-a-time loop would have
-    /// reached with the same running total, timeslice preemption fires at
-    /// **exactly the same instruction** it did before. A hook that returns a
-    /// budget smaller than it needs only makes the JIT check in more often,
-    /// which is always safe; one that returns too large a budget would let the
-    /// guest run past a decision point, which is not.
-    ///
-    /// The default is [`u64::MAX`]: a hook with no notion of time cannot be
-    /// surprised by a longer run.
     fn retire_budget(&self) -> u64 {
         u64::MAX
     }
 }
 
-/// A no-op hook, handy for tests that run raw machine code with no OS.
 pub struct NoHooks;
 
 impl Hooks for NoHooks {

@@ -1,21 +1,3 @@
-//! # exemu-os — the emulated Windows userland
-//!
-//! This crate stands in for `kernel32.dll` (and friends). There are no real
-//! Windows DLLs in the address space; instead every imported symbol is
-//! assigned a unique *thunk address* by [`WinOs::resolve_import`]. The
-//! application writes that address into the guest's Import Address Table.
-//!
-//! When the guest `call`s through the IAT and `rip` lands on a thunk, the
-//! interpreter asks us — via the [`Hooks`] trait — to service it. We read
-//! the arguments per the Windows x64 calling convention, run the call
-//! natively on the host, put the result in `rax`, and simulate the `ret`
-//! back to the caller. The guest never executes a single instruction of the
-//! "DLL".
-//!
-//! The layer depends only on the domain (`exemu-core`); the concrete memory
-//! mapping of thunks, PEB/TEB and the heap arena is arranged by the
-//! application, which passes us the relevant addresses in [`WinConfig`].
-
 #![forbid(unsafe_code)]
 
 mod api;
@@ -43,10 +25,6 @@ mod unixlib;
 mod vm;
 mod win;
 mod win32k;
-/// The recovered win32u / GDI boundary constants (roadmap W4.8) — see
-/// [`win32k::abi`]. Published so `crates/app/tests/win32k_abi.rs` can re-derive
-/// each one from the pinned Wine binaries and assert it against the value the
-/// handlers really use.
 pub use win32k::abi as win32k_abi;
 pub mod winedebug;
 pub mod wow64;
@@ -65,85 +43,30 @@ pub use syscall::SyscallHandler;
 pub use sync::{SignalOp, SyncKind};
 pub use unixlib::{UnixEntry, Unixlib};
 
-/// Addresses and sizes the application hands us so the emulated OS knows
-/// where its thunks, heap and process strings live.
 #[derive(Debug, Clone)]
 pub struct WinConfig {
-    /// Base of the synthetic region where API thunk addresses are handed out.
     pub api_base: u64,
-    /// Bump-allocated heap arena `[heap_base, heap_base + heap_size)`.
     pub heap_base: u64,
     pub heap_size: u64,
-    /// Base the main image is mapped at, reported by `GetModuleHandle(NULL)`.
-    /// Also what attributes an address inside the exe in a fault report — see
-    /// [`WinOs::module_at`], which pairs it with `image_size`/`image_name`.
     pub image_base: u64,
-    /// Pointer to the ASCII / UTF-16 command line (mapped by the app).
     pub cmdline_ptr_a: u64,
     pub cmdline_ptr_w: u64,
-    /// If true, guest console output is echoed to the host stdout/stderr in
-    /// addition to being captured. Tests set this false.
     pub echo: bool,
-    /// If true, unimplemented API calls are logged to the host stderr.
     pub trace: bool,
-    /// Target bitness: true for x86-64 (System V-ish register args), false
-    /// for 32-bit x86 (stdcall/cdecl stack args, callee cleanup).
     pub is_64bit: bool,
-    /// Host directory that roots the guest filesystem. Empty disables file
-    /// I/O (operations then fail as they did before).
     pub sandbox: String,
-    /// The guest path of the running module, reported by GetModuleFileNameW.
     pub module_path_w: String,
-    /// RWX arena where dynamically loaded DLLs are mapped
-    /// `[dll_base, dll_base + dll_size)`.
     pub dll_base: u64,
     pub dll_size: u64,
-    /// Base of the address window from which `VirtualAlloc(NULL, …)` hands out
-    /// fresh reservations (the VM manager bumps upward from here, skipping any
-    /// region already mapped). Must be clear of every other region above.
     pub valloc_base: u64,
-    /// Guest virtual address of the process PEB (mapped by the app behind
-    /// `fs:`/`gs:`). The loader materializes `PEB_LDR_DATA` +
-    /// `LDR_DATA_TABLE_ENTRY` doubly-linked lists in guest memory and stores a
-    /// pointer to the `PEB_LDR_DATA` at `peb_addr + peb_ldr_off`
-    /// (`PEB.Ldr`, roadmap W0.6). Zero disables Ldr materialization.
     pub peb_addr: u64,
-    /// Guest virtual address of the current thread's TEB (behind `gs:`/`fs:`).
-    /// The NT-syscall dispatcher (roadmap W2.3) locates the per-thread
-    /// `syscall_frame` from here. Zero disables the dispatcher's in-TEB frame
-    /// (the host-side save/restore still runs).
     pub teb_base: u64,
-    /// Offset of the `Ldr` field within the PEB (0x18 for 64-bit, 0x0C for
-    /// 32-bit — public winternl.h/ntdef layout).
     pub peb_ldr_off: u64,
-    /// Offset of the `LoaderLock` (`PRTL_CRITICAL_SECTION`) field within the PEB
-    /// (0x110 for 64-bit, 0xA0 for 32-bit — public/community winnt PEB layout).
-    /// The loader seeds a real `RTL_CRITICAL_SECTION` and stores its pointer
-    /// here (roadmap W0.7). Zero disables the field publish (the CS is still
-    /// materialized and used internally).
     pub peb_loaderlock_off: u64,
-    /// Virtual size of the main image (`SizeOfImage`), for its Ldr entry.
     pub image_size: u64,
-    /// Entry-point virtual address of the main image, for its Ldr entry.
     pub image_entry: u64,
-    /// The main image's DLL/base name (e.g. `program.exe`), for its Ldr entry.
     pub image_name: String,
-    /// Host directory holding the pinned Wine PE DLL set
-    /// (`ntdll.dll`/`kernelbase.dll`/`kernel32.dll`/`ucrtbase.dll`, …). When
-    /// `Some` and the full set exists, [`WinOs::load_wine_core`] pre-maps
-    /// **ntdll only** as a **real guest image** (the running image Wine never
-    /// re-maps); Wine's own `loader_init` then loads kernelbase/kernel32/
-    /// ucrtbase from this same directory (roadmap W3.2). `None` (the default)
-    /// keeps every binary on the existing emulated-DLL path, byte-for-byte.
     pub wine_dll_dir: Option<String>,
-    /// Logical DPI reported to a DPI-aware guest by
-    /// `NtUserGetSystemDpiForProcess` and `NtUserCallHwnd`'s
-    /// `GetDpiForWindow` selector (roadmap W9.4, a per-exe profile setting).
-    /// Does **not** reach the `EnumDisplaySettings`/`DEVMODE` device-mode DPI,
-    /// which comes from the installed [`exemu_core::UserDriver`]'s
-    /// `display_mode()` instead and still reports a fixed 96 — see
-    /// `crates/os/src/win32k.rs`'s `write_devmode`. 96 is 100% scaling, the
-    /// same value every caller hardcoded before this field existed.
     pub dpi: u32,
 }
 
@@ -152,7 +75,7 @@ impl Default for WinConfig {
         WinConfig {
             api_base: 0x0000_7EFF_0000_0000,
             heap_base: 0x0000_0002_0000_0000,
-            heap_size: 0x0400_0000, // 64 MiB
+            heap_size: 0x0400_0000,
             image_base: 0x1_4000_0000,
             cmdline_ptr_a: 0,
             cmdline_ptr_w: 0,
@@ -162,8 +85,8 @@ impl Default for WinConfig {
             sandbox: String::new(),
             module_path_w: "C:\\program.exe".into(),
             dll_base: 0x0000_0006_0000_0000,
-            dll_size: 0x0800_0000, // 128 MiB
-            valloc_base: 0x0000_0040_0000_0000, // 256 GiB: between stack and thunks
+            dll_size: 0x0800_0000,
+            valloc_base: 0x0000_0040_0000_0000,
             peb_addr: 0,
             teb_base: 0,
             peb_ldr_off: 0x18,
@@ -177,375 +100,126 @@ impl Default for WinConfig {
     }
 }
 
-/// The emulated Windows OS: thunk registry, process state and API impls.
 pub struct WinOs {
     cfg: WinConfig,
-    /// thunk address → which API it stands for.
     thunks: HashMap<u64, Api>,
-    /// (dll, symbol) → thunk address, so repeated imports share one thunk.
     interned: HashMap<(String, String), u64>,
     next_thunk: u64,
     heap_next: u64,
-    /// Per-allocation size map: guest ptr → allocated byte count (size.max(1)).
-    /// Populated by every heap_alloc call; used by HeapReAlloc to copy only the
-    /// min(old_size, new_size) bytes and by HeapFree for last-block reclaim.
     heap_sizes: HashMap<u64, u64>,
     last_error: u32,
 
-    /// The unimplemented Win32 stubs that have returned 0 to the guest, newest
-    /// first, deduplicated by symbol and capped at [`ZERO_STUB_TRAIL`].
-    ///
-    /// This is the *suspect list* for exemu's most common failure shape: a
-    /// stubbed API returns 0, the guest stores it as a pointer or a function
-    /// pointer, and faults an arbitrary distance later when it dereferences or
-    /// calls it. The fault itself carries no trace of where the zero came from —
-    /// `rip=0`, or a write through a NULL base plus a small field offset — so
-    /// without this the only way to find the source is to guess which stub was
-    /// wrong. See [`WinOs::zero_returning_stubs`].
     zero_stubs: Vec<String>,
 
-    /// The `VirtualAlloc` family's reservations (sorted by base). Each entry
-    /// tracks the nominal `PAGE_*` protection and commit state so `VirtualQuery`
-    /// and `VirtualProtect` report honest values even though the backing memory
-    /// is mapped permissively (RWX) — see [`crate::vm`].
     vm_allocs: Vec<vm::VmAlloc>,
-    /// Bump hint for the next `VirtualAlloc(NULL, …)` reservation.
     valloc_next: u64,
 
-    /// Thunk address whose interception drives sequential `_initterm`
-    /// callbacks (see [`api::InittermFrame`]).
     initterm_driver: u64,
-    /// Active `_initterm` invocations (a stack, since a constructor may
-    /// itself trigger another `_initterm`).
     initterm_stack: Vec<api::InittermFrame>,
 
-    /// Thunk that drives general guest callbacks (window/dialog procs).
     cb_driver: u64,
-    /// Active guest-callback sequences (see [`api::CbFrame`]).
     cb_stack: Vec<api::CbFrame>,
-    /// Thunk a WndProc invoked from a win32k syscall returns to (roadmap W4.6).
     win32k_cb_driver: u64,
-    /// Resume state of win32k syscalls that are mid-WndProc (see
-    /// [`api::Win32kCbFrame`]); a stack so a WndProc can itself dispatch.
     win32k_cb: Vec<api::Win32kCbFrame>,
-    /// Dialog-control text by control id (single active dialog assumed),
-    /// stored as UTF-16 code units. Backs Get/SetDlgItemTextW & WM_GET/SETTEXT.
     controls: std::collections::HashMap<u32, Vec<u16>>,
-    /// Remaining `WM_NULL` iterations `GetMessageW`/`PeekMessageW` will hand a
-    /// message-loop before reporting `WM_QUIT`, so deferred-work loops run.
     msg_pumps: u32,
 
-    /// The audio boundary's own state — live render streams (roadmap W7.2).
     audio: audio::AudioState,
-    /// The host audio backend the mmdevapi driver unixlib pushes PCM at.
-    /// `NoAudio` (accept-and-drop) is the default, which is what a headless run
-    /// and a machine with no audio device get; the application layer injects a
-    /// real one, mirroring `set_driver`.
     audio_sink: Box<dyn exemu_core::AudioSink>,
 
-    /// The windowing backend (NoGui = headless auto-drive).
     gui: Box<dyn exemu_core::Gui>,
-    /// The W4.2 display driver (NoDriver = headless/emulated-corpus default).
-    /// win32k handlers call through this to create, show, and destroy native
-    /// windows; the concrete impl is injected by the application layer, mirroring
-    /// `set_gui` (roadmap W4.2).
     driver: Box<dyn exemu_core::UserDriver>,
-    /// The main→interpreter input channel (roadmap W4.5c). `None` on every
-    /// headless/console/emulated-corpus run, where `NtUserGetMessage` keeps its
-    /// return-`WM_QUIT`-immediately behaviour. `Some` on the live Cocoa path: the
-    /// pump drains native input events (window close → `WM_QUIT`) and parks the
-    /// interpreter thread on it when the guest's queue is empty, so the window
-    /// stays live without a busy-spin.
     input: Option<std::sync::mpsc::Receiver<exemu_core::InputEvent>>,
-    /// Dialog templates parsed from the image, by resource id.
     dialogs: std::collections::HashMap<u32, exemu_core::DialogTemplate>,
-    /// The active dialog's procedure and window handle (when a real window is
-    /// shown), and whether the guest posted a quit.
     dlgproc: u64,
     dialog_hwnd: u64,
     quit_posted: bool,
-    /// Set by EndDialog to terminate an active modal dialog loop (the value
-    /// is what DialogBoxParam returns).
     dialog_result: Option<u64>,
-    /// Progress-bar state by control id: (min, max, pos).
     progress: std::collections::HashMap<u32, (i64, i64, i64)>,
-    /// Custom (CreateWindowEx) window + GDI state.
     gdi: gdi::Gdi,
-    /// Dynamically loaded DLLs (LoadLibrary/GetProcAddress).
     dll: dll::Loader,
 
-    /// Open guest file handles → host file objects.
     files: std::collections::HashMap<u64, fs::OpenFile>,
-    /// File handles that name a **directory** → the guest path they opened, so a
-    /// `RootDirectory`-relative `NtCreateFile` and `NtQueryDirectoryFile` (W2.8)
-    /// can resolve the directory. Populated by `NtCreateFile` when the opened
-    /// object is a directory.
     file_dirs: std::collections::HashMap<u64, String>,
-    /// Open directory-enumeration handles (FindFirstFileW / FindNextFileW).
     find_handles: std::collections::HashMap<u64, fs::FindState>,
-    /// Section objects (`NtCreateSection`) by handle: Wine's PE loader creates a
-    /// `SEC_IMAGE` section over a DLL file, maps a view, and reads the image
-    /// back through it (roadmap W2.7). See [`crate::section`].
     sections: HashMap<u64, section::Section>,
-    /// Open sockets by handle (roadmap W7.1). A `SOCKET` is an NT file handle on
-    /// `\Device\Afd`, so these share the one monotonic handle space `NtClose`
-    /// already routes by lookup. See [`crate::net`].
     sockets: HashMap<u64, net::Socket>,
     next_handle: u64,
-    /// Monotonic source of unique temp-file numbers.
     temp_counter: u32,
-    /// Writable backing cells for the CRT global-accessor family (`__p__fmode`
-    /// etc.), one per distinct name, allocated lazily from the heap arena.
     crt_globals: std::collections::HashMap<String, u64>,
 
-    /// Process environment (ordered `name=value` pairs), seeded with a
-    /// plausible Windows environment. Backs the `GetEnvironmentStrings*`,
-    /// `GetEnvironmentVariable*`, `SetEnvironmentVariable*` and
-    /// `ExpandEnvironmentStrings*` families. Kept ordered so successive
-    /// `GetEnvironmentStrings` calls are stable and match `Set` insertions.
     env: Vec<(String, String)>,
 
-    /// Thread-Local Storage index allocation (`TlsAlloc` family): `true` at an
-    /// index means that slot is in use. The *values* are per-thread, held in
-    /// each [`thread::Thread`] (roadmap P3.4), so two threads see independent
-    /// values for the same index.
     tls_alloc: Vec<bool>,
-    /// Fiber-Local Storage index allocation (`FlsAlloc` family) — the same
-    /// model in a separate namespace. The MSVC CRT keeps its per-thread data
-    /// pointer here.
     fls_alloc: Vec<bool>,
-    /// Absolute virtual addresses of the image's TLS callbacks
-    /// (`IMAGE_TLS_DIRECTORY.AddressOfCallBacks`), in order. Seeded by the app
-    /// after the module is mapped (roadmap W0.3). Each is invoked with
-    /// `(hModule, reason, NULL)` at process attach — before the entry point —
-    /// and again at every thread start (`DLL_THREAD_ATTACH`).
     tls_callbacks: Vec<u64>,
 
-    /// In-memory registry hive: full canonical key path → value map.
-    /// Value map: value name → (REG_* type, raw bytes). The default value
-    /// for a key uses the empty string as its name.
     reg_hive: HashMap<String, HashMap<String, (u32, Vec<u8>)>>,
-    /// Open registry handles (HKEY values allocated by RegCreateKeyExW /
-    /// RegOpenKeyExW) → the canonical key path they refer to.
     reg_handles: HashMap<u64, String>,
 
-    /// Kernel synchronization objects (events/mutexes/semaphores/waitable
-    /// timers) by handle value, with real signaling state (roadmap P3.6). See
-    /// [`crate::sync`].
     kobjects: HashMap<u64, sync::KObject>,
-    /// Named-object namespace: object name → handle, so a second
-    /// `Create*`/`Open*` with the same name shares one object (single-instance
-    /// mutexes, shared events).
     named_kobjects: HashMap<String, u64>,
-    /// The thread id `GetCurrentThreadId` reports and mutex ownership uses;
-    /// updated on each context switch to the running thread's id.
     current_tid: u32,
 
-    /// The cooperative-scheduler thread table (roadmap P3.4), see
-    /// [`crate::thread`]. `threads[current]` is the running thread; its saved
-    /// register state is stale (live state is in the interpreter's `CpuState`)
-    /// until it yields. Index 0 is always the main thread.
     threads: Vec<thread::Thread>,
-    /// Index of the currently-running thread in `threads`.
     current: usize,
-    /// Monotonic thread-id source (the main thread is `0x1001`).
     next_tid: u32,
-    /// Thunk a thread's start routine returns to; interception ends the thread
-    /// with the return value as its exit code (the thread analogue of
-    /// `ReturnExit`).
     thread_exit_thunk: u64,
-    /// A new thread's initial `rip` when the image has TLS callbacks: its
-    /// interception fires the `DLL_THREAD_ATTACH` callbacks before the start
-    /// routine (roadmap W0.3).
     thread_tls_thunk: u64,
-    /// Return target the TLS-attach callbacks drain to; its interception seats
-    /// the real `start_routine(parameter)` frame (roadmap W0.3).
     thread_entry_thunk: u64,
-    /// Instruction ticks since the last preemptive yield (timeslice counter).
     sched_ticks: u64,
 
-    /// Process start instant, the zero for `GetTickCount`/`QueryPerformance
-    /// Counter` (roadmap P3.8) on the host-clock path.
     start_time: std::time::Instant,
 
-    /// The process clock (roadmap W9.6). Default [`exemu_core::GuestClock::host`]
-    /// — every time API falls back to `start_time`/`SystemTime::now()`, exactly
-    /// as before. When the deterministic clock is installed (the same handle the
-    /// interpreter retires instructions into), every guest-visible "now" becomes
-    /// a function of the guest's own instruction stream. See [`crate::time`].
     clock: exemu_core::GuestClock,
 
-    /// Captured console output (also echoed to the host when `cfg.echo`).
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
 
-    /// The image's x64 unwind function table (sorted by begin RVA), used by
-    /// `RtlLookupFunctionEntry`/`RtlVirtualUnwind`/exception dispatch. Empty
-    /// for 32-bit images. See [`crate::exc`].
     function_table: Vec<exemu_core::UnwindEntry>,
-    /// Thunk that drives re-entrant exception-handler calls (roadmap P4.3c).
     exc_driver: u64,
-    /// Active exception dispatches (a stack: a handler can raise again).
     exc_stack: Vec<exc::DispatchFrame>,
-    /// The filter installed by `SetUnhandledExceptionFilter`, or 0.
     unhandled_filter: u64,
 
-    /// The NT-syscall dispatcher's SSDT: index → native `Nt*` handler
-    /// (roadmap W2.3). Each `Nt*` group fills its slots in W2.6+; unknown
-    /// indices return `STATUS_NOT_IMPLEMENTED`. See [`crate::syscall`].
     ssdt: syscall::Ssdt,
-    /// The win32k (USER/GDI) SSDT: index → native `NtUser*`/`NtGdi*` handler
-    /// (roadmap W4.1), selected when a syscall index carries the `0x1000` table
-    /// bit (win32u's stubs, 0x1084–0x1601). The W4.1 skeleton fills the
-    /// load-bearing slots; every other index falls to an honest stub. See
-    /// [`crate::win32k`].
     win32k: syscall::Ssdt,
-    /// The win32k unix-backend state (roadmap W4.1): the recorded client-PFN
-    /// table pointer, the window-class registry, and the HWND/HDC handle
-    /// bookkeeping the skeleton hands back. See [`crate::win32k::Win32kState`].
     win32k_state: win32k::Win32kState,
-    /// The mapped `locale.nls` view: `(base, size)`, mapped once on the first
-    /// `NtInitializeNlsFiles` and returned identically thereafter so the ntdll
-    /// `RtlGetLocaleFileMappingAddress` cache stays consistent (roadmap W3.2).
     nls_locale_base: Option<(u64, u64)>,
-    /// Mapped `NtGetNlsSectionPtr` sections, keyed by section **type and id**:
-    /// `(type, id, base, size)`. Cached so a repeated query returns the same
-    /// view — and keyed by the id too because a codepage section (type 0xb) is
-    /// one table *per codepage*, not one per type.
     nls_section_bases: Vec<(u32, u32, u64, u64)>,
-    /// Guest virtual address of the dedicated "unix stack" the dispatcher
-    /// switches to while a native handler runs (roadmap W2.3), and its top
-    /// (initial RSP). Lazily allocated on first syscall; zero until then.
     unix_stack_top: u64,
-    /// The guest RSP captured at the current NT syscall's entry, before the
-    /// unix-stack switch. `Nt*` handlers (W2.6+) read stack args 5+ relative to
-    /// it via [`WinOs::syscall_arg`] while running on the switched stack.
     syscall_guest_rsp: u64,
-    /// Set by an `Nt*` handler that has itself installed the guest resume state
-    /// (e.g. `NtTerminateThread` on the current thread, which switches to
-    /// another thread via the scheduler). When set, the dispatcher skips its
-    /// context restore/return and resumes the guest exactly as the handler left
-    /// it (roadmap W2.9). Cleared at the start of every dispatch.
     syscall_resume_as_is: bool,
-    /// A full 64-bit syscall result, seated by a handler whose value does not fit
-    /// the `u32` NTSTATUS return (roadmap W4.8). The win32k `GetWindowLongPtr` /
-    /// `SetWindowLongPtr` family returns real pointers — a control's instance
-    /// data — which a `u32` would silently truncate. When set, the dispatcher
-    /// puts *this* in RAX after its ordinary context restore, instead of the
-    /// handler's status. Cleared at the start of every dispatch.
     syscall_result64: Option<u64>,
 
-    /// Registered native unixlibs for the `__wine_unix_call` fast path (roadmap
-    /// W2.4). A PE DLL's `unixlib_handle_t` is the index into this `Vec`; the
-    /// `code` it passes indexes the selected [`unixlib::Unixlib::table`]. See
-    /// [`crate::unixlib`].
     unixlibs: Vec<unixlib::Unixlib>,
-    /// Module base → its registered unixlib handle. Backs the
-    /// `NtQueryVirtualMemory(MemoryWineUnixFuncs)` query (roadmap W2.4).
     unixlib_of_module: HashMap<u64, u64>,
-    /// Thunk address of the `__wine_unix_call` fast path (roadmap W2.4), lazily
-    /// allocated by [`WinOs::wine_unix_call_thunk`]; zero until first requested.
     wine_unix_call_thunk: u64,
-    /// Set by [`WinOs::wine_server_call`] when servicing a `select` request that
-    /// blocked (the running thread was switched off via
-    /// [`WinOs::block_and_switch`], roadmap W2.11). The `__wine_unix_call` fast
-    /// path checks it to resume the switched-in thread as-is (no `ret`) instead
-    /// of returning an NTSTATUS to the now-blocked caller — the blocked thread's
-    /// `wine_server_call` re-runs when it is scheduled again and the wait is
-    /// satisfied. Cleared at the start of every unix-call dispatch and every
-    /// `wine_server_call`.
     unix_call_blocked: bool,
-    /// Set per `__wine_unix_call` dispatch from the selected unixlib's
-    /// [`unixlib::Unixlib::wow64`] flag: the caller is a **32-bit** PE half, so
-    /// its `args` block uses 32-bit pointers (roadmap W5.3).
     pub(crate) unix_call_wow64: bool,
 
-    /// When `Some`, the process is exiting: after the currently-driven callback
-    /// queue (the loaded DLLs' `DLL_PROCESS_DETACH` notifications) drains and no
-    /// callback frames remain, terminate the process with this code instead of
-    /// returning to guest code (roadmap W0.7).
     pending_process_exit: Option<i32>,
 
-    /// The exception the guest is currently failing to resolve, and the bound
-    /// that stops exemu re-delivering it for ever (roadmap W5.12). Reset by
-    /// `NtContinue` — see [`crate::exc::ExcChain`].
     exc_chain: exc::ExcChain,
 
-    /// Set when an exception nothing handled ended the process: either the
-    /// guest's own last-resort `NtRaiseException(…, FirstChance = FALSE)` or
-    /// exemu's re-delivery bound. The run loop turns it into a fault report
-    /// naming the ORIGINAL exception rather than a bare exit status.
     unhandled_exception: Option<exc::UnhandledException>,
 
-    /// Set by `NtTerminateProcess` on the current process (roadmap W3.2): the
-    /// syscall dispatcher observes it after the handler returns and yields
-    /// `Exit::ProcessExit(code)` to the run loop instead of returning the
-    /// NTSTATUS to the (now-terminating) guest. Cleared at the start of every
-    /// dispatch.
     pending_syscall_exit: Option<i32>,
 
-    /// Child processes this process created (roadmap W3.5). Each owns the
-    /// process/thread handle pair the guest holds and the create-time snapshot
-    /// needed to run it. See [`crate::process`].
     children: Vec<process::ChildProcess>,
-    /// Monotonic child process/thread id source.
     next_pid: u32,
-    /// The application layer's child-process runner. The default
-    /// [`exemu_core::NoSpawner`] refuses every request, so a build that has not
-    /// wired one in fails `NtCreateUserProcess` with a real NTSTATUS rather than
-    /// handing back a handle to a process that will never run.
     spawner: Box<dyn exemu_core::ProcessSpawner>,
-    /// How deep this process sits in the spawn chain (0 = the top-level
-    /// process). Passed to the spawner so it can bound recursion.
     spawn_depth: u32,
-    /// Why the last child run failed, when it did — surfaced to tests and to the
-    /// parent's stderr so an emulator failure is never mistaken for a guest exit.
     child_failure: Option<String>,
-    /// How many child processes this process has successfully created, ever.
-    /// Monotonic (unlike `children`, which the guest prunes by closing handles),
-    /// so a probe can state "this binary never reached child creation" as a
-    /// measurement rather than an inference from an instruction count.
     children_created: u32,
-    /// The 32-bit `PEB` of a WoW64 process, or 0 when this process is not a
-    /// WoW64 one (roadmap W5.6). Set by the app's WoW64 boot; it is what
-    /// `NtQueryInformationProcess(ProcessWow64Information)` answers with, and
-    /// what makes `NtQuerySystemInformationEx(SystemSupportedProcessor-
-    /// Architectures)` report i386 as the *current* machine — the two queries
-    /// `wow64.dll`'s own process init uses to discover the process it is in.
     wow64_peb32: u64,
-    /// Pre-mapped WoW64 modules (`wow64cpu.dll`, `wow64win.dll`) by lower-cased
-    /// base name → image base (roadmap W5.7). `wow64.dll` reaches them through
-    /// `LdrLoadDll`/`LdrGetDllHandle`, but Wine's own loader never ran on this
-    /// path — exemu mapped them, exactly as it stands in for the Unix side
-    /// elsewhere — so those two entry points answer out of this table.
     wow64_modules: HashMap<String, u64>,
-    /// `ntdll!KiUserCallbackDispatcher` — the address the kernel resumes user
-    /// mode on to run a **client callback** (roadmap W5.10). Zero on a boot that
-    /// has no real ntdll, in which case win32k falls back to the direct call.
     client_cb_dispatcher: u64,
-    /// Whether the guest is currently executing **32-bit** code, published by
-    /// the run loop (roadmap W5.11). The CPU's mode lives in the interpreter,
-    /// not in [`CpuState`], so the scheduler cannot read it — but it has to save
-    /// it with the rest of a thread's state.
     guest_mode32: bool,
-    /// Set by a thread switch: the mode the newly running thread must resume in.
-    /// The run loop takes it and applies it to the CPU.
     pending_mode_switch: Option<bool>,
-    /// The two entry points a fresh **WoW64 thread** is seated on (roadmap
-    /// W5.11), or `None` on a boot that has no Wine WoW64 set.
     wow64_threading: Option<wow64::Wow64Threading>,
-    /// A **sub-4 GiB** scratch region for by-pointer data a 32-bit client
-    /// callback is handed (a `CREATESTRUCTW`). The 64-bit stack of a WoW64
-    /// process lives at `0x10_0000_0000`, so a struct parked there reaches the
-    /// guest as a truncated, unmapped pointer — the exact class of defect this
-    /// phase exists to remove. Allocated lazily, once.
     wow64_cb_scratch: u64,
 }
 
-// Sentinel handle values returned by GetStdHandle and understood by WriteFile.
-/// How many distinct zero-returning stubs [`WinOs::zero_returning_stubs`] keeps.
-/// Long enough that the real culprit is almost always in it, short enough that
-/// a fault report stays readable.
 const ZERO_STUB_TRAIL: usize = 12;
 
 const HANDLE_STDIN: u64 = 0x0C;
@@ -553,12 +227,7 @@ const HANDLE_STDOUT: u64 = 0x10;
 const HANDLE_STDERR: u64 = 0x14;
 const HANDLE_PROCESS_HEAP: u64 = 0x00AB_0000;
 
-/// The id `GetCurrentProcessId` / `ClientId.UniqueProcess` report for the
-/// process exemu is running. Child processes (roadmap W3.5) get ids from a
-/// separate range so a guest can tell them apart.
 pub(crate) const CURRENT_PROCESS_ID: u64 = 0x1000;
-/// First id handed out to a child process; multiples of four, as Windows does,
-/// and clear of [`CURRENT_PROCESS_ID`].
 const FIRST_CHILD_PROCESS_ID: u32 = 0x2000;
 
 impl WinOs {
@@ -660,7 +329,6 @@ impl WinOs {
             wow64_threading: None,
             wow64_cb_scratch: 0,
         };
-        // Reserve the driver thunks up front so their addresses are stable.
         os.initterm_driver = os.alloc_thunk(Api::InittermDriver);
         os.cb_driver = os.alloc_thunk(Api::CallbackDriver);
         os.win32k_cb_driver = os.alloc_thunk(Api::Win32kCbDriver);
@@ -668,47 +336,22 @@ impl WinOs {
         os.thread_exit_thunk = os.alloc_thunk(Api::ThreadExit);
         os.thread_tls_thunk = os.alloc_thunk(Api::ThreadTlsAttach);
         os.thread_entry_thunk = os.alloc_thunk(Api::ThreadStartEntry);
-        // Seat the main thread as thread 0. Its saved register state is a
-        // placeholder (the live state lives in the interpreter) until it yields.
-        // Its TEB is the app-mapped `cfg.teb_base`; the syscall dispatcher and
-        // per-thread `gs` base follow it (roadmap W2.9).
         let mut main_thread = thread::Thread::main(0x1001);
         main_thread.teb_base = os.cfg.teb_base;
         os.threads.push(main_thread);
-        // Seed HKLM/HKCU with values installers commonly probe (roadmap P3.12).
         os.reg_seed();
-        // Install the NtQueryVirtualMemory SSDT slot so a raw guest `SYSCALL`
-        // can answer the `MemoryWineUnixFuncs` unixlib-handle query (roadmap
-        // W2.4). W2.6 broadens it to the other memory-info classes.
         os.set_syscall_handler(
             unixlib::SSDT_NT_QUERY_VIRTUAL_MEMORY,
             unixlib::ssdt_nt_query_virtual_memory,
         );
-        // `NtCallbackReturn` — the way *out* of a client callback (roadmap
-        // W5.10). It is the only NT service whose caller must not be resumed:
-        // it unwinds the kernel's callback frame and puts the guest back in the
-        // syscall the callback interrupted.
         os.set_syscall_handler(wow64::SSDT_NT_CALLBACK_RETURN, api::ssdt_nt_callback_return);
-        // NT memory syscalls (roadmap W2.6): the NTSTATUS/IN-OUT-pointer face of
-        // the VM manager, reached via raw `SYSCALL`. Indices recovered from the
-        // pinned guest ntdll stubs.
         os.set_syscall_handler(vm::SSDT_NT_ALLOCATE_VIRTUAL_MEMORY, vm::ssdt_nt_allocate_virtual_memory);
         os.set_syscall_handler(vm::SSDT_NT_FREE_VIRTUAL_MEMORY, vm::ssdt_nt_free_virtual_memory);
         os.set_syscall_handler(vm::SSDT_NT_PROTECT_VIRTUAL_MEMORY, vm::ssdt_nt_protect_virtual_memory);
-        // Section syscalls (roadmap W2.7 / W3.2): Wine's PE loader maps DLL
-        // images as SEC_IMAGE sections — NtCreateSection(SEC_IMAGE) parses the
-        // PE + stores its RVA layout, NtQuerySection(SectionImageInformation)
-        // answers the image sanity-check, NtMapViewOfSection lays the sections
-        // out un-relocated. Indices recovered from the pinned guest stubs
-        // (`ZwQuerySection` @ RVA 0xf350 `mov eax,0x51`; free, no collision with
-        // `NtResumeThread` 0x52).
         os.set_syscall_handler(section::SSDT_NT_CREATE_SECTION, section::ssdt_nt_create_section);
         os.set_syscall_handler(section::SSDT_NT_QUERY_SECTION, section::ssdt_nt_query_section);
         os.set_syscall_handler(section::SSDT_NT_MAP_VIEW_OF_SECTION, section::ssdt_nt_map_view_of_section);
         os.set_syscall_handler(section::SSDT_NT_UNMAP_VIEW_OF_SECTION, section::ssdt_nt_unmap_view_of_section);
-        // NT file syscalls (roadmap W2.8): the NTSTATUS/IO_STATUS_BLOCK face of
-        // the P3.9 sandbox filesystem. Indices recovered from the pinned guest
-        // ntdll stubs.
         os.set_syscall_handler(fs::SSDT_NT_CREATE_FILE, fs::ssdt_nt_create_file);
         os.set_syscall_handler(fs::SSDT_NT_READ_FILE, fs::ssdt_nt_read_file);
         os.set_syscall_handler(fs::SSDT_NT_WRITE_FILE, fs::ssdt_nt_write_file);
@@ -718,28 +361,13 @@ impl WinOs {
             fs::SSDT_NT_QUERY_VOLUME_INFORMATION_FILE,
             fs::ssdt_nt_query_volume_information_file,
         );
-        // Guest-FS DLL search (roadmap W3.2): the file/attribute/FSCTL syscalls
-        // Wine's `loader_init` → `open_dll_file` issues to find and stat a DLL on
-        // disk before mapping it as a section. Indices from the pinned stubs.
         os.set_syscall_handler(fs::SSDT_NT_OPEN_FILE, fs::ssdt_nt_open_file);
         os.set_syscall_handler(fs::SSDT_NT_QUERY_ATTRIBUTES_FILE, fs::ssdt_nt_query_attributes_file);
         os.set_syscall_handler(fs::SSDT_NT_FS_CONTROL_FILE, fs::ssdt_nt_fs_control_file);
-        // NtClose (roadmap W2.16 DLL-smoke gap): the universal handle closer,
-        // routed by lookup through the shared handle space (files/dirs/finds +
-        // wineserver kernel objects). Index recovered from the pinned guest stub.
         os.set_syscall_handler(fs::SSDT_NT_CLOSE, fs::ssdt_nt_close);
-        // Sockets (roadmap W7.1). One slot covers the whole networking boundary:
-        // Wine's ws2_32 drives bind/listen/connect/accept/send/recv/select
-        // through `NtDeviceIoControlFile` on a `\Device\Afd` handle. See
-        // [`crate::net`] for the recovered IOCTL map.
         os.set_syscall_handler(net::SSDT_NT_DEVICE_IO_CONTROL_FILE, net::ssdt_nt_device_io_control_file);
-        // NT thread/process syscalls (roadmap W2.9): the NTSTATUS face of the
-        // P3.4 scheduler. Indices recovered from the pinned guest ntdll stubs.
         os.set_syscall_handler(thread::SSDT_NT_CREATE_THREAD_EX, thread::ssdt_nt_create_thread_ex);
         os.set_syscall_handler(thread::SSDT_NT_TERMINATE_THREAD, thread::ssdt_nt_terminate_thread);
-        // NtTerminateProcess (roadmap W3.2): ends the whole process with the
-        // given exit status (routes through the dispatcher's Exit::ProcessExit),
-        // servicing both real termination and Wine's crash-cascade path.
         os.set_syscall_handler(thread::SSDT_NT_TERMINATE_PROCESS, thread::ssdt_nt_terminate_process);
         os.set_syscall_handler(thread::SSDT_NT_SUSPEND_THREAD, thread::ssdt_nt_suspend_thread);
         os.set_syscall_handler(thread::SSDT_NT_RESUME_THREAD, thread::ssdt_nt_resume_thread);
@@ -747,27 +375,14 @@ impl WinOs {
             thread::SSDT_NT_QUERY_INFORMATION_THREAD,
             thread::ssdt_nt_query_information_thread,
         );
-        // Child process creation (roadmap W3.5): the path Wine's
-        // `CreateProcessW` → `create_nt_process` actually takes, plus the single
-        // query kernelbase's `GetExitCodeProcess` is made of. See
-        // [`crate::process`].
         os.set_syscall_handler(
             process::SSDT_NT_CREATE_USER_PROCESS,
             process::ssdt_nt_create_user_process,
         );
-        // It also answers the two classes `wow64.dll`'s own process init issues
-        // to discover it is running an i386 guest and to find the 32-bit PEB
-        // (roadmap W5.6) — W3.5 and W5.6 each grew a handler for index 0x19,
-        // and they are merged in `process::`, because a second registration
-        // here would silently replace the first.
         os.set_syscall_handler(
             process::SSDT_NT_QUERY_INFORMATION_PROCESS,
             process::ssdt_nt_query_information_process,
         );
-        // The write half of `ThreadWow64Context` (roadmap W5.7): how every
-        // 32-bit context Wine's WoW64 layer installs — starting with the one
-        // that seats a thread on `ntdll32!LdrInitializeThunk` — reaches the
-        // CPU-reserved area.
         os.set_syscall_handler(
             thread::SSDT_NT_SET_INFORMATION_THREAD,
             thread::ssdt_nt_set_information_thread,
@@ -780,9 +395,6 @@ impl WinOs {
             thread::SSDT_NT_QUERY_SYSTEM_INFORMATION,
             thread::ssdt_nt_query_system_information,
         );
-        // NT sync syscalls (roadmap W2.12): the NTSTATUS face of the P3.6 sync
-        // objects + P3.4 scheduler (REAL blocking, not speculative WAIT_OBJECT_0).
-        // Indices recovered from the pinned guest ntdll stubs.
         os.set_syscall_handler(sync::SSDT_NT_CREATE_EVENT, sync::ssdt_nt_create_event);
         os.set_syscall_handler(sync::SSDT_NT_OPEN_EVENT, sync::ssdt_nt_open_event);
         os.set_syscall_handler(sync::SSDT_NT_SET_EVENT, sync::ssdt_nt_set_event);
@@ -794,160 +406,84 @@ impl WinOs {
             sync::SSDT_NT_WAIT_FOR_MULTIPLE_OBJECTS,
             sync::ssdt_nt_wait_for_multiple_objects,
         );
-        // NT registry syscalls (roadmap W2.13).
         os.set_syscall_handler(reg::SSDT_NT_CREATE_KEY, reg::ssdt_nt_create_key);
         os.set_syscall_handler(reg::SSDT_NT_OPEN_KEY, reg::ssdt_nt_open_key);
         os.set_syscall_handler(reg::SSDT_NT_QUERY_VALUE_KEY, reg::ssdt_nt_query_value_key);
         os.set_syscall_handler(reg::SSDT_NT_SET_VALUE_KEY, reg::ssdt_nt_set_value_key);
         os.set_syscall_handler(reg::SSDT_NT_ENUMERATE_KEY, reg::ssdt_nt_enumerate_key);
         os.set_syscall_handler(reg::SSDT_NT_QUERY_KEY, reg::ssdt_nt_query_key);
-        // The rest of the registry surface Wine's kernelbase `Reg*` layer binds
-        // (roadmap W6.4) — COM's CLSID resolution drives these for real.
         os.set_syscall_handler(reg::SSDT_NT_OPEN_KEY_EX, reg::ssdt_nt_open_key_ex);
         os.set_syscall_handler(reg::SSDT_NT_ENUMERATE_VALUE_KEY, reg::ssdt_nt_enumerate_value_key);
         os.set_syscall_handler(reg::SSDT_NT_DELETE_KEY, reg::ssdt_nt_delete_key);
         os.set_syscall_handler(reg::SSDT_NT_DELETE_VALUE_KEY, reg::ssdt_nt_delete_value_key);
         os.set_syscall_handler(reg::SSDT_NT_FLUSH_KEY, reg::ssdt_nt_flush_key);
-        // NT time syscalls (roadmap W2.14).
         os.set_syscall_handler(time::SSDT_NT_QUERY_SYSTEM_TIME, time::ssdt_nt_query_system_time);
         os.set_syscall_handler(time::SSDT_NT_QUERY_PERFORMANCE_COUNTER, time::ssdt_nt_query_performance_counter);
-        // NT token syscalls (roadmap W6.6) — who the user is.
         os.set_syscall_handler(token::SSDT_NT_OPEN_PROCESS_TOKEN, token::ssdt_nt_open_process_token);
         os.set_syscall_handler(token::SSDT_NT_OPEN_PROCESS_TOKEN_EX, token::ssdt_nt_open_process_token_ex);
         os.set_syscall_handler(token::SSDT_NT_OPEN_THREAD_TOKEN, token::ssdt_nt_open_thread_token);
         os.set_syscall_handler(token::SSDT_NT_OPEN_THREAD_TOKEN_EX, token::ssdt_nt_open_thread_token_ex);
         os.set_syscall_handler(token::SSDT_NT_QUERY_INFORMATION_TOKEN, token::ssdt_nt_query_information_token);
-        // NLS data syscalls (roadmap W3.2): Wine's ntdll `locale_init` /
-        // kernelbase `init_locale` ask the unix side for the unified `locale.nls`
-        // (NtInitializeNlsFiles, behind RtlGetLocaleFileMappingAddress) and the
-        // auxiliary sort/norm/codepage sections (NtGetNlsSectionPtr). Indices
-        // recovered from the pinned guest ntdll stubs. See [`crate::nls`].
         os.set_syscall_handler(nls::SSDT_NT_INITIALIZE_NLS_FILES, nls::ssdt_nt_initialize_nls_files);
         os.set_syscall_handler(nls::SSDT_NT_GET_NLS_SECTION_PTR, nls::ssdt_nt_get_nls_section_ptr);
-        // Process bootstrap (roadmap W3.1): NtContinue is the handoff the
-        // LdrInitializeThunk → signal_start_thread → ZwContinue boot sequence
-        // ends in. Index recovered from the pinned guest ntdll stub (`ZwContinue`
-        // @ RVA 0xf190, `mov eax,0x43`). See [`crate::boot`].
         os.set_syscall_handler(boot::SSDT_NT_CONTINUE, boot::ssdt_nt_continue);
-        // NtRaiseException (roadmap W5.12): the guest's own dispatcher hands an
-        // exception back to the kernel through this. FirstChance = FALSE is the
-        // last resort and terminates the process with the exception — leaving it
-        // unserviced is what made an unhandled fault spin for ever.
         os.set_syscall_handler(exc::SSDT_NT_RAISE_EXCEPTION, exc::ssdt_nt_raise_exception);
-        // win32k (USER/GDI) skeleton (roadmap W4.1): the second SSDT table,
-        // reached only via a guest win32u `SYSCALL` (index carries the `0x1000`
-        // bit). The emulated corpus never issues these, so registering them is
-        // inherently corpus-safe; the win32k table gives Wine's user32/gdi32 PE
-        // code valid-but-inert return values so it stops null-dereferencing the
-        // `NtUser*`/`NtGdi*` results. See [`crate::win32k`].
         win32k::register(&mut os);
         os
     }
 
-    /// Declare this process a **WoW64** one and publish its 32-bit `PEB`
-    /// (roadmap W5.6). Answers `NtQueryInformationProcess(ProcessWow64-
-    /// Information)` and flips `NtQuerySystemInformationEx`'s architecture
-    /// report to "i386 process on an x86-64 machine" — the pair of queries
-    /// `wow64.dll`'s process init uses to discover its own personality.
     pub fn set_wow64_peb32(&mut self, peb32: u64) {
         self.wow64_peb32 = peb32;
     }
 
-    /// Tell the OS layer which mode the CPU is currently executing in, so a
-    /// thread switch can save and restore it (roadmap W5.11). Called by the run
-    /// loop before it lets the guest run; a cheap store, never per instruction.
     pub fn set_guest_mode32(&mut self, mode32: bool) {
         self.guest_mode32 = mode32;
     }
 
-    /// Take the mode a thread switch asks the CPU to resume in, if one happened.
-    /// `Some(true)` = 32-bit compat, `Some(false)` = long mode.
     pub fn take_thread_mode_switch(&mut self) -> Option<bool> {
         self.pending_mode_switch.take()
     }
 
-    /// Publish the two entry points a fresh **WoW64 thread** is seated on
-    /// (roadmap W5.11). Absent, `NtCreateThreadEx` in a WoW64 process fails
-    /// rather than handing the guest a thread it cannot run.
     pub fn set_wow64_threading(&mut self, t: wow64::Wow64Threading) {
         self.wow64_threading = Some(t);
     }
 
-    /// Publish `ntdll!KiUserCallbackDispatcher`, the entry a kernel resumes user
-    /// mode on to run a **client callback** (roadmap W5.10). Without it a WoW64
-    /// process still creates windows, it just cannot deliver their creation
-    /// messages — [`can_call_client`](Self::can_call_client) answers `false`.
     pub fn set_client_callback_dispatcher(&mut self, entry: u64) {
         self.client_cb_dispatcher = entry;
     }
 
-    /// Register a pre-mapped WoW64 module so `wow64.dll`'s `LdrLoadDll` /
-    /// `LdrGetDllHandle` find it (roadmap W5.7). `name` is matched
-    /// case-insensitively against the *base* name of whatever path the caller
-    /// asks for, because `wow64.dll` builds a full `\??\C:\windows\system32\…`
-    /// path before loading.
     pub fn register_wow64_module(&mut self, name: &str, base: u64) {
         self.wow64_modules.insert(name.to_ascii_lowercase(), base);
     }
 
-    /// The base of a registered WoW64 module, or `None`.
     pub(crate) fn wow64_module(&self, name: &str) -> Option<u64> {
         self.wow64_modules.get(&name.to_ascii_lowercase()).copied()
     }
 
-    /// Install the process clock (roadmap W9.6) — the same handle the
-    /// interpreter retires instructions into, so `RDTSC` and the Win32/NT time
-    /// APIs report one consistent "now". Call once, at load time; the default is
-    /// [`exemu_core::GuestClock::host`] (unchanged host-clock behaviour).
     pub fn set_clock(&mut self, clock: exemu_core::GuestClock) {
         self.clock = clock;
     }
 
-    /// The process clock — which mode is in force, and how much virtual time
-    /// has elapsed.
     pub fn clock(&self) -> &exemu_core::GuestClock {
         &self.clock
     }
 
-    /// Hand the emulated OS the image's parsed x64 unwind table so the native
-    /// `Rtl*` exception APIs and exception dispatch can walk guest frames
-    /// (roadmap P4.3). No-op for 32-bit images (the table is empty).
     pub fn set_unwind_table(&mut self, table: Vec<exemu_core::UnwindEntry>) {
         self.function_table = table;
     }
 
-    /// The image's unwind function table (for the app's fault-report backtrace).
     pub fn unwind_table(&self) -> &[exemu_core::UnwindEntry] {
         &self.function_table
     }
 
-    /// Register the main image's TLS callbacks (absolute virtual addresses, in
-    /// `AddressOfCallBacks` order). The app seeds these after mapping the image
-    /// so [`WinOs::start_process`] can invoke them at process attach and every
-    /// new thread runs them at `DLL_THREAD_ATTACH` (roadmap W0.3).
     pub fn set_tls_callbacks(&mut self, callbacks: Vec<u64>) {
         self.tls_callbacks = callbacks;
     }
 
-    /// Allocate a process-wide TLS slot index for the loader (the value the
-    /// Windows loader stores at a module's `AddressOfIndex`). Shares the
-    /// `TlsAlloc` namespace so a later guest `TlsGetValue(index)` is consistent.
     pub fn alloc_tls_index(&mut self) -> u32 {
         self.tls_alloc(false) as u32
     }
 
-    /// Seat the initial CPU state so that, on the next steps, every registered
-    /// TLS callback runs `callback(hModule, DLL_PROCESS_ATTACH, NULL)` **before**
-    /// the entry point — exactly as the Windows loader fires them ahead of the
-    /// process's `AddressOfEntryPoint` (roadmap W0.3).
-    ///
-    /// The app has already pushed the process-exit sentinel as the entry's
-    /// return address (so `rsp` points at it and `[rsp]` is the sentinel). We
-    /// push `entry` beneath it and drive the callbacks with the re-entrant
-    /// callback machinery: when the callback queue drains, control returns to
-    /// `entry` with `rsp` restored to exactly the frame a bare `call entry`
-    /// would have left (the sentinel back on top). With no TLS callbacks this is
-    /// just `rip = entry` — identical to the previous direct jump.
     pub fn start_process(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, entry: u64) -> Result<()> {
         if self.tls_callbacks.is_empty() {
             cpu.rip = entry;
@@ -957,13 +493,8 @@ impl WinOs {
         let calls: Vec<(u64, Vec<u64>)> = self
             .tls_callbacks
             .iter()
-            .map(|&cb| (cb, vec![module, 1 /* DLL_PROCESS_ATTACH */, 0]))
+            .map(|&cb| (cb, vec![module, 1 , 0]))
             .collect();
-        // Push `entry` beneath the already-seated sentinel so the drained
-        // callback queue "returns" to it. `invoke_callbacks` reads the return
-        // address from `[rsp]` and cleans up `argc` stack args after the last
-        // callback; with `argc = 0` the final `rsp` lands one pointer above —
-        // right back on the sentinel — matching a real `call entry`.
         let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
         let sp = cpu.rsp() - ptr;
         if self.cfg.is_64bit {
@@ -972,14 +503,10 @@ impl WinOs {
             mem.write_u32(sp, entry as u32)?;
         }
         cpu.set_rsp(sp);
-        // Drive the callbacks; ignore the (unused) accumulator result of 0.
         self.invoke_callbacks(cpu, mem, calls, 0, 0, false)?;
         Ok(())
     }
 
-    /// Install a windowing backend and the image's dialog templates. With a
-    /// real backend, `CreateDialogParamW` shows a window and the message loop
-    /// blocks on user input instead of auto-driving the Install button.
     pub fn set_gui(
         &mut self,
         gui: Box<dyn exemu_core::Gui>,
@@ -989,45 +516,22 @@ impl WinOs {
         self.dialogs = dialogs;
     }
 
-    /// Install a W4.2 display driver. win32k handlers call through the driver
-    /// for every window-lifecycle event (create, destroy, show, resize, title).
-    ///
-    /// The default is [`exemu_core::NoDriver`] (all-no-ops), which is correct
-    /// for the emulated-corpus path and for headless test runs. The application
-    /// layer injects a real driver (e.g. `RecordingDriver` for tests, or a
-    /// future `CocoaDriver` for live windows) before running the guest.
     pub fn set_driver(&mut self, d: Box<dyn exemu_core::UserDriver>) {
         self.driver = d;
     }
 
-    /// Install a host audio backend (roadmap W7.2). The mmdevapi driver unixlib
-    /// pushes the frames a guest writes through `IAudioRenderClient` at this
-    /// sink. The default is [`exemu_core::NoAudio`] — accept and drop — which
-    /// keeps a run on a machine with no audio device working; the application
-    /// layer injects the CoreAudio backend, or a recording sink for tests.
     pub fn set_audio_sink(&mut self, sink: Box<dyn exemu_core::AudioSink>) {
         self.audio_sink = sink;
     }
 
-    /// Attach the main→interpreter input channel (roadmap W4.5c). With a channel
-    /// present, `NtUserGetMessage` blocks the interpreter thread on real input
-    /// instead of returning `WM_QUIT` immediately, so a live native window stays
-    /// interactive. Injected by the application layer on the Cocoa path only.
     pub fn set_input(&mut self, rx: std::sync::mpsc::Receiver<exemu_core::InputEvent>) {
         self.input = Some(rx);
     }
 
-    /// Whether a live input channel is attached (the Cocoa path). Off this,
-    /// `NtUserGetMessage` keeps its immediate-`WM_QUIT` behaviour.
     fn has_input(&self) -> bool {
         self.input.is_some()
     }
 
-    /// Drain any pending native input events into the running thread's message
-    /// state (roadmap W4.5c/W4.6). `Close` becomes a pending `WM_QUIT`;
-    /// mouse/keyboard events are posted as `WM_*` to the shown window. A
-    /// disconnected channel (the window host went away) also quits, so the guest
-    /// never spins. Returns `true` while an input channel is attached.
     fn drain_input(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
         let Some(rx) = &self.input else { return false };
@@ -1053,15 +557,6 @@ impl WinOs {
         true
     }
 
-    /// Block the interpreter thread until an input event arrives or `timeout`
-    /// elapses, applying whatever arrives (roadmap W4.5c). Used by the message
-    /// pump when the guest's queue is empty. A dropped channel quits the guest.
-    ///
-    /// This is a **host** wait, and deliberately not virtualised (roadmap W9.6):
-    /// it exists only to wait on a human moving a real mouse, so there is no
-    /// deterministic answer to give it. It is inert unless an input channel is
-    /// installed — the headless and corpus paths return immediately — so it
-    /// cannot affect a pinned instruction count.
     fn wait_for_input(&mut self, timeout: std::time::Duration) {
         use std::sync::mpsc::RecvTimeoutError;
         let Some(rx) = &self.input else { return };
@@ -1077,12 +572,10 @@ impl WinOs {
         }
     }
 
-    /// Whether a real (non-headless) window backend is installed and showing.
     fn gui_active(&self) -> bool {
         self.gui.is_open()
     }
 
-    /// Allocate a fresh thunk address bound to `api`.
     fn alloc_thunk(&mut self, api: Api) -> u64 {
         let addr = self.next_thunk;
         self.next_thunk += 8;
@@ -1090,14 +583,7 @@ impl WinOs {
         addr
     }
 
-    /// Assign (or reuse) a thunk address for an imported symbol. The returned
-    /// address is what the loader writes into the IAT slot.
-    ///
-    /// API-set contract names (`api-ms-win-*`, `ext-ms-win-*`) are resolved to
-    /// their host DLL before the look-up so that, e.g.,
-    /// `api-ms-win-crt-runtime-l1-1-0` is treated identically to `ucrtbase`.
     pub fn resolve_import(&mut self, dll: &str, symbol: &ImportSymbol) -> u64 {
-        // Resolve API-set virtual name → concrete host DLL if applicable.
         let dll_cow: std::borrow::Cow<str> = match exemu_loader::resolve_api_set(dll) {
             Some(host) => std::borrow::Cow::Borrowed(host),
             None => std::borrow::Cow::Borrowed(dll),
@@ -1120,17 +606,10 @@ impl WinOs {
         addr
     }
 
-    /// Allocate the sentinel "return address" placed beneath the entry point.
-    /// When the guest's entry function `ret`s to it, the process terminates
-    /// with the code in EAX.
     pub fn exit_thunk(&mut self) -> u64 {
         self.alloc_thunk(Api::ReturnExit)
     }
 
-    /// Address of the `__wine_unix_call` fast-path thunk (roadmap W2.4). The
-    /// loader stores this in ntdll's `__wine_unix_call_dispatcher` pointer so the
-    /// guest's indirect `call` lands on the intercepted native handler. Allocated
-    /// once; subsequent calls return the same stable address.
     pub fn wine_unix_call_thunk(&mut self) -> u64 {
         if self.wine_unix_call_thunk == 0 {
             self.wine_unix_call_thunk = self.alloc_thunk(Api::WineUnixCall);
@@ -1138,8 +617,6 @@ impl WinOs {
         self.wine_unix_call_thunk
     }
 
-    /// Record that the unimplemented stub for `sym` just handed the guest a 0.
-    /// Newest first, one entry per symbol, capped at [`ZERO_STUB_TRAIL`].
     pub(crate) fn note_zero_returning_stub(&mut self, sym: &str) {
         if let Some(i) = self.zero_stubs.iter().position(|s| s == sym) {
             self.zero_stubs.remove(i);
@@ -1148,26 +625,14 @@ impl WinOs {
         self.zero_stubs.truncate(ZERO_STUB_TRAIL);
     }
 
-    /// The unimplemented Win32 stubs that returned 0 to the guest, newest first.
-    ///
-    /// When a run dies on a NULL dereference or a call through a NULL pointer,
-    /// one of these is very often the source — that is the whole shape of the
-    /// defect (`knowledge/known-issues.know`). The fault reporter prints them
-    /// so the search starts from a list of named suspects instead of nothing.
     pub fn zero_returning_stubs(&self) -> &[String] {
         &self.zero_stubs
     }
 
-    /// Range `[start, end)` of assigned thunk addresses, so the application
-    /// can (optionally) reserve it in the memory map.
     pub fn thunk_range(&self) -> (u64, u64) {
         (self.cfg.api_base, self.next_thunk)
     }
 
-    /// Reverse-lookup: which imported `dll!symbol` a thunk address belongs to.
-    /// Used to produce a precise diagnostic when the guest dereferences an
-    /// import thunk as data (i.e. the symbol was a data export, not a
-    /// function).
     pub fn symbol_for_thunk(&self, addr: u64) -> Option<String> {
         self.interned
             .iter()
@@ -1175,23 +640,13 @@ impl WinOs {
             .map(|((dll, name), _)| format!("{dll}!{name}"))
     }
 
-    /// Captured standard output produced by the guest.
     pub fn captured_stdout(&self) -> &[u8] {
         &self.stdout_buf
     }
-    /// Captured standard error produced by the guest.
     pub fn captured_stderr(&self) -> &[u8] {
         &self.stderr_buf
     }
 
-    // ---- calling-convention helpers --------------------------------------
-
-    /// Integer/pointer argument `i` (0-based) at API entry.
-    ///
-    /// * x86-64: RCX/RDX/R8/R9, then the stack above the 32-byte shadow space.
-    /// * x86-32: all arguments are 4-byte stack slots at `[esp+4 + i*4]`
-    ///   (`[esp]` is the return address). This holds for both stdcall and
-    ///   cdecl — they differ only in who cleans up.
     fn arg(&self, cpu: &CpuState, mem: &dyn Memory, i: usize) -> Result<u64> {
         if self.cfg.is_64bit {
             Ok(match i {
@@ -1206,7 +661,6 @@ impl WinOs {
         }
     }
 
-    /// Read a pointer-sized value (4 bytes in 32-bit mode, 8 in 64-bit).
     pub(crate) fn read_ptr(&self, mem: &dyn Memory, addr: u64) -> Result<u64> {
         if self.cfg.is_64bit {
             mem.read_u64(addr)
@@ -1215,7 +669,6 @@ impl WinOs {
         }
     }
 
-    /// Write a pointer-sized value (4 bytes in 32-bit mode, 8 in 64-bit).
     pub(crate) fn write_ptr(&self, mem: &mut dyn Memory, addr: u64, val: u64) -> Result<()> {
         if self.cfg.is_64bit {
             mem.write_u64(addr, val)
@@ -1224,9 +677,6 @@ impl WinOs {
         }
     }
 
-    /// Simulate the callee's `ret`: pop the return address into `rip`, and in
-    /// 32-bit mode additionally clean `stack_args * 4` bytes off the stack for
-    /// stdcall functions (the Win32 default). 64-bit callers clean their own.
     fn ret(&self, cpu: &mut CpuState, mem: &dyn Memory, stack_args: u32) -> Result<()> {
         let sp = cpu.rsp();
         if self.cfg.is_64bit {
@@ -1239,23 +689,16 @@ impl WinOs {
         Ok(())
     }
 
-    /// Replace the process environment (roadmap W3.5): a child process inherits
-    /// the block its parent built, so the application layer seeds it here rather
-    /// than letting the child start from [`default_environment`]. An empty list
-    /// leaves the default in place.
     pub fn set_environment(&mut self, env: Vec<(String, String)>) {
         if !env.is_empty() {
             self.env = env;
         }
     }
 
-    /// [`WinOs::emit`] under a name the sibling modules can reach (the child
-    /// process runner folds a child's console output into this stream).
     pub(crate) fn emit_bytes(&mut self, is_err: bool, bytes: &[u8]) {
         self.emit(is_err, bytes);
     }
 
-    /// Append console output, echoing to the host if configured.
     fn emit(&mut self, is_err: bool, bytes: &[u8]) {
         use std::io::Write;
         if is_err {
@@ -1272,12 +715,6 @@ impl WinOs {
         }
     }
 
-    /// Bump-allocate `size` bytes from the heap arena (always zero-filled,
-    /// since the arena is mapped zeroed and never reused). Returns 0 (and
-    /// sets ERROR_NOT_ENOUGH_MEMORY) when the arena is exhausted.
-    ///
-    /// Records the allocation in `heap_sizes` so that `HeapReAlloc` can copy
-    /// only the exact old block size, and `HeapFree` can reclaim the last block.
     fn heap_alloc(&mut self, size: u64) -> u64 {
         let align = 16u64;
         let ptr = (self.heap_next + align - 1) & !(align - 1);
@@ -1290,25 +727,17 @@ impl WinOs {
                 ptr
             }
             _ => {
-                self.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+                self.last_error = 8;
                 0
             }
         }
     }
 
-    /// Address of the writable cell backing a CRT global accessor such as
-    /// `__p__fmode`. The C runtime startup does `*__p__fmode() = _fmode;`, so
-    /// the accessor must hand back a real, writable pointer — returning 0
-    /// (the old stub behaviour) makes the guest store through null. Cells are
-    /// pointer-sized, zero-initialised, and stable for the life of the process.
-    /// `_acmdln`/`_wcmdln` are seeded so `__getmainargs` sees the command line.
     pub(crate) fn crt_global(&mut self, mem: &mut dyn Memory, name: &str) -> Result<u64> {
         if let Some(&cell) = self.crt_globals.get(name) {
             return Ok(cell);
         }
         let cell = self.heap_alloc(8);
-        // Seed the command-line accessors; the rest keep their zero default,
-        // which is the correct initial value for _fmode/_commode/argc/etc.
         let seed = match name {
             "__p__acmdln" => self.cfg.cmdline_ptr_a,
             "__p__wcmdln" => self.cfg.cmdline_ptr_w,
@@ -1325,12 +754,6 @@ impl WinOs {
         Ok(cell)
     }
 
-    // ---- Thread/Fiber Local Storage --------------------------------------
-    // Index allocation is process-wide (a slot index is valid in every thread);
-    // the *values* are per-thread, held in each `Thread`, so two threads see
-    // independent values for the same slot. The `fiber` flag selects the TLS or
-    // FLS namespace (independent, as on Windows).
-
     fn tls_alloc_map(&mut self, fiber: bool) -> &mut Vec<bool> {
         if fiber {
             &mut self.fls_alloc
@@ -1339,8 +762,6 @@ impl WinOs {
         }
     }
 
-    /// Reserve a slot index (growing on demand). A fresh slot reads back NULL in
-    /// every thread; free any stale per-thread value at that index first.
     fn tls_alloc(&mut self, fiber: bool) -> u64 {
         let map = self.tls_alloc_map(fiber);
         let idx = match map.iter().position(|used| !*used) {
@@ -1357,19 +778,16 @@ impl WinOs {
         idx as u64
     }
 
-    /// Store a value in the running thread's copy of a slot.
     fn tls_set(&mut self, fiber: bool, index: u64, value: u64) -> bool {
         let cur = self.current;
         self.threads[cur].tls_values(fiber).insert(index, value);
         true
     }
 
-    /// Read the running thread's copy of a slot (NULL if unset).
     fn tls_get(&self, fiber: bool, index: u64) -> u64 {
         self.threads[self.current].tls_values_ref(fiber).get(&index).copied().unwrap_or(0)
     }
 
-    /// Release a slot index and drop its value in every thread.
     fn tls_free(&mut self, fiber: bool, index: u64) -> bool {
         if let Some(used) = self.tls_alloc_map(fiber).get_mut(index as usize) {
             *used = false;
@@ -1380,16 +798,6 @@ impl WinOs {
         true
     }
 
-    // ---- in-memory registry hive ----------------------------------------
-
-    /// Map a predefined HKEY constant to its canonical root name string.
-    ///
-    /// `HKEY_CLASSES_ROOT` is **not** a hive of its own: on Windows (and in
-    /// Wine's kernelbase, whose NT path for it is
-    /// `\Registry\Machine\Software\Classes`) it is a view of the machine's
-    /// class registrations. Mapping it onto that subtree makes the Win32 seam,
-    /// the NT syscalls and the CLSID seed meet on one set of keys, which is
-    /// what COM's class resolution needs (roadmap W6.4).
     fn reg_hkey_root(hkey: u64) -> Option<&'static str> {
         match hkey {
             0x8000_0000 => Some(Self::CLASSES_ROOT),
@@ -1401,9 +809,6 @@ impl WinOs {
         }
     }
 
-    /// Resolve any open HKEY (predefined root or allocated handle) to its
-    /// canonical key-path string. Returns `None` for an unknown handle
-    /// (the caller should return ERROR_INVALID_HANDLE = 6).
     pub(crate) fn reg_resolve(&self, hkey: u64) -> Option<String> {
         if let Some(root) = Self::reg_hkey_root(hkey) {
             return Some(root.to_string());
@@ -1411,9 +816,6 @@ impl WinOs {
         self.reg_handles.get(&hkey).cloned()
     }
 
-    // ---- environment -----------------------------------------------------
-
-    /// Look up an environment variable (case-insensitive, as on Windows).
     pub(crate) fn env_get(&self, name: &str) -> Option<&str> {
         self.env
             .iter()
@@ -1421,7 +823,6 @@ impl WinOs {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Set (or, with `None`, remove) an environment variable, case-insensitively.
     pub(crate) fn env_set(&mut self, name: &str, value: Option<&str>) {
         let pos = self.env.iter().position(|(k, _)| k.eq_ignore_ascii_case(name));
         match (pos, value) {
@@ -1434,7 +835,6 @@ impl WinOs {
         }
     }
 
-    /// The environment block as `name=value\0…\0\0` code units (UTF-16).
     pub(crate) fn env_block_utf16(&self) -> Vec<u16> {
         let mut out = Vec::new();
         for (k, v) in &self.env {
@@ -1443,13 +843,10 @@ impl WinOs {
             out.extend(v.encode_utf16());
             out.push(0);
         }
-        out.push(0); // the block's final terminator
+        out.push(0);
         out
     }
 
-    /// Expand `%VAR%` references in `src`. Unknown variables are left verbatim
-    /// (including the surrounding `%`), matching Windows' behavior. A lone `%`
-    /// with no closing `%` is emitted as-is.
     pub(crate) fn expand_env(&self, src: &str) -> String {
         let mut out = String::new();
         let mut rest = src;
@@ -1462,7 +859,6 @@ impl WinOs {
                     match self.env_get(name) {
                         Some(v) => out.push_str(v),
                         None => {
-                            // Leave the token untouched: %NAME%.
                             out.push('%');
                             out.push_str(name);
                             out.push('%');
@@ -1471,7 +867,6 @@ impl WinOs {
                     rest = &after[close + 1..];
                 }
                 None => {
-                    // No closing '%': emit the remainder literally.
                     out.push('%');
                     out.push_str(after);
                     rest = "";
@@ -1482,7 +877,6 @@ impl WinOs {
         out
     }
 
-    /// The environment block as `name=value\0…\0\0` bytes (ANSI).
     pub(crate) fn env_block_ansi(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for (k, v) in &self.env {
@@ -1496,10 +890,6 @@ impl WinOs {
     }
 }
 
-/// A plausible Windows environment so the C runtime's environment setup
-/// succeeds and programs that read `PATH`/`TEMP`/`USERPROFILE`/etc. behave.
-/// `C:` maps into the sandbox, so these are consistent with the guest
-/// filesystem the emulator presents.
 fn default_environment() -> Vec<(String, String)> {
     [
         ("ALLUSERSPROFILE", "C:\\ProgramData"),
@@ -1533,10 +923,6 @@ fn default_environment() -> Vec<(String, String)> {
 }
 
 impl Hooks for WinOs {
-    /// Timeslice accounting for instructions that ran outside the interpreter
-    /// (a JIT block — roadmap W8.3). Without it a compiled hot loop would never
-    /// reach the preemption check that [`Self::intercept`] performs per
-    /// instruction, and a compute-bound guest thread would starve the others.
     fn retire(&mut self, n: u64, cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<Option<Exit>> {
         if self.preempt_by(cpu, n) {
             return Ok(Some(Exit::Continue));
@@ -1544,34 +930,14 @@ impl Hooks for WinOs {
         Ok(None)
     }
 
-    /// What is left of the running thread's timeslice (roadmap W8.5). The
-    /// chaining JIT stops at the first block boundary at which it has retired
-    /// this many instructions, so [`Self::retire`] — and therefore preemption —
-    /// still happens at the boundary it always did.
     fn retire_budget(&self) -> u64 {
         self.ticks_left()
     }
 
     fn intercept(&mut self, rip: u64, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Option<Exit>> {
-        // Timeslice preemption (roadmap P3.4): with more than one thread, force
-        // a yield every `TIMESLICE` instructions so a CPU-bound thread can't
-        // starve the others. Cheap no-op in the single-threaded case.
         if self.preempt(cpu) {
             return Ok(Some(Exit::Continue));
         }
-        // Fast reject before the hash lookup. Thunk addresses are handed out
-        // **linearly** from `cfg.api_base` (`alloc_thunk` / `resolve_import` are
-        // the only inserters, and both take `next_thunk` then bump it by 8), so
-        // every key in `self.thunks` lies in `[api_base, next_thunk)` — exactly
-        // the range [`WinOs::thunk_range`] already publishes. A `rip` outside it
-        // therefore *cannot* be a thunk, and the compare is equivalent to the
-        // lookup, not an approximation of it.
-        //
-        // This matters because `intercept` runs before **every guest
-        // instruction**: a 7-Zip install is ~4.97e8 instructions, essentially
-        // none of them thunks, so this turns ~5e8 hashes of a `u64` into ~5e8
-        // predictable compares. `next_thunk` only grows, so the guard stays
-        // correct as thunks are allocated mid-run.
         if rip < self.cfg.api_base || rip >= self.next_thunk {
             return Ok(None);
         }
@@ -1587,24 +953,16 @@ impl Hooks for WinOs {
                 if self.cfg.is_64bit {
                     cpu.set_reg(Reg::Rax, value);
                 } else {
-                    cpu.gpr_write(0, 4, value); // eax, upper 32 zeroed
+                    cpu.gpr_write(0, 4, value);
                 }
                 self.ret(cpu, mem, argc)?;
                 Ok(Some(Exit::Continue))
             }
             api::Outcome::Exit(code) => Ok(Some(Exit::ProcessExit(code))),
-            // The handler has already set rip/rsp (e.g. it is driving a
-            // re-entrant guest call); just keep executing.
             api::Outcome::Resume => Ok(Some(Exit::Continue)),
         }
     }
 
-    /// The NT-syscall dispatcher (roadmap W2.3). By the time we are called the
-    /// CPU has already applied the hardware `SYSCALL` side-effects (return
-    /// `rip`→RCX, RFLAGS→R11, `rip` past the instruction). We save the Windows
-    /// context into the TEB `syscall_frame`, switch to a unix stack, index the
-    /// SSDT, call the native `Nt*` handler, then restore the non-volatile set
-    /// and return to the guest at RCX. See [`crate::syscall`].
     fn syscall(&mut self, index: u32, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<Exit> {
         self.dispatch_syscall(index, cpu, mem)
     }

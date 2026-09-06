@@ -1,84 +1,3 @@
-//! W6.2 (second half) — **the comdlg32 file-dialog bridge, measured.**
-//!
-//! The roadmap row leaves the fidelity choice open: pattern-match Wine's
-//! file-dialog window onto a native macOS `NSOpenPanel`, or let Wine render its
-//! own dialog. **This file is the measurement the choice was made on**, and it
-//! pins the answer so it cannot rot.
-//!
-//! ## What is proven here
-//!
-//! 1. [`emulated_path_has_no_file_dialog_at_all`] — the control. exemu
-//!    implements no `GetOpenFileNameW` anywhere: the import resolves to the
-//!    "recognised but unimplemented" thunk, which returns 0 without touching the
-//!    caller's buffer. The sample reports an empty path and exits non-zero. This
-//!    is what gives every Wine-path observation below its meaning.
-//! 2. [`wine_comdlg32_validates_the_openfilenamew_itself`] — **the attribution**.
-//!    A second call with `lStructSize = 0x99` comes back `FALSE` with
-//!    `CommDlgExtendedError() == CDERR_STRUCTSIZE (1)`. exemu has no
-//!    `OPENFILENAMEW` validator of any kind, so a `1` can only have come out of
-//!    Wine's own `GetOpenFileNameW` prologue — the call really is guest code
-//!    from the pinned prefix, not a thunk.
-//! 3. [`wine_get_open_file_name_w_accepts_exactly_two_struct_sizes`] — that
-//!    validator read straight out of the pinned binary, so the constant the
-//!    sample pokes and the code it is supposed to trip are checked against each
-//!    other rather than against a memory of `commdlg.h`.
-//! 4. [`wine_file_dialog_stops_before_it_creates_a_window`] — **the gap, pinned**.
-//!    On the healthy call Wine gets *past* validation and past finding, loading
-//!    and locking its own dialog-template resource — proven by
-//!    `CommDlgExtendedError() == 0`, because `CDERR_FINDRESFAILURE (6)` and
-//!    `CDERR_LOADRESFAILURE (7)` are the codes those two failures set — and then
-//!    `DialogBoxIndirectParamW` does not return TRUE, **without a single window
-//!    reaching the driver**. Those two facts together are the load-bearing
-//!    observation: an extended error of 0 alone would also be consistent with
-//!    "the dialog ran and the user cancelled", and it is the *zero*
-//!    `CreateWindow` calls that says the dialog was never built at all.
-//! 5. [`win32u_publishes_the_indices_the_diagnosis_names`] — the three
-//!    `NtUser*` syscall indices the diagnosis below rests on, recovered from the
-//!    pinned `win32u.dll`'s own export stubs rather than asserted.
-//!
-//! ## The diagnosis, and why it decides the fidelity question
-//!
-//! Tracing the win32u boundary (`EXEMU_W32K_TRACE=1`) through the failing call
-//! shows user32's dialog manager doing exactly what it should — screen DC
-//! (`NtUserGetDC(0)`), dialog font (`NtGdiHfontCreate`), DPI — and then:
-//!
-//! ```text
-//! [w32k] 0x13d1 0x8002 <UNICODE_STRING*> …   NtUserGetAtomName(MAKEINTATOM(32770))
-//! [w32k] 0x13d8 <hinst> <same UNICODE_STRING*> …   NtUserGetClassInfoEx
-//! <nothing more>
-//! ```
-//!
-//! `#32770` is the dialog class, and user32 names it the way Windows does — by
-//! its **well-known integer atom 32770 = 0x8002** — then resolves that atom to a
-//! string with `NtUserGetAtomName` and hands the string to `NtUserGetClassInfoEx`.
-//! exemu's win32k SSDT has **no handler for `NtUserGetAtomName`**, so the
-//! `UNICODE_STRING` comes back empty, the class lookup fails client-side, and
-//! `DialogBoxIndirectParamW` returns -1 before `NtUserCreateWindowEx` is ever
-//! reached. (exemu *does* register `#32770` — see `BUILTIN_CLASSES` in
-//! `crates/os/src/win32k.rs` — but under a `CLASS_ATOM_BASE`-allocated atom,
-//! which is not the atom user32 asks about.)
-//!
-//! That is a **one-handler** gap, and it decides the roadmap row: with a
-//! `NtUserGetAtomName` handler that answers the documented integer-atom rule
-//! (`MAKEINTATOM(n)` → `"#n"`), Wine's own dialog is created — verified
-//! experimentally: `CreateWindow class="#32770" title="Open"`, then
-//! `class="Static" title="Look &in:"`, then `class="ComboBox"`, i.e. Wine's real
-//! file dialog with its real resource-loaded captions, before hitting a
-//! *second*, unrelated problem (the guest stack runs off the bottom during the
-//! nested `WM_NCCREATE`/`WM_CREATE` callbacks the control cascade generates).
-//! A native `NSOpenPanel` would instead need a brand-new intercept seam, its own
-//! `OPENFILENAMEW` marshaller, and would silently drop every OFN semantic
-//! (filters, `OFN_*` flags, hook procs, custom templates, `nFileOffset`/
-//! `nFileExtension`) that Wine's dialog implements for free. **So: let Wine
-//! render it.** The handler and the stack-depth follow-up are OS-layer work.
-//!
-//! **These assertions pin today's behaviour, and will fail loudly the moment it
-//! improves** — deliberately, in the same style as the W6.1 gaps in
-//! `comctl_gate.rs`. When `NtUserGetAtomName` lands, re-baseline this file and
-//! the README table together.
-//!
-//! Skip-guarded on the git-ignored Wine DLL set.
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -93,13 +12,6 @@ fn wine_dlls_present() -> bool {
         && Path::new(WINE_DLLS).join("win32u.dll").exists()
 }
 
-/// A private, empty sandbox for one run, seeded with the file the open dialog is
-/// supposed to come back with.
-///
-/// The shared `$TMPDIR/exemu-sandbox` persists across runs *and* test binaries,
-/// and a guest observes what it finds there — so a gate that pins behaviour must
-/// not share it (this has produced a false failure in `shell_gate` before). The
-/// name carries the pid and a counter so parallel test threads never collide.
 fn seeded_sandbox(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
@@ -107,7 +19,6 @@ fn seeded_sandbox(tag: &str) -> PathBuf {
     let dir =
         std::env::temp_dir().join(format!("exemu-comdlg-gate-{}-{tag}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    // `C:\Users\exemu\Documents` — the sample's `lpstrInitialDir`.
     let docs = dir.join("C").join("Users").join("exemu").join("Documents");
     std::fs::create_dir_all(&docs).expect("seed the sandbox profile tree");
     std::fs::write(docs.join(comdlg_sample::PICK_FILE_NAME), PICK_CONTENT)
@@ -115,12 +26,8 @@ fn seeded_sandbox(tag: &str) -> PathBuf {
     dir
 }
 
-/// The bytes the seeded file holds. The sample prints the first
-/// `RBUF_LEN` bytes it reads back, so this is what a working open path must
-/// surface — and its absence is what proves nothing was opened.
 const PICK_CONTENT: &str = "exemu-comdlg-pick-payload";
 
-/// Parse the sample's `"TAG=value"` report lines.
 fn report(stdout: &[u8]) -> HashMap<String, String> {
     String::from_utf8_lossy(stdout)
         .lines()
@@ -136,25 +43,6 @@ fn num(r: &HashMap<String, String>, k: &str) -> u32 {
     tag(r, k).parse().unwrap_or_else(|_| panic!("{k} is not a number: {:?}", tag(r, k)))
 }
 
-/// **A dialog that reported success must have produced something.** Assert this
-/// on every run, and never read the failure tally without it.
-///
-/// The sample's exit code is its failure count, and for a long time two of its
-/// failure sites were invisible in the printed tags: the `BOOL` each of
-/// `GetOpenFileNameW` and `GetSaveFileNameW` returned. That is exactly where a
-/// regression hid. The tally "improved" from **5 to 3** while all seven reported
-/// tags stayed *byte-identical* — because `DIALOG_DoDialogBox` had started
-/// breaking its modal loop on a manufactured `WM_QUIT` and returning
-/// `dlgInfo->idResult`, which user32 pre-initialises to `IDOK`. Both dialogs
-/// began answering **TRUE with an untouched `lpstrFile`**, and the only visible
-/// consequence was two failures quietly going missing.
-///
-/// **A smaller number is not progress.** A hollow TRUE is strictly *worse* than
-/// the FALSE it replaced: a real application takes an empty `lpstrFile` for a
-/// valid selection and opens whatever the empty path resolves to, where a FALSE
-/// makes it do nothing. So the sample now prints both return values
-/// (`OPENRET` / `SAVERET`) and this function ties each one to what came back —
-/// if a leg says TRUE, its path had better be there.
 fn assert_no_hollow_success(r: &HashMap<String, String>) {
     for (ret, path, who) in [
         (comdlg_sample::TAG_OPEN_RET, comdlg_sample::TAG_OPEN, "GetOpenFileNameW"),
@@ -171,9 +59,6 @@ fn assert_no_hollow_success(r: &HashMap<String, String>) {
     }
 }
 
-/// Run the sample on the Wine boot with a recording driver and a headless,
-/// deterministic message pump (a channel whose sender is dropped at once, the
-/// same shape `comctl_gate` uses — no threads, no timing, no AppKit).
 fn run_on_wine(tag: &str) -> (exemu_app::RunResult, Vec<DriverCall>) {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (tx, rx) = std::sync::mpsc::channel::<exemu_core::InputEvent>();
@@ -195,15 +80,6 @@ fn run_on_wine(tag: &str) -> (exemu_app::RunResult, Vec<DriverCall>) {
     (res, calls)
 }
 
-// ==========================================================================
-// The control: exemu has no file dialog of its own.
-// ==========================================================================
-
-/// exemu implements **no** `comdlg32` function. `GetOpenFileNameW` is a
-/// recognised-but-unimplemented import that returns 0 and never touches the
-/// `OPENFILENAMEW`, so the sample reports an empty path, cannot open it, and
-/// exits non-zero. Every Wine-path observation below is meaningful only against
-/// this.
 #[test]
 fn emulated_path_has_no_file_dialog_at_all() {
     let res = load_and_run(
@@ -225,19 +101,10 @@ fn emulated_path_has_no_file_dialog_at_all() {
     assert_eq!(num(&r, comdlg_sample::TAG_OPEN_RET), 0, "…and the thunk said so, with FALSE");
     assert_eq!(num(&r, comdlg_sample::TAG_SAVE_RET), 0, "…on the save leg too");
     assert_eq!(tag(&r, comdlg_sample::TAG_READ), "", "so there was no path to open");
-    // Four, not the Wine path's five. The arithmetic says why: the open leg
-    // counts a failure for the handle *and* one for the empty read, so a run
-    // that reports both an empty path and an empty read scores 5 only when
-    // `CreateFileW(L"")` fails. Here it does not — the emulated file layer opens
-    // the empty name and reads nothing from it — so this leg contributes one
-    // failure where the Wine path contributes two. Pinned so the difference
-    // stays a known one rather than a surprise.
     assert_eq!(
         res.exit_code, 4,
         "open FALSE + empty path + empty read + save FALSE, and nothing else"
     );
-    // The attribution probe: with no validator anywhere, the deliberately
-    // malformed call reports no error either.
     assert_eq!(
         num(&r, comdlg_sample::TAG_BAD_SIZE),
         0,
@@ -245,17 +112,6 @@ fn emulated_path_has_no_file_dialog_at_all() {
     );
 }
 
-// ==========================================================================
-// Attribution: the call really lands in Wine's own comdlg32.
-// ==========================================================================
-
-/// **The attribution test.** `GetOpenFileNameW` with `lStructSize = 0x99` must
-/// come back `FALSE` with `CommDlgExtendedError() == CDERR_STRUCTSIZE`.
-///
-/// This is the strongest available proof that the guest's `comdlg32` import
-/// binds to Wine's binary and that its code ran: exemu contains no
-/// `OPENFILENAMEW` validator, and the control test above shows the emulated path
-/// reports 0 for exactly the same call.
 #[test]
 fn wine_comdlg32_validates_the_openfilenamew_itself() {
     if !wine_dlls_present() {
@@ -271,8 +127,6 @@ fn wine_comdlg32_validates_the_openfilenamew_itself() {
         comdlg_sample::CDERR_STRUCTSIZE,
         "Wine's own GetOpenFileNameW prologue rejected the malformed OPENFILENAMEW"
     );
-    // The Wine boot really happened: the emulated control needs well under
-    // 10k instructions for the same program.
     assert!(
         res.steps > 1_000_000,
         "the run booted the Wine DLL set (got {} steps)",
@@ -280,14 +134,6 @@ fn wine_comdlg32_validates_the_openfilenamew_itself() {
     );
 }
 
-/// The validator the test above trips, read out of the pinned binary.
-///
-/// `GetOpenFileNameW`'s prologue is `mov eax,[rbx]` / `and eax,0xffffffef` /
-/// `cmp eax,0x88` — i.e. it masks off bit 4 and demands `0x88`, accepting
-/// exactly `0x88` (the pre-Win2000 `OPENFILENAME`) and `0x98` (the current x64
-/// one, which is what [`comdlg_sample::OPENFILENAMEW_SIZE`] is) and nothing
-/// else. Pinning it here means the sample's `BAD_STRUCT_SIZE` and the code it is
-/// meant to trip are checked against each other, not against a remembered header.
 #[test]
 fn wine_get_open_file_name_w_accepts_exactly_two_struct_sizes() {
     if !wine_dlls_present() {
@@ -298,79 +144,17 @@ fn wine_get_open_file_name_w_accepts_exactly_two_struct_sizes() {
     let code = export_bytes(&bytes, "GetOpenFileNameW", 0x40)
         .expect("comdlg32 exports GetOpenFileNameW as code, not a forwarder");
 
-    // `and eax, -0x11` then `cmp eax, 0x88`, in that order, inside the prologue.
     let and_at = find(&code, &[0x83, 0xE0, 0xEF]).expect("the prologue masks lStructSize with ~0x10");
     let cmp_at =
         find(&code, &[0x3D, 0x88, 0x00, 0x00, 0x00]).expect("…and compares the result with 0x88");
     assert!(and_at < cmp_at, "the mask precedes the comparison");
 
-    // Therefore: the two accepted sizes, and the one the sample deliberately
-    // uses to trip the check.
     let accepted = |n: u32| n & !0x10 == 0x88;
     assert!(accepted(comdlg_sample::OPENFILENAMEW_SIZE), "0x98 is accepted");
     assert!(accepted(0x88), "the legacy 0x88 is accepted too");
     assert!(!accepted(comdlg_sample::BAD_STRUCT_SIZE), "0x99 is not — which is the point");
 }
 
-// ==========================================================================
-// The gap, pinned.
-// ==========================================================================
-
-/// **W6.2 as it stands now: Wine builds its whole file dialog, and then nobody
-/// clicks it.** `NtUserGetAtomName` (roadmap W6.2, win32u index 0x13d1) closed
-/// the creation gap this test used to pin — user32's dialog manager names the
-/// dialog class by its integer atom `MAKEINTATOM(32770)`, and with the name
-/// answered, `DialogBoxIndirectParamW` gets all the way through the template.
-///
-/// What that buys, and this test pins:
-///
-/// * **Every control of comdlg32's own template reaches the driver** — the
-///   `#32770` dialog itself plus the `Static`/`ComboBox`/`ToolbarWindow32`/
-///   `ListBox`/`Edit`/`ComboBoxEx32`/`Button` set, from comdlg32's own
-///   resources, as guest code, on both the open and the save leg.
-/// * `CommDlgExtendedError()` stays **0** — no struct, find-resource or
-///   load-resource failure.
-///
-/// * **The modal loop now runs.** With `GetDialogInfo`/`SetDialogInfo`/
-///   `GetDialogProc` serviced (roadmap W6.2), `DIALOG_DoDialogBox` fetches its
-///   `DIALOGINFO` and pumps, where it used to give up before reaching
-///   `NtUserGetMessage` even once.
-///
-/// * **And it is honestly cancelled.** A run with no window host has nobody who
-///   could complete a modal dialog, so exemu closes it rather than letting it
-///   report the `IDOK` it was born with (roadmap W6.2): `WM_CLOSE` first, and
-///   the window destroyed if the dialog does nothing with it. `DIALOG_DoDialogBox`
-///   then takes its "the dialog window is gone" exit and answers **0**, so
-///   `GetOpenFileNameW` returns FALSE with `CommDlgExtendedError() == 0` — a
-///   plain cancel, which is what actually happened.
-///
-/// ## **THE HOLLOW TRUE — the regression this file now makes impossible**
-///
-/// It is worth knowing what the assertions below are guarding against, because
-/// it already happened once. With the modal loop first running and no cancel,
-/// `GetOpenFileNameW` returned **TRUE and meant nothing**: `DIALOG_DoDialogBox`
-/// broke its loop on the `WM_QUIT` exemu manufactures for a hostless run and
-/// returned `dlgInfo->idResult`, which user32 pre-initialises to `IDOK`, so the
-/// call "succeeded" with `lpstrFile` untouched.
-///
-/// The only visible consequence was that the sample's failure tally *improved*
-/// from **5 to 3** while all seven reported tags stayed byte-identical — the two
-/// "the dialog returned FALSE" failures had simply gone missing. **A smaller
-/// number here is not progress**, and a hollow TRUE is worse than the FALSE it
-/// replaces, because a real application takes the empty path for a valid
-/// selection. So: every claim below is made on the returned **path** and the
-/// **bytes read back through it**, the two return values are now printed and
-/// checked against the path by [`assert_no_hollow_success`], and the tally is
-/// pinned *together with* the observables that explain it.
-///
-/// What is still missing, and is the remaining W6.2 work: nobody types a file
-/// name or presses the default button, so the dialog closes with no selection.
-///
-/// A detail worth keeping: `GetSaveFileNameW`'s buffer starts out holding the
-/// name the guest *proposed*, so the guest opens that relative name and writes
-/// to it — landing in the sandbox root — whatever the dialog does. So "a file
-/// was written" is emphatically **not** evidence that the save dialog worked,
-/// which is why the open leg (whose buffer starts empty) carries the claim.
 #[test]
 fn wine_file_dialog_is_built_but_never_completes() {
     if !wine_dlls_present() {
@@ -381,8 +165,6 @@ fn wine_file_dialog_is_built_but_never_completes() {
     let r = report(&res.stdout);
     eprintln!("comdlg wine gap: exit={} steps={} {r:?}", res.exit_code, res.steps);
 
-    // **The load-bearing pair**: "what path came back?" and "what did opening it
-    // read?" — the answer to both is still nothing.
     assert_no_hollow_success(&r);
     assert_eq!(tag(&r, comdlg_sample::TAG_OPEN), "", "GetOpenFileNameW returned no path");
     assert_eq!(tag(&r, comdlg_sample::TAG_READ), "", "so nothing could be opened and read");
@@ -412,18 +194,12 @@ fn wine_file_dialog_is_built_but_never_completes() {
         })
         .collect();
 
-    // The dialog itself, twice: comdlg32 runs the same template for the open
-    // and the save leg. Asserting the count (not just "contains") is what keeps
-    // this honest — one dialog would mean a leg silently stopped failing early.
     assert_eq!(
         created.iter().filter(|c| **c == "#32770").count(),
         2,
         "both legs build comdlg32's own dialog template. Got {created:?}"
     );
 
-    // Controls that can only come from comdlg32's own resources: the file list,
-    // the look-in combo and the shell toolbar are not classes exemu's guest
-    // sample ever registers, so their presence is proof the real template ran.
     for control in ["Static", "ComboBox", "ComboBoxEx32", "ToolbarWindow32", "ListBox", "Edit"] {
         assert!(
             created.contains(&control),
@@ -435,20 +211,6 @@ fn wine_file_dialog_is_built_but_never_completes() {
         "the template's Open/Cancel buttons reach the driver. Got {created:?}"
     );
 
-    // **The tally, tied to the observables above.** With no path in `OPEN`, the
-    // honest failure count is exactly five, and each one is accounted for:
-    //
-    //   1. `GetOpenFileNameW` returned FALSE          → `OPENRET=0`
-    //   2. `lpstrFile` came back empty                → `OPEN=`
-    //   3. `CreateFileW("")` failed                   → (no tag of its own)
-    //   4. nothing was read back                      → `READ=`
-    //   5. `GetSaveFileNameW` returned FALSE          → `SAVERET=0`
-    //
-    // **Anything lower means a dialog reported success without producing
-    // anything** — a hollow TRUE (see the note in the doc comment above), which
-    // is what a 3 here meant the one time it happened. The two return-value
-    // assertions and this count are deliberately redundant: a future change that
-    // makes a dialog "succeed" has to defeat all three at once.
     assert_eq!(num(&r, comdlg_sample::TAG_OPEN_RET), 0, "no path came back, so the answer is FALSE");
     assert_eq!(num(&r, comdlg_sample::TAG_SAVE_RET), 0, "and the save leg cancels the same way");
     assert_eq!(
@@ -458,16 +220,6 @@ fn wine_file_dialog_is_built_but_never_completes() {
     );
 }
 
-// ==========================================================================
-// The syscall indices the diagnosis names, straight from the pinned binary.
-// ==========================================================================
-
-/// `win32u.dll` is a pure syscall shim: every export is
-/// `mov r10,rcx; mov eax,<index>; …; syscall`. Recover the three indices the
-/// diagnosis in the module docs rests on directly from those stubs, so the
-/// numbers quoted in a `EXEMU_W32K_TRACE` transcript can be trusted — and so a
-/// Wine-prefix refresh that renumbers the SSDT fails here instead of silently
-/// invalidating the analysis.
 #[test]
 fn win32u_publishes_the_indices_the_diagnosis_names() {
     if !wine_dlls_present() {
@@ -488,7 +240,6 @@ fn win32u_publishes_the_indices_the_diagnosis_names() {
         Some(0x136b),
         "…and would call next, but never reaches"
     );
-    // Sanity: these are distinct entries in one contiguous NtUser* block.
     let all = [0x13d1u32, 0x13d8, 0x136b];
     assert_eq!(
         all.iter().collect::<std::collections::HashSet<_>>().len(),
@@ -497,12 +248,6 @@ fn win32u_publishes_the_indices_the_diagnosis_names() {
     );
 }
 
-// ==========================================================================
-// Small PE helpers.
-// ==========================================================================
-
-/// Read up to `len` bytes of the code at named export `name` of the PE in
-/// `bytes`, or `None` when the export is missing or is a forwarder.
 fn export_bytes(bytes: &[u8], name: &str, len: usize) -> Option<Vec<u8>> {
     let image = exemu_loader::parse(bytes).ok()?;
     let rva = image
@@ -522,8 +267,6 @@ fn export_bytes(bytes: &[u8], name: &str, len: usize) -> Option<Vec<u8>> {
     None
 }
 
-/// The syscall index a `win32u.dll` stub carries: `4c 8b d1` (`mov r10,rcx`)
-/// then `b8 <imm32>` (`mov eax,index`).
 fn syscall_index(bytes: &[u8], name: &str) -> Option<u32> {
     let code = export_bytes(bytes, name, 16)?;
     if code.len() < 8 || code[0..3] != [0x4C, 0x8B, 0xD1] || code[3] != 0xB8 {
@@ -532,7 +275,6 @@ fn syscall_index(bytes: &[u8], name: &str) -> Option<u32> {
     Some(u32::from_le_bytes([code[4], code[5], code[6], code[7]]))
 }
 
-/// Index of the first occurrence of `needle` in `hay`.
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }

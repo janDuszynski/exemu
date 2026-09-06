@@ -1,10 +1,3 @@
-//! A tiny bounds-checked little-endian cursor over a byte slice.
-//!
-//! PE files are little-endian on every target we care about, and Rust's
-//! `from_le_bytes` makes the reads trivial; this wrapper just adds bounds
-//! checks so a truncated or malicious file yields a clean `InvalidPe` error
-//! instead of a panic.
-
 use exemu_core::{EmuError, Result};
 
 pub struct Reader<'a> {
@@ -26,7 +19,7 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| EmuError::InvalidPe(format!("read of {len} bytes at {off:#x} out of bounds")))
     }
 
-    #[allow(dead_code)] // part of a complete reader API; not every field is 1 byte
+    #[allow(dead_code)]
     pub fn u8(&self, off: usize) -> Result<u8> {
         Ok(self.slice(off, 1)?[0])
     }
@@ -48,13 +41,11 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(arr))
     }
 
-    /// Copy `len` raw bytes out at `off`.
     pub fn bytes(&self, off: usize, len: usize) -> Result<Vec<u8>> {
         Ok(self.slice(off, len)?.to_vec())
     }
 
-    /// Read a NUL-terminated ASCII string starting at `off`.
-    #[allow(dead_code)] // used by string tables the parser may grow into
+    #[allow(dead_code)]
     pub fn cstr(&self, off: usize) -> Result<String> {
         let mut end = off;
         while end < self.data.len() && self.data[end] != 0 {

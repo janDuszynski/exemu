@@ -1,16 +1,3 @@
-//! W4 boot-progress gates under the Wine boot.
-//!
-//! * W4.1: a GUI `.exe` gets **past** the win32k SSDT boundary. Before W4.1,
-//!   Wine's user32/gdi32 null-deref the unserviced `NtUser*/NtGdi*` results
-//!   (fault ~3.37M instr); the win32k skeleton (nonzero class ATOM, HWND/HDC
-//!   handles, 96 DPI, empty message queue) lets them proceed.
-//! * W4.2: the win32k object model marshals the real `CreateWindowEx` /
-//!   `ShowWindow` arguments out of guest memory and pushes them through the
-//!   injected [`exemu_core::UserDriver`] — a `RecordingDriver` observes the
-//!   window the guest actually asked for (class, title, geometry, SW_ cmd).
-//!
-//! Skip-guarded on the git-ignored Wine DLL set.
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -37,11 +24,6 @@ fn gui_sample_passes_win32k_skeleton_on_wine() {
         },
     );
 
-    // Before W4.1, Wine's user32/gdi32 null-deref the unserviced `NtUser*/NtGdi*`
-    // results and the run FAULTS in the win32k layer. With the skeleton second
-    // SSDT table, the GUI sample runs its RegisterClass → CreateWindow →
-    // ShowWindow → message loop to completion and exits cleanly (GetMessage
-    // returns WM_QUIT for now — the real native-event pump is W4.5).
     let res = r.expect("gui_sample should run past the win32k boundary, not fault");
     eprintln!(
         "gui_sample wine boot: exit={} steps={}",
@@ -80,10 +62,6 @@ fn gui_sample_drives_the_user_driver_on_wine() {
     let res = r.expect("gui_sample should run to completion with a driver injected");
     assert_eq!(res.exit_code, 0, "GUI sample exits cleanly with the RecordingDriver");
 
-    // The win32k handlers must marshal the guest's actual CreateWindowExW
-    // arguments (through Wine's user32 → win32u syscall path) and hand them to
-    // the driver: gui_sample asks for "ExemuWindowClass" / "exemu — real GUI
-    // window" at (120, 120) 480×260 with WS_OVERLAPPEDWINDOW, then SW_SHOW=5.
     let calls = log.lock().unwrap();
     let create = calls
         .iter()
@@ -120,8 +98,6 @@ fn gui_sample_paints_and_presents_a_surface_on_wine() {
         return;
     }
 
-    // A unique PNG output directory under the OS temp dir, so PNG presence is a
-    // deterministic assertion without touching the EXEMU_GUI_SHOT env var.
     let shot_dir = std::env::temp_dir().join(format!(
         "exemu-w43-gate-{}-{}",
         std::process::id(),
@@ -132,9 +108,6 @@ fn gui_sample_paints_and_presents_a_surface_on_wine() {
     ));
     let _ = std::fs::remove_dir_all(&shot_dir);
 
-    // Compose the scaffold's drivers: record every UserDriver call for
-    // assertions *and* forward to a PresenterDriver that writes each flushed
-    // frame to a PNG in `shot_dir`.
     let log = Arc::new(Mutex::new(Vec::new()));
     let presenter = OffscreenPresenter::with_dir(Some(shot_dir.clone()));
     let driver = RecordingDriver::with_inner(
@@ -158,8 +131,6 @@ fn gui_sample_paints_and_presents_a_surface_on_wine() {
 
     let calls = log.lock().unwrap();
 
-    // The surface is created for the gui_sample window at its 480×260 client
-    // rect (the geometry gui_sample asks CreateWindowExW for).
     let surface = calls
         .iter()
         .find_map(|c| match c {
@@ -173,9 +144,6 @@ fn gui_sample_paints_and_presents_a_surface_on_wine() {
         "surface allocated at the window's 480×260 client rect"
     );
 
-    // At least one FlushSurface presents those dims with real drawn content:
-    // both the TextOutW glyphs and the Rectangle frame paint black on the white
-    // surface, so non_blank easily clears 200 pixels.
     let flush = calls
         .iter()
         .find_map(|c| match c {
@@ -196,7 +164,6 @@ fn gui_sample_paints_and_presents_a_surface_on_wine() {
         "the text + rectangle frame paint measurable content (non_blank={flush})"
     );
 
-    // The OffscreenPresenter wrote at least one non-empty PNG for the frame.
     let mut png_ok = false;
     if let Ok(entries) = std::fs::read_dir(&shot_dir) {
         for entry in entries.flatten() {
@@ -214,15 +181,6 @@ fn gui_sample_paints_and_presents_a_surface_on_wine() {
     let _ = std::fs::remove_dir_all(&shot_dir);
 }
 
-/// W4.5: the guest drives native windows across the interpreter/main thread
-/// split. The interpreter runs on a spawned thread with a `CocoaPresenter`
-/// whose window commands flow over an mpsc channel; here the *test* thread
-/// stands in for the main-thread window host and drains that channel (real
-/// AppKit is unavailable off the process main thread, so this proves the
-/// plumbing — thread split + channel + clean exit, no deadlock — while the
-/// live NSWindow rendering is covered by `exemu cocoa-demo` / `run --gui
-/// --wine-boot`). Blocking `rx.iter()` returns only once the interpreter
-/// finishes and drops its sender, so a hang here would fail as a timeout.
 #[cfg(target_os = "macos")]
 #[test]
 fn gui_sample_drives_windows_across_the_thread_split_on_wine() {
@@ -248,7 +206,6 @@ fn gui_sample_drives_windows_across_the_thread_split_on_wine() {
         )
     });
 
-    // Stand in for the main-thread window host: collect the whole stream.
     let cmds: Vec<WindowCommand> = rx.iter().collect();
 
     let res = interp
@@ -257,7 +214,6 @@ fn gui_sample_drives_windows_across_the_thread_split_on_wine() {
         .expect("gui_sample runs to completion across the thread split");
     assert_eq!(res.exit_code, 0, "the guest exits cleanly on the split path");
 
-    // A top-level window was created and at least one real frame presented.
     assert!(
         cmds.iter().any(|c| matches!(c, WindowCommand::Create { .. })),
         "the guest's CreateWindowEx reached the main-thread host as a Create command"
@@ -277,11 +233,6 @@ fn gui_sample_drives_windows_across_the_thread_split_on_wine() {
     );
 }
 
-/// W4.5c: with the native input channel attached, a live window **stays up** —
-/// the guest parks in `NtUserGetMessage` instead of quitting, and only exits
-/// once the window is closed. Proves the blocking, non-spinning pump and the
-/// main→interp close→WM_QUIT path (no real AppKit needed: the test stands in for
-/// the host, driving the input channel directly).
 #[cfg(target_os = "macos")]
 #[test]
 fn gui_sample_window_stays_live_until_close_on_wine() {
@@ -312,20 +263,6 @@ fn gui_sample_window_stays_live_until_close_on_wine() {
         )
     });
 
-    // Wait until the window has been shown (a Present crossed the channel).
-    // Do NOT drain-to-completion: the guest will not exit on its own — it parks
-    // in GetMessage waiting for input.
-    // Block on the channel rather than spinning on `try_recv` + sleep: a busy
-    // poll makes the wait itself compete for the CPU the guest needs, which is
-    // how this became load-sensitive. The budget is generous because the whole
-    // Wine boot runs first, and a machine under parallel load has taken well
-    // over 20 s to get here.
-    //
-    // The two ways to fail are distinguished, because they mean opposite things
-    // and the previous single message ("the guest presented its window before we
-    // intervened") described neither: a **disconnect** means the interpreter
-    // thread ended, so join it and surface *its* error, which is the real
-    // diagnosis; a **timeout** means the guest is alive but never presented.
     let deadline = Instant::now() + Duration::from_secs(90);
     let saw_present = loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -350,14 +287,12 @@ fn gui_sample_window_stays_live_until_close_on_wine() {
     };
     assert!(saw_present, "the guest did not present a window within 90 s (it is still running)");
 
-    // The window stays live: the guest is parked in NtUserGetMessage, not exited.
     std::thread::sleep(Duration::from_millis(200));
     assert!(
         !interp.is_finished(),
         "GetMessage blocks (the window stays live) instead of quitting immediately"
     );
 
-    // Close it: the pump wakes, delivers WM_QUIT, and the guest exits cleanly.
     input_tx.send(InputEvent::Close).expect("the interpreter is still listening for input");
     let res = interp
         .join()
@@ -366,13 +301,6 @@ fn gui_sample_window_stays_live_until_close_on_wine() {
     assert_eq!(res.exit_code, 0, "closing the window quits the guest cleanly");
 }
 
-/// W4.6: a synthesized WM_PAINT is dispatched to the guest's WndProc, which
-/// repaints. The interpreter runs on a spawned thread; the test stands in for
-/// the host. gui_sample paints once directly after ShowWindow (present #1), then
-/// its message loop's GetMessage synthesizes a WM_PAINT for the shown window,
-/// DispatchMessage invokes the WndProc, whose WM_PAINT arm BeginPaint/Rectangle/
-/// TextOut/EndPaints — present #2. Seeing a *second* present proves the WndProc
-/// dispatch (the direct-call kernel-callback path) actually ran the guest proc.
 #[cfg(target_os = "macos")]
 #[test]
 fn gui_sample_wm_paint_reaches_the_wndproc_on_wine() {
@@ -403,7 +331,6 @@ fn gui_sample_wm_paint_reaches_the_wndproc_on_wine() {
         )
     });
 
-    // Count presents until the WM_PAINT repaint (#2) has crossed the channel.
     let mut presents = 0;
     let deadline = Instant::now() + Duration::from_secs(25);
     while presents < 2 && Instant::now() < deadline {
@@ -411,7 +338,7 @@ fn gui_sample_wm_paint_reaches_the_wndproc_on_wine() {
             Ok(WindowCommand::Present { .. }) => presents += 1,
             Ok(_) => {}
             Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
-            Err(TryRecvError::Disconnected) => break, // guest exited/crashed early
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     assert!(
@@ -419,7 +346,6 @@ fn gui_sample_wm_paint_reaches_the_wndproc_on_wine() {
         "the WM_PAINT WndProc dispatch produced a second present (saw {presents})"
     );
 
-    // Close the window; the guest exits cleanly through the (now real) pump.
     input_tx.send(InputEvent::Close).expect("the interpreter is still listening for input");
     let res = interp
         .join()
@@ -428,16 +354,6 @@ fn gui_sample_wm_paint_reaches_the_wndproc_on_wine() {
     assert_eq!(res.exit_code, 0, "the guest exits cleanly");
 }
 
-/// W4.6/W4.7: a native mouse click is translated into a `WM_LBUTTONDOWN`,
-/// delivered to the guest's WndProc, which repaints — *at the cursor position*.
-/// After the initial frames (direct paint + synthesized WM_PAINT), an injected
-/// [`InputEvent::MouseButton`] at `(150, 90)` is posted as `WM_LBUTTONDOWN`;
-/// DispatchMessage routes it to the WndProc's click arm, which calls
-/// `GetCursorPos` and draws a rectangle whose top-left is that point (GetDC →
-/// Rectangle → ReleaseDC), a third present. Decoding that frame and finding the
-/// rectangle's edges at `x=150` / `y=90` proves two things at once: native input
-/// reached the guest procedure (W4.6), and `GetCursorPos` returns the tracked
-/// cursor position (W4.7) — had it returned `(0,0)` the frame would be elsewhere.
 #[cfg(target_os = "macos")]
 #[test]
 fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
@@ -471,9 +387,6 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
         )
     });
 
-    // Count presents, injecting a click once the initial frames (#1 direct
-    // paint, #2 synthesized WM_PAINT) have arrived; the click drives present #3,
-    // whose BGRA frame we keep to inspect where the rectangle landed.
     let mut presents = 0;
     let mut clicked = false;
     let mut click_frame: Option<(u32, Vec<u8>)> = None;
@@ -494,7 +407,7 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
             }
             Ok(_) => {}
             Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
-            Err(TryRecvError::Disconnected) => break, // guest exited/crashed early
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     assert!(
@@ -502,20 +415,14 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
         "the injected WM_LBUTTONDOWN reached the WndProc and repainted (saw {presents} presents)"
     );
 
-    // The click rectangle spans (150,90)→(460,250): a black frame whose left edge
-    // is at x=150 and top edge at y=90. Sample one pixel on each edge, clear of
-    // the WM_PAINT text/rectangle content (the left edge below both text lines,
-    // the top edge past the text's right extent), so both cursor coordinates are
-    // pinned to the click and nothing else.
     let (w, bgra) = click_frame.expect("captured the click repaint frame");
     let dark = |x: u32, y: u32| {
         let o = ((y * w + x) * 4) as usize;
-        bgra[o] < 64 && bgra[o + 1] < 64 && bgra[o + 2] < 64 // B, G, R all near black
+        bgra[o] < 64 && bgra[o + 1] < 64 && bgra[o + 2] < 64
     };
     assert!(dark(CLICK_X as u32, 220), "the click rect's left edge tracks cursor.x={CLICK_X}");
     assert!(dark(440, CLICK_Y as u32), "the click rect's top edge tracks cursor.y={CLICK_Y}");
 
-    // Close the window; the guest exits cleanly.
     input_tx.send(InputEvent::Close).expect("the interpreter is still listening for input");
     let res = interp
         .join()
@@ -524,7 +431,6 @@ fn gui_sample_click_repaints_via_the_wndproc_on_wine() {
     assert_eq!(res.exit_code, 0, "the guest exits cleanly");
 }
 
-/// Decode an RGBA8 PNG into `(width, height, rgba_bytes)`.
 fn decode_png(path: &Path) -> (u32, u32, Vec<u8>) {
     let f = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let mut reader = png::Decoder::new(f).read_info().expect("valid PNG header");
@@ -534,14 +440,6 @@ fn decode_png(path: &Path) -> (u32, u32, Vec<u8>) {
     (info.width, info.height, buf)
 }
 
-/// W4.10: the sample's first painted frame is pinned against a committed golden
-/// PNG, so any pixel drift in the GDI paint path fails CI — the standing
-/// regression gate for the W4+ paint work. Rendered headlessly through the
-/// **deterministic** `OffscreenPresenter` (the built-in font8x8 stub, since
-/// `rasterize_text` returns `None` for it — CoreText output would vary by macOS
-/// version), so the golden is platform-independent and this test is not
-/// macOS-gated. Set `EXEMU_BLESS=1` to (re)generate the golden after an
-/// intentional rendering change.
 #[test]
 fn gui_sample_first_frame_matches_golden_on_wine() {
     if !Path::new(WINE_DLLS).join("win32u.dll").exists() {
@@ -549,7 +447,6 @@ fn gui_sample_first_frame_matches_golden_on_wine() {
         return;
     }
 
-    // Render the first frame to a fresh temp dir via the deterministic presenter.
     let shot_dir = std::env::temp_dir().join(format!(
         "exemu-w410-golden-{}-{}",
         std::process::id(),

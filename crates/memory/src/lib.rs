@@ -1,28 +1,3 @@
-//! # exemu-memory — the guest address space
-//!
-//! A straightforward region-based implementation of [`exemu_core::Memory`].
-//! Guest memory is a set of non-overlapping [`Region`]s, each backed by an
-//! owned byte buffer and carrying read/write/execute permissions. Regions
-//! are kept sorted by base address so lookups are a binary search rather
-//! than a linear scan — the hot path for every instruction fetch and every
-//! memory operand.
-//!
-//! Accesses must fall entirely within a single region; an access that spans
-//! a gap (or two separate regions) is reported as [`EmuError::Unmapped`],
-//! which is exactly what a real page fault would do.
-//!
-//! ## Data watchpoints (roadmap W9.3)
-//!
-//! [`VirtualMemory::set_debug`] hands this backend the process's shared
-//! [`DebugControl`], and every *guest* data access then reports itself to the
-//! handle's watchpoint side via
-//! [`note_watch_hit`](DebugControl::note_watch_hit). The `Memory` trait gains
-//! nothing — this is a concrete capability of this one implementation, so every
-//! other implementor (the test doubles) is untouched. A watchpoint is never
-//! expressed as a write into guest memory, so arming one cannot move the
-//! self-modifying-code generation counters and cannot be seen by a guest that
-//! checksums itself.
-
 #![forbid(unsafe_code)]
 
 use std::cell::Cell;
@@ -43,55 +18,16 @@ impl Mapped {
     }
 }
 
-/// The whole guest virtual address space.
 #[derive(Default)]
 pub struct VirtualMemory {
-    /// Regions, invariant: sorted by `region.base`, non-overlapping.
     regions: Vec<Mapped>,
-    /// Self-modifying-code detection (the W8 JIT invalidation seam — roadmap
-    /// W1.7). `code_gen` counts writes that hit executable memory; `page_gen`
-    /// maps a 4 KiB executable page to its own generation. Both are lazily
-    /// populated: a program that never writes into an executable region leaves
-    /// this map empty, so the common data-write path pays only one already-cached
-    /// permission test and a predictably-not-taken branch.
     code_gen: u64,
     page_gen: HashMap<u64, u64>,
-    /// Region-lookup cache (roadmap W8.1): a direct-mapped table of `regions`
-    /// indices, indexed by the guest page number of the address. Guest accesses
-    /// cluster hard, but they *interleave* — one instruction fetches code, reads
-    /// its stack and writes the heap — so a single hint would thrash. Hashing on
-    /// the page keeps a live entry for each of those working sets at once and
-    /// turns the common case into one compare instead of a binary search over
-    /// every mapping.
-    ///
-    /// **It cannot return a wrong answer.** Regions are non-overlapping, so any
-    /// region that contains `addr` *is* the region containing `addr`; the hint is
-    /// always re-validated with [`Region::contains`] and a bounds-checked
-    /// `Vec::get`, so a stale index (after a map/unmap shifts the vector) can
-    /// only cause a miss, never a mis-resolution.
     hints: [Cell<usize>; HINT_SLOTS],
-    /// Bumped by every change that can move or free a region's backing bytes,
-    /// or change the permission under them (roadmap W8.6). The JIT's host-span
-    /// cache is valid exactly as long as this does not move, so **a missed bump
-    /// is a use-after-free** — which is why it lives on the three mutation
-    /// funnels (`insert`, `protect`, `unmap`) rather than at each public entry
-    /// point, and why `layout_generation_moves_for_every_mutation_that_can_
-    /// invalidate_a_span` enumerates them.
     layout_gen: u64,
-    /// The process's shared debug handle, or `None` when no debugger is
-    /// attached — which is every ordinary run, every corpus entry and almost
-    /// every test (roadmap W9.3).
-    ///
-    /// A *detached* [`DebugControl`] is stored as `None` rather than as
-    /// `Some(inert handle)`: `attached` is fixed for the whole life of a handle
-    /// (it is chosen by [`DebugControl::detached`] / [`DebugControl::attached`]
-    /// and never mutated), so collapsing it here cannot go stale, and it keeps
-    /// the not-debugging path down to a null test on one already-loaded word —
-    /// no atomic, no lock. See [`note_watched_access`](Self::note_watched_access).
     debug: Option<DebugControl>,
 }
 
-/// Slots in the region-lookup cache. A power of two so the index is a mask.
 const HINT_SLOTS: usize = 8;
 
 impl VirtualMemory {
@@ -99,15 +35,11 @@ impl VirtualMemory {
         VirtualMemory::default()
     }
 
-    /// Map a zero-filled region.
     pub fn map(&mut self, region: Region) -> Result<()> {
         let bytes = vec![0u8; region.size as usize];
         self.insert(region, bytes)
     }
 
-    /// Map a region and populate its start with `data`; the remainder up to
-    /// `size` is zero-filled. Handy for PE sections where the virtual size
-    /// exceeds the on-disk data (e.g. `.data`/`.bss`).
     pub fn map_with_data(
         &mut self,
         name: impl Into<String>,
@@ -122,15 +54,6 @@ impl VirtualMemory {
         self.insert(Region::new(name, base, size, perm), bytes)
     }
 
-    /// A privileged write that bypasses permission checks, modelling what the
-    /// loader/kernel does when it patches an image (e.g. filling the Import
-    /// Address Table, which usually lives in a read-only section). Still
-    /// bounds-checked against a single region.
-    ///
-    /// Not a guest access, so it fires no data watchpoint (roadmap W9.3) — the
-    /// loader filling an IAT is the host writing, not the program. It *does*
-    /// still bump the self-modifying-code seam, because a JIT has to notice the
-    /// bytes it compiled changing no matter who changed them.
     pub fn poke(&mut self, addr: u64, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -149,53 +72,22 @@ impl VirtualMemory {
         Ok(())
     }
 
-    /// The list of mapped regions (for diagnostics / a memory map dump).
     pub fn regions(&self) -> impl Iterator<Item = &Region> {
         self.regions.iter().map(|m| &m.region)
     }
 
-    /// Total number of bytes currently mapped.
     pub fn mapped_bytes(&self) -> u64 {
         self.regions.iter().map(|m| m.region.size).sum()
     }
 
-    // ---- data watchpoints (roadmap W9.3) ---------------------------------
-
-    /// Install the process's shared debug handle, so that a guest read or write
-    /// landing in an armed watchpoint range is recorded on it. Called once at
-    /// load time with the same handle the run loop and the JIT hold — an
-    /// inherent setter, the same shape as `Interpreter::set_clock`, not a trait
-    /// method, so the `Memory` trait gains no new obligation.
-    ///
-    /// Passing a detached handle is the same as never calling this at all: a
-    /// detached [`DebugControl`] is inert for its whole life, so it is dropped
-    /// here rather than kept and re-tested on every access.
     pub fn set_debug(&mut self, debug: DebugControl) {
         self.debug = debug.is_attached().then_some(debug);
     }
 
-    /// The installed debug handle, or `None` when none is attached (which is
-    /// also what a detached handle collapses to — see [`set_debug`](Self::set_debug)).
     pub fn debug(&self) -> Option<&DebugControl> {
         self.debug.as_ref()
     }
 
-    /// Report a completed *guest* data access to the debug handle.
-    ///
-    /// Three tiers, so that arming nothing costs nothing:
-    ///
-    /// 1. **Not debugging** (the default everywhere): one null test on the
-    ///    `Option`'s niche — no atomic, no lock — and the branch is never taken.
-    /// 2. **Attached but unarmed:** one relaxed load of the watch Bloom filter
-    ///    and a compare against zero ([`DebugControl::any_watchpoints`]).
-    /// 3. **Armed:** out of line, in [`record_watch_hit`](Self::record_watch_hit).
-    ///
-    /// Called *after* the access has succeeded, which is deliberate: the
-    /// interpreter's watchpoints are trap-**after**, matching x86 data
-    /// breakpoints, so the run loop stops with the instruction's effect already
-    /// visible. A faulting access (unmapped, or the wrong permission) never
-    /// reaches here and records nothing, exactly as a real page fault would
-    /// preempt a data breakpoint.
     #[inline]
     fn note_watched_access(&self, addr: u64, len: usize, kind: WatchKind) {
         let Some(d) = self.debug.as_ref() else { return };
@@ -205,11 +97,6 @@ impl VirtualMemory {
         Self::record_watch_hit(d, addr, len, kind);
     }
 
-    /// The armed half of [`note_watched_access`](Self::note_watched_access),
-    /// kept out of line so the two fast rejects above stay a handful of
-    /// instructions. The recorded address is the **accessed** address, not the
-    /// watchpoint's base — an access that merely straddles the range's first
-    /// byte reports where the guest actually pointed.
     #[cold]
     #[inline(never)]
     fn record_watch_hit(d: &DebugControl, addr: u64, len: usize, kind: WatchKind) {
@@ -218,20 +105,11 @@ impl VirtualMemory {
         }
     }
 
-    // ---- internals -------------------------------------------------------
-
-    /// Record that `[addr, addr+len)` — which lives in an executable region —
-    /// was overwritten: bump the global code generation and the per-page
-    /// generation of every 4 KiB page the range spans. Called only from the two
-    /// write paths ([`Memory::write`], [`poke`](Self::poke)) and only after the
-    /// covering region has been confirmed executable, so it is off the hot path
-    /// for ordinary data writes.
     #[cold]
     #[inline(never)]
     fn note_code_write(&mut self, addr: u64, len: usize) {
         self.code_gen = self.code_gen.wrapping_add(1);
         let first = addr / CODE_PAGE_SIZE;
-        // `len >= 1` here (empty writes return early before reaching us).
         let last = (addr + (len as u64 - 1)) / CODE_PAGE_SIZE;
         for page in first..=last {
             let g = self.page_gen.entry(page * CODE_PAGE_SIZE).or_insert(0);
@@ -243,7 +121,6 @@ impl VirtualMemory {
         if region.size == 0 {
             return Ok(());
         }
-        // Reject overlaps with any existing region.
         for m in &self.regions {
             let overlaps = region.base < m.end() && m.region.base < region.end();
             if overlaps {
@@ -252,16 +129,10 @@ impl VirtualMemory {
         }
         let pos = self.regions.partition_point(|m| m.region.base < region.base);
         self.regions.insert(pos, Mapped { region, bytes });
-        // The single funnel every mapping call reaches (`map`, `map_with_data`,
-        // `map_fixed`): the `regions` vector may reallocate and every `Mapped`
-        // after `pos` shifts, so any cached host address is now suspect.
         self.layout_gen = self.layout_gen.wrapping_add(1);
         Ok(())
     }
 
-    /// Index of the region containing `addr`: the cached hint for the address's
-    /// page slot if it still covers the address, else a binary search that
-    /// refreshes that slot.
     #[inline]
     fn find_idx(&self, addr: u64) -> Option<usize> {
         let slot = ((addr >> 12) as usize) & (HINT_SLOTS - 1);
@@ -274,11 +145,8 @@ impl VirtualMemory {
         self.find_idx_slow(addr, slot)
     }
 
-    /// The binary-search half of [`find_idx`](Self::find_idx), kept out of line
-    /// so the cache-hit path stays a handful of instructions.
     #[inline(never)]
     fn find_idx_slow(&self, addr: u64, slot: usize) -> Option<usize> {
-        // The candidate is the last region whose base <= addr.
         let idx = self.regions.partition_point(|m| m.region.base <= addr);
         if idx == 0 {
             return None;
@@ -291,22 +159,12 @@ impl VirtualMemory {
         }
     }
 
-    /// Find the region containing `addr`.
     #[inline]
     fn find_mut(&mut self, addr: u64) -> Option<&mut Mapped> {
         let i = self.find_idx(addr)?;
         Some(&mut self.regions[i])
     }
 
-    /// Resolve `[addr, addr+len)` to a slice inside one region, checking that
-    /// the whole range is contained and that `needed` permission is present.
-    /// Returns `(region index, start, end)` so the caller can reach the backing
-    /// bytes without repeating the lookup.
-    ///
-    /// The error values are built only on the failing branch (`match`, not
-    /// `ok_or`): `EmuError` carries `String` payloads in other variants, so
-    /// constructing one eagerly cost a call to its drop glue on *every*
-    /// successful access — 5% of the whole 7z run before roadmap W8.1.
     #[inline]
     fn locate(
         &self,
@@ -343,11 +201,6 @@ impl Memory for VirtualMemory {
         Ok(())
     }
 
-    /// Instruction fetch. Deliberately **not** watched: a data watchpoint
-    /// watches data, and the debugger's instruction-address breakpoints
-    /// (roadmap W9.3 S2/S3) are the mechanism for "stop when the guest executes
-    /// here". Fetching every instruction through a watch probe would also put
-    /// the check on the single hottest path in the emulator.
     fn fetch(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
         if buf.is_empty() {
             return Ok(());
@@ -371,17 +224,6 @@ impl Memory for VirtualMemory {
         self.note_watched_access(addr, data.len(), WatchKind::Write);
         Ok(())
     }
-
-    // ---- typed accessors, specialised (roadmap W8.1) ----------------------
-    //
-    // Every memory *operand* the interpreter touches arrives here. The default
-    // trait bodies route `read_uint`/`write_uint` through `read_u8`/`u16`/`u32`/
-    // `u64` and then through `read`/`write` with a runtime-length slice, which
-    // costs an extra dynamic dispatch and a `memmove` call for 1–8 bytes. These
-    // overrides resolve the region once and load/store the integer directly.
-    // Semantics are unchanged, including the order in which errors are raised:
-    // an unsupported `size` is rejected *before* the address is examined, and
-    // the message text matches the default bodies verbatim.
 
     fn read_uint(&self, addr: u64, size: u8) -> Result<u64> {
         let len = match size {
@@ -427,8 +269,6 @@ impl Memory for VirtualMemory {
         Ok(())
     }
 
-    // ---- dynamic mapping (backs the OS layer's VirtualAlloc family) -------
-
     fn map_fixed(&mut self, base: u64, size: u64, perm: Perm, name: &str) -> Result<()> {
         self.map(Region::new(name, base, size, perm))
     }
@@ -437,18 +277,11 @@ impl Memory for VirtualMemory {
         let m = self.find_mut(base).ok_or(EmuError::Unmapped { addr: base, len: size as usize })?;
         let old = m.region.perm;
         m.region.perm = perm;
-        // The bytes have not moved, but what may be done with them has: a span
-        // handed out under the old permission — or withheld under it, as a
-        // writable span is for executable memory — must not survive this.
         self.layout_gen = self.layout_gen.wrapping_add(1);
         Ok(old)
     }
 
     fn unmap(&mut self, base: u64, size: u64) -> Result<()> {
-        // Unconditional, and before the work: unmapping *frees* backing buffers,
-        // so this is the one mutation where a missed bump is a dangling pointer
-        // rather than a stale permission. A no-op unmap bumping too is a cache
-        // flush that costs nothing and cannot be wrong.
         self.layout_gen = self.layout_gen.wrapping_add(1);
         if size == 0 {
             if let Some(pos) = self.regions.iter().position(|m| m.region.base == base) {
@@ -462,30 +295,12 @@ impl Memory for VirtualMemory {
     }
 
     fn next_region(&self, addr: u64) -> Option<(u64, u64, Perm)> {
-        // Regions are sorted by base and non-overlapping, so the first with an
-        // end above `addr` is either the region containing `addr` or the next
-        // one above a free gap.
         self.regions
             .iter()
             .find(|m| m.end() > addr)
             .map(|m| (m.region.base, m.region.size, m.region.perm))
     }
 
-    // ---- host spans (the W8.6 JIT software-TLB seam) ----------------------
-
-    /// See [`Memory::host_span`]. Three refusals, and each one is a property the
-    /// JIT would otherwise have to remember:
-    ///
-    /// * a **watchpoint is armed** — every guest access must stay observable, so
-    ///   while a debugger is watching, nothing is handed out and every access
-    ///   goes back through [`note_watched_access`](Self::note_watched_access).
-    ///   Detached (the ordinary case) this is one null test on the `Option`'s
-    ///   niche, and it is paid once per *fill*, not once per access.
-    /// * the range is not wholly inside one region carrying `needed` — the same
-    ///   [`locate`](Self::locate) every ordinary access uses, so an access that
-    ///   would fault can never be served from a span and still faults at exactly
-    ///   the instruction it did before.
-    /// * (for the `_mut` form) the region is **executable**.
     fn host_span(&self, addr: u64, len: usize, needed: Perm) -> Option<&[u8]> {
         if len == 0 || self.watchpoints_armed() {
             return None;
@@ -494,13 +309,6 @@ impl Memory for VirtualMemory {
         Some(&self.regions[idx].bytes[start..end])
     }
 
-    /// See [`Memory::host_span_mut`]. Everything [`host_span`](Self::host_span)
-    /// refuses, plus **executable memory**: a write through the returned bytes
-    /// cannot reach [`note_code_write`](Self::note_code_write), so a guest that
-    /// rewrote its own code through one would be invisible to the JIT's
-    /// invalidation. PE sections are mapped RWX here, so this is what keeps
-    /// every store into an image out of the fast path and on the helper that
-    /// does the self-modification test.
     fn host_span_mut(&mut self, addr: u64, len: usize, needed: Perm) -> Option<&mut [u8]> {
         if len == 0 || self.watchpoints_armed() {
             return None;
@@ -563,34 +371,21 @@ mod tests {
     #[test]
     fn permission_enforced() {
         let mut m = mem();
-        // code region is read+execute, not writable
         assert!(matches!(m.write_u8(0x400000, 1), Err(EmuError::Permission { .. })));
-        // and data region is not executable
         let mut b = [0u8; 1];
         assert!(matches!(m.fetch(0x1000, &mut b), Err(EmuError::Permission { .. })));
     }
 
-    // ---- region-lookup cache (roadmap W8.1) -------------------------------
-    //
-    // The cache stores raw `regions` indices, and `map`/`unmap` shift that
-    // vector under it. These pin the property the whole design rests on: a
-    // stale hint can only *miss*, never mis-resolve, because it is always
-    // re-validated with `contains` and regions never overlap.
-
     #[test]
     fn lookup_cache_survives_a_map_that_shifts_the_region_vector() {
         let mut m = mem();
-        // Warm the hint for the code region (index 1 of [stack, code]).
         m.write_u8(0x400010, 0x11).ok();
-        assert_eq!(m.read_u8(0x400010).unwrap(), 0x00); // code is not writable
+        assert_eq!(m.read_u8(0x400010).unwrap(), 0x00);
         assert_eq!(m.read_u32(0x400000).unwrap(), 0);
 
-        // Insert a region *below* both, pushing every existing index up by one.
         m.map(Region::new("low", 0x100, 0x100, Perm::RW)).unwrap();
         m.write_u8(0x180, 0x5A).unwrap();
 
-        // The warmed hint now names the wrong slot; the lookup must still be
-        // right for every region.
         assert_eq!(m.read_u8(0x180).unwrap(), 0x5A, "new low region");
         assert_eq!(m.read_u32(0x400000).unwrap(), 0, "code region after the shift");
         m.write_u64(0x1100, 0xFEED).unwrap();
@@ -602,12 +397,11 @@ mod tests {
         let mut m = mem();
         m.map_fixed(0x5000_0000, 0x1000, Perm::RW, "valloc").unwrap();
         m.write_u32(0x5000_0010, 0xABCD).unwrap();
-        assert_eq!(m.read_u32(0x5000_0010).unwrap(), 0xABCD); // hint now warm
+        assert_eq!(m.read_u32(0x5000_0010).unwrap(), 0xABCD);
 
         m.unmap(0x5000_0000, 0).unwrap();
         assert!(matches!(m.read_u32(0x5000_0010), Err(EmuError::Unmapped { .. })));
         assert!(matches!(m.write_u32(0x5000_0010, 1), Err(EmuError::Unmapped { .. })));
-        // The regions that remain are still reachable.
         m.write_u64(0x1100, 7).unwrap();
         assert_eq!(m.read_u64(0x1100).unwrap(), 7);
     }
@@ -615,16 +409,12 @@ mod tests {
     #[test]
     fn lookup_cache_sees_a_protection_change() {
         let mut m = mem();
-        // Warm the hint, then take WRITE away from the region it names.
         m.write_u8(0x1000, 1).unwrap();
         m.protect(0x1000, 0x1000, Perm::READ).unwrap();
         assert!(matches!(m.write_u8(0x1000, 2), Err(EmuError::Permission { .. })));
         assert_eq!(m.read_u8(0x1000).unwrap(), 1);
     }
 
-    /// The typed accessors are overridden for speed; they must reject an
-    /// unsupported width *before* looking at the address, exactly as the
-    /// default trait bodies did.
     #[test]
     fn typed_accessors_match_the_default_semantics() {
         let mut m = mem();
@@ -632,19 +422,14 @@ mod tests {
             m.write_uint(0x1200, size, v).unwrap();
             assert_eq!(m.read_uint(0x1200, size).unwrap(), v, "width {size}");
         }
-        // A 4-byte store leaves the neighbouring bytes alone (little-endian).
         m.write_u64(0x1300, 0).unwrap();
         m.write_uint(0x1300, 4, 0x1122_3344).unwrap();
         assert_eq!(m.read_u64(0x1300).unwrap(), 0x1122_3344);
 
-        // Unsupported widths are refused on an *unmapped* address too, proving
-        // the width is checked first.
         assert!(matches!(m.read_uint(0x9999_9999, 3), Err(EmuError::Unsupported(_))));
         assert!(matches!(m.write_uint(0x9999_9999, 3, 0), Err(EmuError::Unsupported(_))));
-        // ...and permissions/bounds still apply at supported widths.
         assert!(matches!(m.write_uint(0x400000, 4, 0), Err(EmuError::Permission { .. })));
         assert!(matches!(m.read_uint(0x9999_9999, 4), Err(EmuError::Unmapped { .. })));
-        // A typed store into executable memory still trips the SMC seam.
         let mut rwx = rwx_mem();
         let before = rwx.code_generation();
         rwx.write_uint(0x400040, 4, 0x9090_9090).unwrap();
@@ -664,25 +449,20 @@ mod tests {
     #[test]
     fn access_spanning_region_end_faults() {
         let m = mem();
-        // 8-byte read starting 4 bytes before the region end overruns it.
         assert!(m.read_u64(0x1000 + 0x1000 - 4).is_err());
     }
 
     #[test]
     fn dynamic_map_protect_unmap() {
         let mut m = mem();
-        // Map a fresh region, then probe it via next_region.
         m.map_fixed(0x5000_0000, 0x2000, Perm::RW, "valloc").unwrap();
         let (base, size, perm) = m.next_region(0x5000_0000).unwrap();
         assert_eq!((base, size), (0x5000_0000, 0x2000));
         assert_eq!(perm, Perm::RW);
-        // A fixed map onto a taken address is rejected (address-in-use signal).
         assert!(m.map_fixed(0x5000_0000, 0x1000, Perm::RW, "dup").is_err());
-        // Re-protect returns the old permission and takes effect.
         let old = m.protect(0x5000_0000, 0x2000, Perm::RX).unwrap();
         assert_eq!(old, Perm::RW);
         assert_eq!(m.next_region(0x5000_0000).unwrap().2, Perm::RX);
-        // MEM_RELEASE (size 0) removes exactly the region at that base.
         m.unmap(0x5000_0000, 0).unwrap();
         assert!(m.read_u8(0x5000_0000).is_err());
     }
@@ -690,18 +470,11 @@ mod tests {
     #[test]
     fn next_region_reports_free_gap() {
         let m = mem();
-        // 0x9000 lies in the gap between the stack (ends 0x2000) and code
-        // (starts 0x400000); next_region points at the code region above it.
         let (base, _, _) = m.next_region(0x9000).unwrap();
         assert_eq!(base, 0x400000);
-        // Above every region, the space is free.
         assert!(m.next_region(0x9000_0000).is_none());
     }
 
-    // ---- self-modifying-code detection seam (roadmap W1.7) ----------------
-
-    /// A region that is both writable and executable (as PE sections are mapped
-    /// RWX at runtime), so writes into it register as code writes.
     fn rwx_mem() -> VirtualMemory {
         let mut m = VirtualMemory::new();
         m.map(Region::new("data", 0x1000, 0x1000, Perm::RW)).unwrap();
@@ -713,7 +486,6 @@ mod tests {
     fn data_writes_never_bump_the_code_generation() {
         let mut m = rwx_mem();
         assert_eq!(m.code_generation(), 0);
-        // Writing into the non-executable data region is invisible to the seam.
         m.write_u64(0x1100, 0xdead_beef).unwrap();
         m.write_u8(0x1200, 0xff).unwrap();
         assert_eq!(m.code_generation(), 0);
@@ -728,32 +500,27 @@ mod tests {
         m.write_u8(0x400010, 0x90).unwrap();
         assert_eq!(m.code_generation(), 1);
         assert_eq!(m.code_page_generation(0x400000), 1);
-        // A second write to the same page advances both counters again.
         m.write_u8(0x400020, 0x90).unwrap();
         assert_eq!(m.code_generation(), 2);
         assert_eq!(m.code_page_generation(0x400000), 2);
-        // A different page in the same region tracks its own generation.
         assert_eq!(m.code_page_generation(0x401000), 0);
     }
 
     #[test]
     fn per_page_generations_are_independent() {
         let mut m = rwx_mem();
-        m.write_u8(0x400000, 0x90).unwrap(); // page 0x400000
-        m.write_u8(0x402000, 0x90).unwrap(); // page 0x402000
-        m.write_u8(0x402008, 0x90).unwrap(); // page 0x402000 again
+        m.write_u8(0x400000, 0x90).unwrap();
+        m.write_u8(0x402000, 0x90).unwrap();
+        m.write_u8(0x402008, 0x90).unwrap();
         assert_eq!(m.code_page_generation(0x400000), 1);
-        assert_eq!(m.code_page_generation(0x401000), 0); // untouched page
+        assert_eq!(m.code_page_generation(0x401000), 0);
         assert_eq!(m.code_page_generation(0x402000), 2);
-        // The global counter is the sum of all executable writes.
         assert_eq!(m.code_generation(), 3);
     }
 
     #[test]
     fn write_spanning_a_page_boundary_bumps_both_pages() {
         let mut m = rwx_mem();
-        // An 8-byte store straddling 0x401000: 4 bytes in page 0x400000, 4 in
-        // page 0x401000. Both pages' generations advance; the global counts once.
         m.write_u64(0x401000 - 4, 0).unwrap();
         assert_eq!(m.code_generation(), 1);
         assert_eq!(m.code_page_generation(0x400ffc), 1);
@@ -762,13 +529,10 @@ mod tests {
 
     #[test]
     fn loader_poke_into_code_also_bumps_the_seam() {
-        // The loader/kernel patch path (IAT fill, packer unpacking) writes through
-        // `poke`; a JIT must see those as code changes too.
         let mut m = rwx_mem();
         m.poke(0x400100, &[0xcc]).unwrap();
         assert_eq!(m.code_generation(), 1);
         assert_eq!(m.code_page_generation(0x400000), 1);
-        // Poke into pure data leaves the seam untouched.
         m.poke(0x1000, &[0x00]).unwrap();
         assert_eq!(m.code_generation(), 1);
     }

@@ -1,36 +1,3 @@
-//! W6/W7 breadth DLL-smoke — the remaining "arrives free as guest code" claim.
-//!
-//! W6.1 (comctl32/uxtheme/comdlg32) and W6.3 (ole32/combase/oleaut32) each
-//! proved their DLLs load, relocate, bind and execute. This does the same for
-//! the DLLs the remaining W6/W7 steps depend on, so the claim that they cost
-//! exemu nothing but a load is **tested rather than asserted** before any of
-//! those steps is attempted:
-//!
-//! | DLL | Unblocks |
-//! | --- | -------- |
-//! | `cabinet.dll` | W6.5 — CAB extraction (retires the planned hand-rolled FDI) |
-//! | `msi.dll`, `setupapi.dll` | W6.5 — MSI/INF installers |
-//! | `shell32.dll`, `shlwapi.dll` | W6.6 — known folders, `IShellLink` |
-//! | `ws2_32.dll` | W7.1 — sockets |
-//!
-//! What each check is worth, and what it is not:
-//!
-//! * **Relocation is verified in guest memory, not assumed.** All six prefer
-//!   `0x180000000`; loading at [`DLL_BASE`] forces the `.reloc` walk, and the
-//!   test reads the first `DIR64` fixup back out of the mapped image and
-//!   asserts it equals `pre-relocation word + load delta`. A `.reloc` walk that
-//!   silently did nothing would pass a "does it map?" check and fail this one.
-//! * **Every named import is cross-checked against the DLL it names**, chasing
-//!   the whole prefix. This is what actually establishes "satisfiable from
-//!   Wine's own set with nothing hand-written" — `msi.dll` alone imports from 22
-//!   distinct modules.
-//! * **It does NOT establish that these DLLs *work*.** Loading and binding is a
-//!   necessary condition, not a sufficient one; W6.1 loaded comctl32 cleanly and
-//!   still found that messaging a control does not terminate. The end-to-end
-//!   gates (W6.5/W6.6/W7.1) are what prove behaviour.
-//!
-//! Skip-guarded on the git-ignored Wine DLL set.
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -39,17 +6,10 @@ use exemu_memory::VirtualMemory;
 
 const WINE_DLLS: &str = "../../example_exe/wine-dlls/x86_64-windows";
 
-/// A non-preferred base. Every DLL here prefers `0x180000000`, so loading at
-/// this address guarantees a non-zero delta and exercises the fixups.
 const DLL_BASE: u64 = 0x0000_0006_0000_0000;
 
-/// `IMAGE_REL_BASED_DIR64` — the 64-bit fixup kind (`Reloc::kind` is the raw
-/// `IMAGE_REL_BASED_*` byte). This is the one worth probing: it rewrites a full
-/// pointer, so a botched walk is visible in the read-back value.
 const IMAGE_REL_BASED_DIR64: u8 = 10;
 
-/// The DLLs, the W-step each unblocks, and entry points a real guest imports.
-/// Export names were read out of the pinned binaries, not guessed.
 const BREADTH: &[(&str, &str, &[&str])] = &[
     ("cabinet.dll", "W6.5", &["FDICreate", "FDICopy", "FDIDestroy", "FDIIsCabinet", "FCICreate"]),
     ("msi.dll", "W6.5", &["MsiOpenPackageW", "MsiInstallProductW", "MsiGetPropertyW", "MsiCloseHandle"]),
@@ -84,9 +44,6 @@ fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) & !(a - 1)
 }
 
-/// Every named export of a pinned DLL (forwarders included — a forwarder is a
-/// perfectly good import target, it just resolves elsewhere), plus the modules
-/// its forwarders point at so they can be checked to exist.
 fn export_names(dir: &Path, dll: &str) -> Option<(HashSet<String>, Vec<String>)> {
     let bytes = std::fs::read(dir.join(dll)).ok()?;
     let image = exemu_loader::parse(&bytes).ok()?;
@@ -105,10 +62,6 @@ fn export_names(dir: &Path, dll: &str) -> Option<(HashSet<String>, Vec<String>)>
     Some((names, fwd))
 }
 
-/// Each breadth DLL is a PE32+ that carries relocations, relocates to a
-/// non-preferred base with the fixups **verified in guest memory**, exports the
-/// entry points a guest imports, and has every named import satisfiable from the
-/// pinned prefix.
 #[test]
 fn breadth_dlls_map_relocate_and_bind() {
     if !dlls_present() {
@@ -117,7 +70,6 @@ fn breadth_dlls_map_relocate_and_bind() {
     }
     let dir = Path::new(WINE_DLLS);
 
-    // One parse per dependency, not one per symbol: msi alone has ~1000 imports.
     let mut cache: HashMap<String, (HashSet<String>, Vec<String>)> = HashMap::new();
     let mut fwd_targets: Vec<String> = Vec::new();
 
@@ -131,8 +83,6 @@ fn breadth_dlls_map_relocate_and_bind() {
         assert_ne!(preferred, DLL_BASE, "{dll}: DLL_BASE must not be the preferred base");
         let delta = DLL_BASE.wrapping_sub(preferred);
 
-        // Pick the first DIR64 fixup and remember the word *before* relocation,
-        // so the assertion below can only pass if the walk actually wrote.
         let probe = image
             .relocations
             .iter()
@@ -145,7 +95,6 @@ fn breadth_dlls_map_relocate_and_bind() {
         exemu_loader::apply_relocations(&mut image.sections, &image.relocations, preferred, DLL_BASE)
             .unwrap_or_else(|e| panic!("{dll}: apply relocations: {e}"));
 
-        // Map the relocated image and read the fixup back out of guest memory.
         let mut mem = VirtualMemory::new();
         let hdr_len = align_up(image.headers.len() as u64, 0x1000).max(0x1000);
         mem.map(Region::new("hdr", DLL_BASE, hdr_len, Perm::RWX)).unwrap();
@@ -170,7 +119,6 @@ fn breadth_dlls_map_relocate_and_bind() {
              (before {before:#x} + delta {delta:#x} != {after:#x})"
         );
 
-        // The entry points a guest imports resolve into the mapped image.
         let by_name: HashMap<&str, u32> = image
             .exports
             .iter()
@@ -186,11 +134,10 @@ fn breadth_dlls_map_relocate_and_bind() {
             mem.read(va, &mut b).unwrap_or_else(|e| panic!("{dll}!{name} is mapped: {e}"));
         }
 
-        // Every named import is really exported by the DLL it names.
         let mut checked = 0usize;
         for imp in &image.imports {
             let exemu_core::ImportSymbol::Named(sym) = &imp.symbol else {
-                continue; // ordinal imports carry no name to cross-check
+                continue;
             };
             let entry = cache.entry(imp.dll.clone()).or_insert_with(|| {
                 export_names(dir, &imp.dll)
@@ -218,8 +165,6 @@ fn breadth_dlls_map_relocate_and_bind() {
         );
     }
 
-    // Every module reached by a forwarder — from these DLLs or their
-    // dependencies — is present in the prefix too.
     fwd_targets.extend(cache.values().flat_map(|(_, t)| t.clone()));
     fwd_targets.sort();
     fwd_targets.dedup();
@@ -229,7 +174,6 @@ fn breadth_dlls_map_relocate_and_bind() {
     eprintln!("{} distinct forwarder target modules, all present", fwd_targets.len());
 }
 
-/// Read the 8 bytes at `rva` out of a parsed image's section data (pre-mapping).
 fn read_rva_u64(image: &exemu_core::PeImage, rva: u32) -> Option<u64> {
     for s in &image.sections {
         let start = s.rva;
@@ -242,11 +186,6 @@ fn read_rva_u64(image: &exemu_core::PeImage, rva: u32) -> Option<u64> {
     None
 }
 
-/// `msi.dll` is the deepest dependency graph in the prefix — it imports from 22
-/// distinct modules, including `cabinet`, `comctl32`, `ole32`, `shell32` and
-/// `shlwapi`. Pinning that the **whole transitive closure** is present is what
-/// makes "MSI arrives as guest code" a checkable claim rather than a hope: if a
-/// future prefix refresh drops a module, this fails naming it.
 #[test]
 fn msi_dependency_closure_is_satisfiable_from_the_prefix() {
     if !dlls_present() {
@@ -268,7 +207,7 @@ fn msi_dependency_closure_is_satisfiable_from_the_prefix() {
             continue;
         };
         let Ok(image) = exemu_loader::parse(&bytes) else {
-            continue; // not a PE we can walk; presence is what matters here
+            continue;
         };
         let mut deps: Vec<String> = image.imports.iter().map(|i| i.dll.to_ascii_lowercase()).collect();
         deps.sort();

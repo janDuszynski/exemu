@@ -1,24 +1,3 @@
-//! **W5 — the WoW64 gate**: a 32-bit guest PE boots on Wine's 64-bit PE set and
-//! reaches exemu's `Nt*` layer through Wine's *own* thunks, with exemu
-//! marshalling nothing.
-//!
-//! The chain under test, every hop after the first belonging to Wine:
-//!
-//! ```text
-//!   <guest>.exe (PE32)  call [IAT]
-//!     → ntdll32!NtAllocateVirtualMemory   Wine's own 32-bit stub
-//!         mov eax,0x18; mov edx,<helper>; call edx; ret 0x18
-//!     → ntdll32 rva 0xe0c4:  jmp dword ptr [__wine_syscall_dispatcher]
-//!     → the wow64cpu BOP (FF 2D far jmp, CS 0x33)  built by BTCpuProcessInit
-//!     → wow64cpu's 64-bit return handler
-//!     → wow64.dll!Wow64SystemServiceEx
-//!     → wow64.dll's per-service marshalling thunk
-//!     → ntdll.dll (64-bit) NtAllocateVirtualMemory — a real `syscall`
-//!     → exemu's SSDT handler → back out to the 32-bit guest
-//! ```
-//!
-//! Skip-guarded on the git-ignored Wine DLL set (both halves).
-
 use std::path::{Path, PathBuf};
 
 use exemu_app::{wow64_boot, wow64_sample, Process, RunConfig};
@@ -43,8 +22,6 @@ fn private_sandbox(tag: &str) -> PathBuf {
     dir
 }
 
-/// The **direct** bring-up: no 32-bit loader at all, straight from
-/// `BTCpuSimulate` into the guest's entry point (roadmap W5.1).
 fn wow64_run_config(tag: &str) -> RunConfig {
     RunConfig {
         wow64_bringup: wow64_boot::Bringup::Direct,
@@ -52,8 +29,6 @@ fn wow64_run_config(tag: &str) -> RunConfig {
     }
 }
 
-/// The default boot: handed to `wow64!Wow64LdrpInitialize`, so **Wine's own
-/// i386 loader** runs (roadmap W5.7).
 fn wine_loader_config(tag: &str) -> RunConfig {
     RunConfig {
         echo: false,
@@ -64,10 +39,6 @@ fn wine_loader_config(tag: &str) -> RunConfig {
     }
 }
 
-/// **W5.4** — the WoW64 *process model* is built: both DLL sets mapped, the
-/// dual TEB/PEB pair linked by the recovered `WowTebOffset`, and the guest's
-/// imports bound to the **32-bit** ntdll (not the 64-bit one that shares its
-/// name).
 #[test]
 fn wow64_process_model_is_built() {
     if !have_wow64_set() {
@@ -79,7 +50,6 @@ fn wow64_process_model_is_built() {
     let proc = Process::load(&exe, &mut cfg).expect("WoW64 boot");
     let boot = proc.wow64().expect("a 32-bit image on the Wine set boots WoW64");
 
-    // Both halves are mapped, and the 32-bit-visible ones are below 4 GiB.
     assert!(boot.ntdll32.base < u32::MAX as u64, "the 32-bit ntdll must be 32-bit addressable");
     assert!(
         boot.wow64cpu.base + boot.wow64cpu.size <= u32::MAX as u64,
@@ -87,7 +57,6 @@ fn wow64_process_model_is_built() {
     );
     assert!(boot.wow64.base > u32::MAX as u64, "wow64.dll has no placement constraint (loaded high)");
 
-    // The two ntdlls are genuinely different images.
     let ntdll32_alloc = boot.ntdll32.export("NtAllocateVirtualMemory").expect("32-bit ntdll export");
     assert!(ntdll32_alloc < u32::MAX as u64);
     assert_ne!(
@@ -96,14 +65,12 @@ fn wow64_process_model_is_built() {
         "the 32-bit and 64-bit ntdlls are distinct images",
     );
 
-    // TEB64 → TEB32 through the recovered signed 32-bit WowTebOffset.
     let linked = exemu_os::wow64::teb32_of(proc.memory(), boot.teb64)
         .expect("TEB64 is mapped")
         .expect("WowTebOffset is non-zero — this IS a WoW64 thread");
     assert_eq!(linked, boot.teb32, "TEB64 + (i32)[TEB64+0x180c] resolves to TEB32");
     assert!(boot.teb32 <= u32::MAX as u64, "TEB32 must be 32-bit addressable");
 
-    // TEB32 carries the 32-bit NT_TIB the guest reads through `fs:`.
     assert_eq!(
         proc.peek_u32(boot.teb32 + exemu_os::wow64::TEB32_SELF).unwrap() as u64,
         boot.teb32,
@@ -121,7 +88,6 @@ fn wow64_process_model_is_built() {
         "PEB32.ImageBaseAddress is the *guest* PE32, not the 64-bit ntdll",
     );
 
-    // The guest's IAT is bound to the 32-bit ntdll's real export.
     let iat = wow64_sample::iat_alloc_va();
     assert_eq!(
         proc.peek_u32(iat).unwrap() as u64,
@@ -130,13 +96,6 @@ fn wow64_process_model_is_built() {
     );
 }
 
-/// **W5.1** — the BOP is published where Wine's *own* 32-bit ntdll looks for it.
-///
-/// exemu's bring-up trampoline runs the real `BTCpuProcessInit` and the real
-/// `BTCpuGetBopCode`, then stores the result into the three cells `wow64.dll`
-/// itself fills. This asserts the outcome against the 32-bit ntdll's actual
-/// bytes: the value published must be the `FF 2D` far-jump trampoline, and the
-/// helper every syscall stub jumps through must reach it.
 #[test]
 fn wow64_transition_is_published_where_the_real_ntdll32_looks() {
     if !have_wow64_set() {
@@ -147,9 +106,6 @@ fn wow64_transition_is_published_where_the_real_ntdll32_looks() {
     let mut cfg = wow64_run_config("publish");
     let mut proc = Process::load(&exe, &mut cfg).expect("WoW64 boot");
 
-    // Run only the bring-up trampoline: BTCpuProcessInit → BTCpuGetBopCode →
-    // the three stores. Stopping before `BTCpuSimulate` keeps the assertions
-    // about the *publish* step alone.
     let (transition, dispatcher, wow32_reserved, bop_expected) = {
         let boot = proc.wow64().expect("WoW64 boot");
         (
@@ -187,22 +143,12 @@ fn wow64_transition_is_published_where_the_real_ntdll32_looks() {
         "TEB32.WOW32Reserved gets it too (the `call dword ptr fs:[0xc0]` stub shape)",
     );
 
-    // The published value is the far-jump trampoline the real init assembled.
     assert_eq!(
         proc.peek_u32(bop).unwrap() & 0xFFFF,
         0x2DFF,
         "the BOP is wow64cpu's own `FF 2D` (jmp fword ptr [mem]) trampoline",
     );
 
-    // The `.bss` selector slots `BTCpuProcessInit` fills from the two contexts it
-    // captures. Their RVAs were recovered by *running* the init
-    // (`dll_smoke.rs::btcpuprocessinit_builds_the_return_bop_and_selectors`).
-    // Checking them here proves the two ntdll routines the init calls really
-    // answered: `RtlCaptureContext` (whose `mov [rcx+0x38], cs` supplies the
-    // 64-bit CS baked into the BOP) and `RtlWow64GetThreadContext` → exemu's
-    // `NtQueryInformationThread(ThreadWow64Context)` (which supplies SegCs/SegSs
-    // out of the CPU-reserved area). A silent failure in either would leave these
-    // reading uninitialised stack.
     let cpu_base = proc.wow64().unwrap().wow64cpu.base;
     assert_eq!(
         proc.peek_u32(cpu_base + 0x600c).unwrap(),
@@ -221,27 +167,12 @@ fn wow64_transition_is_published_where_the_real_ntdll32_looks() {
     );
 }
 
-/// **Measured gap, pinned so it stays visible (roadmap W5.5).**
-///
-/// exemu builds the WoW64 process itself instead of running Wine's
-/// `Wow64LdrpInitialize`, so `wow64.dll`'s **table 1** — the win32k service
-/// descriptor it copies out of `wow64win!sdwhwin32` — is never registered. Table
-/// 0 (ntdll, 0x108 services) *is* live because its descriptor is statically
-/// initialised in `.data` and merely relocated, which is why the `Nt*` path
-/// works and the `NtUser*`/`NtGdi*` path does not.
-///
-/// Consequence: a 32-bit guest cannot yet open a window through the 64-bit set —
-/// the second half of the W5.5 goal. Closing it (running `Wow64LdrpInitialize`,
-/// or performing the descriptor copy) will fail this test and force the claim to
-/// be updated.
 #[test]
 fn wow64_win32k_table_is_not_registered_yet() {
     if !have_wow64_set() {
         eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
         return;
     }
-    // Service descriptors are 32 bytes at `wow64.dll + 0x16080 + table*0x20`
-    // (recovered in `knowledge/w5-wow64-design.know`).
     const DESC_BASE: u64 = 0x16080;
     const DESC_STRIDE: u64 = 0x20;
     const LIMIT: u64 = 0x10;
@@ -251,7 +182,6 @@ fn wow64_win32k_table_is_not_registered_yet() {
     let proc = Process::load(&exe, &mut cfg).expect("WoW64 boot");
     let w = proc.wow64().unwrap().wow64.base;
 
-    // Table 0 (ntdll) is live: a real ServiceTable pointer and 0x108 services.
     assert_ne!(proc.memory().read_u64(w + DESC_BASE).unwrap(), 0, "table 0 ServiceTable is relocated in");
     assert_eq!(
         proc.peek_u32(w + DESC_BASE + LIMIT).unwrap(),
@@ -259,7 +189,6 @@ fn wow64_win32k_table_is_not_registered_yet() {
         "table 0 (ntdll) exposes 0x108 services",
     );
 
-    // Table 1 (win32k) is still zero — the pinned gap.
     assert_eq!(
         proc.memory().read_u64(w + DESC_BASE + DESC_STRIDE).unwrap(),
         0,
@@ -273,8 +202,6 @@ fn wow64_win32k_table_is_not_registered_yet() {
     );
 }
 
-/// **W5.3 + W5.5 — the standing gate.** The 32-bit guest allocates memory
-/// through the entire real chain and terminates with its own success code.
 #[test]
 fn wow64_guest_allocates_through_the_real_wine_chain() {
     if !have_wow64_set() {
@@ -314,10 +241,6 @@ fn wow64_guest_allocates_through_the_real_wine_chain() {
         wow64_sample::WOW64_SENTINEL,
         "the pages the *32-bit guest* sees are really writable at the address it got back",
     );
-    // A whole-chain sanity bound. `BTCpuProcessInit` alone is a few hundred
-    // instructions and wow64.dll's NtAllocateVirtualMemory thunk another couple
-    // of hundred, so a run that "passed" in a handful of instructions would mean
-    // something short-circuited. Measured: 1292.
     assert!(
         (600..10_000).contains(&r.steps),
         "the full WoW64 chain should be ~1.3k instructions, ran {}",
@@ -325,22 +248,6 @@ fn wow64_guest_allocates_through_the_real_wine_chain() {
     );
 }
 
-// ==========================================================================
-// W5.7 — the same process, booted through Wine's own loader
-// ==========================================================================
-
-/// **W5.7 — `wow64.dll` registers the win32k service table itself.**
-///
-/// Under `Bringup::WineLoader` exemu runs `Wow64LdrpInitialize`, whose process
-/// init loads `wow64win.dll`, resolves `sdwhwin32` by name and `movdqu`-copies
-/// the 32-byte service descriptor into its own **table 1** (rva 0x160a0). exemu
-/// does not fabricate one byte of it — the assertion below compares the live
-/// descriptor against the bytes still sitting in `wow64win`'s own image, so a
-/// hand-built table would not match.
-///
-/// This is the half of W5.5 that used to be pinned as failing-by-design; the
-/// *direct* bring-up still cannot do it, which is what
-/// `wow64_win32k_table_is_not_registered_yet` keeps honest.
 #[test]
 fn wow64_wine_loader_registers_the_win32k_table() {
     if !have_wow64_set() {
@@ -354,8 +261,6 @@ fn wow64_wine_loader_registers_the_win32k_table() {
     let exe = wow64_sample::build();
     let mut cfg = wine_loader_config("table1");
     let mut proc = Process::load(&exe, &mut cfg).expect("WoW64 boot");
-    // Stop once Wine's own bring-up has reached `for(;;) BTCpuSimulate()`, i.e.
-    // after its process init + thread init have run.
     let simulate = proc
         .wow64()
         .and_then(|b| b.wow64cpu.export("BTCpuSimulate"))
@@ -369,14 +274,10 @@ fn wow64_wine_loader_registers_the_win32k_table() {
         (b.wow64.base, b.wow64win.export("sdwhwin32").expect("wow64win!sdwhwin32"))
     };
 
-    // Table 0 (ntdll) is statically initialised in `.data`; table 1 is the one
-    // that only exists if Wine's process init ran.
     assert_eq!(proc.peek_u32(w + DESC_BASE + LIMIT).unwrap(), 0x108, "table 0 (ntdll) still 0x108 services");
     let t1 = proc.memory().read_u64(w + DESC_BASE + DESC_STRIDE).unwrap();
     assert_ne!(t1, 0, "table 1 (win32k) ServiceTable is registered");
 
-    // …and it is byte-identical to `wow64win!sdwhwin32`, copied by wow64.dll's
-    // own `movdqu` pair (rva 0x485c–0x486c), not built here.
     for i in 0..4u64 {
         assert_eq!(
             proc.memory().read_u64(w + DESC_BASE + DESC_STRIDE + i * 8).unwrap(),
@@ -387,7 +288,6 @@ fn wow64_wine_loader_registers_the_win32k_table() {
     let limit = proc.peek_u32(w + DESC_BASE + DESC_STRIDE + LIMIT).unwrap();
     assert!(limit > 0x100, "table 1 exposes a real service count ({limit:#x})");
 
-    // Wine also published the BOP itself, into cells exemu never wrote here.
     let (transition, dispatcher, unix) = {
         let b = proc.wow64().unwrap();
         (
@@ -406,24 +306,6 @@ fn wow64_wine_loader_registers_the_win32k_table() {
     );
 }
 
-/// **W5.7 — the standing gate: Wine's own i386 loader boots the process.**
-///
-/// The first 32-bit instruction executed is inside `ntdll32!LdrInitializeThunk`:
-/// `wow64.dll`'s per-thread init copies this thread's `WOW64_CONTEXT` onto the
-/// 32-bit stack and re-seats `Eip` on `LdrSystemDllInitBlock[0x18]`, with the
-/// copied `CONTEXT` as its stack argument. From there Wine's i386 `loader_init`
-/// runs for real — it walks `PEB32.ProcessParameters`, builds `PEB32.Ldr`, and
-/// **maps 32-bit DLLs off disk** through `NtCreateSection`/`NtMapViewOfSection`
-/// (which is why the WoW64 file-system redirector has to point
-/// `\windows\system32` at the i386 half of the prefix) — and only then does it
-/// `NtContinue` into `RtlUserThreadStart`, which calls the program.
-///
-/// So the guest reaches the same success exit as on the direct bring-up, but
-/// through ~650× more instructions, essentially all of them Wine's own loader.
-/// The bound below is deliberately wide: it exists to catch "the loader stopped
-/// running", not to fix a number. Things that move it: the pinned Wine prefix,
-/// the set of NT services the 32-bit loader completes, and how many 32-bit DLLs
-/// the guest's import graph drags in.
 #[test]
 fn wow64_wine_loader_boots_the_i386_ntdll_loader() {
     if !have_wow64_set() {
@@ -438,7 +320,6 @@ fn wow64_wine_loader_boots_the_i386_ntdll_loader() {
         .and_then(|b| b.ntdll32.export("LdrInitializeThunk"))
         .expect("ntdll32!LdrInitializeThunk");
 
-    // The 32-bit thread really starts inside Wine's loader, not at the program.
     let to_loader = proc
         .run_until_rip(ldr_init, 4_000_000)
         .expect("the 32-bit thread was seated on ntdll32!LdrInitializeThunk");
@@ -473,14 +354,10 @@ fn wow64_wine_loader_boots_the_i386_ntdll_loader() {
     let base = proc.peek_u32(base_cell).unwrap() as u64;
     assert!(base != 0 && base <= 0x7FFF_FFFF, "base {base:#x} inside the 32-bit address space");
 
-    // Wine's loader really loaded 32-bit modules: `PEB32.Ldr` is filled in, and
-    // it is not something exemu wrote (the boot leaves the field zero).
     let peb32 = proc.wow64().unwrap().peb32;
     let ldr = proc.peek_u32(peb32 + exemu_os::wow64::peb32::LDR).unwrap();
     assert_ne!(ldr, 0, "ntdll32's loader_init published PEB32.Ldr");
 
-    // Hundreds of thousands of instructions: essentially all of them Wine's
-    // 32-bit loader. Measured: 841,235.
     assert!(
         (300_000..8_000_000).contains(&r.steps),
         "Wine's i386 loader_init should dominate the run, total was {}",
@@ -488,25 +365,6 @@ fn wow64_wine_loader_boots_the_i386_ntdll_loader() {
     );
 }
 
-/// **W5.10 — a 32-bit guest's own window procedure receives its creation
-/// messages, and its answer reaches the kernel.**
-///
-/// The gate the whole client-callback protocol exists for. A PE32 guest
-/// registers a class whose `lpfnWndProc` is its own 32-bit code, creates the
-/// window, and checks three things the direct call could never have delivered:
-///
-/// * `WM_NCCREATE` **and** `WM_CREATE` both arrive (before this, exemu declined
-///   the callback rather than run 32-bit bytes in long mode);
-/// * the `WM_NCCREATE` `lParam` is a **32-bit-addressable** `CREATESTRUCTW`
-///   whose `style` reads back at the 32-bit offset `0x20`;
-/// * a `SendMessageW` returns the value the procedure returned — so the answer
-///   travelled WndProc → `NtCallbackReturn` → exemu's kernel → back out through
-///   `wow64win`.
-///
-/// Nothing in the chain between the guest's `call [IAT]` and its own procedure
-/// is exemu's: it is Wine's i386 `user32`/`win32u`, `wow64cpu`'s BOP,
-/// `wow64.dll`, `wow64win.dll`, and the 64-bit `ntdll` — with exemu supplying
-/// only the kernel side of the win32k syscall and the callback frame.
 #[test]
 fn a_32bit_guest_wndproc_gets_its_creation_messages() {
     if !have_wow64_set() {
@@ -520,9 +378,6 @@ fn a_32bit_guest_wndproc_gets_its_creation_messages() {
     cfg.max_steps = 80_000_000;
     let mut proc = Process::load(&exe, &mut cfg).expect("WoW64 boot");
 
-    // `PEB64.KernelCallbackTable` is `wow64win!user_callbacks`, published from
-    // that DLL's own `DllMain` bytes — without it the dispatcher would
-    // `call [0 + id*8]`.
     let (peb64, wow64win_base, wow64win_size) = {
         let b = proc.wow64().expect("WoW64 boot");
         (b.peb64, b.wow64win.base, b.wow64win.size)
@@ -554,8 +409,6 @@ fn a_32bit_guest_wndproc_gets_its_creation_messages() {
         proc.peek_u32(s::data_va(s::data::SEND_RESULT)).unwrap(),
     );
 
-    // The same facts, read out of guest memory rather than inferred from the
-    // exit code — so a failure names which half broke.
     assert_eq!(seen, s::seen::ALL, "WM_NCCREATE, WM_CREATE and the private probe all arrived");
     let hwnd = proc.peek_u32(s::data_va(s::data::HWND)).unwrap();
     assert_ne!(hwnd, 0, "CreateWindowExW returned a window");

@@ -1,35 +1,17 @@
-//! A small ARM64 (AArch64) instruction encoder.
-//!
-//! Pure, allocation-only, **safe** code: it turns instruction descriptions into
-//! `u32` words and knows nothing about pointers, mappings or execution. That
-//! separation is deliberate — this is where a code-generation bug would live, so
-//! it is the part that must be ordinary Rust the compiler and the test suite can
-//! reason about. The words it produces are handed to
-//! [`crate::buffer::CodeBuffer`], which is where the `unsafe` lives.
-//!
-//! Only the encodings the emitter actually uses are implemented. Every one of
-//! them is covered by a test that *executes* it and checks the architectural
-//! result, rather than comparing against a hand-typed byte pattern — an
-//! encoding table copied wrongly and a test transcribed from the same wrong
-//! table would agree with each other.
-
-/// Register numbers. 31 means `xzr`/`wzr` for most instructions and `sp` for the
-/// load/store and add/sub-immediate forms.
 pub const ZR: u32 = 31;
 pub const SP: u32 = 31;
 
-/// AArch64 condition codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Cond {
     Eq = 0,
     Ne = 1,
-    Cs = 2, // carry set / unsigned >=
-    Cc = 3, // carry clear / unsigned <
-    Mi = 4, // negative
-    Pl = 5, // positive or zero
-    Vs = 6, // overflow set
-    Vc = 7, // overflow clear
+    Cs = 2,
+    Cc = 3,
+    Mi = 4,
+    Pl = 5,
+    Vs = 6,
+    Vc = 7,
     Hi = 8,
     Ls = 9,
     Ge = 10,
@@ -40,7 +22,6 @@ pub enum Cond {
 }
 
 impl Cond {
-    /// The condition that is true exactly when `self` is false.
     pub fn invert(self) -> Cond {
         match self {
             Cond::Eq => Cond::Ne,
@@ -62,11 +43,9 @@ impl Cond {
     }
 }
 
-/// A forward branch waiting to be patched by [`Asm::bind`].
 #[derive(Clone, Copy, Debug)]
 pub struct Label(usize);
 
-/// An ARM64 instruction stream under construction.
 #[derive(Default, Clone)]
 pub struct Asm {
     words: Vec<u32>,
@@ -85,11 +64,6 @@ impl Asm {
         self.words
     }
 
-    /// The stream, writable — for the one case that needs it: a word emitted
-    /// before its value is known (the block's own byte length, which is only
-    /// settled once the block has stopped growing) and patched in afterwards.
-    /// This is a plain `Vec<u32>` that has not been copied into the code buffer
-    /// yet, so nothing here touches executable memory.
     pub fn words_mut(&mut self) -> &mut [u32] {
         &mut self.words
     }
@@ -107,9 +81,6 @@ impl Asm {
         self.words.push(w);
     }
 
-    // ---- moves -----------------------------------------------------------
-
-    /// `movz Xd|Wd, #imm16, LSL #(16*hw)`
     pub fn movz(&mut self, sf64: bool, rd: u32, imm16: u16, hw: u32) {
         debug_assert!(hw < if sf64 { 4 } else { 2 });
         self.emit(
@@ -117,28 +88,22 @@ impl Asm {
         );
     }
 
-    /// `movn Xd|Wd, #imm16, LSL #(16*hw)`
     pub fn movn(&mut self, sf64: bool, rd: u32, imm16: u16, hw: u32) {
         self.emit(
             (sf64 as u32) << 31 | 0b00_100101 << 23 | (hw & 3) << 21 | (imm16 as u32) << 5 | rd,
         );
     }
 
-    /// `movk Xd|Wd, #imm16, LSL #(16*hw)`
     pub fn movk(&mut self, sf64: bool, rd: u32, imm16: u16, hw: u32) {
         self.emit(
             (sf64 as u32) << 31 | 0b11_100101 << 23 | (hw & 3) << 21 | (imm16 as u32) << 5 | rd,
         );
     }
 
-    /// Materialise an arbitrary 64-bit constant into `rd` (1–4 instructions).
     pub fn mov_imm64(&mut self, rd: u32, value: u64) {
-        // All-ones halfword tricks first: `movn` covers the common negative
-        // constants (sign-extended displacements) in one instruction.
         let hw = |i: u32| ((value >> (16 * i)) & 0xffff) as u16;
         let inv = !value;
         let inv_hw = |i: u32| ((inv >> (16 * i)) & 0xffff) as u16;
-        // Count non-zero halfwords of value and of !value.
         let nz = (0..4).filter(|&i| hw(i) != 0).count();
         let nz_inv = (0..4).filter(|&i| inv_hw(i) != 0).count();
         if nz == 0 {
@@ -146,10 +111,6 @@ impl Asm {
             return;
         }
         if nz_inv <= nz {
-            // Build with movn (which writes !imm into the halfword and ones
-            // elsewhere) then movk the remaining halfwords.
-            // `unwrap_or(0)` covers value == u64::MAX, where every inverted
-            // halfword is zero and a single `movn rd, #0` is the whole answer.
             let first = (0..4).find(|&i| inv_hw(i) != 0).unwrap_or(0);
             self.movn(true, rd, inv_hw(first), first);
             for i in 0..4 {
@@ -168,15 +129,10 @@ impl Asm {
         }
     }
 
-    /// `mov Xd, Xn` (`orr Xd, XZR, Xn`).
     pub fn mov_reg(&mut self, sf64: bool, rd: u32, rn: u32) {
         self.orr_reg(sf64, rd, ZR, rn, 0);
     }
 
-    // ---- loads / stores (unsigned scaled offset) --------------------------
-
-    /// `ldr{b,h,} Wt|Xt, [Xn, #off]` for `size` in {1,2,4,8}. `off` is in bytes
-    /// and must be a multiple of `size` and fit the 12-bit scaled immediate.
     pub fn ldr(&mut self, size: u8, rt: u32, rn: u32, off: u32) {
         let (base, scale) = match size {
             1 => (0x3940_0000u32, 0),
@@ -190,23 +146,11 @@ impl Asm {
         self.emit(base | (imm12 & 0xfff) << 10 | rn << 5 | rt);
     }
 
-    /// `ldrb Wt, [Xn, Xm]` — byte load with a register offset (the parity-table
-    /// lookup the flag lowering uses).
     pub fn ldrb_reg(&mut self, rt: u32, rn: u32, rm: u32) {
-        // size=00 V=0 opc=01, option=011 (LSL/UXTX), S=0.
         self.emit(0x3860_6800 | rm << 16 | rn << 5 | rt);
     }
 
-    /// `ldr{b,h,} Wt|Xt, [Xn, Xm]` for `size` in {1,2,4,8} — zero-extending,
-    /// little-endian, **unscaled** register offset, so the address is exactly
-    /// `Xn + Xm`. The guest-memory fast path's load (roadmap W8.6): `Xn` is the
-    /// host base cached for the page and `Xm` is the guest address, so the sum
-    /// is the host address of the guest byte.
-    ///
-    /// Unaligned is fine — these are ordinary loads, and x86 operands are not
-    /// required to be aligned.
     pub fn ldr_reg(&mut self, size: u8, rt: u32, rn: u32, rm: u32) {
-        // size<<30 | 111000011 | Rm | option=011 (LSL/UXTX) | S=0 | 10 | Rn | Rt
         let base: u32 = match size {
             1 => 0x3860_6800,
             2 => 0x7860_6800,
@@ -216,7 +160,6 @@ impl Asm {
         self.emit(base | rm << 16 | rn << 5 | rt);
     }
 
-    /// `str{b,h,} Wt|Xt, [Xn, Xm]` — the store half of [`ldr_reg`](Self::ldr_reg).
     pub fn str_reg(&mut self, size: u8, rt: u32, rn: u32, rm: u32) {
         let base: u32 = match size {
             1 => 0x3820_6800,
@@ -227,14 +170,10 @@ impl Asm {
         self.emit(base | rm << 16 | rn << 5 | rt);
     }
 
-    /// `str Xt, [Xn, Xm, LSL #3]` — 8-byte store to an indexed slot (the block
-    /// trail's ring, written from compiled code when a native link is taken).
     pub fn str_reg_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
-        // size=11 V=0 opc=00, option=011 (LSL/UXTX), S=1 (scale by 8).
         self.emit(0xF820_7800 | rm << 16 | rn << 5 | rt);
     }
 
-    /// `str{b,h,} Wt|Xt, [Xn, #off]`.
     pub fn str(&mut self, size: u8, rt: u32, rn: u32, off: u32) {
         let (base, scale) = match size {
             1 => (0x3900_0000u32, 0),
@@ -248,81 +187,64 @@ impl Asm {
         self.emit(base | (imm12 & 0xfff) << 10 | rn << 5 | rt);
     }
 
-    /// `stp Xt1, Xt2, [Xn, #imm]!` (pre-index).
     pub fn stp_pre(&mut self, rt1: u32, rt2: u32, rn: u32, off: i32) {
         debug_assert_eq!(off % 8, 0);
         let imm7 = ((off / 8) as u32) & 0x7f;
         self.emit(0xA980_0000 | imm7 << 15 | rt2 << 10 | rn << 5 | rt1);
     }
 
-    /// `ldp Xt1, Xt2, [Xn], #imm` (post-index).
     pub fn ldp_post(&mut self, rt1: u32, rt2: u32, rn: u32, off: i32) {
         debug_assert_eq!(off % 8, 0);
         let imm7 = ((off / 8) as u32) & 0x7f;
         self.emit(0xA8C0_0000 | imm7 << 15 | rt2 << 10 | rn << 5 | rt1);
     }
 
-    /// `stp Xt1, Xt2, [Xn, #imm]` (signed offset).
     pub fn stp(&mut self, rt1: u32, rt2: u32, rn: u32, off: i32) {
         debug_assert_eq!(off % 8, 0);
         let imm7 = ((off / 8) as u32) & 0x7f;
         self.emit(0xA900_0000 | imm7 << 15 | rt2 << 10 | rn << 5 | rt1);
     }
 
-    /// `ldp Xt1, Xt2, [Xn, #imm]` (signed offset).
     pub fn ldp(&mut self, rt1: u32, rt2: u32, rn: u32, off: i32) {
         debug_assert_eq!(off % 8, 0);
         let imm7 = ((off / 8) as u32) & 0x7f;
         self.emit(0xA940_0000 | imm7 << 15 | rt2 << 10 | rn << 5 | rt1);
     }
 
-    // ---- add / sub -------------------------------------------------------
-
     fn addsub_reg(&mut self, base: u32, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.emit((sf64 as u32) << 31 | base | rm << 16 | (lsl & 0x3f) << 10 | rn << 5 | rd);
     }
 
-    /// `add Xd, Xn, Xm, LSL #lsl`
     pub fn add_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.addsub_reg(0x0B00_0000, sf64, rd, rn, rm, lsl);
     }
-    /// `adds Xd, Xn, Xm, LSL #lsl` (sets NZCV)
     pub fn adds_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.addsub_reg(0x2B00_0000, sf64, rd, rn, rm, lsl);
     }
-    /// `sub Xd, Xn, Xm, LSL #lsl`
     pub fn sub_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.addsub_reg(0x4B00_0000, sf64, rd, rn, rm, lsl);
     }
-    /// `subs Xd, Xn, Xm, LSL #lsl` (sets NZCV)
     pub fn subs_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.addsub_reg(0x6B00_0000, sf64, rd, rn, rm, lsl);
     }
-    /// `cmp Xn, Xm` — `subs xzr, Xn, Xm`.
     pub fn cmp_reg(&mut self, sf64: bool, rn: u32, rm: u32) {
         self.subs_reg(sf64, ZR, rn, rm, 0);
     }
-    /// `cmp Xn, Xm, ASR #sh` — the overflow test for a 64×64 signed multiply.
     pub fn cmp_reg_asr(&mut self, sf64: bool, rn: u32, rm: u32, sh: u32) {
         self.emit(
             (sf64 as u32) << 31 | 0x6B00_0000 | 0b10 << 22 | rm << 16 | (sh & 0x3f) << 10 | rn << 5
                 | ZR,
         );
     }
-    /// `cmp Xn, Xm, LSR #sh` — the shift folded into the compare, so the
-    /// guest-memory TLB's page-number test costs no separate `lsr`
-    /// (roadmap W8.6).
     pub fn cmp_reg_lsr(&mut self, sf64: bool, rn: u32, rm: u32, sh: u32) {
         self.emit(
             (sf64 as u32) << 31 | 0x6B00_0000 | 0b01 << 22 | rm << 16 | (sh & 0x3f) << 10 | rn << 5
                 | ZR,
         );
     }
-    /// `adcs Xd, Xn, Xm` — add with the ARM carry flag, setting NZCV.
     pub fn adcs_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32) {
         self.emit((sf64 as u32) << 31 | 0x3A00_0000 | rm << 16 | rn << 5 | rd);
     }
-    /// `sbcs Xd, Xn, Xm` — subtract with the ARM carry flag, setting NZCV.
     pub fn sbcs_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32) {
         self.emit((sf64 as u32) << 31 | 0x7A00_0000 | rm << 16 | rn << 5 | rd);
     }
@@ -334,20 +256,15 @@ impl Asm {
         );
     }
 
-    /// `add Xd, Xn, #imm12 {, LSL #12}`
     pub fn add_imm(&mut self, sf64: bool, rd: u32, rn: u32, imm12: u32, sh12: bool) {
         self.addsub_imm(0x1100_0000, sf64, rd, rn, imm12, sh12);
     }
-    /// `sub Xd, Xn, #imm12 {, LSL #12}`
     pub fn sub_imm(&mut self, sf64: bool, rd: u32, rn: u32, imm12: u32, sh12: bool) {
         self.addsub_imm(0x5100_0000, sf64, rd, rn, imm12, sh12);
     }
-    /// `subs Xd, Xn, #imm12` (sets NZCV)
     pub fn subs_imm(&mut self, sf64: bool, rd: u32, rn: u32, imm12: u32, sh12: bool) {
         self.addsub_imm(0x7100_0000, sf64, rd, rn, imm12, sh12);
     }
-
-    // ---- logical ---------------------------------------------------------
 
     fn logic_reg(&mut self, base: u32, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.emit((sf64 as u32) << 31 | base | rm << 16 | (lsl & 0x3f) << 10 | rn << 5 | rd);
@@ -362,29 +279,22 @@ impl Asm {
     pub fn eor_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.logic_reg(0x4A00_0000, sf64, rd, rn, rm, lsl);
     }
-    /// `ands Xd, Xn, Xm` (sets NZ, clears CV)
     pub fn ands_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.logic_reg(0x6A00_0000, sf64, rd, rn, rm, lsl);
     }
-    /// `bic Xd, Xn, Xm` — `Xn AND NOT Xm`.
     pub fn bic_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.logic_reg(0x0A20_0000, sf64, rd, rn, rm, lsl);
     }
-    /// `orn Xd, Xn, Xm`; with `rn == ZR` this is `mvn Xd, Xm`.
     pub fn orn_reg(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, lsl: u32) {
         self.logic_reg(0x2A20_0000, sf64, rd, rn, rm, lsl);
     }
-    /// `mvn Xd, Xm`
     pub fn mvn(&mut self, sf64: bool, rd: u32, rm: u32) {
         self.orn_reg(sf64, rd, ZR, rm, 0);
     }
-    /// `neg Xd, Xm` — `sub Xd, XZR, Xm`.
     pub fn neg(&mut self, sf64: bool, rd: u32, rm: u32) {
         self.sub_reg(sf64, rd, ZR, rm, 0);
     }
 
-    /// `and Xd, Xn, #imm` — returns false (emitting nothing) when `imm` is not
-    /// an encodable bitmask immediate.
     #[must_use]
     pub fn and_imm(&mut self, sf64: bool, rd: u32, rn: u32, imm: u64) -> bool {
         self.logic_imm(0x1200_0000, sf64, rd, rn, imm)
@@ -414,8 +324,6 @@ impl Asm {
         }
     }
 
-    // ---- bitfield --------------------------------------------------------
-
     fn bfm_family(&mut self, base: u32, sf64: bool, rd: u32, rn: u32, immr: u32, imms: u32) {
         let n = sf64 as u32;
         self.emit(
@@ -425,20 +333,16 @@ impl Asm {
         );
     }
 
-    /// `ubfm` — the unsigned bitfield move the shift/extract aliases build on.
     pub fn ubfm(&mut self, sf64: bool, rd: u32, rn: u32, immr: u32, imms: u32) {
         self.bfm_family(0x5300_0000, sf64, rd, rn, immr, imms);
     }
-    /// `sbfm` — the signed bitfield move (`asr`, `sxtb`, `sxth`, `sxtw`).
     pub fn sbfm(&mut self, sf64: bool, rd: u32, rn: u32, immr: u32, imms: u32) {
         self.bfm_family(0x1300_0000, sf64, rd, rn, immr, imms);
     }
-    /// `bfm` — bitfield move keeping the untouched destination bits (`bfi`).
     pub fn bfm(&mut self, sf64: bool, rd: u32, rn: u32, immr: u32, imms: u32) {
         self.bfm_family(0x3300_0000, sf64, rd, rn, immr, imms);
     }
 
-    /// `lsl Xd, Xn, #sh`
     pub fn lsl_imm(&mut self, sf64: bool, rd: u32, rn: u32, sh: u32) {
         let w = if sf64 { 64 } else { 32 };
         if sh == 0 {
@@ -447,7 +351,6 @@ impl Asm {
         }
         self.ubfm(sf64, rd, rn, (w - sh) % w, w - 1 - sh);
     }
-    /// `lsr Xd, Xn, #sh`
     pub fn lsr_imm(&mut self, sf64: bool, rd: u32, rn: u32, sh: u32) {
         let w = if sf64 { 64 } else { 32 };
         if sh == 0 {
@@ -456,30 +359,24 @@ impl Asm {
         }
         self.ubfm(sf64, rd, rn, sh, w - 1);
     }
-    /// `asr Xd, Xn, #sh`
     pub fn asr_imm(&mut self, sf64: bool, rd: u32, rn: u32, sh: u32) {
         let w = if sf64 { 64 } else { 32 };
         self.sbfm(sf64, rd, rn, sh, w - 1);
     }
-    /// `ubfx Xd, Xn, #lsb, #width` — zero-extended bitfield extract.
     pub fn ubfx(&mut self, sf64: bool, rd: u32, rn: u32, lsb: u32, width: u32) {
         self.ubfm(sf64, rd, rn, lsb, lsb + width - 1);
     }
-    /// `sbfx Xd, Xn, #lsb, #width` — sign-extended bitfield extract.
     pub fn sbfx(&mut self, sf64: bool, rd: u32, rn: u32, lsb: u32, width: u32) {
         self.sbfm(sf64, rd, rn, lsb, lsb + width - 1);
     }
-    /// `bfi Xd, Xn, #lsb, #width` — insert `width` low bits of Xn at `lsb`.
     pub fn bfi(&mut self, sf64: bool, rd: u32, rn: u32, lsb: u32, width: u32) {
         let w = if sf64 { 64 } else { 32 };
         self.bfm(sf64, rd, rn, (w - lsb) % w, width - 1);
     }
-    /// `sxtw Xd, Wn`
     pub fn sxtw(&mut self, rd: u32, rn: u32) {
         self.sbfm(true, rd, rn, 0, 31);
     }
 
-    /// Variable shifts.
     pub fn lslv(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32) {
         self.emit((sf64 as u32) << 31 | 0x1AC0_2000 | rm << 16 | rn << 5 | rd);
     }
@@ -493,138 +390,102 @@ impl Asm {
         self.emit((sf64 as u32) << 31 | 0x1AC0_2C00 | rm << 16 | rn << 5 | rd);
     }
 
-    // ---- multiply --------------------------------------------------------
-
-    /// `mul Xd, Xn, Xm` (`madd Xd, Xn, Xm, XZR`).
     pub fn mul(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32) {
         self.emit((sf64 as u32) << 31 | 0x1B00_7C00 | rm << 16 | rn << 5 | rd);
     }
-    /// `smulh Xd, Xn, Xm` — high 64 bits of a signed 64×64 product.
     pub fn smulh(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x9B40_7C00 | rm << 16 | rn << 5 | rd);
     }
-    /// `umulh Xd, Xn, Xm` — high 64 bits of an unsigned 64×64 product.
     pub fn umulh(&mut self, rd: u32, rn: u32, rm: u32) {
         self.emit(0x9BC0_7C00 | rm << 16 | rn << 5 | rd);
     }
 
-    // ---- conditional select ---------------------------------------------
-
-    /// `csel Xd, Xn, Xm, cond`
     pub fn csel(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, cond: Cond) {
         self.emit(
             (sf64 as u32) << 31 | 0x1A80_0000 | rm << 16 | (cond as u32) << 12 | rn << 5 | rd,
         );
     }
-    /// `csinc Xd, Xn, Xm, cond`
     pub fn csinc(&mut self, sf64: bool, rd: u32, rn: u32, rm: u32, cond: Cond) {
         self.emit(
             (sf64 as u32) << 31 | 0x1A80_0400 | rm << 16 | (cond as u32) << 12 | rn << 5 | rd,
         );
     }
-    /// `cset Xd, cond` — 1 when `cond` holds, else 0.
     pub fn cset(&mut self, sf64: bool, rd: u32, cond: Cond) {
         self.csinc(sf64, rd, ZR, ZR, cond.invert());
     }
 
-    // ---- branches --------------------------------------------------------
-
-    /// `ret`
     pub fn ret(&mut self) {
         self.emit(0xD65F_03C0);
     }
-    /// `blr Xn`
     pub fn blr(&mut self, rn: u32) {
         self.emit(0xD63F_0000 | rn << 5);
     }
-    /// `br Xn` — branch to an address held in a register, without linking. The
-    /// one instruction native block linking is built on: a compiled block jumps
-    /// straight into its successor's body instead of returning to Rust.
     pub fn br(&mut self, rn: u32) {
         self.emit(0xD61F_0000 | rn << 5);
     }
 
-    /// `nop`
     pub fn nop(&mut self) {
         self.emit(0xD503_201F);
     }
 
-    /// Emit `b <label>` with the target patched later.
     pub fn b_forward(&mut self) -> Label {
         let at = self.words.len();
         self.emit(0x1400_0000);
         Label(at)
     }
 
-    /// Emit `b.<cond> <label>` with the target patched later.
     pub fn b_cond_forward(&mut self, cond: Cond) -> Label {
         let at = self.words.len();
         self.emit(0x5400_0000 | cond as u32);
         Label(at)
     }
 
-    /// Emit `cbnz Xt, <label>` with the target patched later.
     pub fn cbnz_forward(&mut self, sf64: bool, rt: u32) -> Label {
         let at = self.words.len();
         self.emit((sf64 as u32) << 31 | 0x3500_0000 | rt);
         Label(at)
     }
 
-    /// Emit `cbz Xt, <label>` with the target patched later.
     pub fn cbz_forward(&mut self, sf64: bool, rt: u32) -> Label {
         let at = self.words.len();
         self.emit((sf64 as u32) << 31 | 0x3400_0000 | rt);
         Label(at)
     }
 
-    /// Emit `tbnz Xt, #bit, <label>` — test one bit and branch if set.
     pub fn tbnz_forward(&mut self, rt: u32, bit: u32) -> Label {
         let at = self.words.len();
         self.emit(0x3700_0000 | (bit & 0x1f) << 19 | (bit >> 5) << 31 | rt);
         Label(at)
     }
 
-    /// Emit `tbz Xt, #bit, <label>` — test one bit and branch if clear.
     pub fn tbz_forward(&mut self, rt: u32, bit: u32) -> Label {
         let at = self.words.len();
         self.emit(0x3600_0000 | (bit & 0x1f) << 19 | (bit >> 5) << 31 | rt);
         Label(at)
     }
 
-    /// Resolve a forward branch to the current end of the stream.
-    ///
-    /// The three branch classes carry their offset in different fields, and
-    /// patching the wrong width would silently corrupt the register or bit
-    /// number next to it — so the class is decoded, not assumed.
     pub fn bind(&mut self, label: Label) {
         let target = self.words.len();
         let delta = (target - label.0) as u32;
         let w = self.words[label.0];
         if w & 0xFC00_0000 == 0x1400_0000 {
-            // b: imm26 at bit 0
             debug_assert!(delta < (1 << 25));
             self.words[label.0] = 0x1400_0000 | (delta & 0x03FF_FFFF);
         } else if w & 0x7E00_0000 == 0x3600_0000 {
-            // tbz/tbnz: imm14 at bit 5
             debug_assert!(delta < (1 << 13));
             self.words[label.0] = (w & !0x0007_FFE0) | ((delta & 0x3FFF) << 5);
         } else {
-            // b.cond / cbz / cbnz: imm19 at bit 5
             debug_assert!(delta < (1 << 18));
             self.words[label.0] = (w & !0x00FF_FFE0) | ((delta & 0x7FFFF) << 5);
         }
     }
 }
 
-/// Decode an AArch64 logical-immediate `(N, immr, imms)` triple, per the
-/// `DecodeBitMasks` pseudocode in the architecture reference. `None` for the
-/// reserved encodings.
 pub fn decode_bitmask(n: u32, immr: u32, imms: u32, is64: bool) -> Option<u64> {
     let width: u32 = if is64 { 64 } else { 32 };
     if !is64 && n == 1 {
         return None;
     }
-    // len = highest set bit of the 7-bit value N:NOT(imms)
     let x = (n << 6) | ((!imms) & 0x3f);
     if x == 0 {
         return None;
@@ -641,7 +502,7 @@ pub fn decode_bitmask(n: u32, immr: u32, imms: u32, is64: bool) -> Option<u64> {
     let s = imms & levels;
     let r = immr & levels;
     if s == levels {
-        return None; // all-ones element is not encodable
+        return None;
     }
     let esize_mask: u64 = if esize == 64 { u64::MAX } else { (1u64 << esize) - 1 };
     let welem: u64 = if s + 1 == 64 { u64::MAX } else { (1u64 << (s + 1)) - 1 };
@@ -659,8 +520,6 @@ pub fn decode_bitmask(n: u32, immr: u32, imms: u32, is64: bool) -> Option<u64> {
     Some(out)
 }
 
-/// Is `x` a single contiguous run of ones (`0*1+0*` read from the bottom)?
-/// `0` is not — it has no run at all.
 #[inline]
 fn is_shifted_mask(x: u64) -> bool {
     if x == 0 {
@@ -670,36 +529,14 @@ fn is_shifted_mask(x: u64) -> bool {
     t.count_ones() == 64 - t.leading_zeros()
 }
 
-/// Find the `(N, immr, imms)` encoding of `value` as a logical immediate, if it
-/// has one.
-///
-/// Closed form, then **verified against [`decode_bitmask`]** before it is
-/// returned — so the architecture's own definition is still what decides
-/// whether an encoding is correct, exactly as when this was a search over all
-/// 8192 triples (roadmap W8.6). The search was not cheap enough to leave in: it
-/// ran the decoder ~4100 times for a value whose element is 64 bits wide (the
-/// `and #0xff` every `flags_szp_into` emits is one), and at ~15 emitted
-/// instructions per compiled guest instruction that came to **4.6% of the whole
-/// 7-Zip run** — spent inside the compiler, not the compiled code.
-///
-/// The derivation is the standard one: the element size is the smallest power
-/// of two whose repetition reproduces the value; within one element the value
-/// must be a rotation of `0*1+`, which gives the run length (`imms`) and the
-/// rotation (`immr`); the element size is folded into the high bits of `imms`
-/// with `N` as its top bit. Nothing here is trusted — a triple that does not
-/// decode back to `value` is reported as "not encodable", and
-/// `every_encodable_value_is_found_by_the_closed_form` proves over the whole
-/// 16384-triple space that no value the old search could encode is lost.
 pub fn encode_bitmask(value: u64, is64: bool) -> Option<(u32, u32, u32)> {
     let width: u32 = if is64 { 64 } else { 32 };
     let all: u64 = if is64 { u64::MAX } else { 0xffff_ffff };
     let value = value & all;
-    // 0 and all-ones have no encoding.
     if value == 0 || value == all {
         return None;
     }
 
-    // 1. Element size: halve while the two halves still agree.
     let mut size = width;
     loop {
         size /= 2;
@@ -715,18 +552,15 @@ pub fn encode_bitmask(value: u64, is64: bool) -> Option<(u32, u32, u32)> {
     let esize_mask: u64 = if size == 64 { u64::MAX } else { (1u64 << size) - 1 };
     let mut elem = value & esize_mask;
 
-    // 2. The rotation that turns the element into `0*1+`, and the run length.
     let (rot, ones) = if is_shifted_mask(elem) {
         let i = elem.trailing_zeros();
         (i, (elem >> i).trailing_ones())
     } else {
-        // The run wraps round the element: fill the bits above it so the
-        // *complement* is the contiguous run instead.
         elem |= !esize_mask;
         if !is_shifted_mask(!elem) {
             return None;
         }
-        let clo = (!elem).leading_zeros(); // leading ones of `elem`
+        let clo = (!elem).leading_zeros();
         let ones = (clo + elem.trailing_ones()).checked_sub(64 - size)?;
         (64 - clo, ones)
     };
@@ -735,13 +569,10 @@ pub fn encode_bitmask(value: u64, is64: bool) -> Option<(u32, u32, u32)> {
     }
 
     let immr = (size - rot) & (size - 1);
-    // `size` as a mask in the high bits of the 7-bit `N:imms` field, with the
-    // run length (biased by one) in the low bits; `N` is that field's bit 6.
     let nimms = (!(size - 1) << 1) | (ones - 1);
     let n = ((nimms >> 6) & 1) ^ 1;
     let imms = nimms & 0x3f;
 
-    // The architecture's own decoder has the last word.
     if decode_bitmask(n, immr, imms, is64) == Some(value) {
         Some((n, immr, imms))
     } else {
@@ -755,8 +586,6 @@ mod tests {
     use super::*;
     use crate::buffer::CodeBuffer;
 
-    /// Assemble `body`, append `ret`, run it as `fn(u64, u64) -> u64` and return
-    /// the result. Every encoding test goes through the real CPU.
     fn run2(body: impl FnOnce(&mut Asm), a: u64, b: u64) -> u64 {
         let mut asm = Asm::new();
         body(&mut asm);
@@ -764,17 +593,12 @@ mod tests {
         let mut buf = CodeBuffer::with_capacity(4096).unwrap();
         let code = buf.push(asm.words()).unwrap();
         // SAFETY: the block was just assembled with the AAPCS64 signature below
-        // and lives in `buf`, which outlives the call.
         let f: extern "C" fn(u64, u64) -> u64 = unsafe { code.as_fn() };
         f(a, b)
     }
 
     #[test]
     fn br_jumps_to_the_address_in_a_register() {
-        // `br` is the whole of native block linking, so it is executed here
-        // rather than pattern-matched: assemble a second stream that returns 42,
-        // put its address in x1 and branch to it. If the encoding were wrong the
-        // test would not fail an assertion, it would crash — which is the point.
         let mut tail = Asm::new();
         tail.mov_imm64(0, 42);
         tail.ret();
@@ -785,7 +609,6 @@ mod tests {
         head.br(1);
         let entry = buf.push(head.words()).unwrap();
         // SAFETY: both streams were just assembled for this signature and the
-        // buffer is alive; `br x1` lands on `target`, which ends in `ret`.
         let got = unsafe {
             let f: extern "C" fn(u64, u64) -> u64 = entry.as_fn();
             f(0, target.addr() as u64)
@@ -795,7 +618,6 @@ mod tests {
 
     #[test]
     fn str_reg_lsl3_indexes_a_slot_array() {
-        // `str x0, [x1, x2, lsl #3]` — the trail-ring write.
         let mut slots = [0u64; 4];
         let mut asm = Asm::new();
         asm.mov_imm64(3, 0xABCD);
@@ -806,7 +628,6 @@ mod tests {
         let mut buf = CodeBuffer::with_capacity(4096).unwrap();
         let code = buf.push(asm.words()).unwrap();
         // SAFETY: as `run2` — the stream was just assembled for this signature,
-        // and `slots` is a live 4-element array the store indexes inside.
         unsafe {
             let f: extern "C" fn(u64, u64) -> u64 = code.as_fn();
             f(0, slots.as_mut_ptr() as u64);
@@ -848,7 +669,6 @@ mod tests {
 
     #[test]
     fn cset_reads_the_flags_the_x86_lowering_needs() {
-        // CF for x86 ADD is ARM's C after ADDS.
         let carry = |x: u64, y: u64| {
             run2(
                 |a| {
@@ -861,7 +681,6 @@ mod tests {
         };
         assert_eq!(carry(u64::MAX, 1), 1);
         assert_eq!(carry(1, 1), 0);
-        // x86 CF for SUB is *borrow* = ARM's !C.
         let borrow = |x: u64, y: u64| {
             run2(
                 |a| {
@@ -874,7 +693,6 @@ mod tests {
         };
         assert_eq!(borrow(1, 2), 1);
         assert_eq!(borrow(2, 1), 0);
-        // OF is ARM's V.
         let ovf = |x: u64, y: u64| {
             run2(
                 |a| {
@@ -901,15 +719,9 @@ mod tests {
         assert_eq!(run2(|a| a.lsrv(true, 0, 0, 1), 0x1000, 12), 1);
         assert_eq!(run2(|a| a.asrv(true, 0, 0, 1), (-4096i64) as u64, 12), (-1i64) as u64);
         assert_eq!(run2(|a| a.rorv(true, 0, 0, 1), 1, 1), 0x8000_0000_0000_0000);
-        // bfi replaces a field and leaves the rest alone.
         assert_eq!(run2(|a| a.bfi(true, 0, 1, 8, 8), 0xffff, 0), 0x00ff);
     }
 
-    /// `cmp Xn, Xm, LSR #sh`. The guest-memory TLB's probe compares a stored
-    /// page number against the page of the access's last byte, and folding the
-    /// shift into the compare is what makes that check cost nothing (roadmap
-    /// W8.6) — so the shift has to be *logical*, and applied to the second
-    /// operand only.
     #[test]
     fn cmp_folds_a_logical_shift_right_into_its_second_operand() {
         let eq = |a: u64, b: u64| {
@@ -925,15 +737,10 @@ mod tests {
         assert_eq!(eq(0x9, 0x9123), 1, "x0 == x1 >> 12");
         assert_eq!(eq(0x9, 0xa123), 0);
         assert_eq!(eq(0x9123, 0x9123), 0, "the shift is not optional");
-        // Logical, not arithmetic: the sign bit must not be replicated.
         assert_eq!(eq(0x000f_ffff_ffff_ffff, u64::MAX), 1);
         assert_eq!(eq(u64::MAX, u64::MAX), 0);
     }
 
-    /// The guest-memory fast path is `ldr dst, [base, addr]` with the host base
-    /// and the *guest* address in registers, so the encoding has to be the
-    /// unscaled register-offset form at every width — a scaled one would
-    /// multiply the guest address by the access size. Executed, not inspected.
     #[test]
     fn register_offset_loads_and_stores_address_base_plus_offset() {
         let mut buf = [0u8; 32];
@@ -941,22 +748,19 @@ mod tests {
         for (i, b) in buf.iter_mut().enumerate() {
             *b = i as u8;
         }
-        // x0 = base, x1 = offset; every width reads at exactly base+offset.
         assert_eq!(run2(|a| a.ldr_reg(1, 0, 0, 1), base, 5), 5);
         assert_eq!(run2(|a| a.ldr_reg(2, 0, 0, 1), base, 5), 0x0605);
         assert_eq!(run2(|a| a.ldr_reg(4, 0, 0, 1), base, 5), 0x0807_0605);
         assert_eq!(run2(|a| a.ldr_reg(8, 0, 0, 1), base, 5), 0x0c0b_0a09_0807_0605);
-        // Unaligned is allowed and little-endian.
         assert_eq!(run2(|a| a.ldr_reg(4, 0, 0, 1), base, 3), 0x0605_0403);
 
         let mut out = [0u8; 16];
         let ob = out.as_mut_ptr() as u64;
-        // x2 = the value; store it at ob+offset, then read the whole word back.
         run2(
             |a| {
                 a.mov_imm64(2, 0xdead_beef_cafe_1122);
                 a.str_reg(1, 2, 0, 1);
-                a.str_reg(2, 2, 0, 1); // overwrites with the low half
+                a.str_reg(2, 2, 0, 1);
             },
             ob,
             3,
@@ -973,20 +777,11 @@ mod tests {
             assert_eq!(decode_bitmask(n, immr, imms, true), Some(v));
             assert_eq!(run2(|a| assert!(a.and_imm(true, 0, 0, v)), u64::MAX, 0), v);
         }
-        // 0x8D5 (the x86 arithmetic-flag mask) is NOT a bitmask immediate — the
-        // emitter must fall back to a materialised constant, so prove the
-        // encoder says so rather than emitting something wrong.
         assert_eq!(encode_bitmask(0x8D5, true), None);
         assert_eq!(encode_bitmask(0, true), None);
         assert_eq!(encode_bitmask(u64::MAX, true), None);
     }
 
-    /// The closed-form encoder (roadmap W8.6) replaced a search over all 8192
-    /// `(N, immr, imms)` triples. This walks that whole space — which is exactly
-    /// the set of values the search could ever have found — and requires the
-    /// closed form to encode every one of them. So the replacement provably
-    /// loses nothing: there is no value the old encoder accepted and this one
-    /// declines.
     #[test]
     fn every_encodable_value_is_found_by_the_closed_form() {
         for is64 in [false, true] {
@@ -998,8 +793,6 @@ mod tests {
                         seen += 1;
                         let got = encode_bitmask(v, is64)
                             .unwrap_or_else(|| panic!("{v:#x} (is64={is64}) lost"));
-                        // Several triples can name the same value; what has to
-                        // hold is that the one returned decodes back to it.
                         assert_eq!(
                             decode_bitmask(got.0, got.1, got.2, is64),
                             Some(v),
@@ -1008,15 +801,10 @@ mod tests {
                     }
                 }
             }
-            // 5334 for 64-bit; 3648 for 32-bit, where `N` must be 0 and half
-            // the space is reserved. The floor only guards against the loop
-            // silently walking an empty set.
             assert!(seen > 3000, "only {seen} encodable triples for is64={is64}");
         }
     }
 
-    /// ...and nothing *outside* that space is accepted: for a wide sweep of
-    /// values, "encodable" means precisely "some triple decodes to it".
     #[test]
     fn the_closed_form_declines_exactly_what_no_triple_encodes() {
         let mut encodable = std::collections::HashSet::new();
@@ -1029,8 +817,6 @@ mod tests {
                 }
             }
         }
-        // A deterministic spread: small constants, single bits, runs, and the
-        // masks the compiler actually asks for.
         let mut vals: Vec<u64> = (0..=0x3ffu64).collect();
         for b in 0..64 {
             vals.push(1u64 << b);
@@ -1050,7 +836,6 @@ mod tests {
 
     #[test]
     fn loads_stores_and_branches() {
-        // Store a byte/half/word/dword through x0 then read them back.
         let mut scratch = [0u64; 4];
         let ptr = scratch.as_mut_ptr() as u64;
         run2(
@@ -1073,7 +858,6 @@ mod tests {
         assert_eq!(run2(|a| a.ldr(2, 0, 0, 8), ptr, 0), 0x11);
         assert_eq!(run2(|a| a.ldr(4, 0, 0, 16), ptr, 0), 0xcafe_0011);
 
-        // Forward conditional branch: return 1 if x0 == x1 else 2.
         let eq = |x: u64, y: u64| {
             run2(
                 |a| {
@@ -1091,7 +875,6 @@ mod tests {
         assert_eq!(eq(5, 5), 1);
         assert_eq!(eq(5, 6), 2);
 
-        // cbnz / unconditional b.
         let nz = |x: u64| {
             run2(
                 |a| {
@@ -1112,8 +895,6 @@ mod tests {
 
     #[test]
     fn frame_save_restore() {
-        // The block prologue/epilogue shape: save callee-saved regs, clobber
-        // them, restore, and prove the caller's values survive.
         let mut asm = Asm::new();
         asm.stp_pre(19, 20, SP, -16);
         asm.mov_imm64(19, 0xdead);

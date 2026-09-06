@@ -1,29 +1,19 @@
-//! Tests for the host-backed sandbox directory enumeration APIs:
-//! FindFirstFileW / FindNextFileW / FindClose.
-//!
-//! The test harness mirrors `crt.rs`: it drives `WinOs::intercept` directly
-//! with a mock `VirtualMemory` and `CpuState`, bypassing the CPU interpreter.
-
 use std::collections::HashSet;
 
 use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Perm, Region, Reg};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
 
-// Guest memory layout for these tests.
-const DATA: u64 = 0x4000; // writable data segment (4 KiB)
-const STACK: u64 = 0x9000; // stack grows down from here
-const RET_ADDR: u64 = 0x1_2345; // synthetic return address
+const DATA: u64 = 0x4000;
+const STACK: u64 = 0x9000;
+const RET_ADDR: u64 = 0x1_2345;
 
-// Windows INVALID_HANDLE_VALUE as seen by a 64-bit guest.
 const INVALID_HANDLE_VALUE: u64 = 0xFFFF_FFFF;
 
-// Offset of cFileName inside WIN32_FIND_DATAW.
 const FIND_DATA_CFILENAME_OFFSET: u64 = 44;
 
 fn make_os(sandbox: &str) -> (WinOs, VirtualMemory) {
     let mut mem = VirtualMemory::new();
-    // Data + stack + heap + API-thunk region.
     mem.map(Region::new("data", DATA, 0x1000, Perm::RW)).unwrap();
     mem.map(Region::new("stack", 0x8000, 0x2000, Perm::RW)).unwrap();
     mem.map(Region::new("imports", 0x0000_7EFF_0000_0000, 0x1000, Perm::RW)).unwrap();
@@ -38,8 +28,6 @@ fn make_os(sandbox: &str) -> (WinOs, VirtualMemory) {
     (os, mem)
 }
 
-/// Seat `name` as a kernel32 thunk, push a return address, invoke intercept,
-/// assert it returned `Exit::Continue` to the right address, and return RAX.
 fn call_k32(
     os: &mut WinOs,
     mem: &mut VirtualMemory,
@@ -57,14 +45,12 @@ fn call_k32(
     cpu.reg(Reg::Rax)
 }
 
-/// Write a NUL-terminated UTF-16 string into guest memory.
 fn write_utf16(mem: &mut VirtualMemory, addr: u64, s: &str) {
     for (i, unit) in s.encode_utf16().chain(std::iter::once(0)).enumerate() {
         mem.write_u16(addr + i as u64 * 2, unit).unwrap();
     }
 }
 
-/// Read a NUL-terminated UTF-16 string from guest memory (up to `max` chars).
 fn read_utf16(mem: &VirtualMemory, addr: u64, max: usize) -> String {
     let mut units = Vec::new();
     for i in 0..max {
@@ -77,8 +63,6 @@ fn read_utf16(mem: &VirtualMemory, addr: u64, max: usize) -> String {
     String::from_utf16_lossy(&units).to_owned()
 }
 
-/// A unique temp-dir path for this test run (process id + a static counter
-/// so parallel test threads do not collide).
 fn unique_sandbox() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -89,11 +73,8 @@ fn unique_sandbox() -> std::path::PathBuf {
     ))
 }
 
-// ─── tests ────────────────────────────────────────────────────────────────────
-
 #[test]
 fn find_first_next_close_enumerates_txt_files() {
-    // Build a mini sandbox: <tmp>/C/dir/a.txt + b.txt
     let sandbox = unique_sandbox();
     let dir_c = sandbox.join("C").join("dir");
     std::fs::create_dir_all(&dir_c).unwrap();
@@ -103,13 +84,9 @@ fn find_first_next_close_enumerates_txt_files() {
     let (mut os, mut mem) = make_os(sandbox.to_str().unwrap());
     let mut cpu = CpuState::new();
 
-    // Guest layout:
-    //   DATA+0x000  ← pattern string (UTF-16)
-    //   DATA+0x100  ← 592-byte WIN32_FIND_DATAW buffer
     let pattern_ptr = DATA;
     let find_data_ptr = DATA + 0x100;
 
-    // FindFirstFileW("C:\dir\*.txt", &find_data)
     write_utf16(&mut mem, pattern_ptr, "C:\\dir\\*.txt");
     cpu.set_reg(Reg::Rcx, pattern_ptr);
     cpu.set_reg(Reg::Rdx, find_data_ptr);
@@ -117,11 +94,9 @@ fn find_first_next_close_enumerates_txt_files() {
 
     assert_ne!(handle, INVALID_HANDLE_VALUE, "FindFirstFileW must succeed");
 
-    // First filename (cFileName is at offset 44).
     let first_name =
         read_utf16(&mem, find_data_ptr + FIND_DATA_CFILENAME_OFFSET, 260);
 
-    // Collect remaining names with FindNextFileW.
     let mut names: Vec<String> = vec![first_name];
     loop {
         cpu.set_reg(Reg::Rcx, handle);
@@ -137,7 +112,6 @@ fn find_first_next_close_enumerates_txt_files() {
     assert!(name_set.contains("a.txt"), "a.txt missing; got {:?}", name_set);
     assert!(name_set.contains("b.txt"), "b.txt missing; got {:?}", name_set);
 
-    // FindClose must return TRUE.
     cpu.set_reg(Reg::Rcx, handle);
     let closed = call_k32(&mut os, &mut mem, &mut cpu, "FindClose");
     assert_eq!(closed, 1, "FindClose must return TRUE");
@@ -173,8 +147,6 @@ fn find_first_no_match_returns_invalid_handle() {
 
 #[test]
 fn wildcard_star_includes_dot_dotdot() {
-    // A pattern of "C:\dir\*" must include the "." and ".." virtual entries
-    // that Windows returns for a star glob.
     let sandbox = unique_sandbox();
     let dir_c = sandbox.join("C").join("dir");
     std::fs::create_dir_all(&dir_c).unwrap();
@@ -215,8 +187,6 @@ fn wildcard_star_includes_dot_dotdot() {
 
 #[test]
 fn find_data_attributes_set_correctly() {
-    // Verify that dwFileAttributes is FILE_ATTRIBUTE_DIRECTORY (0x10) for
-    // directories and FILE_ATTRIBUTE_NORMAL (0x80) for regular files.
     let sandbox = unique_sandbox();
     let dir_c = sandbox.join("C").join("root");
     let subdir = dir_c.join("subdir");
@@ -238,7 +208,7 @@ fn find_data_attributes_set_correctly() {
     let mut attr_by_name: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     loop {
         let name = read_utf16(&mem, find_data_ptr + FIND_DATA_CFILENAME_OFFSET, 260);
-        let attrs = mem.read_u32(find_data_ptr).unwrap(); // dwFileAttributes at offset 0
+        let attrs = mem.read_u32(find_data_ptr).unwrap();
         attr_by_name.insert(name, attrs);
 
         cpu.set_reg(Reg::Rcx, handle);
@@ -248,7 +218,6 @@ fn find_data_attributes_set_correctly() {
         }
     }
 
-    // "." and ".." are directories.
     assert_eq!(
         attr_by_name.get(".").copied().unwrap_or(0),
         0x10,
@@ -259,13 +228,11 @@ fn find_data_attributes_set_correctly() {
         0x10,
         ".. must have FILE_ATTRIBUTE_DIRECTORY"
     );
-    // "subdir" is a directory.
     assert_eq!(
         attr_by_name.get("subdir").copied().unwrap_or(0),
         0x10,
         "subdir must have FILE_ATTRIBUTE_DIRECTORY"
     );
-    // "file.txt" is a normal file.
     assert_eq!(
         attr_by_name.get("file.txt").copied().unwrap_or(0),
         0x80,
@@ -280,8 +247,6 @@ fn find_data_attributes_set_correctly() {
 
 #[test]
 fn find_close_on_unknown_handle_is_lenient() {
-    // FindClose on a bogus handle (e.g. INVALID_HANDLE_VALUE) must return TRUE
-    // and not panic — some callers are sloppy about error-path cleanup.
     let sandbox = unique_sandbox();
     std::fs::create_dir_all(sandbox.join("C")).unwrap();
 
@@ -294,8 +259,6 @@ fn find_close_on_unknown_handle_is_lenient() {
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
-
-// ─── P3.9 additions: A-variants, GetFullPathName, Copy/MoveFile ─────────────
 
 fn write_ansi(mem: &mut VirtualMemory, addr: u64, s: &str) {
     for (i, b) in s.bytes().chain(std::iter::once(0)).enumerate() {
@@ -361,13 +324,12 @@ fn get_full_path_name_makes_absolute() {
     let part_ptr = DATA + 0x300;
     write_utf16(&mut mem, name_ptr, "sub\\file.txt");
     cpu.set_reg(Reg::Rcx, name_ptr);
-    cpu.set_reg(Reg::Rdx, 260); // nBufferLength (chars)
+    cpu.set_reg(Reg::Rdx, 260);
     cpu.set_reg(Reg::R8, buf);
     cpu.set_reg(Reg::R9, part_ptr);
     let n = call_k32(&mut os, &mut mem, &mut cpu, "GetFullPathNameW");
     assert!(n > 0, "GetFullPathNameW returned 0");
     assert_eq!(read_utf16(&mem, buf, 260), "C:\\sub\\file.txt");
-    // lpFilePart points at "file.txt" within the buffer.
     let part = mem.read_u64(part_ptr).unwrap();
     assert_eq!(read_utf16(&mem, part, 260), "file.txt");
 
@@ -387,7 +349,6 @@ fn copy_then_move_file_roundtrip() {
     let dst = DATA + 0x80;
     let dst2 = DATA + 0x100;
 
-    // CopyFileW("C:\a.txt", "C:\b.txt", FALSE)
     write_utf16(&mut mem, src, "C:\\a.txt");
     write_utf16(&mut mem, dst, "C:\\b.txt");
     cpu.set_reg(Reg::Rcx, src);
@@ -396,7 +357,6 @@ fn copy_then_move_file_roundtrip() {
     assert_eq!(call_k32(&mut os, &mut mem, &mut cpu, "CopyFileW"), 1, "CopyFileW must succeed");
     assert!(c.join("b.txt").exists(), "copy target missing");
 
-    // MoveFileW("C:\b.txt", "C:\c.txt")
     write_utf16(&mut mem, dst2, "C:\\c.txt");
     cpu.set_reg(Reg::Rcx, dst);
     cpu.set_reg(Reg::Rdx, dst2);
@@ -407,26 +367,6 @@ fn copy_then_move_file_roundtrip() {
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
-/// **Known gap, pinned deliberately (roadmap W9.6).** The virtual clock makes
-/// every clock the guest can *ask* for deterministic, but a file's timestamp is
-/// not a clock read — it is a property of a real file on the real host
-/// filesystem, and `FindFirstFileW` (like `NtQueryDirectoryFile` and
-/// `NtQueryAttributesFile`) reports it verbatim. So a guest that enumerates a
-/// directory still sees host wall-clock values, and two runs that create a file
-/// see two different `ftLastWriteTime`s.
-///
-/// This is left un-virtualised on purpose rather than papered over. Reporting
-/// the virtual clock for every file would be wrong (a file's mtime is not
-/// "now"), and reporting one fixed constant would flatten the newer/older
-/// ordering installers compare — so making it deterministic *and* correct needs
-/// a virtual-FS metadata overlay that records, per path, the virtual time at
-/// which the guest created or wrote it. Until that exists this test is the
-/// honest statement of the limit: if someone virtualises file times, this is
-/// what tells them to come back and update the claim.
-///
-/// It has cost nothing measurable so far: with the virtual clock on, every
-/// corpus binary — including 7-Zip, which writes 107 files and then enumerates
-/// them — repeats its instruction count exactly.
 #[test]
 fn file_timestamps_are_still_the_host_clock_a_pinned_gap() {
     let sandbox = unique_sandbox();
@@ -435,7 +375,6 @@ fn file_timestamps_are_still_the_host_clock_a_pinned_gap() {
     std::fs::write(dir_c.join("a.txt"), b"hello").unwrap();
 
     let (mut os, mut mem) = make_os(sandbox.to_str().unwrap());
-    // Even with the deterministic clock installed…
     os.set_clock(exemu_core::GuestClock::virtualized());
     let mut cpu = CpuState::new();
 
@@ -446,13 +385,10 @@ fn file_timestamps_are_still_the_host_clock_a_pinned_gap() {
     let handle = call_k32(&mut os, &mut mem, &mut cpu, "FindFirstFileW");
     assert_ne!(handle, INVALID_HANDLE_VALUE, "FindFirstFileW must succeed");
 
-    // ftLastWriteTime lives at WIN32_FIND_DATAW +20 (low) / +24 (high).
     let lo = mem.read_u32(find_data_ptr + 20).unwrap() as u64;
     let hi = mem.read_u32(find_data_ptr + 24).unwrap() as u64;
     let mtime = (hi << 32) | lo;
 
-    // …the reported mtime is the host's, which is far past the virtual epoch
-    // (2026-01-01 plus a handful of 100-ns ticks) rather than next to it.
     assert!(
         mtime > exemu_core::VIRTUAL_EPOCH_FILETIME + 10_000_000,
         "file times are documented as un-virtualised; got {mtime}, virtual epoch is {}",

@@ -1,14 +1,3 @@
-//! `exemu` — the command-line front-end.
-//!
-//! Subcommands:
-//!   * `run <file.exe> [--trace] [--no-echo] [-- args...]` — load and execute
-//!   * `info <file.exe>`                                    — dump PE metadata
-//!   * `corpus [--manifest P] [--update]`                   — the regression gate
-//!   * `sample <out.exe>`                                   — write a demo exe
-//!
-//! Argument parsing is hand-rolled to keep the dependency graph and build
-//! time small; this is a thin presentation shell over `exemu-app`.
-
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
@@ -51,15 +40,6 @@ fn run(args: Vec<String>) -> Result<u8, String> {
             Ok(0)
         }
         Some(other) => {
-            // Finder delivers a drag-onto-the-icon or double-click of a
-            // registered document type to a bundled, non-AppKit executable as
-            // a plain command-line argument (roadmap W9.7) — there is no
-            // "run" subcommand in that invocation, just the dropped file's
-            // path. Treat the whole argument list as `run <args...>` when the
-            // first token is not a known subcommand but does name a real
-            // file, so `exemu.app` with an `.exe` dropped on it works without
-            // a wrapper script. A typo'd subcommand (no such file) still
-            // falls through to the ordinary error below.
             if Path::new(other).is_file() {
                 cmd_run(&args)
             } else {
@@ -163,11 +143,6 @@ sandbox under $TMPDIR/exemu-sandbox. For real installers, build with\n\
 }
 
 fn cmd_run(rest: &[String]) -> Result<u8, String> {
-    // First pass: find `--profile <path>` only (stopping at a bare `--`, so a
-    // guest argument never gets mistaken for it), so its settings can seed
-    // the defaults every other flag below is parsed on top of. Merge order is
-    // built-in default < profile file < explicit flag/positional — see
-    // `exemu_cli::profile`'s module docs (roadmap W9.4).
     let mut loaded_profile: Option<profile::Profile> = None;
     for (idx, a) in rest.iter().enumerate() {
         if a == "--" {
@@ -212,8 +187,6 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
             "--audio" => audio = true,
             "--opcode-profile" => opcode_profile = true,
             "--jit" => jit = true,
-            // Value already consumed by the pre-scan above; just skip over it
-            // here so it doesn't fall into "unknown option" / a stray path.
             "--profile" => {
                 i += 1;
             }
@@ -266,15 +239,12 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         i += 1;
     }
 
-    // A positional path or `--` argv always beats the profile's; the profile
-    // only fills in what the command line left unspecified.
     let path = path
         .or(profile_path.as_deref())
         .ok_or("run: missing <file.exe> (or a --profile that sets `path`)")?;
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let final_guest_args = if explicit_args_given { guest_args } else { profile_args };
 
-    // arg0 is conventionally the program name.
     let mut argv = vec![path.to_string()];
     argv.extend(final_guest_args);
 
@@ -294,33 +264,18 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     }
     cfg.wine_boot_dir = wine_boot;
     cfg.sandbox_root = sandbox_root.map(PathBuf::from);
-    // Roadmap W7.2. Opt-in, because the default (`NoAudio`, accept and drop) is
-    // what keeps a headless run and a machine with no audio device working. On
-    // the emulated path there is no audio stack to reach it, so this only ever
-    // does anything under --wine-boot.
     if audio {
         cfg.audio_sink = Some(Box::new(exemu_audio::CoreAudioSink::new()));
     }
 
-    // The guest filesystem lives here regardless of how the run ends — same
-    // resolution `Process::load` uses internally, so `--sandbox-root`/a
-    // profile's `sandbox_root` moves what this reports, not just what the
-    // guest actually sees.
     let sandbox =
         cfg.sandbox_root.clone().unwrap_or_else(|| std::env::temp_dir().join("exemu-sandbox"));
 
-    // Live macOS window path (roadmap W4.5): `--gui` with a Wine boot dir runs
-    // the interpreter on a spawned thread while the main thread owns AppKit and
-    // drives the native windows the guest creates. Every other run (console,
-    // the emulated corpus, plain `--gui`) stays synchronous on this thread.
     #[cfg(target_os = "macos")]
     if gui && cfg.wine_boot_dir.is_some() {
         return run_live_cocoa(bytes, cfg, &sandbox);
     }
 
-    // Borrowed, not consuming: the JIT report is worth having on the *fault*
-    // path too — a binary that stops mid-run is exactly where "how much of this
-    // went native, and what stopped the blocks?" is most useful.
     let mut proc = Process::load(&bytes, &mut cfg).map_err(|e| e.to_string())?;
     let run = proc.run_borrowed();
     let jit_report = proc.jit_report();
@@ -341,10 +296,6 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
         }
         Err(e) => {
             report_jit(&jit_report, 0);
-            // A run that dies on an instruction the decoder doesn't implement
-            // is a data point for prioritizing the ISA (roadmap P0.5): record
-            // it, then still surface the error. The run layer wraps faults in a
-            // diagnostic `EmuError::Fault`, so reach the structured cause.
             if let EmuError::Decode { rip, opcode } = e.cause() {
                 record_decode_miss(telemetry.as_deref(), path, *rip, opcode);
             }
@@ -353,7 +304,6 @@ fn cmd_run(rest: &[String]) -> Result<u8, String> {
     }
 }
 
-/// Print what the block JIT did (roadmap W8), if the run used one.
 fn report_jit(report: &Option<exemu_app::JitReport>, steps: u64) {
     if let Some(j) = report {
         let total = if steps != 0 { steps } else { j.insns_executed + j.not_compiled };
@@ -392,10 +342,6 @@ fn report_jit(report: &Option<exemu_app::JitReport>, steps: u64) {
     }
 }
 
-/// Dump the interpreter's dynamic opcode-frequency profile (roadmap W8.3) — the
-/// measurement that tells the JIT which instruction shapes are worth compiling.
-/// Only a feature-gated build carries the counters; a default build says so
-/// rather than printing an empty (and therefore misleading) table.
 fn print_opcode_profile() {
     #[cfg(feature = "opcode-profile")]
     {
@@ -410,32 +356,23 @@ fn print_opcode_profile() {
     }
 }
 
-/// The macOS live-window run path (roadmap W4.5): spawn the interpreter on its
-/// own thread with a Cocoa driver whose window commands feed this (main) thread,
-/// which owns AppKit and drives the native windows until the guest exits.
 #[cfg(target_os = "macos")]
 fn run_live_cocoa(
     bytes: Vec<u8>,
     mut cfg: RunConfig,
     sandbox: &std::path::Path,
 ) -> Result<u8, String> {
-    // The Cocoa driver replaces the legacy dialog GUI on this path.
     cfg.gui = false;
-    // interp → main: window-lifecycle commands. main → interp: input events.
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     let (input_tx, input_rx) = std::sync::mpsc::channel();
     cfg.driver = Some(Box::new(exemu_gui::CocoaPresenter::with_channel(cmd_tx)));
     cfg.input = Some(input_rx);
 
-    // The interpreter owns the Process (WinOs is not Send), so build and run it
-    // entirely inside the spawned thread — only the Send channels cross.
     let interp = std::thread::spawn(move || {
         let mut cfg = cfg;
         Process::load(&bytes, &mut cfg).and_then(|p| p.run())
     });
 
-    // Main thread: drive native windows and forward close→guest until the guest
-    // exits (the interpreter thread dropping its command sender is the signal).
     exemu_gui::run_live(cmd_rx, input_tx, 3.0);
 
     let run = interp.join().map_err(|_| "interpreter thread panicked".to_string())?;
@@ -453,8 +390,6 @@ fn run_live_cocoa(
     }
 }
 
-/// Resolve the opcode-miss telemetry log path: explicit `--telemetry` flag,
-/// else the `EXEMU_TELEMETRY` env var, else a stable file under the temp dir.
 fn telemetry_log_path(explicit: Option<&str>) -> PathBuf {
     if let Some(p) = explicit {
         return PathBuf::from(p);
@@ -465,8 +400,6 @@ fn telemetry_log_path(explicit: Option<&str>) -> PathBuf {
     }
 }
 
-/// Append one decode miss to the telemetry log (best-effort — a logging
-/// failure must never mask the real run error) and tell the user about it.
 fn record_decode_miss(explicit: Option<&str>, exe_path: &str, rip: u64, opcode: &str) {
     let exe = std::path::Path::new(exe_path)
         .file_name()
@@ -492,8 +425,6 @@ fn record_decode_miss(explicit: Option<&str>, exe_path: &str, rip: u64, opcode: 
     }
 }
 
-/// List what the guest wrote into the sandbox filesystem, so the user knows
-/// where an installer's extracted files actually went.
 fn report_sandbox(sandbox: &std::path::Path) {
     fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         if let Ok(rd) = std::fs::read_dir(dir) {
@@ -587,13 +518,9 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
         }
     }
 
-    // Resource directory summary (W0.9): group entries by type and print a
-    // one-line count per type, then expand RT_DIALOG (unchanged existing
-    // detail) and RT_VERSION (new: print the file version).
     let res_entries = exemu_loader::list_resources(&bytes);
     if !res_entries.is_empty() {
         use std::collections::BTreeMap;
-        // Group by type_id (use 0 as sentinel for named types; sort by type).
         let mut by_type: BTreeMap<u32, (Option<String>, usize)> = BTreeMap::new();
         for e in &res_entries {
             let entry = by_type.entry(e.type_id).or_insert_with(|| (e.type_name.clone(), 0));
@@ -611,13 +538,11 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
             println!("    {label:<20} {count} entrie(s)");
         }
 
-        // RT_VERSION detail: print the file version string.
         if let Some(info) = exemu_loader::find_version_info(&bytes) {
             let (ma, mi, pa, bu) = info.file_version();
             println!("  version              : {ma}.{mi}.{pa}.{bu}");
         }
 
-        // RT_DIALOG detail (existing behaviour, unchanged).
         let dialogs = exemu_loader::parse_dialogs(&bytes);
         if !dialogs.is_empty() {
             let mut ids: Vec<_> = dialogs.keys().copied().collect();
@@ -632,8 +557,6 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
             }
         }
     } else {
-        // Fallback: show dialogs even if list_resources returned empty (e.g.
-        // resources in an unusual layout).
         let dialogs = exemu_loader::parse_dialogs(&bytes);
         if !dialogs.is_empty() {
             let mut ids: Vec<_> = dialogs.keys().copied().collect();
@@ -652,9 +575,6 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
     Ok(0)
 }
 
-/// `opcodes [--telemetry <path>] [--clear]` — read the decode-miss log and
-/// print the most-wanted ranking of unimplemented opcodes, so the highest-
-/// leverage instruction to implement next is obvious (roadmap P0.5).
 fn cmd_opcodes(rest: &[String]) -> Result<u8, String> {
     let mut explicit: Option<&str> = None;
     let mut clear = false;
@@ -733,10 +653,6 @@ fn cmd_gui_sample(rest: &[String]) -> Result<u8, String> {
     Ok(0)
 }
 
-/// `audio-sample <out.exe>` — the roadmap W7.2 proof binary: a console program
-/// that plays a short tone through the ordinary WASAPI chain. It needs a Wine
-/// boot (the whole audio stack is Wine's `mmdevapi` as guest code) and `--audio`
-/// to reach a real device.
 fn cmd_audio_sample(rest: &[String]) -> Result<u8, String> {
     let path = rest.first().ok_or("audio-sample: missing <out.exe>")?;
     let bytes = audio_sample::build();
@@ -750,9 +666,6 @@ fn cmd_audio_sample(rest: &[String]) -> Result<u8, String> {
     Ok(0)
 }
 
-/// `cocoa-demo [--size WxH] [--hold SECS]` — open a live macOS window and blit a
-/// BGRA test frame through the W4.4 `CocoaPresenter`/Metal path. The manual
-/// "window appears" check for W4.4 (the interpreter-driven path is W4.5).
 fn cmd_cocoa_demo(rest: &[String]) -> Result<u8, String> {
     let mut w = 480u32;
     let mut h = 320u32;
@@ -797,9 +710,6 @@ fn cmd_cocoa_demo(rest: &[String]) -> Result<u8, String> {
     }
 }
 
-/// A top-down BGRA8 test frame (`stride = w*4`): a blue→red horizontal gradient,
-/// a white border, and a green square. The colours are chosen so any B/R channel
-/// mistake in the blit is immediately visible.
 fn demo_pattern(w: u32, h: u32) -> Vec<u8> {
     let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
     for y in 0..h {

@@ -1,33 +1,3 @@
-//! Generates a **common-controls** GUI PE — the roadmap W6.1 proof binary.
-//!
-//! Unlike [`crate::gui_sample`] (which only needs `user32`/`gdi32`), this one
-//! imports **`comctl32.dll`**, calls `InitCommonControlsEx`, and then creates
-//! two child controls of its main window — a `BUTTON` (a user32 built-in) and a
-//! `msctls_progress32` progress bar (registered by comctl32) — before painting
-//! its client area and pumping messages.
-//!
-//! Under the Wine boot every one of those calls is **guest PE code**: the
-//! `comctl32.dll` the loader maps is Wine's own binary, its `DllMain` runs, and
-//! `InitCommonControlsEx` registers the control classes through Wine's user32 →
-//! `win32u` → exemu's `NtUserRegisterClassExWOW`. The W6 claim ("these DLLs cost
-//! exemu almost nothing because they are just guest code") is exactly what this
-//! binary exists to test.
-//!
-//! **What this binary actually reaches today** (measured — see
-//! `tests/comctl_gate.rs`): Wine's comctl32 loads, `InitCommonControlsEx`
-//! succeeds, `msctls_progress32` is registered as a real class with a real
-//! WndProc, the progress-bar child window is created with the right parent /
-//! geometry / style, and (since W6.2) the built-in `BUTTON` child is created too
-//! and **all three windows receive `WM_NCCREATE` + `WM_CREATE`** — the sample's
-//! own WndProc proves it by reading its `CREATESTRUCTW` back. Since **W4.8** it
-//! also **messages the progress bar** (`PBM_SETRANGE` + `PBM_SETPOS`, which used
-//! to be the "does not terminate" blocker) and both children **paint themselves**
-//! into the top-level window's surface when the pump delivers their `WM_PAINT`.
-//!
-//! The code is hand-assembled x86-64 with a small local assembler (`Asm`), the
-//! same shape [`crate::gui_sample`] and [`crate::sample`] use, so branch targets
-//! and RIP-relative references stay correct.
-
 use std::collections::HashMap;
 
 const IMAGE_BASE: u64 = 0x1_4000_0000;
@@ -40,72 +10,39 @@ const OPT_HEADER_SIZE: usize = 112 + 16 * 8;
 
 const CLASS_NAME: &str = "ExemuComctlClass";
 const WINDOW_TITLE: &str = "exemu — Wine common controls";
-/// The `BUTTON` class is a user32 built-in; `msctls_progress32` is registered by
-/// comctl32's `InitCommonControlsEx` (`ICC_PROGRESS_CLASS`).
 const BUTTON_CLASS: &str = "BUTTON";
 const BUTTON_TEXT: &str = "Push me";
 const PROGRESS_CLASS: &str = "msctls_progress32";
 const PAINT_LINE1: &str = "Wine comctl32 controls under exemu.";
 const PAINT_LINE2: &str = "InitCommonControlsEx + BUTTON + progress bar.";
 
-/// Client geometry of the main window — the surface the presenter flushes.
 pub const WINDOW_CX: i32 = 520;
 pub const WINDOW_CY: i32 = 300;
 
-/// `BUTTON` child rect `[x, y, cx, cy]`, in the parent's client coordinates.
-/// Exported so the paint gate can sample exactly the pixels the control owns.
 pub const BUTTON_RECT: [i32; 4] = [24, 200, 140, 32];
-/// `msctls_progress32` child rect `[x, y, cx, cy]`, likewise.
 pub const PROGRESS_RECT: [i32; 4] = [184, 204, 300, 24];
 
-/// `INITCOMMONCONTROLSEX.dwICC` — `ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES`:
-/// the progress bar, toolbar/statusbar/trackbar/tooltip, tab, updown, listview,
-/// treeview, hotkey and animate classes plus the user32 standard set.
 const ICC_FLAGS: i32 = 0x0000_00FF | 0x0000_4000;
 
-/// The two child-control IDs (the `hMenu` argument of `CreateWindowExW`).
 pub const ID_BUTTON: i32 = 100;
 const ID_PROGRESS: i32 = 101;
 
-// --- progress-bar control messages (documented `commctrl.h` values) ----------
-/// `PBM_SETRANGE` = `WM_USER + 1`. `lParam` = `MAKELPARAM(low, high)`.
 const PBM_SETRANGE: u32 = 0x0400 + 1;
-/// `PBM_SETPOS` = `WM_USER + 2`. `wParam` = the new position.
 const PBM_SETPOS: u32 = 0x0400 + 2;
-/// The range the sample sets: low 0, high 100, packed as `MAKELPARAM`.
 const PROGRESS_RANGE: u32 = 100 << 16;
-/// The position the sample sets — 60 % of the bar, so the filled part is a
-/// measurable fraction of its width in the painted frame.
 pub const PROGRESS_POS: u32 = 60;
 
-/// The `lpParam` the main window is created with, and therefore the value its
-/// `WM_CREATE` must find in `CREATESTRUCTW.lpCreateParams` (roadmap W6.2). The
-/// WndProc only reports the creation if this round-trips, so the gate's
-/// observation is proof the struct — not just the message — arrived intact.
 pub const CREATE_PARAM_MAGIC: i32 = 0x5A5A_1234;
 
-// --- CREATESTRUCTW (64-bit) field offsets the WndProc reads ------------------
-/// `lpCreateParams` — the `lpParam` passed to `CreateWindowExW`.
 const CS_LP_CREATE_PARAMS: i8 = 0x00;
-/// `lpszClass` — the class name, as a NUL-terminated `LPCWSTR`.
 const CS_LPSZ_CLASS: i8 = 0x40;
 
-// --- window messages the sample's WndProc handles ---------------------------
 const WM_CREATE: i32 = 0x0001;
 const WM_NCCREATE: i32 = 0x0081;
-/// `WM_COMMAND` — what a `BUTTON` sends its **parent** when it is clicked:
-/// `wParam = MAKEWPARAM(control id, BN_CLICKED)` and `lParam = the button's
-/// HWND`. `BN_CLICKED` is 0, so `wParam` is the bare id.
 const WM_COMMAND: i32 = 0x0111;
 
-/// The text the sample's WndProc puts on **the button** when it receives that
-/// notification. It sets it through the `lParam` it was handed, so the text
-/// landing on the button is itself the evidence that `lParam` carried the
-/// button's real HWND (roadmap W4.8 input routing).
 pub const CLICKED_TEXT: &str = "Clicked!";
 
-
-/// Build the common-controls sample executable.
 pub fn build() -> Vec<u8> {
     let r = Rdata::build();
     let text = build_text(&r);
@@ -144,7 +81,7 @@ pub fn build() -> Vec<u8> {
     put_u16(&mut f, opt + 48, 6);
     put_u32(&mut f, opt + 56, image_size);
     put_u32(&mut f, opt + 60, headers_raw as u32);
-    put_u16(&mut f, opt + 68, 2); // Subsystem = WINDOWS_GUI
+    put_u16(&mut f, opt + 68, 2);
     put_u64(&mut f, opt + 72, 0x10_0000);
     put_u64(&mut f, opt + 80, 0x1000);
     put_u64(&mut f, opt + 88, 0x10_0000);
@@ -166,9 +103,6 @@ pub fn build() -> Vec<u8> {
     f
 }
 
-/// The imports, grouped by DLL and in IAT order. `comctl32.dll` is the point of
-/// the exercise: a static import forces the loader to map + relocate + bind
-/// Wine's comctl32 and run its `DllMain` before the entry point.
 fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (
@@ -195,7 +129,6 @@ fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
-/// The wide strings the sample references, in `.rdata` order.
 const WIDE_STRINGS: [&str; 8] = [
     CLASS_NAME,
     WINDOW_TITLE,
@@ -213,9 +146,7 @@ struct Rdata {
     import_dir_size: u32,
     iat_off: u32,
     iat_size: u32,
-    /// Import name → its IAT slot RVA.
     iat: HashMap<String, u32>,
-    /// Wide-string RVAs, parallel to [`WIDE_STRINGS`].
     strings: Vec<u32>,
 }
 
@@ -225,10 +156,8 @@ impl Rdata {
         let n_dlls = plan.len();
         let total_funcs: usize = plan.iter().map(|(_, fs)| fs.len()).sum();
 
-        // Layout within .rdata.
         let import_dir_off = 0u32;
         let import_dir_size = ((n_dlls + 1) * 20) as u32;
-        // Each DLL gets an ILT and IAT of (funcs+1) qwords.
         let thunks_qwords: usize = plan.iter().map(|(_, fs)| fs.len() + 1).sum();
         let ilt_off = import_dir_off + import_dir_size;
         let ilt_size = (thunks_qwords * 8) as u32;
@@ -237,7 +166,6 @@ impl Rdata {
 
         let mut pos = iat_off + iat_size;
 
-        // IMAGE_IMPORT_BY_NAME blobs (hint u16 + asciiz).
         let mut ibn_rva: Vec<u32> = Vec::with_capacity(total_funcs);
         for (_, funcs) in &plan {
             for f in funcs {
@@ -246,13 +174,11 @@ impl Rdata {
                 pos += 2 + f.len() as u32 + 1;
             }
         }
-        // DLL name strings.
         let mut dll_name_rva: Vec<u32> = Vec::with_capacity(n_dlls);
         for (dll, _) in &plan {
             dll_name_rva.push(RDATA_RVA + pos);
             pos += dll.len() as u32 + 1;
         }
-        // Wide strings.
         pos = align_up_u32(pos, 2);
         let mut strings: Vec<u32> = Vec::with_capacity(WIDE_STRINGS.len());
         for s in WIDE_STRINGS {
@@ -262,16 +188,15 @@ impl Rdata {
 
         let mut b = vec![0u8; pos as usize];
 
-        // Import descriptors + ILT/IAT + IBN.
         let mut iat = HashMap::new();
         let mut ilt_cursor = ilt_off;
         let mut iat_cursor = iat_off;
         let mut ibn_i = 0usize;
         for (d, (_dll, funcs)) in plan.iter().enumerate() {
             let desc = import_dir_off as usize + d * 20;
-            put_u32(&mut b, desc, ilt_cursor + RDATA_RVA); // OriginalFirstThunk
-            put_u32(&mut b, desc + 12, dll_name_rva[d]); // Name
-            put_u32(&mut b, desc + 16, iat_cursor + RDATA_RVA); // FirstThunk
+            put_u32(&mut b, desc, ilt_cursor + RDATA_RVA);
+            put_u32(&mut b, desc + 12, dll_name_rva[d]);
+            put_u32(&mut b, desc + 16, iat_cursor + RDATA_RVA);
             for f in funcs {
                 let rva = ibn_rva[ibn_i];
                 put_u64(&mut b, ilt_cursor as usize, rva as u64);
@@ -281,13 +206,10 @@ impl Rdata {
                 iat_cursor += 8;
                 ibn_i += 1;
             }
-            // Null-terminate this DLL's ILT/IAT.
             ilt_cursor += 8;
             iat_cursor += 8;
         }
-        // Descriptor terminator is already zero.
 
-        // IBN blobs.
         ibn_i = 0;
         for (_, funcs) in &plan {
             for f in funcs {
@@ -296,12 +218,10 @@ impl Rdata {
                 ibn_i += 1;
             }
         }
-        // DLL names.
         for (d, (dll, _)) in plan.iter().enumerate() {
             let off = (dll_name_rva[d] - RDATA_RVA) as usize;
             b[off..off + dll.len()].copy_from_slice(dll.as_bytes());
         }
-        // Wide strings.
         for (rva, s) in strings.iter().zip(WIDE_STRINGS) {
             let off = (*rva - RDATA_RVA) as usize;
             let w = wide(s);
@@ -315,7 +235,6 @@ impl Rdata {
         *self.iat.get(name).expect("import present")
     }
 
-    /// RVA of one of the [`WIDE_STRINGS`], by value.
     fn wstr(&self, s: &str) -> u32 {
         let i = WIDE_STRINGS.iter().position(|w| *w == s).expect("wide string present");
         self.strings[i]
@@ -328,18 +247,10 @@ fn wide(s: &str) -> Vec<u8> {
     v
 }
 
-/// UTF-16 code-unit count excluding the terminator — the `c` argument `TextOutW`
-/// takes.
 fn wlen(s: &str) -> u32 {
     s.encode_utf16().count() as u32
 }
 
-// ---- WinMain frame layout ---------------------------------------------------
-// [0x00..0x60] shadow + outgoing stack args (CreateWindowExW takes 12)
-// [0x60..0xA8] WNDCLASSW (0x48 bytes, explicitly zeroed)
-// [0xB0..0xE0] MSG
-// [0xE0..0xE8] INITCOMMONCONTROLSEX { DWORD dwSize; DWORD dwICC; }
-// [0xE8]       hButton   [0xF0] hProgress   [0xF8] scratch (hdc)
 const FRAME: u32 = 0x108;
 const WC: i32 = 0x60;
 const MSG: i32 = 0xB0;
@@ -348,31 +259,24 @@ const H_BUTTON: i32 = 0xE8;
 const H_PROGRESS: i32 = 0xF0;
 const SCRATCH: i32 = 0xF8;
 
-// WNDCLASSW field offsets (64-bit).
 const WC_WNDPROC: i32 = 0x08;
 const WC_CLASSNAME: i32 = 0x40;
 const WC_SIZE: i32 = 0x48;
 
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
-/// `WS_CHILD | WS_VISIBLE`.
 const WS_CHILD_VISIBLE: u32 = 0x5000_0000;
-/// `WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON`.
 const WS_CHILD_BUTTON: u32 = 0x5000_0001;
 
 fn build_text(r: &Rdata) -> Vec<u8> {
     let mut a = Asm::new();
 
-    // ---- entry / WinMain --------------------------------------------------
     a.sub_rsp(FRAME);
 
-    // InitCommonControlsEx(&icc) — the first call into Wine's comctl32, which
-    // registers the common-control window classes.
-    a.mov_at_rsp_imm32(ICC, 8); // dwSize = sizeof(INITCOMMONCONTROLSEX)
-    a.mov_at_rsp_imm32(ICC + 4, ICC_FLAGS); // dwICC
+    a.mov_at_rsp_imm32(ICC, 8);
+    a.mov_at_rsp_imm32(ICC + 4, ICC_FLAGS);
     a.lea_rsp(RCX, ICC);
     a.call_iat(r.slot("InitCommonControlsEx"));
 
-    // WNDCLASSW: zero the whole struct, then fill lpfnWndProc + lpszClassName.
     let mut off = WC;
     while off < WC + WC_SIZE {
         a.mov_at_rsp_imm(off, 0);
@@ -385,73 +289,55 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.lea_rsp(RCX, WC);
     a.call_iat(r.slot("RegisterClassW"));
 
-    // The main window.
-    a.xor32(RCX); // exStyle
+    a.xor32(RCX);
     a.lea_rip(RDX, r.wstr(CLASS_NAME));
     a.lea_rip(R8, r.wstr(WINDOW_TITLE));
     a.mov32(R9, WS_OVERLAPPEDWINDOW);
-    a.mov_at_rsp_imm(0x20, 120); // X
-    a.mov_at_rsp_imm(0x28, 120); // Y
-    a.mov_at_rsp_imm(0x30, WINDOW_CX); // nWidth
-    a.mov_at_rsp_imm(0x38, WINDOW_CY); // nHeight
-    a.mov_at_rsp_imm(0x40, 0); // hWndParent
-    a.mov_at_rsp_imm(0x48, 0); // hMenu
-    a.mov_at_rsp_imm(0x50, 0); // hInstance
-    // lpParam: the WM_CREATE proof value (roadmap W6.2) — the WndProc reports the
-    // creation only if it reads this back out of CREATESTRUCTW.lpCreateParams.
+    a.mov_at_rsp_imm(0x20, 120);
+    a.mov_at_rsp_imm(0x28, 120);
+    a.mov_at_rsp_imm(0x30, WINDOW_CX);
+    a.mov_at_rsp_imm(0x38, WINDOW_CY);
+    a.mov_at_rsp_imm(0x40, 0);
+    a.mov_at_rsp_imm(0x48, 0);
+    a.mov_at_rsp_imm(0x50, 0);
     a.mov_at_rsp_imm(0x58, CREATE_PARAM_MAGIC);
     a.call_iat(r.slot("CreateWindowExW"));
-    a.mov_reg_reg(RBX, RAX); // save hwnd
+    a.mov_reg_reg(RBX, RAX);
 
     a.mov_reg_reg(RCX, RAX);
-    a.mov32(RDX, 5); // SW_SHOW
+    a.mov32(RDX, 5);
     a.call_iat(r.slot("ShowWindow"));
 
-    // ---- the common controls ----------------------------------------------
-    // A BUTTON child (user32's *built-in* control class). Wine's user32 leaves
-    // the built-in control classes (BUTTON/EDIT/STATIC/…) to the kernel side;
-    // since W6.2 exemu's win32k pre-registers them against the WndProcs user32
-    // publishes through `NtUserInitializeClientPfnArrays`, so this reaches
-    // `NtUserCreateWindowEx` and the driver sees a real child window.
     a.xor32(RCX);
     a.lea_rip(RDX, r.wstr(BUTTON_CLASS));
     a.lea_rip(R8, r.wstr(BUTTON_TEXT));
     a.mov32(R9, WS_CHILD_BUTTON);
-    a.mov_at_rsp_imm(0x20, BUTTON_RECT[0]); // X
-    a.mov_at_rsp_imm(0x28, BUTTON_RECT[1]); // Y
-    a.mov_at_rsp_imm(0x30, BUTTON_RECT[2]); // nWidth
-    a.mov_at_rsp_imm(0x38, BUTTON_RECT[3]); // nHeight
-    a.mov_at_rsp_reg(0x40, RBX); // hWndParent
-    a.mov_at_rsp_imm(0x48, ID_BUTTON); // hMenu = control id
+    a.mov_at_rsp_imm(0x20, BUTTON_RECT[0]);
+    a.mov_at_rsp_imm(0x28, BUTTON_RECT[1]);
+    a.mov_at_rsp_imm(0x30, BUTTON_RECT[2]);
+    a.mov_at_rsp_imm(0x38, BUTTON_RECT[3]);
+    a.mov_at_rsp_reg(0x40, RBX);
+    a.mov_at_rsp_imm(0x48, ID_BUTTON);
     a.mov_at_rsp_imm(0x50, 0);
     a.mov_at_rsp_imm(0x58, 0);
     a.call_iat(r.slot("CreateWindowExW"));
     a.mov_at_rsp_reg(H_BUTTON, RAX);
 
-    // A msctls_progress32 child — the comctl32-registered control.
     a.xor32(RCX);
     a.lea_rip(RDX, r.wstr(PROGRESS_CLASS));
-    a.xor32(R8); // no window text
+    a.xor32(R8);
     a.mov32(R9, WS_CHILD_VISIBLE);
-    a.mov_at_rsp_imm(0x20, PROGRESS_RECT[0]); // X
-    a.mov_at_rsp_imm(0x28, PROGRESS_RECT[1]); // Y
-    a.mov_at_rsp_imm(0x30, PROGRESS_RECT[2]); // nWidth
-    a.mov_at_rsp_imm(0x38, PROGRESS_RECT[3]); // nHeight
-    a.mov_at_rsp_reg(0x40, RBX); // hWndParent
-    a.mov_at_rsp_imm(0x48, ID_PROGRESS); // hMenu = control id
+    a.mov_at_rsp_imm(0x20, PROGRESS_RECT[0]);
+    a.mov_at_rsp_imm(0x28, PROGRESS_RECT[1]);
+    a.mov_at_rsp_imm(0x30, PROGRESS_RECT[2]);
+    a.mov_at_rsp_imm(0x38, PROGRESS_RECT[3]);
+    a.mov_at_rsp_reg(0x40, RBX);
+    a.mov_at_rsp_imm(0x48, ID_PROGRESS);
     a.mov_at_rsp_imm(0x50, 0);
     a.mov_at_rsp_imm(0x58, 0);
     a.call_iat(r.slot("CreateWindowExW"));
     a.mov_at_rsp_reg(H_PROGRESS, RAX);
 
-    // ---- drive the control -------------------------------------------------
-    // `SendMessageW(hProgress, PBM_SETRANGE, 0, MAKELPARAM(0, 100))` then
-    // `PBM_SETPOS` — the ordinary way an app moves a progress bar, and the pair
-    // that used to be the W6 "messaging a control does not terminate" blocker.
-    // The message reaches `NtUserMessageCall`, which dispatches to **comctl32's
-    // own** `ProgressWindowProc`; that WndProc runs its range/position handler
-    // and returns, so control flow comes back here (see the terminates gate in
-    // `tests/comctl_gate.rs`).
     a.mov_reg_at_rsp(RCX, H_PROGRESS);
     a.mov32(RDX, PBM_SETRANGE);
     a.xor32(R8);
@@ -463,39 +349,31 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.xor32(R9);
     a.call_iat(r.slot("SendMessageW"));
 
-    // ---- direct paint ------------------------------------------------------
-    // As in gui_sample: paint once without waiting for a message pump, so the
-    // surface/present pipeline is exercised even with no input channel attached.
-    a.mov_reg_reg(RCX, RBX); // hwnd
+    a.mov_reg_reg(RCX, RBX);
     a.call_iat(r.slot("GetDC"));
     a.mov_at_rsp_reg(SCRATCH, RAX);
-    // TextOutW(hdc, 16, 16, line1, wlen)
     a.mov_reg_reg(RCX, RAX);
     a.mov32(RDX, 16);
     a.mov32(R8, 16);
     a.lea_rip(R9, r.wstr(PAINT_LINE1));
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE1) as i32);
     a.call_iat(r.slot("TextOutW"));
-    // TextOutW(hdc, 16, 44, line2, wlen)
     a.mov_reg_at_rsp(RCX, SCRATCH);
     a.mov32(RDX, 16);
     a.mov32(R8, 44);
     a.lea_rip(R9, r.wstr(PAINT_LINE2));
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE2) as i32);
     a.call_iat(r.slot("TextOutW"));
-    // Rectangle(hdc, 12, 84, 500, 180) — a frame around the control strip.
     a.mov_reg_at_rsp(RCX, SCRATCH);
     a.mov32(RDX, 12);
     a.mov32(R8, 84);
     a.mov32(R9, 500);
     a.mov_at_rsp_imm(0x20, 180);
     a.call_iat(r.slot("Rectangle"));
-    // ReleaseDC(hwnd, hdc) — the present point.
     a.mov_reg_reg(RCX, RBX);
     a.mov_reg_at_rsp(RDX, SCRATCH);
     a.call_iat(r.slot("ReleaseDC"));
 
-    // ---- message loop ------------------------------------------------------
     a.label("loop");
     a.lea_rsp(RCX, MSG);
     a.xor32(RDX);
@@ -512,9 +390,6 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.call_iat(r.slot("ExitProcess"));
     a.int3();
 
-    // ---- wndproc(hwnd=rcx, msg=rdx, wparam=r8, lparam=r9) -----------------
-    // Frame: [0x00..0x20] shadow + 5th-arg slot at 0x20, PAINTSTRUCT @0x30
-    //        (72 bytes → 0x30..0x78), hwnd@0x80, hdc@0x88.
     const WP_FRAME: u32 = 0xC8;
     const WP_PS: i32 = 0x30;
     const WP_HWND: i32 = 0x80;
@@ -522,9 +397,9 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.label("wndproc");
     a.sub_rsp(WP_FRAME);
     a.mov_at_rsp_reg(WP_HWND, RCX);
-    a.cmp_rdx_imm8(0x0F); // WM_PAINT
+    a.cmp_rdx_imm8(0x0F);
     a.je("paint");
-    a.cmp_rdx_imm8(0x02); // WM_DESTROY
+    a.cmp_rdx_imm8(0x02);
     a.je("destroy");
     a.cmp_rdx_imm32(WM_NCCREATE);
     a.je("nccreate");
@@ -535,47 +410,28 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.call_iat(r.slot("DefWindowProcW"));
     a.jmp("wp_ret");
 
-    // WM_COMMAND → **the button notification**. Reached only if a real click
-    // travelled the whole way: exemu's win32k hit-tested the point onto the
-    // BUTTON child, Wine's own `ButtonWndProc` took the capture, pushed itself,
-    // released the capture on the button-up, read its control id back out of
-    // `GWLP_ID`, asked `GetParent` and sent this message. The handler answers by
-    // setting the window text of the HWND in **lParam**, so the recorded driver
-    // call names the button — proof the notification carried its handle, not
-    // just its id.
     a.label("command");
-    a.cmp_r8_imm32(ID_BUTTON); // wParam = MAKEWPARAM(id, BN_CLICKED), BN_CLICKED = 0
+    a.cmp_r8_imm32(ID_BUTTON);
     a.jne("command_done");
-    a.mov_reg_reg(RCX, R9); // lParam = the button's HWND
+    a.mov_reg_reg(RCX, R9);
     a.lea_rip(RDX, r.wstr(CLICKED_TEXT));
     a.call_iat(r.slot("SetWindowTextW"));
     a.label("command_done");
     a.xor32(RAX);
     a.jmp("wp_ret");
 
-    // WM_NCCREATE → TRUE ("keep creating me"), the documented contract. Handled
-    // here rather than deferred to DefWindowProcW **on purpose**: under the
-    // current Wine boot `user32!DefWindowProcW` forwards to
-    // `NTDLL.NtdllDefWindowProc_W`, which resolves into a *second*, dead ntdll
-    // image (see the module note in `tests/comctl_gate.rs`) and tail-jumps
-    // through a null slot. Every real WndProc handles its own WM_NCCREATE /
-    // WM_CREATE anyway, so this is ordinary Win32 code, not a workaround shape.
     a.label("nccreate");
     a.mov32(RAX, 1);
     a.jmp("wp_ret");
 
-    // WM_CREATE → read CREATESTRUCTW.lpCreateParams (r9 = lParam); only if it
-    // carries the magic the window was created with does the WndProc report the
-    // creation, by setting the window text to CREATESTRUCTW.lpszClass. That one
-    // driver call is the gate's evidence that the whole struct arrived intact.
     a.label("create");
     a.cmp_at_r9_imm32(CS_LP_CREATE_PARAMS, CREATE_PARAM_MAGIC);
     a.jne("create_done");
-    a.mov_rdx_at_r9(CS_LPSZ_CLASS); // lpszClass
+    a.mov_rdx_at_r9(CS_LPSZ_CLASS);
     a.mov_reg_at_rsp(RCX, WP_HWND);
     a.call_iat(r.slot("SetWindowTextW"));
     a.label("create_done");
-    a.xor32(RAX); // WM_CREATE: 0 = continue creation
+    a.xor32(RAX);
     a.jmp("wp_ret");
 
     a.label("destroy");
@@ -589,28 +445,24 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.lea_rsp(RDX, WP_PS);
     a.call_iat(r.slot("BeginPaint"));
     a.mov_at_rsp_reg(WP_HDC, RAX);
-    // Rectangle(hdc, 12, 84, 500, 180)
     a.mov_reg_reg(RCX, RAX);
     a.mov32(RDX, 12);
     a.mov32(R8, 84);
     a.mov32(R9, 500);
     a.mov_at_rsp_imm(0x20, 180);
     a.call_iat(r.slot("Rectangle"));
-    // TextOutW(hdc, 16, 16, line1, wlen)
     a.mov_reg_at_rsp(RCX, WP_HDC);
     a.mov32(RDX, 16);
     a.mov32(R8, 16);
     a.lea_rip(R9, r.wstr(PAINT_LINE1));
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE1) as i32);
     a.call_iat(r.slot("TextOutW"));
-    // TextOutW(hdc, 16, 44, line2, wlen)
     a.mov_reg_at_rsp(RCX, WP_HDC);
     a.mov32(RDX, 16);
     a.mov32(R8, 44);
     a.lea_rip(R9, r.wstr(PAINT_LINE2));
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE2) as i32);
     a.call_iat(r.slot("TextOutW"));
-    // EndPaint(hwnd, &ps)
     a.mov_reg_at_rsp(RCX, WP_HWND);
     a.lea_rsp(RDX, WP_PS);
     a.call_iat(r.slot("EndPaint"));
@@ -623,8 +475,6 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.finish()
 }
 
-// ============================ mini assembler ==============================
-
 const RAX: u8 = 0;
 const RCX: u8 = 1;
 const RDX: u8 = 2;
@@ -635,7 +485,6 @@ const R9: u8 = 9;
 struct Asm {
     code: Vec<u8>,
     labels: HashMap<String, usize>,
-    /// (position of rel32 field, target label) for .text-internal references.
     fixups: Vec<(usize, String)>,
 }
 
@@ -648,23 +497,20 @@ impl Asm {
         self.labels.insert(name.to_string(), self.code.len());
     }
 
-    /// Emit `[rsp+disp]` addressing (SIB, base=rsp) after the opcode; `reg` is
-    /// the ModRM.reg field.
     fn modrm_rsp(&mut self, reg: u8, disp: i32) {
         let reg = reg & 7;
         if (-128..=127).contains(&disp) {
-            self.code.push(0x40 | (reg << 3) | 0x04); // mod=01, rm=100
-            self.code.push(0x24); // SIB: base=rsp, no index
+            self.code.push(0x40 | (reg << 3) | 0x04);
+            self.code.push(0x24);
             self.code.push(disp as u8);
         } else {
-            self.code.push(0x80 | (reg << 3) | 0x04); // mod=10
+            self.code.push(0x80 | (reg << 3) | 0x04);
             self.code.push(0x24);
             self.code.extend_from_slice(&disp.to_le_bytes());
         }
     }
 
     fn rex(&mut self, r: u8) {
-        // REX.W + optional REX.R (reg>=8). The rsp base never needs REX.B.
         let mut rex = 0x48;
         if r >= 8 {
             rex |= 0x04;
@@ -696,13 +542,11 @@ impl Asm {
         self.code.push(0x8D);
         self.modrm_rsp(reg, disp);
     }
-    /// `mov qword [rsp+disp], imm32` (sign-extended).
     fn mov_at_rsp_imm(&mut self, disp: i32, imm: i32) {
         self.code.extend_from_slice(&[0x48, 0xC7]);
         self.modrm_rsp(0, disp);
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
-    /// `mov dword [rsp+disp], imm32` — the DWORD fields of INITCOMMONCONTROLSEX.
     fn mov_at_rsp_imm32(&mut self, disp: i32, imm: i32) {
         self.code.push(0xC7);
         self.modrm_rsp(0, disp);
@@ -710,7 +554,6 @@ impl Asm {
     }
 
     fn mov_reg_reg(&mut self, dst: u8, src: u8) {
-        // mov dst, src  (REX.W 89 /r, reg=src, rm=dst)
         let mut rex = 0x48;
         if src >= 8 {
             rex |= 0x04;
@@ -744,23 +587,18 @@ impl Asm {
     fn cmp_rdx_imm8(&mut self, imm: i8) {
         self.code.extend_from_slice(&[0x48, 0x83, 0xFA, imm as u8]);
     }
-    /// `cmp rdx, imm32` — the message ids above 0x7F (`WM_NCCREATE` = 0x81).
     fn cmp_rdx_imm32(&mut self, imm: i32) {
         self.code.extend_from_slice(&[0x48, 0x81, 0xFA]);
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
-    /// `cmp r8, imm32` — test the WndProc's `wParam` (the control id a
-    /// `WM_COMMAND` carries).
     fn cmp_r8_imm32(&mut self, imm: i32) {
         self.code.extend_from_slice(&[0x49, 0x81, 0xF8]);
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
-    /// `cmp qword [r9+disp8], imm32` — test a field of the `CREATESTRUCTW` lParam.
     fn cmp_at_r9_imm32(&mut self, disp: i8, imm: i32) {
         self.code.extend_from_slice(&[0x49, 0x81, 0x79, disp as u8]);
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
-    /// `mov rdx, qword [r9+disp8]` — load a `CREATESTRUCTW` field into an arg.
     fn mov_rdx_at_r9(&mut self, disp: i8) {
         self.code.extend_from_slice(&[0x49, 0x8B, 0x51, disp as u8]);
     }
@@ -789,12 +627,11 @@ impl Asm {
     fn lea_label(&mut self, reg: u8, label: &str) {
         self.rex(reg);
         self.code.push(0x8D);
-        self.code.push(0x05 | ((reg & 7) << 3)); // mod=00, rm=101 (RIP)
+        self.code.push(0x05 | ((reg & 7) << 3));
         self.fixups.push((self.code.len(), label.to_string()));
         self.code.extend_from_slice(&[0, 0, 0, 0]);
     }
 
-    /// `lea reg, [rip+disp]` to an absolute .rdata RVA (known now).
     fn lea_rip(&mut self, reg: u8, target_rva: u32) {
         self.rex(reg);
         self.code.push(0x8D);
@@ -804,7 +641,6 @@ impl Asm {
         self.code.extend_from_slice(&(disp as i32).to_le_bytes());
     }
 
-    /// `call [rip+disp]` to an IAT slot (known now).
     fn call_iat(&mut self, slot_rva: u32) {
         self.code.extend_from_slice(&[0xFF, 0x15]);
         let next = TEXT_RVA as i64 + self.code.len() as i64 + 4;
@@ -821,8 +657,6 @@ impl Asm {
         self.code
     }
 }
-
-// ---- byte helpers (mirrors gui_sample.rs) -----------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn write_section(f: &mut [u8], at: usize, name: &[u8], vsize: u32, vaddr: u32, raw_size: u32, raw_ptr: u32, chars: u32) {
@@ -854,9 +688,6 @@ fn align_up_u32(v: u32, a: u32) -> u32 {
 mod tests {
     use super::*;
 
-    /// The generated image is a PE32+ GUI executable that statically imports
-    /// `comctl32!InitCommonControlsEx` plus the two control class names — the
-    /// shape the W6.1 gate depends on.
     #[test]
     fn comctl_sample_is_a_pe_importing_comctl32() {
         let exe = build();
@@ -874,7 +705,6 @@ mod tests {
         assert!(has("user32.dll", "SendMessageW"));
         assert!(has("gdi32.dll", "Rectangle"));
 
-        // The control class names travel in .rdata as UTF-16.
         let needle = wide(PROGRESS_CLASS);
         assert!(
             exe.windows(needle.len()).any(|w| w == needle),

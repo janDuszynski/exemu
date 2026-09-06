@@ -1,39 +1,7 @@
-//! The corpus regression gate (roadmap W9.6) — the per-exe pins as a test.
-//!
-//! The roadmap lists per-exe regression pins as one of four standing harnesses,
-//! and the only one that can catch cross-thread / IPC / integration regressions:
-//! the differential CPU oracle is single-stream and structurally cannot see
-//! them. This test runs the pins in `corpus.toml` and fails on any drift —
-//! a different instruction count, a moved fault site, a lost output file.
-//!
-//! # When it skips, and why
-//!
-//! 1. **No corpus.** The binaries live in `example_exe/`, which is git-ignored
-//!    (third-party installers we do not redistribute). A fresh checkout — CI —
-//!    has none, so the test prints SKIP and passes, the same skip-guard idiom as
-//!    `crates/app/tests/wine_gate.rs`.
-//! 2. **Debug build.** The pins are measured on a `--release` build, and a debug
-//!    build is ~10x slower — 7-Zip alone executes ~496M instructions. On the
-//!    host-clock entry it is worse than slow: a guest that polls the clock spins
-//!    a different number of times at a different host speed, so the count
-//!    genuinely differs and debug pins would be a second, unmaintained set of
-//!    numbers. (A `virtual_clock` entry has no such excuse — its count is a pure
-//!    function of the guest's instruction stream — but the runtime alone still
-//!    rules a debug run out.) Run `cargo test --release`.
-//!
-//! # Tiers
-//!
-//! By default only the entries flagged `quick = true` run (~2 s — Firefox
-//! Installer on both clocks, and tcc). Set `EXEMU_CORPUS=full` to include the
-//! minutes-long ones (7-Zip's full install, SteamSetup's 93M-instruction reach).
-//! The full tier is the release gate; the quick tier is what `cargo test
-//! --release` can afford to run on every change.
-
 use std::path::{Path, PathBuf};
 
 use exemu_cli::corpus::{render_table, Manifest, Options};
 
-/// `corpus.toml` lives at the repository root, two levels above this crate.
 fn manifest_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("corpus.toml")
 }
@@ -107,9 +75,6 @@ fn corpus_pins_hold() {
     }
 }
 
-/// The manifest itself must stay well-formed and internally consistent even on
-/// a machine with no corpus — this half of the gate always runs, so a typo in
-/// `corpus.toml` fails in CI rather than on the one machine that has the exes.
 #[test]
 fn manifest_is_well_formed() {
     let path = manifest_path();
@@ -127,10 +92,6 @@ fn manifest_is_well_formed() {
             e.name,
             e.tolerance
         );
-        // The virtual clock leaves no host input to jitter on, so such an entry
-        // is an equality — for a fault's reach metric as much as for an exit.
-        // Any slack here would be un-earned and would hide a real one-instruction
-        // change (roadmap W9.6).
         if e.virtual_clock {
             assert_eq!(
                 e.tolerance, 0,
@@ -140,10 +101,6 @@ fn manifest_is_well_formed() {
         }
         match e.outcome {
             exemu_cli::corpus::Outcome::Exit => {
-                // On the host clock a completed trace is the strongest assertion
-                // available, so it is pinned at the bare measurement noise floor
-                // — never scaled to the length of the run the way a fault's reach
-                // metric is.
                 if !e.virtual_clock {
                     assert_eq!(
                         e.tolerance,
@@ -167,9 +124,6 @@ fn manifest_is_well_formed() {
         manifest.entries.iter().any(|e| e.quick),
         "at least one entry must be in the quick tier or the default gate is empty"
     );
-    // Both clock paths stay covered. The virtual clock is the high-resolution
-    // instrument, but the host clock is what a plain `exemu run` still does, so
-    // dropping it from the gate would stop testing the default.
     assert!(
         manifest.entries.iter().any(|e| e.virtual_clock),
         "at least one entry must pin the deterministic clock (roadmap W9.6)"
@@ -178,8 +132,6 @@ fn manifest_is_well_formed() {
         manifest.entries.iter().any(|e| !e.virtual_clock && e.quick),
         "at least one quick entry must stay on the default host clock"
     );
-    // `--update` must be able to round-trip whatever is committed, or a
-    // re-blessed manifest would silently lose fields.
     let reparsed = Manifest::load(&path).expect("reload");
     assert_eq!(
         Manifest::load(&path).unwrap().to_toml(),

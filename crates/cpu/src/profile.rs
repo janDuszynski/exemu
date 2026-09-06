@@ -1,35 +1,10 @@
-//! Dynamic opcode-frequency profiling (roadmap W8.3) — **off by default**.
-//!
-//! The JIT's first slice should cover the instruction *shapes a real workload
-//! actually executes*, not the ones that feel common. This module counts every
-//! instruction the interpreter retires, keyed by the shape that matters for
-//! code generation: the opcode byte, whether it came through the `0F` escape,
-//! the operand-size prefixes (`REX.W` / `66`) and — for the ModRM-`reg`-dispatched
-//! groups (`80`/`81`/`83`, the shifts, `F6`/`F7`, `FE`/`FF`, …) — the sub-opcode.
-//!
-//! It is compiled in only under the `profile` cargo feature, so the shipping
-//! interpreter carries **zero** cost (not even a branch): every hook site is a
-//! `#[cfg]`-gated block. That matters because the corpus pins are exact
-//! instruction counts — an instrumented build must not be able to change them,
-//! and the only way to guarantee that is for the instrumentation not to exist.
-//!
-//! Usage:
-//! ```text
-//! cargo build --release -p exemu-cli --features opcode-profile
-//! ./target/release/exemu run --opcode-profile <file.exe>
-//! ```
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Key layout (14 bits):
-/// `[group_reg:3][p66:1][rex_w:1][esc0f:1][opcode:8]`
 const KEY_BITS: usize = 14;
-/// Number of distinct instruction shapes the table can hold.
 pub const KEYS: usize = 1 << KEY_BITS;
 
 static COUNTS: [AtomicU64; KEYS] = [const { AtomicU64::new(0) }; KEYS];
 
-/// Build the table key for one decoded instruction shape.
 #[inline]
 pub fn key(opcode: u8, esc0f: bool, rex_w: bool, p66: bool, group_reg: u8) -> u16 {
     (opcode as u16)
@@ -39,15 +14,11 @@ pub fn key(opcode: u8, esc0f: bool, rex_w: bool, p66: bool, group_reg: u8) -> u1
         | (((group_reg & 7) as u16) << 11)
 }
 
-/// Count one retired instruction.
 #[inline]
 pub fn record(opcode: u8, esc0f: bool, rex_w: bool, p66: bool, group_reg: u8) {
     COUNTS[key(opcode, esc0f, rex_w, p66, group_reg) as usize].fetch_add(1, Ordering::Relaxed);
 }
 
-/// True when the ModRM `reg` field selects the operation for this opcode, so the
-/// profile should keep them apart (`81 /5` = SUB is a different codegen problem
-/// from `81 /0` = ADD).
 #[inline]
 pub fn is_group(opcode: u8, esc0f: bool) -> bool {
     if esc0f {
@@ -60,7 +31,6 @@ pub fn is_group(opcode: u8, esc0f: bool) -> bool {
     }
 }
 
-/// Every shape seen at least once, as `(key, count)`, most frequent first.
 pub fn snapshot() -> Vec<(u16, u64)> {
     let mut out: Vec<(u16, u64)> = COUNTS
         .iter()
@@ -78,12 +48,10 @@ pub fn snapshot() -> Vec<(u16, u64)> {
     out
 }
 
-/// Total instructions counted.
 pub fn total() -> u64 {
     COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).sum()
 }
 
-/// Decompose a key back into `(opcode, esc0f, rex_w, p66, group_reg)`.
 pub fn decode_key(k: u16) -> (u8, bool, bool, bool, u8) {
     (
         (k & 0xff) as u8,
@@ -94,7 +62,6 @@ pub fn decode_key(k: u16) -> (u8, bool, bool, bool, u8) {
     )
 }
 
-/// A human-readable label for a profile key, e.g. `83 /5  sub r/m,imm8  [w]`.
 pub fn label(k: u16) -> String {
     let (op, esc, w, p66, greg) = decode_key(k);
     let mut s = String::new();
@@ -121,7 +88,6 @@ const SHIFT_NAMES: [&str; 8] = ["rol", "ror", "rcl", "rcr", "shl", "shr", "shl",
 const CC: [&str; 16] =
     ["o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g"];
 
-/// Best-effort mnemonic for the shape (enough to read a profile at a glance).
 fn mnemonic(op: u8, esc: bool, greg: u8) -> &'static str {
     if esc {
         return match op {
@@ -188,7 +154,7 @@ fn mnemonic(op: u8, esc: bool, greg: u8) -> &'static str {
         0x63 => "movsxd",
         0x68 | 0x6A => "push imm",
         0x69 | 0x6B => "imul r,r/m,imm",
-        0x70..=0x7F => CC[(op & 0xf) as usize], // rendered below as jcc
+        0x70..=0x7F => CC[(op & 0xf) as usize],
         0x80 | 0x81 | 0x83 => ALU_NAMES[(greg & 7) as usize],
         0x84 | 0x85 => "test r/m,r",
         0x86 | 0x87 => "xchg r/m,r",
@@ -244,9 +210,6 @@ fn mnemonic(op: u8, esc: bool, greg: u8) -> &'static str {
     }
 }
 
-/// Render the top `n` shapes as a report, with cumulative coverage — the shape
-/// of the answer the JIT needs ("how much of the stream do the top N opcodes
-/// account for?").
 pub fn report(n: usize) -> String {
     let snap = snapshot();
     let total = total();

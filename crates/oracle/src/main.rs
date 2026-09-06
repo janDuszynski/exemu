@@ -1,10 +1,5 @@
-//! `exemu-oracle` CLI. See the crate docs; the real work lives behind the
-//! `unicorn` feature.
-
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    // The JIT differential needs no reference emulator, so it is always
-    // available — including in a build without the `unicorn` feature.
     if argv.iter().any(|a| a == "jit") {
         jit_main(&argv);
         return;
@@ -12,8 +7,6 @@ fn main() {
     unicorn_main(&argv);
 }
 
-/// `exemu-oracle jit [--bits 32|64|both] [--count N] [--seed S] [--chain K]
-///  [--layout low|edge|mixed] [--laps K] [--debug off|break|watch]`
 fn jit_main(argv: &[String]) {
     use exemu_cpu::Bits;
     use exemu_oracle::jitdiff::{fuzz, render, DebugMix, JitFuzzConfig, Layout, LayoutMix};
@@ -50,10 +43,6 @@ fn jit_main(argv: &[String]) {
                 i += 1;
                 chain = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(chain);
             }
-            // Run each trial round a loop instead of once, which is what makes
-            // native block linking (roadmap W8.5) visible here: the first pass
-            // fills the link slots, and every pass after it enters blocks by a
-            // `br` from the previous block rather than through Rust.
             "--laps" => {
                 i += 1;
                 laps = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(laps);
@@ -70,12 +59,6 @@ fn jit_main(argv: &[String]) {
                     }
                 };
             }
-            // Arm one thing per trial and require the run to land on an
-            // instruction count computed from the *interpreter's* trace
-            // (roadmap W9.3). `break` splits the block at an address drawn from
-            // the trial's own trace; `watch` puts a data watchpoint somewhere in
-            // the data region and requires the block to rewind onto exactly the
-            // instruction that first touches it.
             "--debug" => {
                 i += 1;
                 debug = match argv.get(i).map(|s| s.as_str()).and_then(DebugMix::parse) {
@@ -148,10 +131,6 @@ fn jit_main(argv: &[String]) {
             })
             .collect();
         println!("     layouts: {}", per_layout.join("  "));
-        // The number that says whether the guest-memory TLB was engaged at all.
-        // Zero fills means every access in the whole run went through the
-        // helper, i.e. the fast path was never measured — which a "0
-        // divergences" line would otherwise hide completely.
         println!(
             "     guest-memory TLB: {} entries filled, {} fills refused",
             s.tlb_fills, s.tlb_denied

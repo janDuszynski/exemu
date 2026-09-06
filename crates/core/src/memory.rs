@@ -1,12 +1,5 @@
-//! The guest memory abstraction.
-//!
-//! The domain only cares that *something* can store and retrieve bytes at
-//! 64-bit guest addresses and knows about permissions. The concrete paged
-//! implementation lives in the `exemu-memory` crate.
-
 use crate::error::{EmuError, Result};
 
-/// Access permission bits for a mapped region. Combine with `|`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Perm(pub u8);
 
@@ -31,7 +24,6 @@ impl Perm {
     }
 }
 
-/// A contiguous span of guest address space with a name and permissions.
 #[derive(Debug, Clone)]
 pub struct Region {
     pub name: String,
@@ -56,27 +48,14 @@ impl Region {
     }
 }
 
-/// Guest physical/virtual memory as the interpreter sees it.
-///
-/// Only [`read`](Memory::read) and [`write`](Memory::write) are required;
-/// the typed little-endian accessors are provided on top of them so every
-/// implementation gets them for free and behaves identically.
 pub trait Memory {
-    /// Fill `buf` with bytes starting at `addr`. Fails if any byte is
-    /// unmapped or unreadable.
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()>;
 
-    /// Store `data` starting at `addr`. Fails if any byte is unmapped or
-    /// unwritable.
     fn write(&mut self, addr: u64, data: &[u8]) -> Result<()>;
 
-    /// Fetch bytes for execution. Defaults to [`read`](Memory::read) but a
-    /// backend may enforce the executable bit here.
     fn fetch(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
         self.read(addr, buf)
     }
-
-    // ---- little-endian typed helpers -------------------------------------
 
     fn read_u8(&self, addr: u64) -> Result<u8> {
         let mut b = [0u8; 1];
@@ -118,7 +97,6 @@ pub trait Memory {
         self.write(addr, &v.to_le_bytes())
     }
 
-    /// Read an integer of `size` (1/2/4/8) bytes, zero-extended into a u64.
     fn read_uint(&self, addr: u64, size: u8) -> Result<u64> {
         Ok(match size {
             1 => self.read_u8(addr)? as u64,
@@ -129,7 +107,6 @@ pub trait Memory {
         })
     }
 
-    /// Write the low `size` (1/2/4/8) bytes of `v`.
     fn write_uint(&mut self, addr: u64, size: u8, v: u64) -> Result<()> {
         match size {
             1 => self.write_u8(addr, v as u8),
@@ -140,7 +117,6 @@ pub trait Memory {
         }
     }
 
-    /// Read a NUL-terminated ASCII/UTF-8 string (without the terminator).
     fn read_cstr(&self, addr: u64, max: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         for i in 0..max as u64 {
@@ -153,164 +129,52 @@ pub trait Memory {
         Ok(out)
     }
 
-    // ---- dynamic mapping (VirtualAlloc/Free/Protect/Query support) --------
-    //
-    // The domain exposes just enough of the concrete address space for the OS
-    // layer's virtual-memory manager to reserve, release, re-protect and probe
-    // regions at runtime. Backends that are fixed-size (test doubles) inherit
-    // the defaults below and simply refuse dynamic mapping.
-
-    /// Map a fresh zero-filled region of `size` bytes at the fixed address
-    /// `base` with permission `perm`. Fails on overlap with an existing region
-    /// (which the caller uses to detect a taken address). Default: unsupported.
     fn map_fixed(&mut self, base: u64, size: u64, perm: Perm, name: &str) -> Result<()> {
         let _ = (base, size, perm, name);
         Err(EmuError::Unsupported("dynamic mapping".into()))
     }
 
-    /// Change the protection of the region containing `base` to `perm`,
-    /// returning that region's previous permission. Page-granular splitting is
-    /// not modelled — the whole covering region is re-protected. Default:
-    /// unsupported.
     fn protect(&mut self, base: u64, size: u64, perm: Perm) -> Result<Perm> {
         let _ = (base, size, perm);
         Err(EmuError::Unsupported("protect".into()))
     }
 
-    /// Release mapped memory. `size == 0` releases the single region that
-    /// starts exactly at `base` (VirtualFree/MEM_RELEASE); otherwise every
-    /// region fully inside `[base, base+size)` is released. Default:
-    /// unsupported.
     fn unmap(&mut self, base: u64, size: u64) -> Result<()> {
         let _ = (base, size);
         Err(EmuError::Unsupported("unmap".into()))
     }
 
-    /// The first mapped region whose end is above `addr`, as
-    /// `(base, size, perm)`. If its base is `<= addr`, then `addr` is inside
-    /// that region; otherwise `addr` lies in a free gap that ends at the
-    /// returned base. `None` means everything at/above `addr` is free.
-    /// Default: `None`.
     fn next_region(&self, addr: u64) -> Option<(u64, u64, Perm)> {
         let _ = addr;
         None
     }
 
-    // ---- host spans (the W8.6 JIT software-TLB seam) ----------------------
-    //
-    // A JIT that calls back into this trait for every guest load and store pays
-    // a call, a region lookup and a `Result` for each one, and that was measured
-    // at ~40% of a whole 7-Zip run. These three methods let it keep a small
-    // direct-mapped cache of *host* addresses instead, so the common access is a
-    // handful of emitted instructions with no call at all.
-    //
-    // The seam is deliberately narrow. It hands out **safe slices**, not raw
-    // pointers, so a backend needs no `unsafe` to provide it and the bounds of
-    // what it exposes are checked by the compiler; turning one into a pointer
-    // that outlives the borrow is the *caller's* explicit `unsafe`, and the
-    // caller is the one crate in this workspace allowed to write it. Every
-    // method is defaulted to "no host mapping", so a backend opts in and every
-    // test double is untouched.
-
-    /// The host bytes backing `[addr, addr+len)`, when that whole range lies
-    /// inside a **single** region that carries `needed`.
-    ///
-    /// `None` means "ask the ordinary way" and is always a valid answer — the
-    /// default, for every backend that has no stable host mapping. A backend
-    /// that does implement it must return `None` rather than `Some` whenever a
-    /// direct access through the returned bytes would not be equivalent to the
-    /// same access made through [`read`](Memory::read) / [`read_uint`]:
-    ///
-    /// * the range leaves the region, is unmapped, or lacks `needed` — so an
-    ///   access that would fault can never be served from a span, and therefore
-    ///   still faults at exactly the instruction it faulted at before;
-    /// * anything the backend would otherwise *observe* about the access is
-    ///   armed — a data watchpoint, most concretely (roadmap W9.3). An armed
-    ///   watchpoint must keep seeing every guest access, so it is expressed here
-    ///   as "no spans while armed" rather than as a rule the caller has to
-    ///   remember.
-    ///
-    /// The bytes stay where they are until [`layout_generation`] changes.
-    ///
-    /// [`read_uint`]: Memory::read_uint
-    /// [`layout_generation`]: Memory::layout_generation
     fn host_span(&self, addr: u64, len: usize, needed: Perm) -> Option<&[u8]> {
         let _ = (addr, len, needed);
         None
     }
 
-    /// As [`host_span`](Memory::host_span), for a range that will be
-    /// **written** through.
-    ///
-    /// One extra rule, and it is the important one: a backend must **never**
-    /// return a writable span covering executable memory. A write through the
-    /// returned bytes cannot bump [`code_generation`](Memory::code_generation)
-    /// or [`code_page_generation`](Memory::code_page_generation), so a guest
-    /// that rewrites its own code through such a span would be invisible to a
-    /// JIT's invalidation — the one failure this seam must not make possible.
-    /// Stores into executable memory therefore always go the ordinary way.
     fn host_span_mut(&mut self, addr: u64, len: usize, needed: Perm) -> Option<&mut [u8]> {
         let _ = (addr, len, needed);
         None
     }
 
-    /// A counter bumped by **every** change that can move or free the bytes a
-    /// span points at, or change the permissions under them: mapping, unmapping,
-    /// re-protecting, and any reallocation of the backend's own storage.
-    ///
-    /// A cache of host addresses is valid exactly as long as this does not move,
-    /// so a caller holding one compares it once per batch of work rather than
-    /// re-resolving per access. A backend that never hands out spans can leave
-    /// this at `0`. **Missing a bump is a use-after-free**, so the rule for an
-    /// implementor is to bump on the mutation funnel, not at each call site.
     fn layout_generation(&self) -> u64 {
         0
     }
 
-    /// Is anything armed that must observe every guest data access — a data
-    /// watchpoint (roadmap W9.3)?
-    ///
-    /// [`host_span`](Memory::host_span) already refuses while this is true, so
-    /// this is not what makes an armed watchpoint correct. It is what lets a
-    /// caller *throw away* a cache it filled earlier, at a boundary of its own
-    /// choosing, rather than re-testing per access — which is what keeps the
-    /// far more common detached case free.
     fn watchpoints_armed(&self) -> bool {
         false
     }
 
-    // ---- self-modifying-code detection (the W8 JIT invalidation seam) -----
-    //
-    // The interpreter decodes fresh every step, so self-modifying code already
-    // works with no help here. A future JIT, however, will cache decoded/compiled
-    // blocks keyed by guest address and must throw a cached block away the moment
-    // the bytes underneath it change. These two counters are the seam that lets it
-    // do so cheaply: a backend bumps them whenever a write lands in *executable*
-    // memory. Test doubles inherit the no-op defaults (they hold no code the JIT
-    // would cache), so nothing changes for them.
-
-    /// A monotonic counter incremented once for every write (guest or loader
-    /// `poke`) that touches at least one byte of an executable region. A JIT can
-    /// compare a snapshot of this against the live value to answer "did *any*
-    /// executable byte change since I last checked?" in O(1). Default: `0`
-    /// (never changes → a cache built on it would simply never self-invalidate,
-    /// which is safe for a backend that stores no executable bytes).
     fn code_generation(&self) -> u64 {
         0
     }
 
-    /// The generation of the executable page containing `addr` (page = 4 KiB).
-    /// Incremented every time a write lands anywhere in that page while the page
-    /// is executable. A JIT keys cached blocks by page and re-validates each
-    /// against the generation captured at compile time; a bump means "recompile".
-    /// Pages that are not (or never were) executable report `0`. Default: `0`.
     fn code_page_generation(&self, addr: u64) -> u64 {
         let _ = addr;
         0
     }
 }
 
-/// Guest page size used by the self-modifying-code generation map. 4 KiB is the
-/// x86 base page; the JIT invalidation seam ([`Memory::code_page_generation`])
-/// works at this granularity.
 pub const CODE_PAGE_SIZE: u64 = 0x1000;

@@ -1,8 +1,3 @@
-//! Tests for the typed GDI device-context object model (roadmap P5b.1):
-//! `SelectObject` returning the previously-selected object of the same kind,
-//! `SaveDC`/`RestoreDC`, `CreateFontIndirect` + `GetObject`, and the background
-//! color/mode setters. Driven through `Hooks::intercept`.
-
 use exemu_core::{CpuState, Hooks, ImportSymbol, Memory, Perm, Reg, Region};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
@@ -62,12 +57,9 @@ fn select_object_returns_previous_of_same_kind() {
     assert_ne!(b1, 0);
     assert_ne!(b1, b2);
 
-    // Selecting a brush returns the previously-selected brush (0 initially).
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SelectObject", &[HDC, b1]), 0);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SelectObject", &[HDC, b2]), b1);
-    // A pen is a distinct slot: selecting it returns the previous *pen* (0), not b2.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SelectObject", &[HDC, p1]), 0);
-    // Selecting another brush still tracks the brush slot (b2).
     let b3 = call(&mut os, &mut mem, &mut cpu, "CreateSolidBrush", &[0x0012_3456]);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SelectObject", &[HDC, b3]), b2);
 }
@@ -82,9 +74,7 @@ fn save_restore_dc_reverts_selection() {
 
     call(&mut os, &mut mem, &mut cpu, "SelectObject", &[HDC, b1]);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SaveDC", &[HDC]), 1, "first SaveDC → level 1");
-    // Change the selection inside the saved state.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SelectObject", &[HDC, b2]), b1);
-    // Restore reverts the current brush back to b1.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "RestoreDC", &[HDC, (-1i64) as u64]), 1);
     assert_eq!(
         call(&mut os, &mut mem, &mut cpu, "SelectObject", &[HDC, b3]),
@@ -97,14 +87,13 @@ fn save_restore_dc_reverts_selection() {
 fn create_font_and_get_object_roundtrip() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::default();
-    // Build a LOGFONTW: lfHeight @0, lfWeight @16, lfItalic @20, lfFaceName @28.
     let lf = SCRATCH;
     for i in 0..92u64 {
         mem.write_u8(lf + i, 0).unwrap();
     }
-    mem.write_u32(lf, (-24i32) as u32).unwrap(); // height
-    mem.write_u32(lf + 16, 700).unwrap(); // weight (bold)
-    mem.write_u8(lf + 20, 1).unwrap(); // italic
+    mem.write_u32(lf, (-24i32) as u32).unwrap();
+    mem.write_u32(lf + 16, 700).unwrap();
+    mem.write_u8(lf + 20, 1).unwrap();
     put_wstr(&mut mem, lf + 28, "Segoe UI");
 
     let hfont = call(&mut os, &mut mem, &mut cpu, "CreateFontIndirectW", &[lf]);
@@ -123,13 +112,10 @@ fn create_font_and_get_object_roundtrip() {
 fn bk_color_and_mode_return_previous() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::default();
-    // First set returns the default (0), second returns the prior value.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetBkColor", &[HDC, 0x00AA_BBCC]), 0);
-    // COLORREF 0x00CCBBAA (BGR) → packed 0x00AABBCC; the previous is returned as
-    // the packed value we stored.
     let prev = call(&mut os, &mut mem, &mut cpu, "SetBkColor", &[HDC, 0]);
     assert_ne!(prev, 0, "second SetBkColor returns the previously set color");
 
-    assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetBkMode", &[HDC, 1]), 0); // TRANSPARENT
+    assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetBkMode", &[HDC, 1]), 0);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "SetBkMode", &[HDC, 2]), 1, "returns prior mode");
 }

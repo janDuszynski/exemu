@@ -1,7 +1,3 @@
-//! Tests for the Win32 message queue (roadmap P5a.1): PostMessage /
-//! PostThreadMessage / GetMessage / PeekMessage / PostQuitMessage /
-//! TranslateMessage, driven through `Hooks::intercept`.
-
 use exemu_core::{CpuState, Hooks, ImportSymbol, Memory, Perm, Reg, Region};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
@@ -23,8 +19,6 @@ fn setup() -> (WinOs, VirtualMemory) {
     (os, mem)
 }
 
-/// Call a user32 API with up to four register args + optional stack args,
-/// returning RAX.
 fn call(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState, name: &str, args: &[u64]) -> u64 {
     let thunk = os.resolve_import("user32.dll", &ImportSymbol::Named(name.into()));
     cpu.set_rsp(RSP);
@@ -43,7 +37,6 @@ fn call(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState, name: &str,
     cpu.reg(Reg::Rax)
 }
 
-/// Read the (hwnd, message, wParam, lParam) a MSG buffer holds (64-bit layout).
 fn read_msg(mem: &VirtualMemory) -> (u64, u64, u64, u64) {
     (
         mem.read_u64(MSGBUF).unwrap(),
@@ -57,9 +50,7 @@ fn read_msg(mem: &VirtualMemory) -> (u64, u64, u64, u64) {
 fn post_then_get_roundtrip() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::default();
-    // PostMessage(hwnd=0x1234, WM_USER, wParam=7, lParam=99).
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "PostMessageW", &[0x1234, 0x0400, 7, 99]), 1);
-    // GetMessage delivers it and returns TRUE (nonzero).
     let r = call(&mut os, &mut mem, &mut cpu, "GetMessageW", &[MSGBUF, 0, 0, 0]);
     assert_eq!(r, 1, "GetMessage returns TRUE for a normal message");
     assert_eq!(read_msg(&mem), (0x1234, 0x0400, 7, 99));
@@ -81,13 +72,10 @@ fn fifo_order_preserved() {
 fn post_quit_delivers_wm_quit_and_returns_zero() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::default();
-    // A queued message is still delivered before the quit.
     call(&mut os, &mut mem, &mut cpu, "PostMessageW", &[9, 0x0400, 0, 0]);
     call(&mut os, &mut mem, &mut cpu, "PostQuitMessage", &[42]);
-    // First GetMessage: the queued message (returns TRUE).
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetMessageW", &[MSGBUF, 0, 0, 0]), 1);
     assert_eq!(read_msg(&mem).0, 9);
-    // Next GetMessage: WM_QUIT, returns 0 (loop exits), wParam = exit code.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "GetMessageW", &[MSGBUF, 0, 0, 0]), 0);
     let (_, message, wparam, _) = read_msg(&mem);
     assert_eq!(message, WM_QUIT);
@@ -100,15 +88,12 @@ fn peek_noremove_then_remove() {
     let mut cpu = CpuState::default();
     call(&mut os, &mut mem, &mut cpu, "PostMessageW", &[5, 0x0400, 1, 2]);
     call(&mut os, &mut mem, &mut cpu, "PostMessageW", &[6, 0x0400, 0, 0]);
-    // PM_NOREMOVE (0): peek the head without consuming — repeatable.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "PeekMessageW", &[MSGBUF, 0, 0, 0, 0]), 1);
     assert_eq!(read_msg(&mem).0, 5);
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "PeekMessageW", &[MSGBUF, 0, 0, 0, 0]), 1);
     assert_eq!(read_msg(&mem).0, 5, "PM_NOREMOVE does not consume");
-    // PM_REMOVE (1): consume the head.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "PeekMessageW", &[MSGBUF, 0, 0, 0, 1]), 1);
     assert_eq!(read_msg(&mem).0, 5);
-    // The next message is now at the head, proving 5 was removed.
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "PeekMessageW", &[MSGBUF, 0, 0, 0, 0]), 1);
     assert_eq!(read_msg(&mem).0, 6);
 }
@@ -117,13 +102,11 @@ fn peek_noremove_then_remove() {
 fn translate_keydown_to_char() {
     let (mut os, mut mem) = setup();
     let mut cpu = CpuState::default();
-    // Build a WM_KEYDOWN MSG for VK 'A' (0x41) in the buffer, then translate it.
     mem.write_u64(MSGBUF, 0).unwrap();
     mem.write_u32(MSGBUF + 8, WM_KEYDOWN as u32).unwrap();
-    mem.write_u64(MSGBUF + 16, 0x41).unwrap(); // wParam = VK_A
+    mem.write_u64(MSGBUF + 16, 0x41).unwrap();
     mem.write_u64(MSGBUF + 24, 0).unwrap();
     assert_eq!(call(&mut os, &mut mem, &mut cpu, "TranslateMessage", &[MSGBUF]), 1, "keydown translates");
-    // The synthesized WM_CHAR is now queued; GetMessage delivers it.
     let out = MSGBUF + 0x100;
     call(&mut os, &mut mem, &mut cpu, "GetMessageW", &[out, 0, 0, 0]);
     assert_eq!(mem.read_u32(out + 8).unwrap() as u64, WM_CHAR);

@@ -1,52 +1,3 @@
-//! W4.8 — **the win32u / GDI boundary, re-derived from the pinned binaries.**
-//!
-//! Everything exemu's win32k layer knows about Wine's USER/GDI split is a number
-//! it read out of a binary once: a syscall index, a fan-in call selector, a field
-//! offset in the DC object gdi32 shares with the kernel, a fixed handle-table
-//! slot a stock object must live in. None of it is documented anywhere. This test
-//! recovers each of those from the bytes of
-//! `example_exe/wine-dlls/x86_64-windows/{win32u,user32,gdi32}.dll` on **every
-//! run** and asserts it against the constants in [`exemu_os::win32k_abi`] — the
-//! same constants the handlers use, not a mirrored copy.
-//!
-//! A Wine bump that renumbers a syscall, a `NtUserCall*` selector or a DC_ATTR
-//! field therefore fails **here**, by name, instead of turning into a control
-//! that silently paints nothing. It is the `afd_abi.rs` treatment for the GUI
-//! boundary.
-//!
-//! What it establishes, all from the binary:
-//!
-//! 1. Every win32u index exemu services is the `mov eax, imm32` immediate in
-//!    that export's own stub.
-//! 2. The `NtUserCall{Hwnd,HwndParam,OneParam}` **call-number enums** — user32's
-//!    thin wrapper for each public API loads the selector as an immediate into
-//!    the trailing argument register straight before the win32u thunk.
-//! 3. `GetClientRect`'s parameter block is `{ RECT *rect; DWORD dpi_ctx; }`.
-//! 4. A GDI handle is `(type << 16) | slot`, and gdi32 recovers the type from
-//!    the **low byte of the handle-table entry's generation word** — the rule
-//!    that makes brushes and pens work.
-//! 5. `GetStockObject` reads fixed slots directly and **executes `ud2`** on an
-//!    empty one, so those slots must be published.
-//! 6. The DC_ATTR offsets exemu writes (origin) and reads (text colour).
-//! 7. **Hit-testing, capture and focus belong to the kernel side.**
-//!    `user32!WindowFromPoint` is four instructions ending in a tail-jump;
-//!    `SetCapture`/`ReleaseCapture`/`SetFocus` are bare thunks; and
-//!    `GetFocus`/`GetActiveWindow`/`GetCapture` are the three
-//!    `NtUserGetThreadState` indices.
-//! 8. **`NtUserMessageCall` is a family selected by its `type` argument** — the
-//!    `mov dword ptr [rsp+0x28], imm32` each user32 wrapper issues, including
-//!    the internal `dispatch_message` behind `DispatchMessageW`. That the slot
-//!    is written as a *dword* is itself load-bearing: the upper half is stale.
-//! 9. **`DefWindowProc` is that syscall and nothing else** — no `WM_NCHITTEST`
-//!    arm anywhere in user32 — and the handle it forwards is whatever
-//!    `NtUserCallHwnd` code 0x10 returned, which therefore has to be the HWND.
-//!
-//! Where a routine has no export of its own (`DefWindowProcW`'s export is a
-//! forwarder into ntdll), it is reached through the **COFF symbol table** the
-//! pinned DLLs ship.
-//!
-//! Skip-guarded on the git-ignored Wine DLL set.
-
 use std::collections::BTreeMap;
 
 use exemu_core::ImportSymbol;
@@ -60,23 +11,13 @@ fn wine_dlls_present() -> bool {
         .all(|d| std::path::Path::new(WINE_DLLS).join(d).exists())
 }
 
-// ---------------------------------------------------------------------------
-// A mapped pinned DLL, with the pieces every recovery below needs.
-// ---------------------------------------------------------------------------
-
 struct Dll {
     name: &'static str,
-    /// `.text` bytes and the RVA they start at.
     code: Vec<u8>,
     text_rva: u32,
-    /// `.pdata` function ranges, sorted.
     funcs: Vec<(u32, u32)>,
-    /// Exported name → RVA (forwarders excluded).
     exports: BTreeMap<String, u32>,
-    /// COFF symbol name → RVA — the only route to a routine whose export is a
-    /// forwarder (`DefWindowProcW`).
     symbols: BTreeMap<String, u32>,
-    /// `dll!Symbol` → IAT slot RVA, for annotating indirect calls.
     imports: BTreeMap<u32, String>,
 }
 
@@ -125,8 +66,6 @@ impl Dll {
             .unwrap_or_else(|| panic!("{} exports {sym}", self.name))
     }
 
-    /// The RVA of a routine's *code*: its export when it has one, otherwise its
-    /// COFF symbol (a forwarded export like `DefWindowProcW` has no export RVA).
     fn code_rva(&self, sym: &str) -> u32 {
         self.exports
             .get(sym)
@@ -135,7 +74,6 @@ impl Dll {
             .unwrap_or_else(|| panic!("{} has neither an export nor a symbol for {sym}", self.name))
     }
 
-    /// The IAT slot RVA of an imported symbol, matched on the bare name.
     fn iat(&self, sym: &str) -> u32 {
         *self
             .imports
@@ -145,7 +83,6 @@ impl Dll {
             .0
     }
 
-    /// Bytes of `[begin, end)`, clamped to `.text`.
     fn slice(&self, begin: u32, end: u32) -> &[u8] {
         let lo = begin.saturating_sub(self.text_rva) as usize;
         let hi = (end.saturating_sub(self.text_rva) as usize).min(self.code.len());
@@ -155,7 +92,6 @@ impl Dll {
         &self.code[lo..hi]
     }
 
-    /// The `.pdata` range containing `rva`.
     fn func_at(&self, rva: u32) -> (u32, u32) {
         *self
             .funcs
@@ -165,15 +101,6 @@ impl Dll {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Byte-level readers (no decoder — the same "what was in the register when the
-// call happened" reading a disassembler gives, done on raw bytes).
-// ---------------------------------------------------------------------------
-
-/// `mov <reg32>, imm32` (the `B8+rd` short form) **or** `xor <reg32>, <same>` —
-/// which is how a wrapper passing selector 0 spells it (`user32!GetFocus` is
-/// `xor ecx, ecx`). Returns `(reg, value, length)` with `reg` in the 0..7
-/// encoding; a REX.B prefix bumps it to 8..15.
 fn mov_reg_imm32(code: &[u8], i: usize) -> Option<(u8, u32, usize)> {
     let (base, rex_b) = if code.get(i)? & 0xF8 == 0x40 {
         (i + 1, code[i] & 1)
@@ -181,7 +108,6 @@ fn mov_reg_imm32(code: &[u8], i: usize) -> Option<(u8, u32, usize)> {
         (i, 0)
     };
     let op = *code.get(base)?;
-    // `xor r32, r32` — 31 /r (or 33 /r) with mod=11 and reg == rm.
     if (op == 0x31 || op == 0x33) && base + 2 <= code.len() {
         let modrm = code[base + 1];
         let (reg, rm) = ((modrm >> 3) & 7, modrm & 7);
@@ -196,10 +122,6 @@ fn mov_reg_imm32(code: &[u8], i: usize) -> Option<(u8, u32, usize)> {
     Some(((op - 0xB8) | (rex_b << 3), imm, base + 5 - i))
 }
 
-/// `mov dword ptr [rsp+disp8], imm32` — `C7 44 24 disp8 imm32`. The form every
-/// user32 wrapper uses to fill `NtUserMessageCall`'s stack arguments, and the
-/// reason those slots must be read as **dwords**: the upper half of the qword is
-/// never written.
 fn mov_stack_imm32(code: &[u8], i: usize) -> Option<(u8, u32, usize)> {
     if i + 8 > code.len() || code[i] != 0xC7 || code[i + 1] != 0x44 || code[i + 2] != 0x24 {
         return None;
@@ -209,8 +131,6 @@ fn mov_stack_imm32(code: &[u8], i: usize) -> Option<(u8, u32, usize)> {
     Some((disp, imm, 8))
 }
 
-/// The immediate a function stores at `[rsp+slot]` before its first call/jmp
-/// through `iat_slot` — how `NtUserMessageCall`'s `type` argument is recovered.
 fn stack_imm_at_call(dll: &Dll, begin: u32, end: u32, iat_slot: u32, slot: u8) -> Option<u32> {
     let body = dll.slice(begin, end);
     let mut last: BTreeMap<u8, u32> = BTreeMap::new();
@@ -230,10 +150,6 @@ fn stack_imm_at_call(dll: &Dll, begin: u32, end: u32, iat_slot: u32, slot: u8) -
     None
 }
 
-/// Every immediate standing at `[rsp+slot]` at each call/jmp through
-/// `iat_slot` in `[begin, end)` — [`stack_imm_at_call`] without the "first one
-/// only", so a routine that issues two different `NtUserMessageCall` types
-/// (`user32!bcast_childwindow`, `user32!post_dde_message`) reports both.
 fn stack_imms_at_calls(dll: &Dll, begin: u32, end: u32, iat_slot: u32, slot: u8) -> Vec<u32> {
     let body = dll.slice(begin, end);
     let mut last: BTreeMap<u8, u32> = BTreeMap::new();
@@ -256,12 +172,8 @@ fn stack_imms_at_calls(dll: &Dll, begin: u32, end: u32, iat_slot: u32, slot: u8)
     out
 }
 
-/// `NtUserMessageCall`'s 6th argument — the first stack slot past the shadow
-/// space plus one (the `type`).
 const MESSAGE_CALL_TYPE_SLOT: u8 = 0x28;
 
-/// Every pinned PE that imports `NtUserMessageCall`. `wow64win.dll` is in the
-/// list because its 32→64 thunk is the only evidence for type `0x307`.
 const MESSAGE_CALL_CALLERS: [&str; 5] =
     ["user32.dll", "imm32.dll", "wintab32.dll", "wow64win.dll", "explorer.exe"];
 
@@ -269,8 +181,6 @@ fn message_call_dlls_present() -> bool {
     MESSAGE_CALL_CALLERS.iter().all(|d| std::path::Path::new(WINE_DLLS).join(d).exists())
 }
 
-/// Every `NtUserMessageCall` type exemu names, from the ABI table plus the two
-/// members that table cannot key by caller.
 fn message_call_space() -> Vec<u64> {
     abi::MESSAGE_CALL_TYPES
         .iter()
@@ -281,9 +191,6 @@ fn message_call_space() -> Vec<u64> {
         .collect()
 }
 
-/// Targets of the `call rel32`s (`E8`) inside `[begin, end)`, in order. A bare
-/// byte scan finds `E8` bytes that are really immediates, so only targets that
-/// land exactly on a `.pdata` function start are kept.
 fn direct_calls(dll: &Dll, begin: u32, end: u32) -> Vec<u32> {
     let body = dll.slice(begin, end);
     let mut out = Vec::new();
@@ -302,19 +209,11 @@ fn direct_calls(dll: &Dll, begin: u32, end: u32) -> Vec<u32> {
     out
 }
 
-/// The first `jmp qword [rip+disp32]` / `call qword [rip+disp32]` target inside a
-/// short export body (used for the bare-thunk wrappers, which carry no `.pdata`
-/// entry of their own).
 fn first_rip_indirect(dll: &Dll, rva: u32, len: u32) -> Option<u32> {
     let body = dll.slice(rva, rva + len);
     (0..body.len()).find_map(|i| rip_indirect(body, i, dll.text_rva, rva + i as u32))
 }
 
-/// The pinned DLLs ship a **COFF symbol table**, which is the only way to reach a
-/// routine that is not exported under its own name. `user32!DefWindowProcW` is
-/// exactly that case: the export is a *forwarder* to `NTDLL.NtdllDefWindowProc_W`
-/// (which jumps back through the client-PFN slot), so the code has to be found by
-/// symbol. Returns `name -> RVA` for every symbol that belongs to a section.
 fn coff_symbols(bytes: &[u8]) -> BTreeMap<String, u32> {
     let mut out = BTreeMap::new();
     let lfanew = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
@@ -360,7 +259,6 @@ fn coff_symbols(bytes: &[u8]) -> BTreeMap<String, u32> {
     out
 }
 
-/// `call/jmp qword ptr [rip+disp32]` (`FF 15` / `FF 25`) → the IAT slot RVA.
 fn rip_indirect(code: &[u8], i: usize, text_rva: u32, at: u32) -> Option<u32> {
     if i + 6 > code.len() || code[i] != 0xFF || (code[i + 1] != 0x15 && code[i + 1] != 0x25) {
         return None;
@@ -370,18 +268,7 @@ fn rip_indirect(code: &[u8], i: usize, text_rva: u32, at: u32) -> Option<u32> {
     u32::try_from(at as i64 + 6 + disp as i64).ok()
 }
 
-/// The selector immediate a `user32` wrapper hands one of the `NtUserCall*`
-/// multiplexers: walk the exported function forward remembering the last
-/// `mov <reg>, imm32` per register, and read `reg` at the first call/jmp through
-/// `iat_slot`.
-///
-/// `reg` is the x86-64 register number of the multiplexer's trailing argument:
-/// `ecx`(1) for `NtUserCallNoParam`, `edx`(2) for the one-argument families,
-/// `r8d`(8) for the two-argument ones.
 fn selector_at_call(dll: &Dll, export: &str, iat_slot: u32, reg: u8) -> Option<u32> {
-    // `code_rva`, not `export`: the dialog selectors are only ever passed by
-    // internal routines (`DIALOG_get_info`), which the COFF symbol table names
-    // but the export table does not.
     let rva = dll.code_rva(export);
     let (begin, end) = dll.func_at(rva);
     let body = dll.slice(begin, end);
@@ -402,14 +289,6 @@ fn selector_at_call(dll: &Dll, export: &str, iat_slot: u32, reg: u8) -> Option<u
     None
 }
 
-/// The selector immediates at every `call *%rdi` in a routine that has parked an
-/// import slot in `rdi` (`mov rdi, [rip+disp32]`), in order.
-///
-/// `selector_at_call` only recognises a direct `call [rip+disp32]`, which is
-/// what a one-call wrapper emits. `user32!SetWindowLongPtrA` makes **two**
-/// `NtUserCallTwoParam` calls in a row and so loads the slot once and calls
-/// through the register — and it is the only routine in the binary that uses
-/// `GetDialogProc` at all, so reading it needs this shape.
 fn selectors_via_parked_rdi(dll: &Dll, sym: &str, iat_slot: u32) -> Vec<u32> {
     let (begin, end) = dll.func_at(dll.code_rva(sym));
     let body = dll.slice(begin, end);
@@ -419,7 +298,6 @@ fn selectors_via_parked_rdi(dll: &Dll, sym: &str, iat_slot: u32) -> Vec<u32> {
     let mut i = 0usize;
     while i + 1 < body.len() {
         let at = begin + i as u32;
-        // `mov rdi, [rip+disp32]` — 48 8b 3d disp32.
         if body[i..].starts_with(&[0x48, 0x8B, 0x3D]) && i + 7 <= body.len() {
             let disp = i32::from_le_bytes(body[i + 3..i + 7].try_into().unwrap());
             parked = u32::try_from(at as i64 + 7 + disp as i64) == Ok(iat_slot);
@@ -431,7 +309,6 @@ fn selectors_via_parked_rdi(dll: &Dll, sym: &str, iat_slot: u32) -> Vec<u32> {
             i += len;
             continue;
         }
-        // `call *%rdi` — ff d7. The trailing argument of a two-param call is r8d.
         if parked && body[i] == 0xFF && body[i + 1] == 0xD7 {
             out.push(last.get(&8).copied().unwrap_or(u32::MAX));
             i += 2;
@@ -442,12 +319,10 @@ fn selectors_via_parked_rdi(dll: &Dll, sym: &str, iat_slot: u32) -> Vec<u32> {
     out
 }
 
-/// Whether `needle` occurs anywhere in `[begin, end)`.
 fn contains(dll: &Dll, begin: u32, end: u32, needle: &[u8]) -> bool {
     dll.slice(begin, end).windows(needle.len()).any(|w| w == needle)
 }
 
-/// Every `mov <reg32>, imm32` immediate inside an exported function, in order.
 fn immediates(dll: &Dll, export: &str) -> Vec<u32> {
     let (begin, end) = dll.func_at(dll.export(export));
     let body = dll.slice(begin, end);
@@ -464,14 +339,6 @@ fn immediates(dll: &Dll, export: &str) -> Vec<u32> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// 1. win32u syscall indices
-// ---------------------------------------------------------------------------
-
-/// Every win32u index exemu services is the `mov eax, imm32` immediate in that
-/// export's own stub (`mov r10,rcx; mov eax,IDX; test …; syscall`). Recovering
-/// them *by export name* is what makes a Wine bump that renumbers the table an
-/// immediate, named failure instead of a wrong-handler dispatch.
 #[test]
 fn win32u_syscall_indices_match_the_pinned_stubs() {
     if !wine_dlls_present() {
@@ -481,9 +348,6 @@ fn win32u_syscall_indices_match_the_pinned_stubs() {
     let win32u = Dll::load("win32u.dll");
     for (name, expected) in abi::SYSCALLS {
         let rva = win32u.export(name);
-        // The stub is 3 bytes of `mov r10,rcx` then `mov eax,imm32`; read the
-        // first `B8` immediate in its opening bytes rather than assuming the
-        // exact prologue.
         let stub = win32u.slice(rva, rva + 24);
         let idx = stub
             .iter()
@@ -494,21 +358,11 @@ fn win32u_syscall_indices_match_the_pinned_stubs() {
             idx, expected,
             "win32u!{name} is index {idx:#x} in the pinned build, exemu registers {expected:#x}"
         );
-        // Every win32u index carries the 0x1000 table-selector bit that routes
-        // it to exemu's second SSDT.
         assert_ne!(idx & 0x1000, 0, "win32u!{name} ({idx:#x}) carries the win32k table bit");
     }
     eprintln!("win32u: {} indices re-derived by export name", abi::SYSCALLS.len());
 }
 
-// ---------------------------------------------------------------------------
-// 2. The NtUserCall* fan-in enums
-// ---------------------------------------------------------------------------
-
-/// The call-number enums are not public anywhere. They are recovered from
-/// user32's thin wrappers: each public API loads its selector as an immediate
-/// into the multiplexer's trailing argument register right before the win32u
-/// thunk, e.g. `user32!GetClientRect` does `mov r8d, 0xe; call NtUserCallHwndParam`.
 #[test]
 fn nt_user_call_selectors_match_the_pinned_user32_wrappers() {
     if !wine_dlls_present() {
@@ -517,7 +371,6 @@ fn nt_user_call_selectors_match_the_pinned_user32_wrappers() {
     }
     let user32 = Dll::load("user32.dll");
 
-    // Register numbers of each multiplexer's trailing (selector) argument.
     const EDX: u8 = 2;
     const R8D: u8 = 8;
 
@@ -553,8 +406,6 @@ fn nt_user_call_selectors_match_the_pinned_user32_wrappers() {
         );
     }
 
-    // The four selectors are distinct *within* each multiplexer — the property
-    // that makes "one index, many operations" decodable at all.
     for (label, set) in [
         ("NtUserCallHwnd", abi::CALL_HWND.iter().map(|(_, c)| *c).collect::<Vec<_>>()),
         ("NtUserCallHwndParam", abi::CALL_HWND_PARAM.iter().map(|(_, c)| *c).collect()),
@@ -567,34 +418,6 @@ fn nt_user_call_selectors_match_the_pinned_user32_wrappers() {
     }
 }
 
-/// **`GetDialogProc` is selector 0 of `NtUserCallTwoParam`** (roadmap W6.2), and
-/// zero is exactly the value a mistake would also produce — so it is pinned from
-/// the only routine in the pinned user32 that uses it,
-/// `user32!SetWindowLongPtrA`. Setting `DWLP_DLGPROC` on a dialog makes three
-/// calls back to back:
-///
-/// ```text
-///   mov  edx, 1              ; NtUserCallHwnd_GetDialogInfo — is it a dialog?
-///   call NtUserCallHwnd
-///   mov  rdi, [rip+…]        ; park __imp_NtUserCallTwoParam
-///   mov  r8d, 9              ; NtUserAllocWinProc(newproc, ansi)
-///   call *rdi
-///   call NtUserSetWindowLongPtr(hwnd, DWLP_DLGPROC, winproc, ansi)
-///   xor  r8d, r8d            ; NtUserCallTwoParam_GetDialogProc(oldproc, ansi)
-///   call *rdi
-///   test rax, rax
-///   cmovne rbx, rax          ; …falling back to the raw value on 0
-/// ```
-///
-/// Asserting the **pair** `[AllocWinProc = 9, GetDialogProc = 0]` is what makes
-/// the zero meaningful: a scan that had found the wrong function, or decoded
-/// nothing, could not also produce the 9 in front of it. The two values agree
-/// with the pinned user32's own DWARF enumeration
-/// (`NtUserCallTwoParam_GetDialogProc = 0`, `NtUserAllocWinProc = 9`).
-///
-/// The `cmovne` is also why answering the procedure itself is safe: user32
-/// treats a zero as "not one of the kernel side's A/W pairs" and keeps what it
-/// had.
 #[test]
 fn get_dialog_proc_is_selector_zero_of_nt_user_call_two_param() {
     if !wine_dlls_present() {
@@ -612,12 +435,6 @@ fn get_dialog_proc_is_selector_zero_of_nt_user_call_two_param() {
     );
 }
 
-/// `GetWindowLong` and `GetWindowLongPtr{A,W}` are three *different* selectors of
-/// the same multiplexer, and `IsIconic` is what pins the first one's meaning: it
-/// asks for `GWL_STYLE` (`mov rdx, -16`) with selector `0xa` and then tests
-/// `WS_MINIMIZE` in the answer, which is only sensible if `0xa` reads a window
-/// long. exemu services all three the same way, so this asserts the shape rather
-/// than trusting the name.
 #[test]
 fn get_window_long_selector_is_pinned_by_is_iconic() {
     if !wine_dlls_present() {
@@ -628,7 +445,6 @@ fn get_window_long_selector_is_pinned_by_is_iconic() {
     let hwnd_param = user32.iat("NtUserCallHwndParam");
     let (begin, end) = user32.func_at(user32.export("IsIconic"));
 
-    // `mov rdx, 0xfffffffffffffff0` — GWL_STYLE as a sign-extended imm32.
     assert!(
         contains(&user32, begin, end, &[0x48, 0xC7, 0xC2, 0xF0, 0xFF, 0xFF, 0xFF]),
         "user32!IsIconic asks for GWL_STYLE (-16)"
@@ -639,24 +455,15 @@ fn get_window_long_selector_is_pinned_by_is_iconic() {
         selector, 0x0a,
         "IsIconic reads GWL_STYLE through NtUserCallHwndParam selector {selector:#x}"
     );
-    // `shr eax, 0x1d; and eax, 1` — bit 29, i.e. WS_MINIMIZE (0x20000000). This
-    // is what proves the selector returns the *style*, not something else.
     assert!(
         contains(&user32, begin, end, &[0xC1, 0xE8, 0x1D]),
         "user32!IsIconic extracts WS_MINIMIZE (bit 29) from the returned long"
     );
-    // …and the three window-long selectors are consecutive and distinct.
     let ptr_a = abi::CALL_HWND_PARAM.iter().find(|(n, _)| *n == "GetWindowLongPtrA").unwrap().1;
     let ptr_w = abi::CALL_HWND_PARAM.iter().find(|(n, _)| *n == "GetWindowLongPtrW").unwrap().1;
     assert_eq!((ptr_a, ptr_w), (0x0b, 0x0c), "the Ptr variants follow GetWindowLong");
 }
 
-/// `GetClientRect`'s `param` is a pointer to `{ RECT *rect; DWORD dpi_ctx; }`,
-/// not to the RECT itself — a distinction that silently writes a rect into the
-/// wrong place if you get it backwards. user32 builds that block on its own
-/// stack: the caller's `RECT*` (arrived in `rdx`, saved to `rsi`) is stored at
-/// `[rsp+0x20]`, the DPI-awareness context at `[rsp+0x28]`, and `lea rdx,
-/// [rsp+0x20]` is what the syscall receives.
 #[test]
 fn get_client_rect_param_is_a_rect_pointer_plus_dpi() {
     if !wine_dlls_present() {
@@ -679,18 +486,6 @@ fn get_client_rect_param_is_a_rect_pointer_plus_dpi() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 2b. Input routing: who hit-tests, and the message-call family
-// ---------------------------------------------------------------------------
-
-/// **Hit-testing is the kernel side's job, and the binary is what says so.**
-///
-/// `user32!WindowFromPoint` is *four instructions*: unpack the by-value `POINT`
-/// (x stays in the low half of `rcx`, y is shifted out into `edx`) and tail-jump
-/// `NtUserWindowFromPoint`. There is no window-tree walk, no Z-order, no clip
-/// arithmetic on the user side at all — so all of it has to live in exemu's
-/// win32k. The same holds for the capture and the focus: `SetCapture`,
-/// `ReleaseCapture` and `SetFocus` are bare thunks.
 #[test]
 fn window_from_point_and_capture_are_bare_kernel_calls() {
     if !wine_dlls_present() {
@@ -699,7 +494,6 @@ fn window_from_point_and_capture_are_bare_kernel_calls() {
     }
     let user32 = Dll::load("user32.dll");
 
-    // `WindowFromPoint` reaches the syscall and nothing else.
     let (begin, end) = user32.func_at(user32.export("WindowFromPoint"));
     assert!(
         end - begin < 0x40,
@@ -717,15 +511,11 @@ fn window_from_point_and_capture_are_bare_kernel_calls() {
         Some("win32u.dll!NtUserWindowFromPoint"),
         "…and that import is NtUserWindowFromPoint"
     );
-    // …and it is the function's *last* instruction (`48 FF 25 disp32`, 7 bytes),
-    // so nothing else runs: no helper, no tree walk, no clip arithmetic.
     assert!(
         contains(&user32, end - 7, end, &[0x48, 0xFF, 0x25]),
         "WindowFromPoint ends in the tail-jump — the whole hit test is the kernel's"
     );
 
-    // The capture/focus setters are bare thunks: the first indirect branch in
-    // the export's bytes is the win32u entry of the same name.
     for (export, import) in [
         ("SetCapture", "win32u.dll!NtUserSetCapture"),
         ("ReleaseCapture", "win32u.dll!NtUserReleaseCapture"),
@@ -742,9 +532,6 @@ fn window_from_point_and_capture_are_bare_kernel_calls() {
     }
 }
 
-/// `GetFocus` / `GetActiveWindow` / `GetCapture` are one-line wrappers that load
-/// index 0 / 1 / 2 and tail-jump `NtUserGetThreadState` — which is where those
-/// three index values come from. (`GetFocus` spells its zero `xor ecx, ecx`.)
 #[test]
 fn thread_state_indices_match_the_pinned_user32_wrappers() {
     if !wine_dlls_present() {
@@ -764,20 +551,6 @@ fn thread_state_indices_match_the_pinned_user32_wrappers() {
     }
 }
 
-/// **`NtUserMessageCall` is a whole family behind one index**, and the `type`
-/// argument in its 6th slot is what selects the member. Each caller stores that
-/// type as a `mov dword ptr [rsp+0x28], imm32` right before the syscall —
-/// including `DefWindowProcW`, which *is* nothing but this call.
-///
-/// The `dword` matters as much as the value: the upper half of the qword slot is
-/// never written, so a handler that reads the argument 64 bits wide picks up the
-/// previous frame's bytes.
-///
-/// The family is **not** all sends. `SPY_EnterMessage`/`SPY_ExitMessage` bracket
-/// every message user32 delivers, `SPY_GetMsgName` is a string query, and the
-/// IME / systray / tablet / DDE members are not message deliveries at all — so
-/// each is pinned here by the routine that issues it, which is what lets
-/// `nt_user_message_call` dispatch on an allow-list instead of guessing.
 #[test]
 fn message_call_types_match_the_pinned_callers() {
     if !wine_dlls_present() || !message_call_dlls_present() {
@@ -798,9 +571,6 @@ fn message_call_types_match_the_pinned_callers() {
         );
     }
 
-    // The dispatch type has no exported wrapper: `DispatchMessageW` tail-calls an
-    // internal `dispatch_message`, and that is where 0x3001 lives. Follow the
-    // call rather than trusting the number.
     let iat = user32.iat("NtUserMessageCall");
     let (db, de) = user32.func_at(user32.export("DispatchMessageW"));
     let dispatch_type = direct_calls(&user32, db, de)
@@ -818,9 +588,6 @@ fn message_call_types_match_the_pinned_callers() {
         abi::MESSAGE_CALL_DISPATCH
     );
 
-    // Each type gets exactly one disposition — the property that makes
-    // dispatching on it sound. A member in two lists, or in none, is a bug in
-    // exemu's table rather than in the binary.
     for t in message_call_space() {
         let n = [
             abi::MESSAGE_CALL_SENDS.contains(&t),
@@ -836,20 +603,6 @@ fn message_call_types_match_the_pinned_callers() {
     }
 }
 
-/// **Nothing outside exemu's table reaches the syscall.** The per-routine pins
-/// above prove each named type is right; this proves the *set* is complete, by
-/// sweeping every `.pdata` function of every pinned PE that imports
-/// `NtUserMessageCall` and collecting the immediate stored at the type slot
-/// before each call site.
-///
-/// `wow64win!wow64_NtUserMessageCall` is swept for the same reason and is the
-/// only evidence for one member: type `0x307` has no caller anywhere in the
-/// pinned PE set, and would otherwise be invisible.
-///
-/// A Wine bump that adds a member fails here — which matters because an
-/// unrecognised type is answered with a zero, not dispatched to a WndProc, so
-/// without this test a new member would silently stop working instead of
-/// silently recursing.
 #[test]
 fn the_pinned_binaries_issue_no_message_call_type_exemu_does_not_know() {
     if !wine_dlls_present() || !message_call_dlls_present() {
@@ -878,9 +631,6 @@ fn the_pinned_binaries_issue_no_message_call_type_exemu_does_not_know() {
             "{site} issues NtUserMessageCall type {imm:#x}, which exemu does not name"
         );
     }
-    // Every type exemu names, except the two the sweep cannot see, is actually
-    // issued: `DISPATCH_MESSAGE`'s caller is reached above, and `0x307` has no
-    // caller at all outside wow64win's thunk (which the sweep does cover).
     let issued: std::collections::BTreeSet<u64> = seen.iter().map(|(_, i)| *i as u64).collect();
     for t in known {
         assert!(
@@ -890,19 +640,6 @@ fn the_pinned_binaries_issue_no_message_call_type_exemu_does_not_know() {
     }
 }
 
-/// **`DefWindowProc` is the kernel's, hit test included.**
-///
-/// The pinned `user32!DefWindowProcW` handles a handful of IME/syscommand
-/// messages and forwards everything else to `NtUserMessageCall` — it never
-/// compares the message against `WM_NCHITTEST`, and user32 exports no
-/// `NC_HandleNCHitTest`-shaped helper it could delegate to. So the default hit
-/// test has to be answered on the kernel side, which is what exemu's
-/// `def_window_proc` does.
-///
-/// It also pins the trap that made this invisible: the handle
-/// `DefWindowProcW` passes on is **whatever `NtUserCallHwnd` code 0x10 returned**
-/// (`call WIN_IsCurrentProcess; mov rbx, rax`), so that code must answer the
-/// HWND, not a boolean.
 #[test]
 fn def_window_proc_forwards_the_hit_test_and_trusts_call_hwnd_0x10() {
     if !wine_dlls_present() {
@@ -912,12 +649,10 @@ fn def_window_proc_forwards_the_hit_test_and_trusts_call_hwnd_0x10() {
     let user32 = Dll::load("user32.dll");
     let (begin, end) = user32.func_at(user32.code_rva("DefWindowProcW"));
 
-    // No WM_NCHITTEST arm: the message id never appears as a comparison
-    // immediate anywhere in the body.
     let hit = abi::WM_NCHITTEST;
     for cmp in [
-        [0x81, 0xFE].as_slice(), // cmp esi, imm32
-        [0x81, 0xFA].as_slice(), // cmp edx, imm32
+        [0x81, 0xFE].as_slice(),
+        [0x81, 0xFA].as_slice(),
     ] {
         let mut needle = cmp.to_vec();
         needle.extend_from_slice(&hit.to_le_bytes());
@@ -931,7 +666,6 @@ fn def_window_proc_forwards_the_hit_test_and_trusts_call_hwnd_0x10() {
         "user32 exports a non-client hit-test helper — the default may not be the kernel's"
     );
 
-    // It forwards through NtUserMessageCall with the DefWindowProc type.
     let iat = user32.iat("NtUserMessageCall");
     let ty = stack_imm_at_call(&user32, begin, end, iat, 0x28)
         .expect("DefWindowProcW reaches NtUserMessageCall");
@@ -939,9 +673,6 @@ fn def_window_proc_forwards_the_hit_test_and_trusts_call_hwnd_0x10() {
         abi::MESSAGE_CALL_TYPES.iter().find(|(_, n, _)| *n == "DefWindowProcW").unwrap().2;
     assert_eq!(ty as u64, expected, "DefWindowProcW forwards with type {ty:#x}");
 
-    // The handle it forwards is the result of `NtUserCallHwnd(hwnd, 0x10)`:
-    // its first direct call is a helper that issues exactly that, and the
-    // instruction that follows the call is `mov rbx, rax`.
     let call_hwnd = user32.iat("NtUserCallHwnd");
     const EDX: u8 = 2;
     let helper = *direct_calls(&user32, begin, end).first().expect("DefWindowProcW calls a helper");
@@ -979,19 +710,6 @@ fn def_window_proc_forwards_the_hit_test_and_trusts_call_hwnd_0x10() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 3. The GDI handle encoding and the stock-object slots
-// ---------------------------------------------------------------------------
-
-/// **A GDI handle is `(type << 16) | slot`, and the type is the low byte of the
-/// handle-table entry's generation word.**
-///
-/// This is the rule that unblocks brushes and pens: `gdi32!SelectObject` walks
-/// `PEB[0xF8] + (handle & 0xFFFF) * 24`, checks the in-use byte, checks
-/// `word[entry+0x0C] == handle >> 16`, then computes
-/// `(byte[entry+0x0C] & 0x7f) << 16` and dispatches on it — `0x100000` to
-/// `NtGdiSelectBrush`. A brush handle therefore *must* be `0x0010_0000 | slot`
-/// with `0x0010` in the entry's generation word; anything else is rejected.
 #[test]
 fn gdi_handle_type_lives_in_the_generation_word() {
     if !wine_dlls_present() {
@@ -1001,32 +719,27 @@ fn gdi_handle_type_lives_in_the_generation_word() {
     let gdi32 = Dll::load("gdi32.dll");
     let (begin, end) = gdi32.func_at(gdi32.export("SelectObject"));
 
-    // `mov rax, [rcx+0xf8]` — the handle table read out of the PEB.
     assert!(
         contains(&gdi32, begin, end, &[0x48, 0x8B, 0x81, 0xF8, 0x00, 0x00, 0x00]),
         "SelectObject reads the handle table from PEB+{:#x}",
         abi::GDI_PEB_TABLE_PTR_OFF
     );
-    // `lea rdx,[rax+rax*2]` then `lea rax,[rax+rdx*8]` — index * 3 * 8 = *24.
     assert!(
         contains(&gdi32, begin, end, &[0x48, 0x8D, 0x14, 0x40])
             || contains(&gdi32, begin, end, &[0x48, 0x8D, 0x04, 0x40]),
         "SelectObject scales the slot index by 3 (× 8 = {} bytes per entry)",
         abi::GDI_ENTRY_SIZE
     );
-    // `cmp byte ptr [rax+0xe], 0` — the in-use byte.
     assert!(
         contains(&gdi32, begin, end, &[0x80, 0x78, 0x0E, 0x00]),
         "SelectObject tests the in-use byte at entry+{:#x}",
         abi::GDI_ENTRY_TYPE_OFF
     );
-    // `cmp word ptr [rax+0xc], dx` — generation == handle >> 16.
     assert!(
         contains(&gdi32, begin, end, &[0x66, 0x39, 0x50, 0x0C]),
         "SelectObject compares the generation word at entry+{:#x} with handle>>16",
         abi::GDI_ENTRY_GENERATION_OFF
     );
-    // `movzx eax, byte [rax+0xc]; and eax,0x7f; shl eax,0x10` — the type.
     assert!(
         contains(&gdi32, begin, end, &[0x0F, 0xB6, 0x40, 0x0C]),
         "SelectObject reads the object type from the LOW BYTE of entry+{:#x}",
@@ -1037,10 +750,9 @@ fn gdi_handle_type_lives_in_the_generation_word() {
             && contains(&gdi32, begin, end, &[0xC1, 0xE0, 0x10]),
         "SelectObject masks that byte to 7 bits and shifts it to bits 16..22"
     );
-    // …and dispatches `brush_type << 16` to NtGdiSelectBrush.
     let expected_cmp = (abi::GDI_TYPE_BRUSH as u32) << 16;
     let mut cmp = [0u8; 5];
-    cmp[0] = 0x3D; // cmp eax, imm32
+    cmp[0] = 0x3D;
     cmp[1..].copy_from_slice(&expected_cmp.to_le_bytes());
     assert!(
         contains(&gdi32, begin, end, &cmp),
@@ -1050,14 +762,6 @@ fn gdi_handle_type_lives_in_the_generation_word() {
     );
 }
 
-/// **`GetStockObject` reads fixed handle-table slots and traps on an empty one.**
-///
-/// It issues no syscall at all: it maps the index to a slot, reads
-/// `PEB[0xF8] + slot*24` and — the load-bearing part — branches to a `ud2` when
-/// the entry's in-use byte is zero. A win32k that leaves the stock slots empty
-/// does not return NULL, it **crashes** the first Wine control that asks for a
-/// stock brush while painting. This asserts both the slot arithmetic exemu
-/// publishes against and the fact that the trap is really there.
 #[test]
 fn stock_object_slots_are_fixed_and_an_empty_one_traps() {
     if !wine_dlls_present() {
@@ -1068,7 +772,6 @@ fn stock_object_slots_are_fixed_and_an_empty_one_traps() {
     let get_stock = gdi32.export("GetStockObject");
     let (begin, end) = gdi32.func_at(get_stock);
 
-    // No syscall: GetStockObject reaches no win32u import at all.
     let body = gdi32.slice(begin, end);
     let win32u_slots: Vec<u32> = gdi32
         .imports
@@ -1087,23 +790,18 @@ fn stock_object_slots_are_fixed_and_an_empty_one_traps() {
         i += 1;
     }
 
-    // `add ecx, 0x20` — the plain mapping `slot = index + STOCK_SLOT_BASE`.
     let base = u8::try_from(abi::STOCK_SLOT_BASE).expect("stock slot base is a byte");
     assert!(
         contains(&gdi32, begin, end, &[0x83, 0xC1, base]),
         "GetStockObject maps index -> index + {:#x}",
         abi::STOCK_SLOT_BASE
     );
-    // `cmp byte ptr [rdx+0xe], 0` then a branch into a block ending in `ud2`.
     assert!(
         contains(&gdi32, begin, end, &[0x80, 0x7A, 0x0E, 0x00]),
         "GetStockObject tests the in-use byte at entry+{:#x}",
         abi::GDI_ENTRY_TYPE_OFF
     );
 
-    // The DPI-variant font slots appear as literal immediates in the body. Each
-    // of them must be one exemu publishes, or a control asking for that font
-    // reads an empty slot and executes the trap.
     let published: Vec<u64> = abi::stock_slots().iter().map(|(s, _)| *s).collect();
     let imms = immediates(&gdi32, "GetStockObject");
     let dpi_slots: Vec<u32> = imms
@@ -1122,7 +820,6 @@ fn stock_object_slots_are_fixed_and_an_empty_one_traps() {
         );
     }
 
-    // Every published slot is inside the recovered range, and no two collide.
     let mut sorted = published.clone();
     sorted.sort_unstable();
     sorted.dedup();
@@ -1140,16 +837,6 @@ fn stock_object_slots_are_fixed_and_an_empty_one_traps() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 4. DC_ATTR — the DC object gdi32 and the kernel share
-// ---------------------------------------------------------------------------
-
-/// The DC origin, text colour and background colour live at fixed offsets in the
-/// user-mode DC object, and gdi32 reads them **without a syscall** — so exemu has
-/// to write them there. `GetDCOrgEx` in particular reads `+0x48`/`+0x4c` and
-/// nothing in gdi32 ever writes them, which is what makes the DC origin the
-/// kernel side's job (and therefore why a child control's DC needs its offset
-/// published, roadmap W4.8).
 #[test]
 fn dc_attr_offsets_match_the_pinned_gdi32_accessors() {
     if !wine_dlls_present() {
@@ -1161,7 +848,6 @@ fn dc_attr_offsets_match_the_pinned_gdi32_accessors() {
     for (export, off) in abi::DC_ATTR {
         let (begin, end) = gdi32.func_at(gdi32.export(export));
         let off8 = u8::try_from(off).expect("DC_ATTR offsets fit a disp8");
-        // `mov e?x, dword ptr [rax+disp8]` — ModRM 0x40|reg|rm=0 (rax).
         let found = (0u8..8).any(|reg| contains(&gdi32, begin, end, &[0x8B, 0x40 | (reg << 3), off8]));
         assert!(
             found,
@@ -1169,7 +855,6 @@ fn dc_attr_offsets_match_the_pinned_gdi32_accessors() {
              layout has drifted from the pinned build"
         );
     }
-    // The y half of the origin is the dword right after the x half.
     let (begin, end) = gdi32.func_at(gdi32.export("GetDCOrgEx"));
     let org_x = abi::DC_ATTR.iter().find(|(n, _)| *n == "GetDCOrgEx").unwrap().1;
     let org_y = u8::try_from(org_x + 4).unwrap();
@@ -1177,8 +862,6 @@ fn dc_attr_offsets_match_the_pinned_gdi32_accessors() {
         (0u8..8).any(|reg| contains(&gdi32, begin, end, &[0x8B, 0x40 | (reg << 3), org_y])),
         "GetDCOrgEx reads the origin's y at +{org_y:#x}, immediately after x"
     );
-    // And GetDCOrgEx issues no syscall: the origin only ever comes from the
-    // shared DC object, i.e. from whatever the kernel side put there.
     let body = gdi32.slice(begin, end);
     let win32u_slots: Vec<u32> = gdi32
         .imports
@@ -1196,9 +879,6 @@ fn dc_attr_offsets_match_the_pinned_gdi32_accessors() {
     }
 }
 
-/// `SetTextColor` / `SetBkColor` are **not** plain client-side stores: they go
-/// through `NtGdiGetAndSetDCDword` with a selector immediate. Those selectors are
-/// what exemu's handler dispatches on.
 #[test]
 fn dc_dword_selectors_match_the_pinned_gdi32_setters() {
     if !wine_dlls_present() {
@@ -1219,10 +899,6 @@ fn dc_dword_selectors_match_the_pinned_gdi32_setters() {
     }
 }
 
-/// `user32!FillRect` — the call every themeless control paints with — lowers to
-/// `SelectObject(brush)` + `PatBlt(PATCOPY)` + `SelectObject(previous)`, which is
-/// why exemu services exactly those three and not a `FillRect` syscall (there
-/// isn't one).
 #[test]
 fn fill_rect_lowers_to_select_brush_plus_patblt() {
     if !wine_dlls_present() {
@@ -1232,19 +908,15 @@ fn fill_rect_lowers_to_select_brush_plus_patblt() {
     let user32 = Dll::load("user32.dll");
     let (begin, end) = user32.func_at(user32.export("FillRect"));
 
-    // `mov dword ptr [rsp+0x28], 0x00f00021` — PATCOPY in the 6th argument slot.
     assert!(
         contains(&user32, begin, end, &[0xC7, 0x44, 0x24, 0x28, 0x21, 0x00, 0xF0, 0x00]),
         "user32!FillRect issues PatBlt with PATCOPY (0x00f00021)"
     );
-    // It calls gdi32!PatBlt, not any win32u entry point directly.
     let pat_blt = user32.iat("PatBlt");
     let body = user32.slice(begin, end);
     let calls_patblt = (0..body.len().saturating_sub(6))
         .any(|i| rip_indirect(body, i, user32.text_rva, begin + i as u32) == Some(pat_blt));
     assert!(calls_patblt, "user32!FillRect calls gdi32!PatBlt");
-    // And there is no `FillRect` in win32u at all — the brush+blt pair is the
-    // whole lowering.
     let win32u = Dll::load("win32u.dll");
     assert!(
         !win32u.exports.keys().any(|k| k.contains("FillRect")),

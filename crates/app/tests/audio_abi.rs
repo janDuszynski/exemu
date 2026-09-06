@@ -1,37 +1,3 @@
-//! W7.2 — **the mmdevapi driver unixlib, re-derived from the pinned binaries**.
-//!
-//! Before exemu plays a single sample it has to know, exactly, what Wine's audio
-//! stack *asks its driver for*. This test recovers that surface from the bytes
-//! of `example_exe/wine-dlls/x86_64-windows/{winealsa,winepulse}.drv` and
-//! `mmdevapi.dll` on every run and asserts it against the constants in
-//! [`exemu_os::audio`]. A guessed code index or a wrong structure offset fails
-//! **here**, loudly, instead of turning into silence three layers down.
-//!
-//! What it establishes, all from the binary:
-//!
-//! 1. Wine's `*.drv` audio drivers carry **no PE half worth the name**:
-//!    `winealsa.drv` and `winepulse.drv` are byte-identical, export nothing, and
-//!    import exactly `kernel32!DisableThreadLibraryCalls`. Nothing about the
-//!    interface is ALSA- or PulseAudio-specific, because nothing about the
-//!    interface is in them at all.
-//! 2. **`mmdevapi.dll` is the PE half** — the only audio DLL in the prefix that
-//!    imports the unixlib bootstrap trio.
-//! 3. `mmdevapi!load_driver` builds `L"wine" + name + L".drv"`, `LoadLibraryW`s
-//!    it, and asks `NtQueryVirtualMemory(…, MemoryWineUnixFuncs, …, 8, …)` for
-//!    that module's unixlib handle — the exact handshake exemu answers.
-//! 4. The **complete code table**: every `call [__wine_unix_call_dispatcher]` in
-//!    mmdevapi's `.text`, the `mov edx, imm` code in its argument slot, and the
-//!    name of the enclosing function read out of mmdevapi's own **COFF symbol
-//!    table**. The codes are a dense 0..=36.
-//! 5. The **argument-structure offsets** exemu marshals, re-derived from the
-//!    `lea r8, [rsp+disp]` that forms each call's `args` pointer and the
-//!    `[rsp+disp8]` stores and loads around it.
-//!
-//! No disassembler: the scans are raw byte patterns, the same technique
-//! `afd_abi.rs` uses.
-//!
-//! Skip-guarded on the git-ignored Wine DLL set.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use exemu_core::ImportSymbol;
@@ -51,11 +17,6 @@ fn skip() -> bool {
     true
 }
 
-// ---------------------------------------------------------------------------
-// Byte-level recovery helpers
-// ---------------------------------------------------------------------------
-
-/// `call qword ptr [rip+disp32]` — `FF 15 <disp32>`; the RVA it resolves to.
 fn rip_call(code: &[u8], text_rva: u32, i: usize) -> Option<u32> {
     if i + 6 > code.len() || code[i] != 0xFF || code[i + 1] != 0x15 {
         return None;
@@ -64,9 +25,6 @@ fn rip_call(code: &[u8], text_rva: u32, i: usize) -> Option<u32> {
     u32::try_from(text_rva as i64 + i as i64 + 6 + disp as i64).ok()
 }
 
-/// `mov <reg>, qword ptr [rip+disp32]` / `lea` — the RVA of the operand, for
-/// the `48 8B ?? ...` and `48 8D ?? ...` forms with a `rip` base (`modrm.rm`
-/// = 5, `mod` = 0).
 fn rip_operand(code: &[u8], text_rva: u32, i: usize, op: u8) -> Option<u32> {
     if i + 7 > code.len() || code[i] & 0xF8 != 0x48 || code[i + 1] != op {
         return None;
@@ -78,40 +36,28 @@ fn rip_operand(code: &[u8], text_rva: u32, i: usize, op: u8) -> Option<u32> {
     u32::try_from(text_rva as i64 + i as i64 + 7 + disp as i64).ok()
 }
 
-/// UTF-16LE bytes of `s`, without a terminator — for searching an image.
 fn utf16(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
-/// One recovered dispatcher call site.
 #[derive(Debug, Clone, Copy)]
 struct Site {
-    /// RVA of the `call` itself.
     call_rva: u32,
-    /// RVA of the enclosing `.pdata` function.
     func_rva: u32,
-    /// The `code` argument (`mov edx, imm32` / `xor edx, edx`).
     code: Option<u32>,
-    /// `[rsp+disp]` the `args` pointer was `lea`'d from, or `None` when the
-    /// call passes `args = NULL` (`xor r8d, r8d`).
     args_disp: Option<u32>,
-    /// Whether `args` was explicitly NULL.
     args_null: bool,
 }
 
-/// The recovered picture of `mmdevapi.dll`.
 struct Mmdevapi {
     code: Vec<u8>,
     text_rva: u32,
-    /// `.data` section bytes and RVA (the dispatcher pointer lives there).
     data: Vec<u8>,
     data_rva: u32,
     funcs: Vec<(u32, u32)>,
-    /// COFF symbol name → RVA, and the reverse for the ones in `.text`.
     sym: BTreeMap<String, u32>,
     sym_at: BTreeMap<u32, String>,
     sites: Vec<Site>,
-    /// The whole file, for literal searches.
     bytes: Vec<u8>,
     image: exemu_core::PeImage,
 }
@@ -179,7 +125,6 @@ impl Mmdevapi {
             .unwrap_or_else(|| panic!("{rva:#x} lies in a .pdata function"))
     }
 
-    /// The call site issuing `code` from the function named `func`.
     fn site(&self, func: &str, code: u32) -> Site {
         let (begin, _) = self.func_of(self.sym(func));
         let hits: Vec<Site> = self
@@ -200,7 +145,6 @@ impl Mmdevapi {
         hits[0]
     }
 
-    /// The IAT slot RVA of an imported symbol.
     fn iat(&self, dll_name: &str, symbol: &str) -> u32 {
         self.image
             .imports
@@ -213,34 +157,24 @@ impl Mmdevapi {
             .iat_rva
     }
 
-    /// Whether `needle` occurs in `[begin, end)` of `.text`.
     fn contains(&self, begin: u32, end: u32, needle: &[u8]) -> bool {
         let lo = (begin - self.text_rva) as usize;
         let hi = ((end - self.text_rva) as usize).min(self.code.len());
         lo < hi && self.code[lo..hi].windows(needle.len()).any(|w| w == needle)
     }
 
-    /// Whether the function containing `rva` calls `iat_rva`.
     fn calls(&self, func_begin: u32, func_end: u32, iat_rva: u32) -> bool {
         let lo = (func_begin - self.text_rva) as usize;
         let hi = ((func_end - self.text_rva) as usize).min(self.code.len());
         (lo..hi).any(|i| rip_call(&self.code, self.text_rva, i) == Some(iat_rva))
     }
 
-    /// Whether the function *hoists* `iat_rva` into a register
-    /// (`mov r64, qword ptr [rip+disp32]`) and calls it indirectly — what gcc
-    /// does for an import used inside a loop, and what `load_driver_devices`
-    /// does with `malloc`/`free`.
     fn loads_iat(&self, func_begin: u32, func_end: u32, iat_rva: u32) -> bool {
         let lo = (func_begin - self.text_rva) as usize;
         let hi = ((func_end - self.text_rva) as usize).min(self.code.len());
         (lo..hi).any(|i| rip_operand(&self.code, self.text_rva, i, 0x8B) == Some(iat_rva))
     }
 
-    /// The `disp8` of the first `mov eax, dword ptr [rsp+disp8]`
-    /// (`8B 44 24 disp8`) at or after `from`, bounded by the function end. This
-    /// is how mmdevapi reads an `HRESULT` back out of an argument block, so the
-    /// answer minus the block's base is the result field's offset.
     fn first_result_load(&self, from: u32, end: u32) -> u32 {
         let lo = (from - self.text_rva) as usize;
         let hi = ((end - self.text_rva) as usize).min(self.code.len());
@@ -255,9 +189,6 @@ impl Mmdevapi {
     }
 }
 
-/// Parse the COFF symbol table mingw leaves in the shipped image: 18-byte
-/// records at `PointerToSymbolTable`, names either inline (8 bytes) or an offset
-/// into the string table that follows.
 fn coff_symbols(bytes: &[u8], image: &exemu_core::PeImage) -> (BTreeMap<String, u32>, BTreeMap<u32, String>) {
     let pe_off = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
     let symptr = u32::from_le_bytes(bytes[pe_off + 12..pe_off + 16].try_into().unwrap()) as usize;
@@ -292,12 +223,6 @@ fn coff_symbols(bytes: &[u8], image: &exemu_core::PeImage) -> (BTreeMap<String, 
     (by_name, by_rva)
 }
 
-/// Walk each `.pdata` function's bytes forward, remembering the most recent
-/// `mov edx, imm32` / `xor edx, edx` (the unixlib `code`) and the most recent
-/// `lea r8, [rsp+disp]` / `xor r8d, r8d` (the `args` pointer), and record every
-/// call through the dispatcher slot. Same "what was in the argument register
-/// when the call happened" reading a disassembler gives, done on raw bytes so
-/// the test carries no decoder of its own.
 fn scan_dispatcher_calls(code: &[u8], text_rva: u32, funcs: &[(u32, u32)], dispatcher: u32) -> Vec<Site> {
     let mut out = Vec::new();
     for &(begin, end) in funcs {
@@ -313,33 +238,28 @@ fn scan_dispatcher_calls(code: &[u8], text_rva: u32, funcs: &[(u32, u32)], dispa
         let mut args_null = false;
         let mut i = lo;
         while i < hi {
-            // mov edx, imm32
             if code[i] == 0xBA && i + 5 <= hi {
                 edx = Some(u32::from_le_bytes(code[i + 1..i + 5].try_into().unwrap()));
                 i += 5;
                 continue;
             }
-            // xor edx, edx
             if i + 2 <= hi && code[i] == 0x31 && code[i + 1] == 0xD2 {
                 edx = Some(0);
                 i += 2;
                 continue;
             }
-            // lea r8, [rsp+disp8]
             if i + 5 <= hi && code[i..i + 4] == [0x4C, 0x8D, 0x44, 0x24] {
                 args = Some(code[i + 4] as u32);
                 args_null = false;
                 i += 5;
                 continue;
             }
-            // lea r8, [rsp+disp32]
             if i + 8 <= hi && code[i..i + 4] == [0x4C, 0x8D, 0x84, 0x24] {
                 args = Some(u32::from_le_bytes(code[i + 4..i + 8].try_into().unwrap()));
                 args_null = false;
                 i += 8;
                 continue;
             }
-            // xor r8d, r8d
             if i + 3 <= hi && code[i..i + 3] == [0x45, 0x31, 0xC0] {
                 args = None;
                 args_null = true;
@@ -364,14 +284,6 @@ fn scan_dispatcher_calls(code: &[u8], text_rva: u32, funcs: &[(u32, u32)], dispa
     out
 }
 
-// ---------------------------------------------------------------------------
-// 1. Wine's `*.drv` audio drivers have no PE half
-// ---------------------------------------------------------------------------
-
-/// The finding that decides the whole shape of W7.2: the pinned prefix's audio
-/// drivers are **not** ALSA-specific PE halves that exemu would have to be
-/// compatible with. They are the *same stub*, byte for byte, with no exports and
-/// a `DllMain` whose only import is `DisableThreadLibraryCalls`.
 #[test]
 fn the_audio_drv_modules_are_identical_export_less_stubs() {
     if skip() {
@@ -419,14 +331,6 @@ fn the_audio_drv_modules_are_identical_export_less_stubs() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 2. mmdevapi is the PE half
-// ---------------------------------------------------------------------------
-
-/// Exactly one audio DLL in the prefix imports the unixlib bootstrap trio. That
-/// is the module exemu must answer, and everything above it (`winmm`'s waveOut,
-/// `dsound`, `xaudio2`) reaches the driver through its COM surface as guest
-/// code, never through this boundary.
 #[test]
 fn mmdevapi_is_the_only_audio_dll_that_asks_for_a_unix_side() {
     if skip() {
@@ -456,11 +360,6 @@ fn mmdevapi_is_the_only_audio_dll_that_asks_for_a_unix_side() {
     }
 }
 
-/// The PE-side bootstrap: `__wine_unix_call_dispatcher` starts as a pointer to a
-/// self-installing trampoline that resolves the real dispatcher out of
-/// `ntdll.dll` by name. Verifying it matters because it is the mechanism exemu's
-/// boot already wires (`RVA_WINE_UNIX_CALL_DISPATCHER`) — mmdevapi reaching
-/// exemu at all depends on it.
 #[test]
 fn the_dispatcher_slot_bootstraps_itself_out_of_ntdll() {
     if skip() {
@@ -486,15 +385,12 @@ fn the_dispatcher_slot_bootstraps_itself_out_of_ntdll() {
         m.calls(begin, end, m.iat("ntdll.dll", "RtlFindExportedRoutineByName")),
         "…and finds the dispatcher there by name"
     );
-    // UNICODE_STRING{ Length = 2*9, MaximumLength = 2*10 } for L"ntdll.dll",
-    // stored as one dword immediate — derived from the name, not transcribed.
     let ustr = 0x12u32 | (0x14u32 << 16);
     assert!(
         m.contains(begin, end, &[&[0xC7u8, 0x44, 0x24][..], &[0x30], &ustr.to_le_bytes()[..]].concat())
             || m.contains(begin, end, &ustr.to_le_bytes()),
         "unix_call_init builds a UNICODE_STRING for L\"ntdll.dll\""
     );
-    // The symbol it asks for, verbatim, in .rdata.
     let needle = b"__wine_unix_call_dispatcher\0";
     assert!(
         m.bytes.windows(needle.len()).any(|w| w == needle),
@@ -502,14 +398,6 @@ fn the_dispatcher_slot_bootstraps_itself_out_of_ntdll() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 3. load_driver — how a driver is found and paired
-// ---------------------------------------------------------------------------
-
-/// `load_driver` is the entire handshake exemu answers. Everything asserted here
-/// is what makes exemu's own generated `winecoreaudio.drv` reachable: the module
-/// name is built from the registry list with mmdevapi's own `L"wine%s.drv"`, and
-/// the unixlib handle comes from `MemoryWineUnixFuncs` on that module.
 #[test]
 fn load_driver_builds_the_module_name_and_queries_memory_wine_unix_funcs() {
     if skip() {
@@ -535,20 +423,15 @@ fn load_driver_builds_the_module_name_and_queries_memory_wine_unix_funcs() {
         m.calls(begin, end, m.iat("ntdll.dll", "NtQueryVirtualMemory")),
         "…then asks that module for its unixlib handle"
     );
-    // mov r8d, 1000 — MemoryWineUnixFuncs, in NtQueryVirtualMemory's third
-    // argument register, inside load_driver's own body.
     assert!(
         m.contains(begin, end, &[&[0x41u8, 0xB8][..], &1000u32.to_le_bytes()[..]].concat()),
         "the info class is MemoryWineUnixFuncs (1000)"
     );
-    // mov qword [rsp+0x20], 8 — the buffer length: one unixlib_handle_t.
     assert!(
         m.contains(begin, end, &[0x48, 0xC7, 0x44, 0x24, 0x20, 0x08, 0x00, 0x00, 0x00]),
         "…and it asks for exactly 8 bytes"
     );
 
-    // The first thing it does with the handle is code 0 with args = NULL,
-    // and the probe that follows is code 27.
     let attach = m.site("load_driver", audio::CODE_PROCESS_ATTACH);
     assert!(attach.args_null, "process_attach takes no arguments");
     let probe = m.site("load_driver", audio::CODE_TEST_CONNECT);
@@ -556,7 +439,6 @@ fn load_driver_builds_the_module_name_and_queries_memory_wine_unix_funcs() {
         probe.call_rva > attach.call_rva,
         "test_connect follows process_attach"
     );
-    // The priority slot is pre-seeded with `Neutral` before the probe.
     let base = probe.args_disp.expect("test_connect passes an args pointer");
     let seed = [
         &[0xC7u8, 0x44, 0x24][..],
@@ -572,10 +454,6 @@ fn load_driver_builds_the_module_name_and_queries_memory_wine_unix_funcs() {
     );
 }
 
-/// The driver-selection inputs, verbatim from mmdevapi's `.rdata`: the registry
-/// key `init_driver` opens, and the fallback list it uses when the value is
-/// absent. `coreaudio` being in that list is why exemu needs no patch to be
-/// selected — it only has to seed the registry value and provide the module.
 #[test]
 fn the_driver_registry_key_and_default_list_are_mmdevapis_own_literals() {
     if skip() {
@@ -604,14 +482,6 @@ fn the_driver_registry_key_and_default_list_are_mmdevapis_own_literals() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 4. The code table
-// ---------------------------------------------------------------------------
-
-/// The complete unixlib contract, recovered exhaustively: every dispatcher call
-/// site in mmdevapi's `.text`, its code, and the name of the function issuing it
-/// from mmdevapi's own COFF symbol table. A drift in any index — the classic way
-/// to get a unixlib silently wrong — fails here.
 #[test]
 fn the_driver_unixlib_table_is_a_dense_zero_to_thirtysix() {
     if skip() {
@@ -619,7 +489,6 @@ fn the_driver_unixlib_table_is_a_dense_zero_to_thirtysix() {
     }
     let m = Mmdevapi::recover();
 
-    // Each row: the code, and a function that must issue it.
     let rows: &[(u32, &str)] = &[
         (audio::CODE_PROCESS_ATTACH, "load_driver"),
         (audio::CODE_PROCESS_DETACH, "DllMain"),
@@ -666,8 +535,6 @@ fn the_driver_unixlib_table_is_a_dense_zero_to_thirtysix() {
         assert_eq!(site.code, Some(*code));
     }
 
-    // …and nothing outside 0..=36 is ever issued, which is what makes a
-    // 37-entry table complete rather than merely sufficient.
     let issued: BTreeSet<u32> = m.sites.iter().filter_map(|s| s.code).collect();
     assert_eq!(
         issued,
@@ -683,15 +550,6 @@ fn the_driver_unixlib_table_is_a_dense_zero_to_thirtysix() {
     eprintln!("recovered {} dispatcher call sites, codes 0..=36", m.sites.len());
 }
 
-// ---------------------------------------------------------------------------
-// 5. Argument-structure offsets
-// ---------------------------------------------------------------------------
-
-/// Where each answer lands. The `HRESULT` field is the one exemu writes on every
-/// path, so getting its offset wrong turns a working backend into a caller that
-/// reads back garbage. Each row is re-derived: find the call, take the
-/// `lea r8, [rsp+base]` that formed its `args`, then the first
-/// `mov eax, [rsp+disp]` after it — the difference is the offset.
 #[test]
 fn the_result_field_offsets_are_where_mmdevapi_reads_them_back() {
     if skip() {
@@ -715,11 +573,6 @@ fn the_result_field_offsets_are_where_mmdevapi_reads_them_back() {
         ("clock_GetPosition", audio::CODE_GET_POSITION, audio::POSITION_RESULT),
         ("stream_release", audio::CODE_RELEASE_STREAM, audio::RELEASE_STREAM_RESULT),
         ("client_SetEventHandle", audio::CODE_SET_EVENT_HANDLE, audio::EVENT_RESULT),
-        // The trap in this table: `set_sample_rate` looks like the
-        // `{stream, HRESULT}` family but carries a `float` in between, so its
-        // result sits at +0x0c. mmdevapi pre-seeds that slot with `E_NOTIMPL`,
-        // which means a driver writing +0x08 instead would *look* like it had
-        // answered — the failure would be silent.
         ("AudioClockAdjustment_SetSampleRate", audio::CODE_SET_SAMPLE_RATE, audio::SAMPLE_RATE_RESULT),
     ];
     for (func, code, want) in rows {
@@ -735,10 +588,6 @@ fn the_result_field_offsets_are_where_mmdevapi_reads_them_back() {
     }
 }
 
-/// The input fields on the render hot path, recovered from the stores that
-/// precede each call. These are the offsets exemu reads the frame counts and the
-/// `BYTE**` out-pointer from — the difference between playing a buffer and
-/// scribbling somewhere else.
 #[test]
 fn the_render_path_input_offsets_are_where_mmdevapi_writes_them() {
     if skip() {
@@ -746,8 +595,6 @@ fn the_render_path_input_offsets_are_where_mmdevapi_writes_them() {
     }
     let m = Mmdevapi::recover();
 
-    // render_GetBuffer: `mov [rsp+base+8], edi` (frames),
-    //                   `mov [rsp+base+0x10], rbx` (the BYTE** out).
     let get = m.site("render_GetBuffer", audio::CODE_GET_RENDER_BUFFER);
     let (gb, ge) = m.func_of(get.call_rva);
     let base = get.args_disp.unwrap();
@@ -762,8 +609,6 @@ fn the_render_path_input_offsets_are_where_mmdevapi_writes_them() {
         audio::RENDER_GET_DATA
     );
 
-    // render_ReleaseBuffer: `mov [rsp+base+8], edi` (frames written),
-    //                       `mov [rsp+base+0xc], esi` (flags).
     let rel = m.site("render_ReleaseBuffer", audio::CODE_RELEASE_RENDER_BUFFER);
     let (rb, re) = m.func_of(rel.call_rva);
     let rbase = rel.args_disp.unwrap();
@@ -778,7 +623,6 @@ fn the_render_path_input_offsets_are_where_mmdevapi_writes_them() {
         audio::RENDER_REL_FLAGS
     );
 
-    // The `{stream, HRESULT, T *out}` family writes its out-pointer at +0x10.
     for func in [
         "client_GetBufferSize",
         "client_GetCurrentPadding",
@@ -788,8 +632,6 @@ fn the_render_path_input_offsets_are_where_mmdevapi_writes_them() {
         let site = m.sites.iter().find(|s| s.func_rva == m.func_of(m.sym(func)).0).unwrap();
         let (b, e) = m.func_of(site.call_rva);
         let base = site.args_disp.unwrap();
-        // The register carrying the caller's out-pointer differs (rbx or rsi);
-        // the *slot* it lands in is the fact under test.
         let disp = (base + audio::STREAM_OUT_PTR as u32) as u8;
         assert!(
             m.contains(b, e, &[0x48, 0x89, 0x5C, 0x24, disp]) || m.contains(b, e, &[0x48, 0x89, 0x74, 0x24, disp]),
@@ -799,10 +641,6 @@ fn the_render_path_input_offsets_are_where_mmdevapi_writes_them() {
     }
 }
 
-/// The pre-seeded poison values. mmdevapi writes a failure HRESULT into two of
-/// these result slots *before* the call, so a driver that writes the wrong
-/// offset leaves the poison in place and looks like it answered. Pinning them
-/// makes the offsets above load-bearing rather than incidental.
 #[test]
 fn mmdevapi_pre_seeds_the_result_slots_it_expects_the_driver_to_overwrite() {
     if skip() {
@@ -816,7 +654,6 @@ fn mmdevapi_pre_seeds_the_result_slots_it_expects_the_driver_to_overwrite() {
         let site = m.site(func, code);
         let (b, e) = m.func_of(site.call_rva);
         let base = site.args_disp.expect("an args pointer");
-        // mov dword ptr [rsp+disp8], imm32
         let needle = [
             &[0xC7u8, 0x44, 0x24][..],
             &[(base + off as u32) as u8],
@@ -830,9 +667,6 @@ fn mmdevapi_pre_seeds_the_result_slots_it_expects_the_driver_to_overwrite() {
     }
 }
 
-/// `get_mix_format`'s reply block is a `CoTaskMemAlloc(0x28)` — exactly
-/// `sizeof(WAVEFORMATEXTENSIBLE)`. That single immediate is what fixes the shape
-/// of the format exemu must write, and it is read straight out of the caller.
 #[test]
 fn get_mix_format_allocates_exactly_a_waveformatextensible() {
     if skip() {
@@ -844,7 +678,6 @@ fn get_mix_format_allocates_exactly_a_waveformatextensible() {
         m.calls(begin, end, m.iat("ole32.dll", "CoTaskMemAlloc")),
         "client_GetMixFormat allocates the block it hands the driver"
     );
-    // mov ecx, 0x28
     assert!(
         m.contains(begin, end, &[&[0xB9u8][..], &audio::WAVEFORMATEXTENSIBLE_LEN.to_le_bytes()[..]].concat()),
         "…of {} bytes",
@@ -852,10 +685,6 @@ fn get_mix_format_allocates_exactly_a_waveformatextensible() {
     );
 }
 
-/// `get_endpoint_ids`'s overflow protocol. mmdevapi loops on
-/// `HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)`, growing the buffer each
-/// time, so exemu must answer with that exact HRESULT rather than a generic
-/// failure — otherwise enumeration stops with zero endpoints.
 #[test]
 fn get_endpoint_ids_retries_on_the_insufficient_buffer_hresult() {
     if skip() {
@@ -863,7 +692,6 @@ fn get_endpoint_ids_retries_on_the_insufficient_buffer_hresult() {
     }
     let m = Mmdevapi::recover();
     let (begin, end) = m.func_of(m.sym("load_driver_devices"));
-    // cmp eax, 0x8007007A
     assert!(
         m.contains(
             begin,
@@ -877,15 +705,12 @@ fn get_endpoint_ids_retries_on_the_insufficient_buffer_hresult() {
         m.loads_iat(begin, end, m.iat("ucrtbase.dll", "malloc")),
         "…after growing the buffer"
     );
-    // Each endpoint entry is a pair of u32 offsets: `mov ebx,[rax]` then
-    // `mov eax,[rax+4]`, both added to the buffer base.
     assert!(
         m.contains(begin, end, &[0x8B, 0x18, 0x8B, 0x40, audio::ENDPOINT_ID_OFF as u8]),
         "an endpoint entry is {{name@+{:#x}, id@+{:#x}}}",
         audio::ENDPOINT_NAME_OFF,
         audio::ENDPOINT_ID_OFF
     );
-    // …and `lea rax, [rdx + rsi*8]` indexes them, which fixes the stride.
     assert!(
         m.contains(begin, end, &[0x48, 0x8D, 0x04, 0xF2]),
         "…with a stride of {}",
@@ -893,10 +718,6 @@ fn get_endpoint_ids_retries_on_the_insufficient_buffer_hresult() {
     );
 }
 
-/// `mmdevapi!get_device_guid` widens the endpoint **id** with
-/// `MultiByteToWideChar`, which is how we know the id is a `char` string while
-/// the friendly name is `WCHAR` — a detail that would otherwise be a coin flip,
-/// and one exemu's endpoint table depends on.
 #[test]
 fn the_endpoint_id_is_a_char_string_and_the_name_is_wide() {
     if skip() {
@@ -908,14 +729,11 @@ fn the_endpoint_id_is_a_char_string_and_the_name_is_wide() {
         m.calls(begin, end, m.iat("kernel32.dll", "MultiByteToWideChar")),
         "get_device_guid widens the id it was handed — so the id is multibyte"
     );
-    // The friendly name goes to MMDevice_Create untouched, and the registry key
-    // it builds is a wide format string.
     let fmt = utf16("Software\\Wine\\Drivers\\%s\\devices\\%u,");
     assert!(
         m.bytes.windows(fmt.len()).any(|w| w == fmt),
         "the per-device registry path is a wide literal"
     );
-    // get_device_name_from_guid hands the id back with _strdup — a char* API.
     let (nb, ne) = m.func_of(m.sym("get_device_name_from_guid"));
     assert!(
         m.calls(nb, ne, m.iat("ucrtbase.dll", "_strdup")),
@@ -923,9 +741,6 @@ fn the_endpoint_id_is_a_char_string_and_the_name_is_wide() {
     );
 }
 
-/// `client_GetDevicePeriod` clamps whatever the driver reports up to 10 ms.
-/// Recovered because it tells exemu that reporting a *smaller* default period
-/// achieves nothing, and pins the units as 100 ns.
 #[test]
 fn mmdevapi_clamps_the_default_period_to_ten_milliseconds() {
     if skip() {
@@ -933,7 +748,6 @@ fn mmdevapi_clamps_the_default_period_to_ten_milliseconds() {
     }
     let m = Mmdevapi::recover();
     let (begin, end) = m.func_of(m.sym("client_GetDevicePeriod"));
-    // mov edx, 0x186A0 ; cmp rax, rdx ; cmovl rax, rdx
     assert!(
         m.contains(begin, end, &[&[0xBAu8][..], &(audio::DEFAULT_PERIOD as u32).to_le_bytes()[..]].concat()),
         "the floor is {} in 100 ns units (10 ms)",

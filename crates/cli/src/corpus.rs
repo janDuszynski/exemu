@@ -1,107 +1,3 @@
-//! The corpus regression gate (roadmap W9.6).
-//!
-//! The roadmap names **per-exe regression pins** as one of the four standing
-//! harnesses, and the only one that can see cross-thread / IPC / integration
-//! regressions — the differential CPU oracle is single-stream and structurally
-//! blind to them. Until now those pins were prose in the knowledge base: a
-//! human ran a binary and eyeballed the instruction count. This module turns
-//! them into a declarative manifest plus a runner that diffs a real run against
-//! it, so drift fails instead of being noticed (or not) months later.
-//!
-//! # How a run is isolated — and why that is the whole ballgame
-//!
-//! Every entry runs in a **child `exemu run` process** with `TMPDIR` pointed at
-//! a private scratch directory that is deleted and recreated first. That is not
-//! hygiene, it is the precondition for the pin existing at all:
-//!
-//!   * The guest filesystem sandbox is `$TMPDIR/exemu-sandbox`, and it
-//!     **persists and accumulates across runs**. An installer enumerates and
-//!     overwrites what it finds there, so the guest genuinely executes a
-//!     different number of instructions depending on what previous runs left
-//!     behind. Measured on 7-Zip: the same binary reported 496,505,788
-//!     instructions / 110 files against one dirty sandbox and 496,505,786 / 115
-//!     files against another. Execution is deterministic *given* the sandbox
-//!     state and non-deterministic across a dirty one — so a corpus pin
-//!     measured against a shared sandbox is measuring the sandbox, not the
-//!     emulator. Against a fresh one, 7-Zip runs 496,505,572 instructions and
-//!     leaves 108 files: the 107 it extracts plus the loader's copy of the .exe
-//!     at `C:\7z2602-x64.exe`.
-//!   * A private `TMPDIR` also means the gate never clobbers the sandbox a
-//!     developer is looking at, which wiping a shared one would.
-//!   * And a corpus binary that dies takes its child process down, not the gate.
-//!
-//! The child is the real shipped CLI, so the gate measures the product rather
-//! than a test-only code path. Its two report lines are the parse contract:
-//!
-//! ```text
-//! [exemu] process exited with code 0 after 496505788 instructions
-//!   faulted after 92883812 instructions
-//! ```
-//!
-//! # The third source of drift, and how `virtual_clock` removes it
-//!
-//! An exact instruction count is the most precise behavioural fingerprint
-//! available for free: it summarises every branch the emulator took across
-//! hundreds of millions of instructions. With the sandbox isolation above in
-//! place, the obvious policy is "tolerance 0 for a run that completes" — and for
-//! a while **measurement said not quite**. Three back-to-back runs of Firefox
-//! Installer through this runner (same binary, same arguments, same build, each
-//! with a freshly created sandbox) produced 4,665,427 / 4,665,426 / 4,665,427
-//! instructions, and an independent full pass gave 7-Zip Δ 0, tcc Δ 0, Firefox
-//! Δ +1, **SteamSetup Δ −189**. Sandbox state was the large source of
-//! irreproducibility but not the only one: the emulator also serviced the *real
-//! host clock*, so a guest comparing two timestamps branched on how fast the
-//! host happened to be.
-//!
-//! That third source is now removable. `virtual_clock = true` on an entry runs
-//! it with `--virtual-clock` (roadmap W9.6): `RDTSC`, `GetTickCount`,
-//! `QueryPerformanceCounter`, `NtQuerySystemTime` and `KUSER_SHARED_DATA` are
-//! all driven from the retired-instruction count at a nominal 10M
-//! instructions/second from a fixed epoch, so the guest's whole notion of time
-//! is a function of its own instruction stream. Measured through this runner,
-//! the two binaries that used to wander stop dead:
-//!
-//! ```text
-//!                       host clock (3 runs)                 virtual clock
-//!   Firefox Installer   4,665,427 / …,427 / …,426           4,665,426 ×5
-//!   SteamSetup          92,864,324 / …,324 / 92,864,999     92,865,377 ×4
-//! ```
-//!
-//! So the tolerance policy is now conditioned on the clock:
-//!
-//!   * **`virtual_clock = true` — tolerance 0, whatever the outcome.** There is
-//!     no host input left to jitter on, so the pin is an equality and the gate
-//!     resolves a single instruction. Keeping a noise floor here would throw
-//!     away exactly the resolution the mode was built to buy. This is also the
-//!     precondition for W8.7 (diffing a JIT against the interpreter
-//!     instruction-for-instruction needs exact replay).
-//!   * **Host clock, `outcome = "exit"` — 64 instructions.** The program reached
-//!     a defined end state, so the count is the complete trace length rather
-//!     than a progress marker: the strongest assertion available, kept as tight
-//!     as the instrument allows. 64 is ~2 orders of magnitude above the observed
-//!     ±1 jitter and ~7 below any real behaviour change these binaries can
-//!     express, so in practice it is exact while never firing on noise.
-//!   * **Host clock, `outcome = "fault"` — exact stop identity, `max(64, 0.1%)`
-//!     on steps.** The assertion that carries the meaning is *where and why it
-//!     dies*: the fault `rip` and the fault text are compared exactly, with no
-//!     tolerance, on **both** clock paths. The step count is only a "how far did
-//!     we get" reach metric, and an unrelated improvement (one more CRT init
-//!     step, a newly implemented stub called during startup) shifts it slightly
-//!     without changing the defect. A real regression does not move it slightly:
-//!     these three faults live 728, 4.7M and 93M instructions apart.
-//!
-//! All three are written into the manifest as explicit numbers, so the tolerance
-//! a reviewer sees is the tolerance in force — not a formula hidden in this file.
-//! The child never inherits `EXEMU_VIRTUAL_CLOCK` from the developer's shell:
-//! an entry runs in exactly the mode its pin was measured in.
-//!
-//! Artifact counts are compared exactly whenever the manifest states one: an
-//! installer that writes 107 of its 108 files has regressed even if it still
-//! exits 0 after the same number of instructions. (This is also why the private
-//! `TMPDIR` matters — the ad-hoc measurement this gate replaces reported 110
-//! files for 7-Zip because it counted a *shared* sandbox that still held two
-//! files from an earlier run.)
-
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -109,20 +5,10 @@ use std::time::{Duration, Instant};
 
 use crate::toml_lite::{quote, Value};
 
-// ---------------------------------------------------------------------------
-// Model
-// ---------------------------------------------------------------------------
-
-/// How a corpus run ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// The guest called `ExitProcess` (or fell off the end) — a clean stop.
     Exit,
-    /// The run hit a guest fault the emulator could not deliver or service.
     Fault,
-    /// The run used up its instruction budget without stopping. Always a
-    /// failure when expected: it means the pin's `max_steps` is now too small,
-    /// or the guest is looping.
     Budget,
 }
 
@@ -151,90 +37,33 @@ impl std::fmt::Display for Outcome {
     }
 }
 
-/// One pinned corpus binary.
 #[derive(Clone, Debug)]
 pub struct Entry {
-    /// Display name (usually the file name).
     pub name: String,
-    /// Path to the executable, resolved relative to the manifest's directory.
     pub path: String,
-    /// Expected outcome kind.
     pub outcome: Outcome,
-    /// Expected process exit code (`outcome = "exit"` only).
     pub exit_code: i64,
-    /// Expected instruction count.
     pub steps: u64,
-    /// Absolute instruction-count slack. See the module docs for the policy:
-    /// a 64-instruction noise floor for clean exits, `max(64, 0.1%)` for the
-    /// reach metric of a fault.
     pub tolerance: u64,
-    /// Expected number of files left in the guest sandbox, or `None` to skip
-    /// the check. Includes the copy of the executable itself that the loader
-    /// places at `C:\<name>` so the guest can read its own file.
     pub artifacts: Option<u64>,
-    /// Instruction budget handed to the child (`--max-steps`).
     pub max_steps: u64,
-    /// Expected fault `rip` (`outcome = "fault"` only) — the stop *site*.
     pub rip: Option<u64>,
-    /// Expected first line of the fault report — the stop *reason*.
     pub stop: Option<String>,
-    /// Run this entry in the cheap default tier. Long binaries are opt-in so
-    /// `cargo test` stays fast; see [`Options::quick`].
     pub quick: bool,
-    /// Run this entry with the deterministic guest clock (`--virtual-clock`,
-    /// roadmap W9.6), so its instruction count does not depend on how fast the
-    /// host is. Per-entry rather than global because it is a *behavioural* mode:
-    /// an entry pinned under it must have its count re-measured under it, and an
-    /// entry left on the host clock keeps its host-clock pin. Turning it on is
-    /// what lets [`Entry::default_tolerance`] drop that entry's tolerance to 0.
     pub virtual_clock: bool,
-    /// Run this entry through the **block JIT** (`--jit`, roadmap W8). Pinned to
-    /// the *same* numbers as the interpreter entry for the same binary: the JIT
-    /// is required to be bit-for-bit identical, so a JIT entry that drifts from
-    /// its interpreter twin is precisely the failure this gate exists to catch.
-    /// Per-entry for the same reason `virtual_clock` is — it selects which
-    /// engine the pin describes.
     pub jit: bool,
-    /// Run this entry with a **debugger handle attached but nothing armed**
-    /// (`EXEMU_DEBUG_IDLE`, roadmap W9.3). Pinned to the *same* numbers as the
-    /// undebugged entry for the same binary, because the whole claim the debug
-    /// seam rests on is that attaching costs nothing: a detached handle is
-    /// inert, and an attached-but-unarmed one is one relaxed load against a
-    /// zero filter. An entry that drifts from its twin means attaching started
-    /// costing something, which is exactly what this gate exists to catch.
     pub debug_idle: bool,
-    /// Boot this entry on the **Wine PE DLL set** in this directory
-    /// (`--wine-boot <dir>`, the `x86_64-windows` half of the pinned prefix),
-    /// resolved relative to the manifest like `path`. `None` keeps the
-    /// emulated path.
-    ///
-    /// Per-entry for the same reason `virtual_clock` and `jit` are: it selects
-    /// *which program* the pin describes. The same `.exe` on the emulated path
-    /// and on the Wine path are not the same run — on one it calls exemu's
-    /// hand-written Win32, on the other it calls Wine's, through Wine's own
-    /// loader — so the two are pinned as separate entries rather than one
-    /// number that changes meaning with a flag.
-    ///
-    /// The directory lives under the git-ignored `example_exe/`, so
-    /// [`Manifest::corpus_present`] requires it exactly as it requires the
-    /// binaries: a checkout without the prefix skips the whole manifest
-    /// instead of failing.
     pub wine_boot: Option<String>,
-    /// Free prose kept verbatim across `--update` rewrites.
     pub note: Option<String>,
 }
 
-/// The parsed manifest plus the directory it was loaded from (entry paths are
-/// resolved against it, so the gate works from any working directory).
 #[derive(Clone, Debug)]
 pub struct Manifest {
-    /// Leading comment block, preserved verbatim by [`Manifest::to_toml`].
     pub header: String,
     pub entries: Vec<Entry>,
     pub dir: PathBuf,
 }
 
-/// What a real run did.
 #[derive(Clone, Debug)]
 pub struct Observed {
     pub outcome: Outcome,
@@ -242,18 +71,14 @@ pub struct Observed {
     pub steps: u64,
     pub rip: Option<u64>,
     pub artifacts: u64,
-    /// One-line summary of where it stopped (the fault's first report line, or
-    /// `exit <code>`).
     pub detail: String,
     pub elapsed: Duration,
 }
 
-/// One entry's result: what happened, and every way it disagreed with the pin.
 #[derive(Clone, Debug)]
 pub struct Verdict {
     pub entry: Entry,
     pub observed: Observed,
-    /// Empty when the run matched the manifest.
     pub problems: Vec<String>,
 }
 
@@ -263,31 +88,17 @@ impl Verdict {
     }
 }
 
-/// Progress callback invoked before each entry starts.
 pub type OnStart = Box<dyn Fn(&Entry)>;
 
-/// How to run the manifest.
 pub struct Options {
-    /// The `exemu` binary to spawn per entry.
     pub exemu_bin: PathBuf,
-    /// Scratch root; each entry gets a private `TMPDIR` beneath it.
     pub workroot: PathBuf,
-    /// Only run entries whose name contains this substring.
     pub only: Option<String>,
-    /// Only run entries flagged `quick = true`.
     pub quick: bool,
-    /// Called before each entry starts, so a caller can show progress.
     pub on_start: Option<OnStart>,
 }
 
 impl Options {
-    /// Defaults: spawn the currently running executable (the CLI re-invokes
-    /// itself) with scratch space under the system temp dir.
-    ///
-    /// `exemu_bin` and the scratch root are made absolute here because the
-    /// child runs with its working directory set to the corpus binary's own
-    /// folder (see [`run_entry`]); a relative path would resolve against the
-    /// wrong directory.
     pub fn new(exemu_bin: PathBuf) -> Options {
         Options {
             exemu_bin: absolute(exemu_bin),
@@ -306,17 +117,7 @@ fn absolute(p: PathBuf) -> PathBuf {
     std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
 }
 
-// ---------------------------------------------------------------------------
-// Manifest parsing / emitting
-//
-// `[[binary]]` table arrays of scalar keys, over the [`crate::toml_lite`]
-// value parser this module shares with [`crate::profile`] (roadmap W9.4) — see
-// that module for why there is no third-party TOML dependency. Hand emitting
-// also gives `--update` a canonical, minimal, reviewable diff.
-// ---------------------------------------------------------------------------
-
 impl Manifest {
-    /// Parse a manifest from `path`.
     pub fn load(path: &Path) -> Result<Manifest, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read manifest {}: {e}", path.display()))?;
@@ -367,14 +168,12 @@ impl Manifest {
         if entries.is_empty() {
             return Err("manifest declares no [[binary]] entries".into());
         }
-        // Trim the header to a single trailing newline so rewrites are stable.
         while header.ends_with("\n\n") {
             header.pop();
         }
         Ok(Manifest { header, entries, dir })
     }
 
-    /// Render back to TOML in a canonical layout (used by `--update`).
     pub fn to_toml(&self) -> String {
         let mut o = self.header.clone();
         if !o.is_empty() && !o.ends_with('\n') {
@@ -420,13 +219,11 @@ impl Manifest {
         o
     }
 
-    /// Write the manifest back to `path`.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         std::fs::write(path, self.to_toml())
             .map_err(|e| format!("cannot write manifest {}: {e}", path.display()))
     }
 
-    /// Absolute (or manifest-relative) path of an entry's executable.
     pub fn exe_path(&self, e: &Entry) -> PathBuf {
         let p = Path::new(&e.path);
         if p.is_absolute() {
@@ -436,8 +233,6 @@ impl Manifest {
         }
     }
 
-    /// Absolute (or manifest-relative) path of an entry's Wine prefix
-    /// directory, if it declares one.
     pub fn wine_boot_path(&self, e: &Entry) -> Option<PathBuf> {
         e.wine_boot.as_ref().map(|d| {
             let p = Path::new(d);
@@ -449,12 +244,8 @@ impl Manifest {
         })
     }
 
-    /// Are all the manifest's binaries — and the Wine prefixes its entries
-    /// name — present? Both live in the git-ignored `example_exe/`, so a fresh
-    /// checkout has neither and every consumer must skip rather than fail.
     pub fn corpus_present(&self) -> bool {
         self.entries.iter().all(|e| {
-            // `rust-version = 1.80`, so no `is_none_or` here.
             let prefix_ok = match self.wine_boot_path(e) {
                 Some(d) => d.is_dir(),
                 None => true,
@@ -524,27 +315,8 @@ impl Entry {
         })
     }
 
-    /// On the **host clock**, guest execution repeats to about ±1 instruction,
-    /// not exactly: the emulator services the real host clock, so a guest that
-    /// compares two timestamps can branch on how fast the host happened to be.
-    /// A host-clock tolerance is therefore at least this noise floor: two orders
-    /// of magnitude above the measured jitter, and far below any behaviour
-    /// change worth catching. It does not apply to a `virtual_clock` entry,
-    /// which has no jitter to absorb.
     pub const JITTER_FLOOR: u64 = 64;
 
-    /// The tolerance `--update` writes for a freshly measured entry.
-    ///
-    /// * **`virtual_clock` — 0, for any outcome.** With the deterministic clock
-    ///   (roadmap W9.6) there is no host input left to jitter on: the count is
-    ///   the same on every run, on every machine, so the pin is an equality and
-    ///   the gate sees a one-instruction change. This is the point of the mode,
-    ///   and leaving a noise floor in place that is no longer needed would throw
-    ///   away the resolution it bought.
-    /// * **Host clock, `outcome = "exit"` — the bare noise floor**, because the
-    ///   count is a complete trace.
-    /// * **Host clock, a fault — `max(floor, 0.1%)`** on what is only a reach
-    ///   metric. See the module docs for the full policy.
     pub fn default_tolerance(outcome: Outcome, steps: u64, virtual_clock: bool) -> u64 {
         if virtual_clock {
             return 0;
@@ -556,34 +328,16 @@ impl Entry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Running
-// ---------------------------------------------------------------------------
-
-/// Run one entry in a child `exemu run` with a private `TMPDIR`.
 pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, String> {
     let exe = m.exe_path(e);
     if !exe.exists() {
         return Err(format!("{}: not found at {}", e.name, exe.display()));
     }
-    // A private TMPDIR per entry: the guest sandbox is `$TMPDIR/exemu-sandbox`,
-    // so this both isolates the artifact count and keeps the corpus from
-    // touching a sandbox another run may be using.
     let work = absolute(opts.workroot.join(sanitize(&e.name)));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)
         .map_err(|err| format!("cannot create scratch dir {}: {err}", work.display()))?;
 
-    // The child is invoked from the executable's own directory with a BARE file
-    // name, never a path. This is load-bearing, not cosmetic: `exemu run` uses
-    // the path it was given as the guest's `argv[0]`, and the guest command line
-    // is built into guest memory where the CRT parses it — so a longer path
-    // makes the guest execute more instructions. Measured on Firefox Installer:
-    // a bare name runs 4,665,426 instructions and an absolute path 4,666,362, a
-    // 936-instruction difference from nothing but the spelling. Pinning the bare
-    // name makes the counts a property of the emulator, identical in every
-    // checkout and on every machine, instead of a property of where the repo
-    // happens to live.
     let dir = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
     let leaf = exe.file_name().ok_or_else(|| format!("{}: not a file", exe.display()))?;
 
@@ -595,15 +349,10 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
         .arg("--no-echo")
         .arg("--max-steps")
         .arg(e.max_steps.to_string())
-        // Keep opcode-miss telemetry out of the developer's real log.
         .arg("--telemetry")
         .arg(work.join("telemetry.log"))
         .env("TMPDIR", &work)
-        // Never inherit the developer's clock choice: an entry runs under
-        // exactly the mode its pin was measured in, whatever the shell says.
         .env_remove("EXEMU_VIRTUAL_CLOCK")
-        // Same reasoning for the JIT: an entry runs on the engine its pin
-        // describes, never on whatever the developer's environment selects.
         .env_remove("EXEMU_JIT")
         .env_remove("EXEMU_DEBUG_IDLE");
     if e.virtual_clock {
@@ -612,16 +361,9 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
     if e.jit {
         cmd.arg("--jit");
     }
-    // Same hygiene as `EXEMU_JIT`: the manifest decides, never the developer's
-    // environment. `EXEMU_DEBUG_IDLE` is an env var rather than a flag because
-    // it is a *test* affordance — it attaches a handle with nothing armed, so
-    // the run is observably identical to an undebugged one.
     if e.debug_idle {
         cmd.env("EXEMU_DEBUG_IDLE", "1");
     }
-    // The prefix is passed as an ABSOLUTE path: the child runs with its working
-    // directory set to the binary's own folder (see the bare-`argv[0]` note
-    // above), so a manifest-relative one would not resolve there.
     if let Some(dir) = m.wine_boot_path(e) {
         cmd.arg("--wine-boot").arg(absolute(dir));
     }
@@ -638,8 +380,6 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
     Ok(obs)
 }
 
-/// Extract the outcome from an `exemu run` stderr report. See the module docs
-/// for the two lines this contract depends on.
 fn parse_report(report: &str) -> Option<Observed> {
     let blank = Observed {
         outcome: Outcome::Exit,
@@ -651,7 +391,6 @@ fn parse_report(report: &str) -> Option<Observed> {
         elapsed: Duration::ZERO,
     };
 
-    // Clean exit: "[exemu] process exited with code 0 after 496505788 instructions".
     if let Some(line) = report.lines().find(|l| l.contains("process exited with code")) {
         let code = after(line, "process exited with code ")?.parse::<i64>().ok()?;
         let steps = after(line, " after ")?.parse::<u64>().ok()?;
@@ -664,8 +403,6 @@ fn parse_report(report: &str) -> Option<Observed> {
         });
     }
 
-    // Otherwise a fault report. The step count is on its own line; budget
-    // exhaustion is a *distinct* outcome even though it is reported the same way.
     let steps_line = report.lines().find(|l| l.contains("faulted after "))?;
     let steps = after(steps_line, "faulted after ")?.parse::<u64>().ok()?;
     let budget = report.contains("instruction budget exhausted");
@@ -673,7 +410,6 @@ fn parse_report(report: &str) -> Option<Observed> {
         .lines()
         .find_map(|l| l.trim_start().strip_prefix("rip=0x"))
         .and_then(|s| u64::from_str_radix(s.split_whitespace().next().unwrap_or(""), 16).ok());
-    // First line of the report is the structured error; `exemu: ` is main()'s prefix.
     let detail = report
         .lines()
         .find(|l| l.starts_with("exemu: "))
@@ -689,13 +425,10 @@ fn parse_report(report: &str) -> Option<Observed> {
     })
 }
 
-/// The first whitespace-delimited token following `marker` in `line`.
 fn after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     line.split_once(marker)?.1.split_whitespace().next()
 }
 
-/// Count every file (not directory) below `dir`, the way `exemu run` reports
-/// the guest filesystem.
 fn count_files(dir: &Path) -> u64 {
     fn walk(dir: &Path, depth: u32, n: &mut u64) {
         if depth > 32 {
@@ -720,7 +453,6 @@ fn sanitize(name: &str) -> String {
     name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect()
 }
 
-/// Diff one observation against its pin. Returns one message per disagreement.
 pub fn compare(e: &Entry, o: &Observed) -> Vec<String> {
     let mut problems = Vec::new();
 
@@ -731,7 +463,6 @@ pub fn compare(e: &Entry, o: &Observed) -> Vec<String> {
         ));
     }
 
-    // Step count: exact for a clean exit, tolerant for a fault's reach metric.
     let delta = o.steps as i128 - e.steps as i128;
     if delta.unsigned_abs() > e.tolerance as u128 {
         problems.push(format!(
@@ -747,7 +478,6 @@ pub fn compare(e: &Entry, o: &Observed) -> Vec<String> {
         problems.push(format!("exit code: expected {} but got {}", e.exit_code, o.exit_code));
     }
 
-    // A fault's identity — where and why — is pinned exactly.
     if e.outcome == Outcome::Fault && o.outcome == Outcome::Fault {
         if let (Some(want), Some(got)) = (e.rip, o.rip) {
             if want != got {
@@ -773,7 +503,6 @@ pub fn compare(e: &Entry, o: &Observed) -> Vec<String> {
     problems
 }
 
-/// Run every selected entry and diff it against the manifest.
 pub fn run_manifest(m: &Manifest, opts: &Options) -> Result<Vec<Verdict>, String> {
     let mut out = Vec::new();
     for e in &m.entries {
@@ -798,8 +527,6 @@ pub fn run_manifest(m: &Manifest, opts: &Options) -> Result<Vec<Verdict>, String
     Ok(out)
 }
 
-/// Fold observations back into the manifest (the `--update` rewrite).
-/// Returns a human-readable list of what changed.
 pub fn apply_update(m: &mut Manifest, verdicts: &[Verdict]) -> Vec<String> {
     let mut changes = Vec::new();
     for v in verdicts {
@@ -843,11 +570,6 @@ pub fn apply_update(m: &mut Manifest, verdicts: &[Verdict]) -> Vec<String> {
     changes
 }
 
-// ---------------------------------------------------------------------------
-// Presentation
-// ---------------------------------------------------------------------------
-
-/// Group digits with thin separators so 496505788 reads as 496,505,788.
 pub fn commas(n: u64) -> String {
     let s = n.to_string();
     let mut o = String::with_capacity(s.len() + s.len() / 3);
@@ -860,7 +582,6 @@ pub fn commas(n: u64) -> String {
     o
 }
 
-/// The status table `exemu corpus` prints.
 pub fn render_table(verdicts: &[Verdict]) -> String {
     let mut o = String::new();
     let namew = verdicts.iter().map(|v| v.entry.name.len()).max().unwrap_or(8).max(6);
@@ -903,14 +624,8 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{keep}…")
 }
 
-// ---------------------------------------------------------------------------
-// The `exemu corpus` subcommand
-// ---------------------------------------------------------------------------
-
-/// Default manifest location, relative to the repository root.
 pub const DEFAULT_MANIFEST: &str = "corpus.toml";
 
-/// Blanks wide enough to wipe a progress line before the table is printed.
 const PROGRESS_CLEAR: &str = "                                                                                ";
 
 pub fn cmd_corpus(rest: &[String]) -> Result<u8, String> {
@@ -957,9 +672,6 @@ pub fn cmd_corpus(rest: &[String]) -> Result<u8, String> {
     let mut opts = Options::new(exemu_bin);
     opts.only = only;
     opts.quick = quick;
-    // Progress goes to stderr on a rewound line, so a terminal shows which
-    // binary is running during a minutes-long pass without polluting the table
-    // on stdout (which is what a caller would pipe).
     opts.on_start = Some(Box::new(|e: &Entry| {
         use std::io::Write as _;
         eprint!("{PROGRESS_CLEAR}\r[exemu] running {}…\r", e.name);
@@ -1014,10 +726,6 @@ pub fn cmd_corpus(rest: &[String]) -> Result<u8, String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests (pure — no corpus binaries needed)
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1048,14 +756,6 @@ rip       = "0x20001c2c"
 stop      = "unmapped memory access at 0x0000000000001010"
 "#;
 
-    /// **A `wine_boot` entry survives `--update`** (roadmap W5).
-    ///
-    /// `--update` re-emits the whole manifest from the parsed `Entry`s, so a
-    /// field that parses but is never written back would be silently deleted
-    /// the first time anyone re-blessed a count — and the WoW64 entries would
-    /// quietly become emulated-path duplicates of the entries above them,
-    /// pinned to numbers from a different program. That failure is invisible in
-    /// the pass/fail table, so it is pinned here instead.
     #[test]
     fn a_wine_boot_entry_round_trips_and_resolves_against_the_manifest() {
         const SRC: &str = r#"[[binary]]
@@ -1085,7 +785,6 @@ artifacts = 4
         assert_eq!(back.entries[0].steps, e.steps);
         assert_eq!(back.entries[0].exit_code, e.exit_code);
 
-        // An entry without one is unaffected, and emits no key.
         let plain = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
         assert_eq!(plain.entries[0].wine_boot, None);
         assert_eq!(plain.wine_boot_path(&plain.entries[0]), None);
@@ -1105,7 +804,6 @@ artifacts = 4
         assert_eq!(a.steps, 496_505_788);
         assert_eq!(a.tolerance, 64);
         assert_eq!(a.artifacts, Some(110));
-        // Name defaults to the file name when absent.
         let b = &m.entries[1];
         assert_eq!(b.name, "bad.exe");
         assert_eq!(b.outcome, Outcome::Fault);
@@ -1169,16 +867,13 @@ artifacts = 4
             elapsed: Duration::ZERO,
         };
         assert!(compare(e, &o).is_empty(), "the pinned run passes");
-        // The measured ±1 clock jitter must not fail the gate…
         o.steps = e.steps + 1;
         assert!(compare(e, &o).is_empty(), "run-to-run jitter is absorbed");
-        // …but anything past the noise floor is drift a reviewer must see.
         o.steps = e.steps + Entry::JITTER_FLOOR + 1;
         assert_eq!(compare(e, &o).len(), 1, "drift past the noise floor is caught");
         o.steps = e.steps;
         o.artifacts = 109;
         assert_eq!(compare(e, &o).len(), 1, "a lost artifact is drift");
-        // A clean exit that stops cleanly with the wrong code is drift too.
         o.artifacts = 110;
         o.exit_code = 1;
         assert_eq!(compare(e, &o).len(), 1, "a changed exit code is drift");
@@ -1210,19 +905,12 @@ artifacts = 4
 
     #[test]
     fn tolerance_policy_is_the_noise_floor_for_exits_and_relative_for_faults() {
-        // A completed trace is pinned as tightly as the instrument allows: the
-        // bare jitter floor, independent of how long the run was.
         assert_eq!(Entry::default_tolerance(Outcome::Exit, 496_505_788, false), 64);
         assert_eq!(Entry::default_tolerance(Outcome::Exit, 1_000, false), 64);
-        // A fault's step count is a reach metric: 0.1%…
         assert_eq!(Entry::default_tolerance(Outcome::Fault, 92_883_812, false), 92_883);
-        // …but never below the floor, or a short run would get a useless ±0.
         assert_eq!(Entry::default_tolerance(Outcome::Fault, 728, false), 64);
     }
 
-    /// The whole return on the W9.6 virtual clock: with the host clock out of
-    /// the loop there is no jitter to absorb, so the pin becomes an equality —
-    /// for a completed run *and* for a fault's reach metric.
     #[test]
     fn the_virtual_clock_removes_the_tolerance_entirely() {
         assert_eq!(Entry::default_tolerance(Outcome::Exit, 496_505_788, true), 0);
@@ -1230,8 +918,6 @@ artifacts = 4
         assert_eq!(Entry::default_tolerance(Outcome::Budget, 300_000_000, true), 0);
     }
 
-    /// A `virtual_clock` entry round-trips through the manifest, and the flag is
-    /// only emitted when set — so host-clock entries keep their existing shape.
     #[test]
     fn the_virtual_clock_flag_round_trips() {
         const TEXT: &str = r#"[[binary]]
@@ -1249,14 +935,11 @@ tolerance = 0
         assert_eq!(m.entries[0].tolerance, 0);
         let again = Manifest::parse(&m.to_toml(), PathBuf::from("/repo")).expect("reparse");
         assert!(again.entries[0].virtual_clock, "the flag survives a rewrite");
-        // Absent means host clock, and the key is not written back.
         let host = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
         assert!(!host.entries[0].virtual_clock);
         assert!(!host.to_toml().contains("virtual_clock"));
     }
 
-    /// The JIT flag round-trips, and is absent by default — so an entry never
-    /// silently changes which engine its pin describes.
     #[test]
     fn the_debug_idle_flag_round_trips() {
         const TEXT: &str = r#"[[binary]]
@@ -1324,9 +1007,7 @@ tolerance = 0
         assert_eq!(changes.len(), 2, "steps and artifacts moved: {changes:?}");
         assert_eq!(m.entries[0].steps, 496_505_900);
         assert_eq!(m.entries[0].artifacts, Some(111));
-        // The prose survives the rewrite.
         assert!(m.to_toml().contains("a \\\"quoted\\\" note"));
-        // And the re-blessed manifest now passes.
         assert!(compare(&m.entries[0], &v.observed).is_empty());
     }
 }

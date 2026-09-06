@@ -1,27 +1,7 @@
-//! DllMain dispatch: PROCESS_ATTACH leaves-first, THREAD_ATTACH per new
-//! thread, PROCESS_DETACH on FreeLibrary ref-count-zero, and a real
-//! PEB.LoaderLock CRITICAL_SECTION (roadmap W0.7).
-//!
-//! The de-risk fixture (leaves-first ordering): the exe `LoadLibrary`s
-//! **B.dll**, which *imports* a function from **A.dll**. The loader must load
-//! the dependency A first and run its `DllMain(DLL_PROCESS_ATTACH)` *before*
-//! B's. Each DllMain is real guest code:
-//!
-//!   * A.dll's DllMain, on reason==DLL_PROCESS_ATTACH, writes a sentinel
-//!     `0xAAAA` to a shared scratch cell.
-//!   * B.dll's DllMain, on reason==DLL_PROCESS_ATTACH, *reads* that cell and,
-//!     only if it already holds A's sentinel, writes its own `0xBBBB` marker to
-//!     a second cell.
-//!
-//! B's marker therefore appears iff A's DllMain ran first — pinning
-//! leaves-first order. An ordering bug (B before A) leaves B's cell zero.
-
 use exemu_core::{Cpu, Exit, ImportSymbol, Memory, Perm, Reg, Region};
 use exemu_cpu::{Bits, Interpreter};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
-
-// ---- tiny byte helpers -----------------------------------------------------
 
 fn put_u16(f: &mut [u8], at: usize, v: u16) {
     f[at..at + 2].copy_from_slice(&v.to_le_bytes());
@@ -39,7 +19,6 @@ const OPT_HDR_SIZE: usize = 112 + 16 * 8;
 const SEC_ALIGN: u32 = 0x1000;
 const FILE_ALIGN: u32 = 0x200;
 
-// A shared RW scratch region the DllMains poke, well clear of every mapping.
 const SCRATCH: u64 = 0x3_0000_0000;
 
 struct Sec<'a> {
@@ -53,8 +32,6 @@ fn align_up(v: u32, a: u32) -> u32 {
     v.div_ceil(a) * a
 }
 
-/// Assemble a minimal PE32+ DLL from sections + optional export/import dirs +
-/// an entry RVA (adapted from the loader test fixture).
 fn assemble_pe(
     secs: &[Sec],
     export_dir: Option<(u32, u32)>,
@@ -77,15 +54,15 @@ fn assemble_pe(
     put_u32(&mut f, 0x3C, PE_OFF as u32);
     put_u32(&mut f, PE_OFF, 0x0000_4550);
     let coff = PE_OFF + 4;
-    put_u16(&mut f, coff, 0x8664); // AMD64
+    put_u16(&mut f, coff, 0x8664);
     put_u16(&mut f, coff + 2, secs.len() as u16);
     put_u16(&mut f, coff + 16, OPT_HDR_SIZE as u16);
-    put_u16(&mut f, coff + 18, 0x2022); // DLL
+    put_u16(&mut f, coff + 18, 0x2022);
 
     let opt = coff + 20;
     let last = secs.last().unwrap();
     let image_size = align_up(last.rva + last.data.len() as u32, SEC_ALIGN);
-    put_u16(&mut f, opt, 0x20B); // PE32+
+    put_u16(&mut f, opt, 0x20B);
     put_u32(&mut f, opt + 16, entry_rva);
     put_u64(&mut f, opt + 24, IMAGE_BASE);
     put_u32(&mut f, opt + 32, SEC_ALIGN);
@@ -94,8 +71,8 @@ fn assemble_pe(
     put_u16(&mut f, opt + 48, 6);
     put_u32(&mut f, opt + 56, image_size);
     put_u32(&mut f, opt + 60, headers_raw);
-    put_u16(&mut f, opt + 68, 3); // CONSOLE
-    put_u32(&mut f, opt + 108, 16); // NumberOfRvaAndSizes
+    put_u16(&mut f, opt + 68, 3);
+    put_u32(&mut f, opt + 108, 16);
 
     let dir = |i: usize| opt + 112 + i * 8;
     if let Some((rva, size)) = export_dir {
@@ -122,8 +99,6 @@ fn assemble_pe(
     f
 }
 
-/// Build an export directory for one symbol `sym` at code RVA `code_rva`,
-/// living at `EDATA_RVA`. Returns the section bytes and its byte length.
 fn build_edata(dll_name: &str, sym: &str, edata_rva: u32, code_rva: u32) -> Vec<u8> {
     let dir_off = 0u32;
     let eat_off = dir_off + 40;
@@ -137,9 +112,9 @@ fn build_edata(dll_name: &str, sym: &str, edata_rva: u32, code_rva: u32) -> Vec<
     let edata_len = pos;
     let mut ed = vec![0u8; edata_len as usize];
     put_u32(&mut ed, dir_off as usize + 12, dllname_rva);
-    put_u32(&mut ed, dir_off as usize + 16, 1); // ordinal base
-    put_u32(&mut ed, dir_off as usize + 20, 1); // NumberOfFunctions
-    put_u32(&mut ed, dir_off as usize + 24, 1); // NumberOfNames
+    put_u32(&mut ed, dir_off as usize + 16, 1);
+    put_u32(&mut ed, dir_off as usize + 20, 1);
+    put_u32(&mut ed, dir_off as usize + 24, 1);
     put_u32(&mut ed, dir_off as usize + 28, edata_rva + eat_off);
     put_u32(&mut ed, dir_off as usize + 32, edata_rva + names_off);
     put_u32(&mut ed, dir_off as usize + 36, edata_rva + ords_off);
@@ -153,27 +128,20 @@ fn build_edata(dll_name: &str, sym: &str, edata_rva: u32, code_rva: u32) -> Vec<
     ed
 }
 
-/// A.dll (the leaf): exports `a_func`, and its DllMain — on DLL_PROCESS_ATTACH
-/// — writes 0xAAAA to `SCRATCH[0]`.
 fn build_a_dll() -> Vec<u8> {
     const EDATA_RVA: u32 = 0x1000;
     const CODE_RVA: u32 = 0x2000;
     const ENTRY_RVA: u32 = 0x3000;
     let ed = build_edata("a.dll", "a_func", EDATA_RVA, CODE_RVA);
-    let text = vec![0xC3u8]; // a_func: ret
-    // DllMain(hinst=rcx, reason=rdx, reserved=r8):
-    //   cmp edx,1 ; jne done ; mov rax,SCRATCH ; mov dword[rax],0xAAAA ;
-    //   done: mov eax,1 ; ret
-    // Layout (offsets): 0 cmp(3) 3 jne(2) 5 mov rax,imm64(10) 15 mov[rax](6)
-    // 21 mov eax,1 ; jne end = 5, target = 21 → rel8 = 16 = 0x10.
+    let text = vec![0xC3u8];
     let mut entry = Vec::new();
-    entry.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
-    entry.extend_from_slice(&[0x75, 0x10]); // jne +16 → to `mov eax,1`
-    entry.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    entry.extend_from_slice(&[0x83, 0xFA, 0x01]);
+    entry.extend_from_slice(&[0x75, 0x10]);
+    entry.extend_from_slice(&[0x48, 0xB8]);
     entry.extend_from_slice(&SCRATCH.to_le_bytes());
-    entry.extend_from_slice(&[0xC7, 0x00, 0xAA, 0xAA, 0x00, 0x00]); // mov dword[rax],0xAAAA
-    entry.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
-    entry.push(0xC3); // ret
+    entry.extend_from_slice(&[0xC7, 0x00, 0xAA, 0xAA, 0x00, 0x00]);
+    entry.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+    entry.push(0xC3);
     assemble_pe(
         &[
             Sec { name: b".edata", rva: EDATA_RVA, data: &ed, chars: 0x4000_0040 },
@@ -186,16 +154,12 @@ fn build_a_dll() -> Vec<u8> {
     )
 }
 
-/// B.dll (the dependent): imports `a_func` from a.dll, exports `b_func`, and
-/// its DllMain — on DLL_PROCESS_ATTACH — reads `SCRATCH[0]` and, only if it
-/// already holds A's 0xAAAA sentinel, writes 0xBBBB to `SCRATCH[8]`.
 fn build_b_dll() -> Vec<u8> {
     const IDATA_RVA: u32 = 0x1000;
     const EDATA_RVA: u32 = 0x2000;
     const CODE_RVA: u32 = 0x3000;
     const ENTRY_RVA: u32 = 0x4000;
 
-    // .idata: import a.dll!a_func.
     let (dep_dll, dep_sym) = ("a.dll", "a_func");
     let desc_off = 0u32;
     let ilt_off = 40u32;
@@ -218,29 +182,21 @@ fn build_b_dll() -> Vec<u8> {
     idata[dn..dn + dep_dll.len()].copy_from_slice(dep_dll.as_bytes());
 
     let ed = build_edata("b.dll", "b_func", EDATA_RVA, CODE_RVA);
-    let text = vec![0xC3u8]; // b_func: ret
+    let text = vec![0xC3u8];
 
-    // DllMain(hinst=rcx, reason=rdx, reserved=r8):
-    //   cmp edx,1 ; jne done ; mov rax,SCRATCH ; mov ecx,[rax] ;
-    //   cmp ecx,0xAAAA ; jne done ; mov rax,SCRATCH+8 ; mov dword[rax],0xBBBB ;
-    //   done: mov eax,1 ; ret
-    // Layout (offsets): 0 cmp(3) 3 jne(2) 5 mov rax,imm64(10) 15 mov ecx,[rax](2)
-    // 17 cmp ecx,imm32(6) 23 jne(2) 25 mov rax,imm64(10) 35 mov[rax](6)
-    // 41 mov eax,1 ; jne#1 end = 5, target 41 → rel8 = 36 = 0x24; jne#2 end = 25,
-    // target 41 → rel8 = 16 = 0x10.
     let mut entry = Vec::new();
-    entry.extend_from_slice(&[0x83, 0xFA, 0x01]); // cmp edx, 1
-    entry.extend_from_slice(&[0x75, 0x24]); // jne +36 → to `mov eax,1`
-    entry.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    entry.extend_from_slice(&[0x83, 0xFA, 0x01]);
+    entry.extend_from_slice(&[0x75, 0x24]);
+    entry.extend_from_slice(&[0x48, 0xB8]);
     entry.extend_from_slice(&SCRATCH.to_le_bytes());
-    entry.extend_from_slice(&[0x8B, 0x08]); // mov ecx, [rax]
-    entry.extend_from_slice(&[0x81, 0xF9, 0xAA, 0xAA, 0x00, 0x00]); // cmp ecx, 0xAAAA
-    entry.extend_from_slice(&[0x75, 0x10]); // jne +16 → to `mov eax,1`
-    entry.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    entry.extend_from_slice(&[0x8B, 0x08]);
+    entry.extend_from_slice(&[0x81, 0xF9, 0xAA, 0xAA, 0x00, 0x00]);
+    entry.extend_from_slice(&[0x75, 0x10]);
+    entry.extend_from_slice(&[0x48, 0xB8]);
     entry.extend_from_slice(&(SCRATCH + 8).to_le_bytes());
-    entry.extend_from_slice(&[0xC7, 0x00, 0xBB, 0xBB, 0x00, 0x00]); // mov dword[rax],0xBBBB
-    entry.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]); // mov eax, 1
-    entry.push(0xC3); // ret
+    entry.extend_from_slice(&[0xC7, 0x00, 0xBB, 0xBB, 0x00, 0x00]);
+    entry.extend_from_slice(&[0xB8, 0x01, 0x00, 0x00, 0x00]);
+    entry.push(0xC3);
 
     assemble_pe(
         &[
@@ -269,7 +225,6 @@ fn setup_os() -> (WinOs, VirtualMemory, u64, tempdir::Guard, std::path::PathBuf)
     mem.map(Region::new("heap", 0x2_0000_0000, 0x10000, Perm::RW)).unwrap();
     mem.map(Region::new("imports", 0x0000_7EFF_0000_0000, 0x10000, Perm::RW)).unwrap();
     mem.map(Region::new("stack", 0x0F_FFF0_0000, 0x0020_0000, Perm::RW)).unwrap();
-    // Shared scratch cells the DllMains poke.
     mem.map(Region::new("scratch", SCRATCH, 0x1000, Perm::RW)).unwrap();
 
     let cfg = WinConfig {
@@ -298,11 +253,6 @@ fn setup_os() -> (WinOs, VirtualMemory, u64, tempdir::Guard, std::path::PathBuf)
 const STACK: u64 = 0x10_0000_0000;
 const RET: u64 = 0x1_2345;
 
-/// Drive a kernel32 API through the interpreter exactly as a real run does,
-/// with the `WinOs` as the hooks: the thunk is intercepted, and any guest-code
-/// `DllMain` bodies a `LoadLibrary`/`FreeLibrary` triggers execute as real
-/// instructions (so A/B DllMain actually poke the scratch cells). Runs until
-/// control returns to the sentinel `RET`.
 fn call_api(
     os: &mut WinOs,
     mem: &mut VirtualMemory,
@@ -355,8 +305,6 @@ fn dllmain_process_attach_runs_leaves_first() {
     let b_handle = call_api(&mut os, &mut mem, &mut interp, "LoadLibraryA", &[name_ptr]);
     assert_ne!(b_handle, 0, "LoadLibrary(b.dll) failed");
 
-    // A's DllMain must have run (0xAAAA) *before* B's, so B saw it and wrote
-    // 0xBBBB. If B's DllMain had run first (an ordering bug) SCRATCH[8] is 0.
     assert_eq!(mem.read_u32(SCRATCH).unwrap(), 0xAAAA, "A DllMain did not run");
     assert_eq!(
         mem.read_u32(SCRATCH + 8).unwrap(),
@@ -364,7 +312,6 @@ fn dllmain_process_attach_runs_leaves_first() {
         "B DllMain did not observe A's global — leaves-first order violated"
     );
 
-    // PEB.LoaderLock points at a valid, currently-unlocked RTL_CRITICAL_SECTION.
     let cs = mem.read_u64(peb_addr + 0x110).unwrap();
     assert_ne!(cs, 0, "PEB.LoaderLock not published");
     assert_eq!(mem.read_u32(cs + 8).unwrap() as i32, -1, "LoaderLock LockCount should be -1 (unlocked)");
@@ -383,13 +330,8 @@ fn free_library_runs_process_detach() {
     put_str(&mut mem, name_ptr, "b.dll");
     let b_handle = call_api(&mut os, &mut mem, &mut interp, "LoadLibraryA", &[name_ptr]);
     assert_ne!(b_handle, 0);
-    // A's attach sentinel is present.
     assert_eq!(mem.read_u32(SCRATCH).unwrap(), 0xAAAA);
 
-    // Clear the scratch so we can observe a fresh DllMain call: FreeLibrary
-    // drops b.dll's ref count to zero, running its DllMain(DLL_PROCESS_DETACH).
-    // B's DllMain only writes on reason==DLL_PROCESS_ATTACH, so DETACH must NOT
-    // re-write 0xBBBB — proving the reason argument is DETACH, not ATTACH.
     mem.write_u32(SCRATCH + 8, 0).unwrap();
     let r = call_api(&mut os, &mut mem, &mut interp, "FreeLibrary", &[b_handle]);
     assert_eq!(r, 1, "FreeLibrary should return TRUE");
@@ -399,8 +341,6 @@ fn free_library_runs_process_detach() {
         "DLL_PROCESS_DETACH must not re-run the ATTACH branch"
     );
 
-    // A second FreeLibrary of the (already-zero) handle must not re-fire detach
-    // (the module is no longer attached); it still returns TRUE.
     let r2 = call_api(&mut os, &mut mem, &mut interp, "FreeLibrary", &[b_handle]);
     assert_eq!(r2, 1);
 }

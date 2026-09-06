@@ -1,11 +1,3 @@
-//! A host-backed guest filesystem, rooted at a sandbox directory.
-//!
-//! Guest Windows paths are mapped into the sandbox so that installers and
-//! command-line tools can create directories, write files and read them back
-//! without touching the real filesystem outside the sandbox. Everything here
-//! is best-effort: unknown flags are ignored and errors surface as the
-//! Windows failure values the caller expects.
-
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,82 +5,48 @@ use exemu_core::{CpuState, Memory, Result};
 
 use crate::WinOs;
 
-/// An open file the guest is holding a handle to.
 pub struct OpenFile {
     pub file: std::fs::File,
 }
 
-/// One entry collected during a directory enumeration.
 #[derive(Clone)]
 pub struct FindEntry {
     pub name: String,
     pub is_dir: bool,
     pub size: u64,
-    /// Creation time as FILETIME (100-ns intervals since 1601-01-01 UTC).
     pub ctime: u64,
-    /// Last access time as FILETIME.
     pub atime: u64,
-    /// Last write/modification time as FILETIME.
     pub mtime: u64,
 }
 
-/// State associated with an open directory-enumeration handle
-/// (FindFirstFile / FindNextFile / FindClose).
 pub struct FindState {
     pub entries: Vec<FindEntry>,
     pub pos: usize,
-    /// Whether entries marshal as `WIN32_FIND_DATAW` (true) or …A (false); set
-    /// by `FindFirstFile` and honoured by `FindNextFile` for the same handle.
     pub wide: bool,
 }
 
-// Windows constants.
-pub const INVALID_HANDLE_VALUE: u64 = 0xFFFF_FFFF; // (HANDLE)-1 as seen by 32-bit callers
+pub const INVALID_HANDLE_VALUE: u64 = 0xFFFF_FFFF;
 const INVALID_FILE_ATTRIBUTES: u64 = 0xFFFF_FFFF;
 const FILE_ATTRIBUTE_DIRECTORY: u64 = 0x10;
 const FILE_ATTRIBUTE_NORMAL: u64 = 0x80;
-// CreateFile dwCreationDisposition
 const CREATE_NEW: u64 = 1;
 const CREATE_ALWAYS: u64 = 2;
 const OPEN_EXISTING: u64 = 3;
 const OPEN_ALWAYS: u64 = 4;
 const TRUNCATE_EXISTING: u64 = 5;
-// Generic access rights
 const GENERIC_WRITE: u64 = 0x4000_0000;
 
 impl WinOs {
-    /// Whether a guest handle refers to an open file.
     pub(crate) fn is_file_handle(&self, handle: u64) -> bool {
         self.files.contains_key(&handle)
     }
 
-    /// Whether `handle` is one of the three standard-stream sentinels seeded
-    /// into `RTL_USER_PROCESS_PARAMETERS` (StdInput/StdOutput/StdError). These
-    /// are the same small constants the emulated corpus's `GetStdHandle` returns
-    /// (`HANDLE_STDIN`=0x0C / `HANDLE_STDOUT`=0x10 / `HANDLE_STDERR`=0x14), which
-    /// sit far below `next_handle`'s 0x1000 base — so they never collide with a
-    /// real file/kernel handle. Under the Wine boot, kernelbase's `GetStdHandle`
-    /// hands these raw values back to the CRT, which drives `NtWriteFile` /
-    /// `NtReadFile` / `NtQueryVolumeInformationFile` on them (roadmap W3.4).
     pub(crate) fn is_std_handle(&self, handle: u64) -> bool {
         handle == crate::HANDLE_STDIN
             || handle == crate::HANDLE_STDOUT
             || handle == crate::HANDLE_STDERR
     }
 
-    /// Translate a guest Windows path into a host path under the sandbox.
-    /// A drive prefix (`C:`) becomes a directory named after the letter, and
-    /// backslashes become path separators; `..` components are dropped so a
-    /// guest cannot escape the sandbox.
-    ///
-    /// **Wine-boot DLL search redirect (roadmap W3.2).** When `cfg.wine_dll_dir`
-    /// is set (only the `EXEMU_WINE_BOOT` path sets it) and a guest path under
-    /// `C:\windows\system32\` (case-insensitive) has no counterpart in the
-    /// sandbox, the leaf is resolved against the pinned Wine prefix instead. This
-    /// lets Wine's guest `loader_init` `NtOpenFile(\??\C:\windows\system32\
-    /// kernel32.dll)` find the real DLL on disk. The scope is tight
-    /// (`\windows\system32\` only, and only when the sandbox copy is absent) so
-    /// the emulated corpus — which never sets `wine_dll_dir` — is untouched.
     pub(crate) fn host_path(&self, guest: &str) -> Option<PathBuf> {
         if self.cfg.sandbox.is_empty() {
             return None;
@@ -98,12 +56,10 @@ impl WinOs {
         for comp in cleaned.split('/') {
             match comp {
                 "" | "." | ".." => {}
-                c if c.ends_with(':') => out.push(&c[..c.len() - 1]), // drive letter
+                c if c.ends_with(':') => out.push(&c[..c.len() - 1]),
                 c => out.push(c),
             }
         }
-        // If the sandbox copy is missing, fall back to the pinned Wine prefix
-        // for a `\windows\system32\<name>` guest path.
         if !out.exists() {
             if let Some(redirect) = self.wine_dll_redirect(guest) {
                 return Some(redirect);
@@ -112,20 +68,8 @@ impl WinOs {
         Some(out)
     }
 
-    /// Resolve a `\windows\system32\<leaf>` guest path (case-insensitive) to its
-    /// counterpart in the pinned Wine DLL prefix (`cfg.wine_dll_dir`), or `None`
-    /// when the guest path is not under system32 or no prefix is configured. Only
-    /// the immediate `system32\<leaf>` case is handled — nested subdirectories
-    /// under system32 are deliberately not redirected (kept tight).
     fn wine_dll_redirect(&self, guest: &str) -> Option<PathBuf> {
         let dir = self.cfg.wine_dll_dir.as_ref()?;
-        // **The WoW64 file-system redirector.** In a WoW64 process,
-        // `C:\windows\system32` is the *32-bit* system directory: Windows
-        // rewrites it to `SysWOW64` behind the 32-bit program's back so a PE32
-        // that hard-codes `system32\foo.dll` gets the 32-bit `foo.dll`. exemu's
-        // pinned prefix keeps the two halves in sibling directories, so the
-        // redirect is a directory swap. Without it Wine's **32-bit** loader is
-        // handed x86_64 PEs and every import resolves to STATUS_DLL_NOT_FOUND.
         let dir = if self.wow64_peb32 != 0 {
             let sib = std::path::Path::new(dir)
                 .parent()
@@ -136,18 +80,12 @@ impl WinOs {
             dir.clone()
         };
         let dir = &dir;
-        // Normalise: strip the NT/DOS prefix and drive letter, lower-case for the
-        // marker search.
         let cleaned = strip_nt_prefix(guest).replace('/', "\\");
         let lower = cleaned.to_ascii_lowercase();
-        // Accept both `c:\windows\system32\` and a drive-less `\windows\system32\`
-        // — plus `syswow64`, the name a WoW64-aware program uses to reach the
-        // 32-bit set explicitly.
         let (pos, mlen) = ["\\windows\\system32\\", "\\windows\\syswow64\\"]
             .iter()
             .find_map(|m| lower.find(m).map(|p| (p, m.len())))?;
         let leaf = &cleaned[pos + mlen..];
-        // Only a bare leaf (no further separators) maps into the flat prefix.
         if leaf.is_empty() || leaf.contains('\\') {
             return None;
         }
@@ -161,9 +99,6 @@ impl WinOs {
         h
     }
 
-    // ---- the file APIs ---------------------------------------------------
-
-    /// CreateFileW(name, access, share, sa, disposition, flags, template).
     pub(crate) fn create_file(&mut self, name: &str, access: u64, disposition: u64) -> u64 {
         let Some(path) = self.host_path(name) else {
             return INVALID_HANDLE_VALUE;
@@ -197,7 +132,7 @@ impl WinOs {
         match opts.open(&path) {
             Ok(f) => self.alloc_handle(f),
             Err(_) => {
-                self.set_last_error(2); // ERROR_FILE_NOT_FOUND
+                self.set_last_error(2);
                 INVALID_HANDLE_VALUE
             }
         }
@@ -214,17 +149,11 @@ impl WinOs {
     }
 
     pub(crate) fn close_handle(&mut self, handle: u64) -> bool {
-        // Sockets share this handle space (roadmap W7.1): `closesocket` is
-        // `CloseHandle` → `NtClose`, so the socket table is one more thing this
-        // lookup routes to.
         if self.close_socket(handle) {
             return true;
         }
         if self.kobjects.remove(&handle).is_some() {
             self.named_kobjects.retain(|_, &mut h| h != handle);
-            // A child process's handle pair is tracked alongside the object
-            // (roadmap W3.5); drop the bookkeeping once the guest lets go of
-            // both, so a long-running parent does not accumulate dead children.
             self.forget_child_handle(handle);
             return true;
         }
@@ -233,8 +162,6 @@ impl WinOs {
         self.files.remove(&handle).is_some()
     }
 
-    /// Allocate a fresh, unique kernel handle value (shared monotonic space
-    /// with file/find handles, so `CloseHandle` can route by lookup).
     pub(crate) fn alloc_khandle(&mut self) -> u64 {
         let h = self.next_handle;
         self.next_handle += 4;
@@ -246,21 +173,18 @@ impl WinOs {
         of.file.metadata().ok().map(|m| m.len())
     }
 
-    /// SetFilePointer(handle, distance, high, method) → new position (low 32).
     pub(crate) fn set_file_pointer(&mut self, handle: u64, distance: i64, method: u64) -> u64 {
         let Some(of) = self.files.get_mut(&handle) else {
             return INVALID_HANDLE_VALUE;
         };
         let seek = match method {
-            0 => SeekFrom::Start(distance.max(0) as u64), // FILE_BEGIN
-            1 => SeekFrom::Current(distance),             // FILE_CURRENT
-            _ => SeekFrom::End(distance),                 // FILE_END
+            0 => SeekFrom::Start(distance.max(0) as u64),
+            1 => SeekFrom::Current(distance),
+            _ => SeekFrom::End(distance),
         };
         of.file.seek(seek).unwrap_or(0) & 0xFFFF_FFFF
     }
 
-    /// GetTempFileNameW: pick a unique name in `dir` with `prefix`, create an
-    /// empty file for it, and return the guest path plus the unique number.
     pub(crate) fn temp_file_name(&mut self, dir: &str, prefix: &str, unique: u32) -> (String, u32) {
         let u = if unique != 0 {
             unique
@@ -271,7 +195,6 @@ impl WinOs {
         let pfx: String = prefix.chars().take(3).collect();
         let sep = if dir.ends_with('\\') { "" } else { "\\" };
         let name = format!("{dir}{sep}{pfx}{:x}.TMP", u & 0xFFFF);
-        // Create an empty file so a later CreateFile(OPEN_EXISTING) succeeds.
         if let Some(path) = self.host_path(&name) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -295,10 +218,6 @@ impl WinOs {
         }
     }
 
-    /// GetFullPathName: turn a possibly-relative guest path into an absolute
-    /// one. Relative names resolve against `C:\` (the sandbox root); already-
-    /// absolute paths (drive-qualified or UNC) are returned normalised to
-    /// backslashes. `.`/`..` collapsing is not modelled.
     pub(crate) fn full_path_name(&self, name: &str) -> String {
         let n = name.replace('/', "\\");
         let bytes = n.as_bytes();
@@ -312,11 +231,9 @@ impl WinOs {
         }
     }
 
-    /// MoveFile/MoveFileEx: rename within the sandbox, falling back to
-    /// copy+delete across host devices.
     pub(crate) fn move_file(&mut self, src: &str, dst: &str) -> bool {
         let (Some(s), Some(d)) = (self.host_path(src), self.host_path(dst)) else {
-            self.set_last_error(2); // ERROR_FILE_NOT_FOUND
+            self.set_last_error(2);
             return false;
         };
         if let Some(parent) = d.parent() {
@@ -332,14 +249,13 @@ impl WinOs {
         false
     }
 
-    /// CopyFile: duplicate a sandbox file; honour `fail_if_exists`.
     pub(crate) fn copy_file(&mut self, src: &str, dst: &str, fail_if_exists: bool) -> bool {
         let (Some(s), Some(d)) = (self.host_path(src), self.host_path(dst)) else {
             self.set_last_error(2);
             return false;
         };
         if fail_if_exists && d.exists() {
-            self.set_last_error(80); // ERROR_FILE_EXISTS
+            self.set_last_error(80);
             return false;
         }
         if let Some(parent) = d.parent() {
@@ -361,8 +277,6 @@ impl WinOs {
         }
     }
 
-    /// Write a UTF-16 string (with NUL) into guest memory, returning the
-    /// number of code units written excluding the terminator.
     pub(crate) fn write_wstr(mem: &mut dyn Memory, addr: u64, s: &str, max: usize) -> Result<u64> {
         if addr == 0 || max == 0 {
             return Ok(0);
@@ -379,13 +293,6 @@ impl WinOs {
         self.last_error = code;
     }
 
-    // ---- directory enumeration (FindFirstFileW / FindNextFileW) ----------
-
-    /// FindFirstFileW / FindFirstFileExW: enumerate sandbox entries whose names
-    /// match the wildcard `leaf` inside `dir`, write the first match into
-    /// the guest `WIN32_FIND_DATAW` buffer at `data_ptr`, and return a find
-    /// handle. Returns `INVALID_HANDLE_VALUE` (and sets last-error 2) when
-    /// there are no matches or the directory does not exist.
     pub(crate) fn find_first_file(
         &mut self,
         mem: &mut dyn Memory,
@@ -393,20 +300,18 @@ impl WinOs {
         data_ptr: u64,
         wide: bool,
     ) -> Result<u64> {
-        // Split the guest path into a directory part and the wildcard leaf.
         let (dir, leaf) = match pattern.rfind('\\') {
             Some(pos) => (&pattern[..pos], &pattern[pos + 1..]),
             None => ("", pattern),
         };
 
         let Some(host_dir) = self.host_path(dir) else {
-            self.set_last_error(2); // ERROR_FILE_NOT_FOUND
+            self.set_last_error(2);
             return Ok(INVALID_HANDLE_VALUE);
         };
 
         let mut entries: Vec<FindEntry> = Vec::new();
 
-        // Virtual "." entry — the directory itself.
         if glob_matches(leaf, ".") {
             let (ctime, atime, mtime) = std::fs::metadata(&host_dir)
                 .as_ref()
@@ -422,7 +327,6 @@ impl WinOs {
             });
         }
 
-        // Virtual ".." entry — the parent directory.
         if glob_matches(leaf, "..") {
             let (ctime, atime, mtime) = host_dir
                 .parent()
@@ -440,7 +344,6 @@ impl WinOs {
             });
         }
 
-        // Real entries from the host directory.
         if let Ok(iter) = std::fs::read_dir(&host_dir) {
             for de in iter.flatten() {
                 let file_name = de.file_name();
@@ -456,23 +359,17 @@ impl WinOs {
             }
         }
 
-        // Sort case-insensitively for determinism.  "." and ".." sort before
-        // alphabetic names (ASCII 0x2E < 0x61) so they naturally come first.
         entries.sort_by(|a, b| {
             a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
         });
 
         if entries.is_empty() {
-            self.set_last_error(2); // ERROR_FILE_NOT_FOUND
+            self.set_last_error(2);
             return Ok(INVALID_HANDLE_VALUE);
         }
 
-        // Marshal the first entry into the guest buffer.
         write_find_data(mem, data_ptr, &entries[0], wide)?;
 
-        // Allocate a find handle from the same monotonic counter as file
-        // handles (but we do NOT add it to `self.files`, so is_file_handle
-        // correctly returns false for find handles).
         let h = self.next_handle;
         self.next_handle += 4;
         self.find_handles.insert(h, FindState { entries, pos: 1, wide });
@@ -480,9 +377,6 @@ impl WinOs {
         Ok(h)
     }
 
-    /// FindNextFileW: advance to the next matching entry and marshal it.
-    /// Returns TRUE (1) on success; sets last-error ERROR_NO_MORE_FILES (18)
-    /// and returns FALSE (0) when the list is exhausted or the handle is unknown.
     pub(crate) fn find_next_file(
         &mut self,
         mem: &mut dyn Memory,
@@ -490,7 +384,7 @@ impl WinOs {
         data_ptr: u64,
     ) -> Result<u64> {
         let Some(state) = self.find_handles.get_mut(&handle) else {
-            self.set_last_error(18); // ERROR_NO_MORE_FILES
+            self.set_last_error(18);
             return Ok(0);
         };
         if state.pos < state.entries.len() {
@@ -500,44 +394,25 @@ impl WinOs {
             write_find_data(mem, data_ptr, &entry, wide)?;
             Ok(1)
         } else {
-            self.set_last_error(18); // ERROR_NO_MORE_FILES
+            self.set_last_error(18);
             Ok(0)
         }
     }
 
-    /// FindClose: release a find handle. Always returns TRUE; lenient for
-    /// unknown handles (a close after exhaustion is harmless).
     pub(crate) fn find_close(&mut self, handle: u64) -> u64 {
         self.find_handles.remove(&handle);
-        1 // TRUE
+        1
     }
 }
 
-// ---- free helpers -----------------------------------------------------------
-
-/// Write a `WIN32_FIND_DATAW`/`WIN32_FIND_DATAA` into guest memory. Fields
-/// 0..44 are identical; only the trailing name arrays differ:
-/// ```text
-///   0  dwFileAttributes  DWORD
-///   4  ftCreationTime    FILETIME (low @ 4, high @ 8)
-///  12  ftLastAccessTime  FILETIME (low @12, high @16)
-///  20  ftLastWriteTime   FILETIME (low @20, high @24)
-///  28  nFileSizeHigh     DWORD   (high BEFORE low)
-///  32  nFileSizeLow      DWORD
-///  36  dwReserved0/1     DWORD × 2
-///  44  cFileName          WCHAR[260] (…W, 520B) | CHAR[260] (…A, 260B)
-/// tail cAlternateFileName  WCHAR[14]  (…W)       | CHAR[14]  (…A)
-/// ```
-/// Total size: 592 bytes (W) or 318 bytes (A).
 fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry, wide: bool) -> Result<()> {
     let total = if wide { 592 } else { 318 };
-    // Zero the whole structure first (also clears cAlternateFileName).
     mem.write(ptr, &vec![0u8; total])?;
 
     let attrs: u32 = if entry.is_dir {
-        FILE_ATTRIBUTE_DIRECTORY as u32 // 0x10
+        FILE_ATTRIBUTE_DIRECTORY as u32
     } else {
-        FILE_ATTRIBUTE_NORMAL as u32 // 0x80
+        FILE_ATTRIBUTE_NORMAL as u32
     };
     mem.write_u32(ptr, attrs)?;
 
@@ -547,11 +422,9 @@ fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry, wide: bool
     mem.write_u32(ptr + 16, (entry.atime >> 32) as u32)?;
     mem.write_u32(ptr + 20, entry.mtime as u32)?;
     mem.write_u32(ptr + 24, (entry.mtime >> 32) as u32)?;
-    // nFileSizeHigh @ 28 (HIGH comes BEFORE low), nFileSizeLow @ 32.
     mem.write_u32(ptr + 28, (entry.size >> 32) as u32)?;
     mem.write_u32(ptr + 32, entry.size as u32)?;
 
-    // cFileName at offset 44 (already NUL-terminated by the zero-fill).
     if wide {
         WinOs::write_wstr(mem, ptr + 44, &entry.name, 260)?;
     } else {
@@ -560,12 +433,7 @@ fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry, wide: bool
     Ok(())
 }
 
-/// Convert `std::fs::Metadata` timestamps to FILETIME values
-/// (100-nanosecond intervals since 1601-01-01 00:00:00 UTC).
-/// Returns `(ctime, atime, mtime)`. Any unavailable time becomes 0.
 fn metadata_times(meta: &std::fs::Metadata) -> (u64, u64, u64) {
-    /// Difference in 100-ns units between the Windows epoch (1601-01-01) and
-    /// the UNIX epoch (1970-01-01): 11644473600 seconds × 10_000_000.
     const EPOCH_DIFF: u64 = 116_444_736_000_000_000;
     let to_ft = |res: std::io::Result<std::time::SystemTime>| -> u64 {
         res.ok()
@@ -580,9 +448,6 @@ fn metadata_times(meta: &std::fs::Metadata) -> (u64, u64, u64) {
     (to_ft(meta.created()), to_ft(meta.accessed()), to_ft(meta.modified()))
 }
 
-/// Case-insensitive wildcard glob: `*` matches any run of characters (including
-/// empty), `?` matches exactly one character. `*.*` is treated as `*`
-/// (matches everything, including names with no dot) per Windows convention.
 fn glob_matches(pattern: &str, name: &str) -> bool {
     let effective_pat: &str = if pattern == "*.*" { "*" } else { pattern };
     let p: Vec<char> = effective_pat.chars().map(|c| c.to_ascii_lowercase()).collect();
@@ -590,13 +455,10 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     glob_ci(&p, &n)
 }
 
-/// Recursive case-insensitive glob core (operates on char slices that have
-/// already been lower-cased).
 fn glob_ci(p: &[char], n: &[char]) -> bool {
     match p.first() {
         None => n.is_empty(),
         Some('*') => {
-            // '*' matches 0 or more characters from `n`.
             (0..=n.len()).any(|i| glob_ci(&p[1..], &n[i..]))
         }
         Some('?') => !n.is_empty() && glob_ci(&p[1..], &n[1..]),
@@ -604,52 +466,15 @@ fn glob_ci(p: &[char], n: &[char]) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// NT file syscalls (roadmap W2.8) — the NTSTATUS / IO_STATUS_BLOCK face of the
-// sandbox filesystem the Win32 `CreateFileW`/`ReadFile`/… APIs drive.
-//
-// Wine's PE `ntdll.dll` reaches these through a raw `SYSCALL` (the SSDT index in
-// EAX, recovered from the pinned guest stubs' `mov eax,N`): NtReadFile = 0x06,
-// NtWriteFile = 0x08, NtQueryInformationFile = 0x11, NtQueryDirectoryFile =
-// 0x35, NtQueryVolumeInformationFile = 0x49, NtCreateFile = 0x55. The W2.3
-// dispatcher has already saved the context and switched to the unix stack; each
-// handler reads its arguments via [`WinOs::syscall_arg`] (arg0=R10, arg1=RDX,
-// arg2=R8, arg3=R9, args 5+ on the guest stack) and returns an NTSTATUS the
-// dispatcher places in RAX.
-//
-// The object namespace: a guest file is named by an OBJECT_ATTRIBUTES whose
-// ObjectName UNICODE_STRING is an NT path like `\??\C:\dir\file`. exemu strips
-// the `\??\` (DOS-device) prefix and hands the remaining `C:\…` to the P3.9
-// sandbox (`host_path`). A RootDirectory handle names a base directory the
-// ObjectName is relative to (used by Wine's directory-relative opens).
-//
-// Clean-room Class B: struct layouts (UNICODE_STRING / OBJECT_ATTRIBUTES /
-// IO_STATUS_BLOCK / FILE_*_INFORMATION) are the public `winternl.h` / `ntifs.h`
-// definitions; the SSDT indices come from the pinned guest binary — no Wine
-// `.c` was read.
-
-/// `STATUS_SUCCESS`.
 const STATUS_SUCCESS: u32 = 0x0000_0000;
-/// `STATUS_END_OF_FILE` — a read reached EOF with no bytes transferred.
 const STATUS_END_OF_FILE: u32 = 0xC000_0011;
-/// `STATUS_NO_MORE_FILES` — a directory enumeration is exhausted.
 const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
-/// `STATUS_INVALID_PARAMETER` — a required pointer argument was NULL, or an
-/// unsupported information class was requested.
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
-/// `STATUS_INVALID_HANDLE` — the handle names no live file.
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
-/// `STATUS_OBJECT_NAME_NOT_FOUND` — the named file does not exist (and the
-/// disposition does not create it).
 const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
-/// `STATUS_BUFFER_TOO_SMALL` — the caller's buffer cannot hold the fixed part
-/// of the requested information class.
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
-/// `STATUS_INVALID_INFO_CLASS` — a `FileInformationClass` exemu does not
-/// implement. Honest refusal beats answering with a struct of another shape.
 const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 
-// NtCreateFile `CreateDisposition` (arg — distinct from the Win32 disposition).
 const FILE_SUPERSEDE: u32 = 0;
 const FILE_OPEN: u32 = 1;
 const FILE_CREATE: u32 = 2;
@@ -657,87 +482,52 @@ const FILE_OPEN_IF: u32 = 3;
 const FILE_OVERWRITE: u32 = 4;
 const FILE_OVERWRITE_IF: u32 = 5;
 
-// NtCreateFile `DesiredAccess` bits we care about.
 const FILE_WRITE_DATA: u64 = 0x0000_0002;
 const FILE_APPEND_DATA: u64 = 0x0000_0004;
-const NT_GENERIC_WRITE: u64 = 0x4000_0000; // GENERIC_WRITE
+const NT_GENERIC_WRITE: u64 = 0x4000_0000;
 
-// IO_STATUS_BLOCK.Information for a create/open (the disposition that occurred).
 const FILE_SUPERSEDED: u64 = 0;
 const FILE_OPENED: u64 = 1;
 const FILE_CREATED: u64 = 2;
 const FILE_OVERWRITTEN: u64 = 3;
 
-// FILE_INFORMATION_CLASS values used by NtQueryInformationFile.
 const FILE_STANDARD_INFORMATION: u32 = 5;
 const FILE_POSITION_INFORMATION: u32 = 14;
-const FILE_END_OF_FILE_INFORMATION: u32 = 20; // returns std info shape for size
+const FILE_END_OF_FILE_INFORMATION: u32 = 20;
 
-// FS_INFORMATION_CLASS values used by NtQueryVolumeInformationFile.
 const FILE_FS_SIZE_INFORMATION: u32 = 3;
 const FILE_FS_DEVICE_INFORMATION: u32 = 4;
 
-/// `FILE_DEVICE_NAMED_PIPE` — the DeviceType `GetFileType` maps to
-/// `FILE_TYPE_PIPE`. Reported for the std-stream sentinels so the CRT's
-/// `_isatty` stays FALSE and it drives `NtWriteFile` rather than ConDrv's
-/// `WriteConsoleW` (roadmap W3.4). A FILE_DEVICE_CONSOLE-class value would
-/// instead map to `FILE_TYPE_CHAR` and take the (unserviced) ConDrv path.
 const FILE_DEVICE_NAMED_PIPE: u32 = 0x11;
 
-/// SSDT indices, recovered from the pinned guest `ntdll.dll` stubs' `mov eax,N`.
 pub(crate) const SSDT_NT_CREATE_FILE: u32 = 0x55;
 pub(crate) const SSDT_NT_READ_FILE: u32 = 0x06;
 pub(crate) const SSDT_NT_WRITE_FILE: u32 = 0x08;
 pub(crate) const SSDT_NT_QUERY_INFORMATION_FILE: u32 = 0x11;
 pub(crate) const SSDT_NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
 pub(crate) const SSDT_NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 0x49;
-/// `NtOpenFile` — open an EXISTING file/directory (roadmap W3.2). Index recovered
-/// from the pinned guest `ntdll.dll` stub's `mov eax,N`.
 pub(crate) const SSDT_NT_OPEN_FILE: u32 = 0x33;
-/// `NtQueryAttributesFile` — stat a named file without opening it (roadmap W3.2).
 pub(crate) const SSDT_NT_QUERY_ATTRIBUTES_FILE: u32 = 0x3d;
-/// `NtFsControlFile` — FSCTL device control (roadmap W3.2). Wine's `open_dll_file`
-/// issues the reparse-point probe (FSCTL 0x9009c) and only tests for success, so
-/// a benign non-success return is correct.
 pub(crate) const SSDT_NT_FS_CONTROL_FILE: u32 = 0x39;
-/// `NtClose` — the universal handle closer (files, dirs, find handles, and the
-/// wineserver-backed kernel objects). Index recovered from the pinned guest
-/// `ntdll.dll` stub's `mov eax,N`.
 pub(crate) const SSDT_NT_CLOSE: u32 = 0x0f;
 
-/// `STATUS_OBJECT_PATH_NOT_FOUND` — an intermediate directory in the path does
-/// not exist (a missing DLL search path yields this or OBJECT_NAME_NOT_FOUND, and
-/// Wine's `search_dll_file` treats either as "try the next path").
 const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
-/// `STATUS_NOT_IMPLEMENTED` — returned for the tolerated `NtFsControlFile`
-/// reparse-probe fast path (Wine only branches on success).
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 
-/// `FILE_ATTRIBUTE_DIRECTORY` / `FILE_ATTRIBUTE_NORMAL` as `u32` for the NT face.
 const NT_FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 const NT_FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-/// Difference in 100-ns units between the Windows FILETIME epoch (1601-01-01) and
-/// the UNIX epoch (1970-01-01).
 const FILETIME_EPOCH_DIFF: u64 = 116_444_736_000_000_000;
 
 impl WinOs {
-    /// Resolve an `OBJECT_ATTRIBUTES*` to a guest Windows path (`C:\…`), applying
-    /// the DOS-device `\??\` prefix strip and any `RootDirectory` base directory.
-    /// Returns `None` if the pointer is NULL or the name cannot be read.
     fn nt_object_name(&self, mem: &dyn Memory, objattr: u64) -> Option<String> {
         if objattr == 0 {
             return None;
         }
-        // OBJECT_ATTRIBUTES (64-bit): Length@0, RootDirectory@8, ObjectName@0x10.
         let root_dir = mem.read_u64(objattr + 8).ok()?;
         let name_ptr = mem.read_u64(objattr + 0x10).ok()?;
         let name = read_unicode_string(mem, name_ptr)?;
-        // Strip the DOS-device namespace prefix so the sandbox sees `C:\…`.
         let name = strip_nt_prefix(&name);
 
-        // A RootDirectory handle names a base directory for a relative name. We
-        // only model file handles opened over sandbox directories: recover the
-        // directory's guest path and join it.
         if root_dir != 0 && root_dir != u64::MAX {
             if let Some(base) = self.dir_handle_guest_path(root_dir) {
                 let sep = if base.ends_with('\\') || name.is_empty() { "" } else { "\\" };
@@ -747,18 +537,10 @@ impl WinOs {
         Some(name)
     }
 
-    /// The guest path recorded for an open directory handle (for RootDirectory-
-    /// relative opens). `None` if the handle is not a tracked open directory.
     fn dir_handle_guest_path(&self, handle: u64) -> Option<String> {
         self.file_dirs.get(&handle).cloned()
     }
 
-    /// `NtCreateFile(*FileHandle, DesiredAccess, *ObjectAttributes,
-    /// *IoStatusBlock, *AllocationSize, FileAttributes, ShareAccess,
-    /// CreateDisposition, CreateOptions, EaBuffer, EaLength)`.
-    /// arg0=&FileHandle, arg1=DesiredAccess, arg2=&ObjectAttributes,
-    /// arg3=&IoStatusBlock, arg4=&AllocationSize, arg5=FileAttributes,
-    /// arg6=ShareAccess, arg7=CreateDisposition, arg8=CreateOptions.
     pub(crate) fn nt_create_file(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle_ptr = self.syscall_arg(cpu, mem, 0)?;
         let access = self.syscall_arg(cpu, mem, 1)?;
@@ -814,8 +596,6 @@ impl WinOs {
             Err(_) => return Ok(STATUS_OBJECT_NAME_NOT_FOUND),
         };
 
-        // Record whether the handle names a directory so a RootDirectory-relative
-        // open (and NtQueryDirectoryFile) can resolve against it later.
         let is_dir = file.metadata().map(|m| m.is_dir()).unwrap_or(false);
         let handle = self.alloc_handle(file);
         if is_dir {
@@ -838,16 +618,6 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
-    /// `NtOpenFile(*FileHandle, DesiredAccess, *ObjectAttributes, *IoStatusBlock,
-    /// ShareAccess, OpenOptions)` — open an EXISTING file or directory (no create,
-    /// no truncate). This is the `FILE_OPEN`-disposition slice of `NtCreateFile`
-    /// with the leaner 6-argument layout Wine's `open_dll_file` uses to probe the
-    /// DLL search path (roadmap W3.2).
-    ///
-    /// arg0=&FileHandle (OUT), arg1=DesiredAccess, arg2=&ObjectAttributes,
-    /// arg3=&IoStatusBlock, arg4=ShareAccess, arg5=OpenOptions. A missing file →
-    /// `STATUS_OBJECT_NAME_NOT_FOUND` (a missing intermediate directory →
-    /// `STATUS_OBJECT_PATH_NOT_FOUND`) so `search_dll_file` moves to the next path.
     pub(crate) fn nt_open_file(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle_ptr = self.syscall_arg(cpu, mem, 0)?;
         let access = self.syscall_arg(cpu, mem, 1)?;
@@ -859,8 +629,6 @@ impl WinOs {
         let Some(name) = self.nt_object_name(mem, objattr) else {
             return Ok(STATUS_INVALID_PARAMETER);
         };
-        // `\Device\Afd` is a device, not a file: opening it mints a socket
-        // (roadmap W7.1). This is how every `SOCKET` in the process is born.
         if let Some(status) = self.nt_open_afd(mem, &name, handle_ptr, iosb_ptr)? {
             return Ok(status);
         }
@@ -868,8 +636,6 @@ impl WinOs {
             return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
         };
         if !path.exists() {
-            // Distinguish a missing leaf from a missing parent so a caller that
-            // walks a search path sees the same NTSTATUS Windows would return.
             let status = match path.parent() {
                 Some(p) if !p.exists() => STATUS_OBJECT_PATH_NOT_FOUND,
                 _ => STATUS_OBJECT_NAME_NOT_FOUND,
@@ -877,8 +643,6 @@ impl WinOs {
             return Ok(status);
         }
 
-        // Open existing only. Request write only if the caller asked for it (a
-        // directory or a read-only host file otherwise fails a write-mode open).
         let wants_write = access & (NT_GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0;
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
@@ -887,9 +651,6 @@ impl WinOs {
         }
         let file = match opts.open(&path) {
             Ok(f) => f,
-            // A directory (or a read-only file opened for write) may reject the
-            // OpenOptions above; fall back to a plain read-only open so a
-            // directory handle still succeeds.
             Err(_) => match std::fs::OpenOptions::new().read(true).open(&path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -909,14 +670,6 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
-    /// `NtQueryAttributesFile(*ObjectAttributes, *FileInformation)` — stat a named
-    /// file without opening a handle (roadmap W3.2). Wine's `open_dll_file` calls
-    /// it right after `NtOpenFile` to read the file's basic attributes.
-    ///
-    /// arg0=&ObjectAttributes, arg1=&FileInformation (a `FILE_BASIC_INFORMATION`:
-    /// CreationTime/LastAccessTime/LastWriteTime/ChangeTime as FILETIMEs @0..0x20,
-    /// FileAttributes u32 @0x20, pad to 0x28). Existing → `STATUS_SUCCESS`;
-    /// missing → `STATUS_OBJECT_NAME_NOT_FOUND`.
     pub(crate) fn nt_query_attributes_file(
         &mut self,
         cpu: &mut CpuState,
@@ -936,32 +689,22 @@ impl WinOs {
         if info == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        // Reuse the host mtime for every FILETIME field (Wine only reads them as
-        // opaque stamps to detect a changed image), else a constant if absent.
         let ft = meta
             .modified()
             .ok()
             .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() * 10_000_000 + d.subsec_nanos() as u64 / 100 + FILETIME_EPOCH_DIFF)
             .unwrap_or(FILETIME_EPOCH_DIFF);
-        mem.write_u64(info, ft)?; // CreationTime
-        mem.write_u64(info + 0x08, ft)?; // LastAccessTime
-        mem.write_u64(info + 0x10, ft)?; // LastWriteTime
-        mem.write_u64(info + 0x18, ft)?; // ChangeTime
+        mem.write_u64(info, ft)?;
+        mem.write_u64(info + 0x08, ft)?;
+        mem.write_u64(info + 0x10, ft)?;
+        mem.write_u64(info + 0x18, ft)?;
         let attrs = if meta.is_dir() { NT_FILE_ATTRIBUTE_DIRECTORY } else { NT_FILE_ATTRIBUTE_NORMAL };
-        mem.write_u32(info + 0x20, attrs)?; // FileAttributes
-        mem.write_u32(info + 0x24, 0)?; // pad
+        mem.write_u32(info + 0x20, attrs)?;
+        mem.write_u32(info + 0x24, 0)?;
         Ok(STATUS_SUCCESS)
     }
 
-    /// `NtFsControlFile(FileHandle, Event, ApcRoutine, ApcContext, *IoStatusBlock,
-    /// FsControlCode, InputBuffer, InputBufferLength, OutputBuffer,
-    /// OutputBufferLength)` (roadmap W3.2). Wine's `open_dll_file` issues the
-    /// reparse-point probe (FSCTL 0x9009c) and only `test eax,eax; jne`s to skip
-    /// the reparse fast-path, so a benign non-success return is correct and
-    /// tolerated. We service the IO_STATUS_BLOCK and return `STATUS_NOT_IMPLEMENTED`.
-    ///
-    /// arg0=FileHandle, arg4=&IoStatusBlock, arg5=FsControlCode.
     pub(crate) fn nt_fs_control_file(
         &mut self,
         cpu: &mut CpuState,
@@ -972,27 +715,15 @@ impl WinOs {
         if !self.is_file_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
-        // No FSCTL is actually serviced; report the (tolerated) not-implemented
-        // status both in RAX and the IO_STATUS_BLOCK so the caller's branch skips
-        // the reparse fast-path cleanly.
         write_iosb(mem, iosb_ptr, STATUS_NOT_IMPLEMENTED, 0)?;
         Ok(STATUS_NOT_IMPLEMENTED)
     }
 
-    /// `NtClose(Handle)`. The universal object closer: routes by lookup through
-    /// [`WinOs::close_handle`], which reclaims files, open directories, find
-    /// handles, and the wineserver-backed kernel objects (events, mutants,
-    /// semaphores) that share the one monotonic handle space. A handle that
-    /// names no live object → `STATUS_INVALID_HANDLE` (not a fault). The
-    /// pseudo-handles `NtCurrentProcess` (-1) / `NtCurrentThread` (-2) are
-    /// accepted as no-ops (Windows returns SUCCESS for them).
     pub(crate) fn nt_close(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         if handle == u64::MAX || handle == u64::MAX - 1 {
             return Ok(STATUS_SUCCESS);
         }
-        // The std-stream sentinels (roadmap W3.4) are persistent, not tracked in
-        // any object table; closing one is a benign success (never INVALID_HANDLE).
         if self.is_std_handle(handle) {
             return Ok(STATUS_SUCCESS);
         }
@@ -1003,22 +734,12 @@ impl WinOs {
         }
     }
 
-    /// `NtReadFile(FileHandle, Event, ApcRoutine, ApcContext, *IoStatusBlock,
-    /// Buffer, Length, *ByteOffset, Key)`. arg0=FileHandle, arg4=&IoStatusBlock,
-    /// arg5=Buffer, arg6=Length, arg7=&ByteOffset.
     pub(crate) fn nt_read_file(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let iosb_ptr = self.syscall_arg(cpu, mem, 4)?;
         let buffer = self.syscall_arg(cpu, mem, 5)?;
-        // `Length` is a `ULONG` (32-bit): the caller may pass it in a 64-bit
-        // register/stack slot with dirty upper bits (Wine's `WriteFile`/`ReadFile`
-        // shims write only the low 32), so mask to avoid a giant bogus length.
         let length = self.syscall_arg(cpu, mem, 6)? & 0xFFFF_FFFF;
         let offset_ptr = self.syscall_arg(cpu, mem, 7)?;
-        // Std-in path (roadmap W3.4). Reading the standard-input sentinel reports
-        // end-of-file (no bytes transferred). This satisfies the console-hello
-        // gate — which writes but never reads stdin — and is the correct answer
-        // for a non-interactive (piped, empty) stdin: the CRT sees EOF and stops.
         if self.is_std_handle(handle) {
             write_iosb(mem, iosb_ptr, STATUS_END_OF_FILE, 0)?;
             return Ok(STATUS_END_OF_FILE);
@@ -1026,8 +747,6 @@ impl WinOs {
         if !self.is_file_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
-        // Honour an explicit ByteOffset (Wine passes one for synchronous reads);
-        // a negative sentinel (FILE_USE_FILE_POINTER_POSITION) keeps the cursor.
         if offset_ptr != 0 {
             let off = mem.read_u64(offset_ptr)?;
             if (off as i64) >= 0 {
@@ -1049,23 +768,12 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
-    /// `NtWriteFile(FileHandle, Event, ApcRoutine, ApcContext, *IoStatusBlock,
-    /// Buffer, Length, *ByteOffset, Key)`. arg0=FileHandle, arg4=&IoStatusBlock,
-    /// arg5=Buffer, arg6=Length, arg7=&ByteOffset.
     pub(crate) fn nt_write_file(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let iosb_ptr = self.syscall_arg(cpu, mem, 4)?;
         let buffer = self.syscall_arg(cpu, mem, 5)?;
-        // `Length` is a `ULONG` (32-bit): mask the caller-supplied value so dirty
-        // upper 32 bits (Wine's shims write only the low dword) don't inflate it.
         let length = self.syscall_arg(cpu, mem, 6)? & 0xFFFF_FFFF;
         let offset_ptr = self.syscall_arg(cpu, mem, 7)?;
-        // Console/stdio path (roadmap W3.4). When the CRT's `_isatty` is FALSE
-        // (see `nt_query_volume_information_file`, which reports a non-console
-        // device type for std handles), ucrtbase's `_write` falls through to
-        // kernelbase `WriteFile`, which calls `NtWriteFile` with the raw
-        // std-out/std-err handle unchanged. Route those bytes to the capture+echo
-        // sink (`captured_stdout`/`captured_stderr`) and report the full count.
         if self.is_std_handle(handle) {
             let mut data = vec![0u8; length as usize];
             if length != 0 {
@@ -1080,8 +788,6 @@ impl WinOs {
         }
         if offset_ptr != 0 {
             let off = mem.read_u64(offset_ptr)?;
-            // FILE_WRITE_TO_END_OF_FILE (0xFFFFFFFF_FFFFFFFF) appends; a plain
-            // negative sentinel keeps the cursor; a nonneg offset seeks.
             if off == u64::MAX {
                 if let Some(of) = self.files.get_mut(&handle) {
                     let _ = of.file.seek(SeekFrom::End(0));
@@ -1101,9 +807,6 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
-    /// `NtQueryInformationFile(FileHandle, *IoStatusBlock, FileInformation,
-    /// Length, FileInformationClass)`. arg0=FileHandle, arg1=&IoStatusBlock,
-    /// arg2=FileInformation, arg3=Length, arg4=FileInformationClass.
     pub(crate) fn nt_query_information_file(
         &mut self,
         cpu: &mut CpuState,
@@ -1114,9 +817,6 @@ impl WinOs {
         let info = self.syscall_arg(cpu, mem, 2)?;
         let length = self.syscall_arg(cpu, mem, 3)?;
         let class = self.syscall_arg(cpu, mem, 4)? as u32;
-        // Std-stream sentinels (roadmap W3.4). The CRT may probe these before
-        // writing; answer as an empty, position-0 pipe. Handled before the
-        // `is_file_handle` guard so a std handle is never rejected as invalid.
         if self.is_std_handle(handle) {
             return match class {
                 FILE_STANDARD_INFORMATION => {
@@ -1124,8 +824,8 @@ impl WinOs {
                         return Ok(STATUS_BUFFER_TOO_SMALL);
                     }
                     let zero = [0u8; 0x18];
-                    mem.write(info, &zero)?; // AllocationSize/EndOfFile = 0
-                    mem.write_u32(info + 0x10, 1)?; // NumberOfLinks
+                    mem.write(info, &zero)?;
+                    mem.write_u32(info + 0x10, 1)?;
                     write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 0x18)?;
                     Ok(STATUS_SUCCESS)
                 }
@@ -1133,7 +833,7 @@ impl WinOs {
                     if length < 8 {
                         return Ok(STATUS_BUFFER_TOO_SMALL);
                     }
-                    mem.write_u64(info, 0)?; // CurrentByteOffset
+                    mem.write_u64(info, 0)?;
                     write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 8)?;
                     Ok(STATUS_SUCCESS)
                 }
@@ -1155,9 +855,6 @@ impl WinOs {
 
         match class {
             FILE_STANDARD_INFORMATION => {
-                // FILE_STANDARD_INFORMATION (0x18 bytes): AllocationSize (i64) @0,
-                // EndOfFile (i64) @8, NumberOfLinks (u32) @0x10, DeletePending
-                // (u8) @0x14, Directory (u8) @0x15.
                 if length < 0x18 {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
@@ -1169,7 +866,6 @@ impl WinOs {
                 Ok(STATUS_SUCCESS)
             }
             FILE_END_OF_FILE_INFORMATION => {
-                // FILE_END_OF_FILE_INFORMATION: EndOfFile (i64) @0.
                 if length < 8 {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
@@ -1178,7 +874,6 @@ impl WinOs {
                 Ok(STATUS_SUCCESS)
             }
             FILE_POSITION_INFORMATION => {
-                // FILE_POSITION_INFORMATION: CurrentByteOffset (i64) @0.
                 if length < 8 {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
@@ -1193,9 +888,6 @@ impl WinOs {
         }
     }
 
-    /// `NtQueryVolumeInformationFile(FileHandle, *IoStatusBlock, FsInformation,
-    /// Length, FsInformationClass)`. arg0=FileHandle, arg1=&IoStatusBlock,
-    /// arg2=FsInformation, arg3=Length, arg4=FsInformationClass.
     pub(crate) fn nt_query_volume_information_file(
         &mut self,
         cpu: &mut CpuState,
@@ -1206,20 +898,13 @@ impl WinOs {
         let info = self.syscall_arg(cpu, mem, 2)?;
         let length = self.syscall_arg(cpu, mem, 3)?;
         let class = self.syscall_arg(cpu, mem, 4)? as u32;
-        // Std-stream sentinels (roadmap W3.4). `GetFileType` reads DeviceType
-        // from `FILE_FS_DEVICE_INFORMATION`: a FILE_DEVICE_CONSOLE-class value
-        // maps to FILE_TYPE_CHAR and flips the CRT's `_isatty` TRUE (→ the ConDrv
-        // `WriteConsoleW` path, which exemu deliberately does NOT service). Report
-        // FILE_DEVICE_NAMED_PIPE (0x11 → FILE_TYPE_PIPE) so `_isatty` stays FALSE
-        // and the CRT takes the `WriteFile`→`NtWriteFile` stdio path instead.
-        // Handled before the `is_file_handle` guard so a std handle is accepted.
         if self.is_std_handle(handle) {
             return match class {
                 FILE_FS_DEVICE_INFORMATION => {
                     if length < 8 {
                         return Ok(STATUS_BUFFER_TOO_SMALL);
                     }
-                    mem.write_u32(info, FILE_DEVICE_NAMED_PIPE)?; // 0x11 → non-console
+                    mem.write_u32(info, FILE_DEVICE_NAMED_PIPE)?;
                     mem.write_u32(info + 4, 0)?;
                     write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 8)?;
                     Ok(STATUS_SUCCESS)
@@ -1235,23 +920,17 @@ impl WinOs {
         }
         match class {
             FILE_FS_SIZE_INFORMATION => {
-                // FILE_FS_SIZE_INFORMATION (0x18): TotalAllocationUnits (i64) @0,
-                // AvailableAllocationUnits (i64) @8, SectorsPerAllocationUnit
-                // (u32) @0x10, BytesPerSector (u32) @0x14. Report a nominal large
-                // volume (the sandbox is host-backed; exact figures don't matter).
                 if length < 0x18 {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
-                mem.write_u64(info, 0x0010_0000)?; // 1M units
-                mem.write_u64(info + 8, 0x0008_0000)?; // 512K free
-                mem.write_u32(info + 0x10, 8)?; // 8 sectors/unit
-                mem.write_u32(info + 0x14, 512)?; // 512 bytes/sector
+                mem.write_u64(info, 0x0010_0000)?;
+                mem.write_u64(info + 8, 0x0008_0000)?;
+                mem.write_u32(info + 0x10, 8)?;
+                mem.write_u32(info + 0x14, 512)?;
                 write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 0x18)?;
                 Ok(STATUS_SUCCESS)
             }
             FILE_FS_DEVICE_INFORMATION => {
-                // FILE_FS_DEVICE_INFORMATION (0x08): DeviceType (u32) @0,
-                // Characteristics (u32) @4. FILE_DEVICE_DISK = 7.
                 if length < 8 {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
@@ -1267,24 +946,6 @@ impl WinOs {
         }
     }
 
-    /// `NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext,
-    /// *IoStatusBlock, FileInformation, Length, FileInformationClass,
-    /// ReturnSingleEntry, *FileName, RestartScan)`. arg0=FileHandle,
-    /// arg4=&IoStatusBlock, arg5=FileInformation, arg6=Length,
-    /// arg7=FileInformationClass, arg8=ReturnSingleEntry, arg9=*FileName,
-    /// arg10=RestartScan.
-    ///
-    /// Answers the two classes the pinned Wine prefix actually asks for, one
-    /// entry per call: **`FileBothDirectoryInformation`** (3), which
-    /// `ntdll!lookup_winsxs` uses, and
-    /// **`FileIdExtdBothDirectoryInformation`** (0x3F), which
-    /// `kernelbase!FindFirstFileExW`/`FindNextFileW` use — see
-    /// [`FILE_BOTH_DIRECTORY_INFORMATION`] and
-    /// [`FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION`] for the layouts and where
-    /// each was recovered from. Any other class is refused.
-    ///
-    /// The directory handle carries the enumeration cursor (a `FindState` keyed
-    /// by the handle), (re)built on the first call or when `RestartScan` is set.
     pub(crate) fn nt_query_directory_file(
         &mut self,
         cpu: &mut CpuState,
@@ -1293,9 +954,6 @@ impl WinOs {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let iosb_ptr = self.syscall_arg(cpu, mem, 4)?;
         let info = self.syscall_arg(cpu, mem, 5)?;
-        // Length / FileInformationClass / RestartScan are ULONG and BOOLEAN, so
-        // only their low 32 bits are the guest's — see `syscall_arg_u32`, and
-        // `kernelbase!FindNextFileW`, which writes all three as `mov dword`.
         let length = self.syscall_arg_u32(cpu, mem, 6)? as u64;
         let class_id = self.syscall_arg_u32(cpu, mem, 7)? as u64;
         let name_ptr = self.syscall_arg(cpu, mem, 9)?;
@@ -1303,17 +961,11 @@ impl WinOs {
         if !self.is_file_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
-        // The class decides the layout, and getting it wrong is silent — so an
-        // unknown one is refused rather than answered with the class-3 struct.
-        // (`FileInformationClass` was previously ignored altogether, which meant
-        // Wine's own FindFirstFileW — class 0x3F, name at +0x72 — was handed a
-        // name at +0x5E and read zeroes.)
         let Some(&class) = DIR_INFO_CLASSES.iter().find(|c| c.class == class_id) else {
             write_iosb(mem, iosb_ptr, STATUS_INVALID_INFO_CLASS, 0)?;
             return Ok(STATUS_INVALID_INFO_CLASS);
         };
 
-        // The wildcard (optional): a UNICODE_STRING* naming the search pattern.
         let pattern = if name_ptr != 0 {
             read_unicode_string(mem, name_ptr).unwrap_or_else(|| "*".to_string())
         } else {
@@ -1321,7 +973,6 @@ impl WinOs {
         };
         let pattern = if pattern.is_empty() { "*".to_string() } else { pattern };
 
-        // (Re)build the enumeration cursor on the first call / RestartScan.
         if restart || !self.find_handles.contains_key(&handle) {
             let Some(dir) = self.dir_handle_guest_path(handle) else {
                 return Ok(STATUS_INVALID_PARAMETER);
@@ -1343,8 +994,6 @@ impl WinOs {
 
         let name_units: Vec<u16> = entry.name.encode_utf16().collect();
         let name_bytes = name_units.len() as u64 * 2;
-        // The entry is the fixed part UP TO the name, then the name — not the
-        // struct's padded `sizeof`.
         let need = class.name_off + name_bytes;
         if length < need {
             write_iosb(mem, iosb_ptr, STATUS_BUFFER_TOO_SMALL, 0)?;
@@ -1355,8 +1004,6 @@ impl WinOs {
         Ok(STATUS_SUCCESS)
     }
 
-    /// Collect the sandbox directory entries under guest path `dir` matching the
-    /// wildcard `pattern`, as `FindEntry`s (reusing the FindFirstFile machinery).
     fn collect_dir_entries(&self, dir: &str, pattern: &str) -> Vec<FindEntry> {
         let mut entries: Vec<FindEntry> = Vec::new();
         let Some(host_dir) = self.host_path(dir) else {
@@ -1380,14 +1027,11 @@ impl WinOs {
     }
 }
 
-/// Read a `UNICODE_STRING` (64-bit layout: `USHORT Length; USHORT MaximumLength;
-/// PWSTR Buffer` — Buffer at offset 8) into a `String`. `Length` is a **byte**
-/// count, not units, and the buffer is not necessarily NUL-terminated.
 pub(crate) fn read_unicode_string(mem: &dyn Memory, ptr: u64) -> Option<String> {
     if ptr == 0 {
         return None;
     }
-    let length = mem.read_u16(ptr).ok()? as u64; // bytes
+    let length = mem.read_u16(ptr).ok()? as u64;
     let buffer = mem.read_u64(ptr + 8).ok()?;
     if buffer == 0 {
         return Some(String::new());
@@ -1400,8 +1044,6 @@ pub(crate) fn read_unicode_string(mem: &dyn Memory, ptr: u64) -> Option<String> 
     Some(String::from_utf16_lossy(&v))
 }
 
-/// Strip the DOS-device / Win32 file-namespace prefix from an NT path so the
-/// sandbox sees a plain `C:\…` drive path: `\??\`, `\\?\`, `\DosDevices\`.
 pub(crate) fn strip_nt_prefix(name: &str) -> String {
     for p in ["\\??\\", "\\\\?\\", "\\DosDevices\\", "\\GLOBAL??\\"] {
         if let Some(rest) = name.strip_prefix(p) {
@@ -1411,100 +1053,30 @@ pub(crate) fn strip_nt_prefix(name: &str) -> String {
     name.to_string()
 }
 
-/// Write an `IO_STATUS_BLOCK` (64-bit: `union { NTSTATUS Status; PVOID Pointer };
-/// ULONG_PTR Information` — Status@0, Information@8). NULL pointer is a no-op.
 fn write_iosb(mem: &mut dyn Memory, ptr: u64, status: u32, information: u64) -> Result<()> {
     if ptr == 0 {
         return Ok(());
     }
     mem.write_u32(ptr, status)?;
-    mem.write_u32(ptr + 4, 0)?; // upper half of the Status/Pointer union
+    mem.write_u32(ptr + 4, 0)?;
     mem.write_u64(ptr + 8, information)?;
     Ok(())
 }
 
-/// A directory-entry information class `NtQueryDirectoryFile` can answer:
-/// which `FileInformationClass` value asks for it, and **where its
-/// variable-length `FileName` starts**.
-///
-/// `name_off` is the size of the fixed part that precedes the name. It is
-/// **not** `sizeof(struct)`: every one of these ends in `WCHAR FileName[1]`, so
-/// its `sizeof` is padded past the field. Writing the name at the padded
-/// `sizeof` is a real bug and it is silent — the reader gets a `FileNameLength`
-/// that says there is a name and finds zeroes there.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct DirInfoClass {
-    /// The `FileInformationClass` value the guest passes.
     class: u64,
-    /// Byte offset of `FileName[0]`.
     name_off: u64,
 }
 
-/// `FileBothDirectoryInformation` (3) — `FILE_BOTH_DIR_INFORMATION`.
-///
-/// ```text
-///   0x00 NextEntryOffset   ULONG   (0 — last/only entry)
-///   0x04 FileIndex         ULONG
-///   0x08 CreationTime      LARGE_INTEGER
-///   0x10 LastAccessTime    LARGE_INTEGER
-///   0x18 LastWriteTime     LARGE_INTEGER
-///   0x20 ChangeTime        LARGE_INTEGER
-///   0x28 EndOfFile         LARGE_INTEGER
-///   0x30 AllocationSize    LARGE_INTEGER
-///   0x38 FileAttributes    ULONG
-///   0x3C FileNameLength    ULONG   (bytes)
-///   0x40 EaSize            ULONG
-///   0x44 ShortNameLength   CCHAR
-///   0x46 ShortName         WCHAR[12]   (0x18 bytes, ends at 0x5E)
-///   0x5E FileName          WCHAR[]     ← sizeof is 0x60 only because of tail pad
-/// ```
-///
-/// **Recovered from the pinned prefix's own consumer, not from the header.**
-/// `ntdll!lookup_winsxs` reads the entry it just asked for with
-/// `mov eax,[r15]; lea r14,[r15+0x5e]` (64-bit, rva 0x55e6e) and
-/// `mov eax,[esi]; lea ebx,[esi+0x5e]` (32-bit, rva 0x53f67) — `r15`/`esi` walk
-/// the buffer by `NextEntryOffset`, and `[r15+0x3c]` is read later as
-/// `FileNameLength`. Both halves agree, and both ask for class 3
-/// (`mov dword ptr [rsp+0x38], 3` / `mov dword ptr [esp+0x1c], 3`).
 const FILE_BOTH_DIRECTORY_INFORMATION: DirInfoClass = DirInfoClass { class: 3, name_off: 0x5E };
 
-/// `FileIdExtdBothDirectoryInformation` (0x3F) —
-/// `FILE_ID_EXTD_BOTH_DIR_INFORMATION`. Same head through `EaSize`, then:
-///
-/// ```text
-///   0x44 ReparsePointTag   ULONG
-///   0x48 FileId            FILE_ID_128 (0x10 bytes)
-///   0x58 ShortNameLength   CCHAR
-///   0x5A ShortName         WCHAR[12]   (0x18 bytes, ends at 0x72)
-///   0x72 FileName          WCHAR[]
-/// ```
-///
-/// **This is the class Wine's own `FindFirstFileW`/`FindNextFileW` use**, so it
-/// is the one nearly every Wine-hosted guest's directory enumeration goes
-/// through — and answering it with the class-3 layout put the name 0x14 bytes
-/// short of where the reader looks. Recovered from `kernelbase!FindNextFileW`
-/// (rva 0x1fa90): it passes `mov dword ptr [rsp+0x38], 0x3f`, then reads
-/// `[r14+0x3c]` (FileNameLength), `[r14+0x72]`/`[r14+0x74]` (the `.`/`..`
-/// check on `FileName[0..1]`), `[r14+0x44]` into `WIN32_FIND_DATAW.dwReserved0`
-/// (the reparse tag), `movsx rax, byte [r14+0x58]` (ShortNameLength) and
-/// `lea rsi,[r14+0x5a]` (ShortName).
 const FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION: DirInfoClass =
     DirInfoClass { class: 0x3F, name_off: 0x72 };
 
-/// The classes exemu answers. Anything else gets `STATUS_INVALID_INFO_CLASS`
-/// rather than a struct of the wrong shape: a guest told "success" over a
-/// layout it did not ask for reads garbage and blames itself.
 const DIR_INFO_CLASSES: [DirInfoClass; 2] =
     [FILE_BOTH_DIRECTORY_INFORMATION, FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION];
 
-/// Write one directory entry in `class`'s layout into guest memory.
-/// `NextEntryOffset` is 0 (single-entry-per-call model).
-///
-/// The head through `FileNameLength` is identical in every class here; what
-/// differs is only where the name goes, which is what [`DirInfoClass`] carries.
-/// Everything between `EaSize` and the name (`ShortName`, the reparse tag, the
-/// 128-bit file id) is left zeroed — `ShortNameLength = 0` is what tells a
-/// reader there is no 8.3 alias, and Wine's `FindNextFileW` honours it.
 fn write_dir_information(
     mem: &mut dyn Memory,
     ptr: u64,
@@ -1513,16 +1085,15 @@ fn write_dir_information(
     name_units: &[u16],
 ) -> Result<()> {
     let name_bytes = name_units.len() * 2;
-    // Zero the fixed part (also clears ShortName and everything before the name).
     let zero = vec![0u8; class.name_off as usize];
     mem.write(ptr, &zero)?;
-    mem.write_u32(ptr, 0)?; // NextEntryOffset
+    mem.write_u32(ptr, 0)?;
     mem.write_u64(ptr + 0x08, entry.ctime)?;
     mem.write_u64(ptr + 0x10, entry.atime)?;
     mem.write_u64(ptr + 0x18, entry.mtime)?;
-    mem.write_u64(ptr + 0x20, entry.mtime)?; // ChangeTime ≈ LastWriteTime
-    mem.write_u64(ptr + 0x28, entry.size)?; // EndOfFile
-    mem.write_u64(ptr + 0x30, entry.size)?; // AllocationSize
+    mem.write_u64(ptr + 0x20, entry.mtime)?;
+    mem.write_u64(ptr + 0x28, entry.size)?;
+    mem.write_u64(ptr + 0x30, entry.size)?;
     let attrs: u32 = if entry.is_dir { FILE_ATTRIBUTE_DIRECTORY as u32 } else { FILE_ATTRIBUTE_NORMAL as u32 };
     mem.write_u32(ptr + 0x38, attrs)?;
     mem.write_u32(ptr + 0x3C, name_bytes as u32)?;
@@ -1532,17 +1103,14 @@ fn write_dir_information(
     Ok(())
 }
 
-/// SSDT thunk for `NtCreateFile` (index 0x55).
 pub(crate) fn ssdt_nt_create_file(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_create_file(cpu, mem)
 }
 
-/// SSDT thunk for `NtOpenFile` (index 0x33).
 pub(crate) fn ssdt_nt_open_file(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_open_file(cpu, mem)
 }
 
-/// SSDT thunk for `NtQueryAttributesFile` (index 0x3d).
 pub(crate) fn ssdt_nt_query_attributes_file(
     os: &mut WinOs,
     cpu: &mut CpuState,
@@ -1551,7 +1119,6 @@ pub(crate) fn ssdt_nt_query_attributes_file(
     os.nt_query_attributes_file(cpu, mem)
 }
 
-/// SSDT thunk for `NtFsControlFile` (index 0x39).
 pub(crate) fn ssdt_nt_fs_control_file(
     os: &mut WinOs,
     cpu: &mut CpuState,
@@ -1560,22 +1127,18 @@ pub(crate) fn ssdt_nt_fs_control_file(
     os.nt_fs_control_file(cpu, mem)
 }
 
-/// SSDT thunk for `NtClose` (index 0x0f).
 pub(crate) fn ssdt_nt_close(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_close(cpu, mem)
 }
 
-/// SSDT thunk for `NtReadFile` (index 0x06).
 pub(crate) fn ssdt_nt_read_file(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_read_file(cpu, mem)
 }
 
-/// SSDT thunk for `NtWriteFile` (index 0x08).
 pub(crate) fn ssdt_nt_write_file(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     os.nt_write_file(cpu, mem)
 }
 
-/// SSDT thunk for `NtQueryInformationFile` (index 0x11).
 pub(crate) fn ssdt_nt_query_information_file(
     os: &mut WinOs,
     cpu: &mut CpuState,
@@ -1584,7 +1147,6 @@ pub(crate) fn ssdt_nt_query_information_file(
     os.nt_query_information_file(cpu, mem)
 }
 
-/// SSDT thunk for `NtQueryDirectoryFile` (index 0x35).
 pub(crate) fn ssdt_nt_query_directory_file(
     os: &mut WinOs,
     cpu: &mut CpuState,
@@ -1593,7 +1155,6 @@ pub(crate) fn ssdt_nt_query_directory_file(
     os.nt_query_directory_file(cpu, mem)
 }
 
-/// SSDT thunk for `NtQueryVolumeInformationFile` (index 0x49).
 pub(crate) fn ssdt_nt_query_volume_information_file(
     os: &mut WinOs,
     cpu: &mut CpuState,

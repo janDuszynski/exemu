@@ -1,13 +1,5 @@
-//! Arithmetic/logic helpers that also compute EFLAGS exactly as an x86 CPU
-//! would. Keeping the flag math in one place makes the interpreter's opcode
-//! handlers short and keeps conditional branches correct.
-//!
-//! `size` is always in bytes (1, 2, 4, 8). Inputs are treated as unsigned
-//! `u64`s masked to `size`; results are returned masked to `size`.
-
 use exemu_core::cpu::{flags, CpuState};
 
-/// Mask covering the low `size` bytes.
 #[inline]
 pub fn mask(size: u8) -> u64 {
     match size {
@@ -18,13 +10,11 @@ pub fn mask(size: u8) -> u64 {
     }
 }
 
-/// The sign bit for a value of `size` bytes.
 #[inline]
 pub fn sign_bit(size: u8) -> u64 {
     1u64 << (size * 8 - 1)
 }
 
-/// Sign-extend the low `size` bytes of `v` to a full 64-bit value.
 #[inline]
 pub fn sext(v: u64, size: u8) -> u64 {
     match size {
@@ -40,7 +30,6 @@ fn parity(v: u64) -> bool {
     (v as u8).count_ones() % 2 == 0
 }
 
-/// Set SF, ZF and PF from a result. AF/CF/OF are handled per-operation.
 #[inline]
 pub fn set_szp(s: &mut CpuState, res: u64, size: u8) {
     let r = res & mask(size);
@@ -49,7 +38,6 @@ pub fn set_szp(s: &mut CpuState, res: u64, size: u8) {
     s.set_flag(flags::PF, parity(r));
 }
 
-/// `a + b + carry_in`, setting CF/OF/AF/SF/ZF/PF. Returns the masked result.
 pub fn add(s: &mut CpuState, a: u64, b: u64, carry_in: u64, size: u8) -> u64 {
     let m = mask(size);
     let (a, b) = (a & m, b & m);
@@ -63,8 +51,6 @@ pub fn add(s: &mut CpuState, a: u64, b: u64, carry_in: u64, size: u8) -> u64 {
     res
 }
 
-/// `a - b - borrow_in`, setting CF (borrow)/OF/AF/SF/ZF/PF. Returns the
-/// masked result. Used for SUB, SBB, CMP and NEG.
 pub fn sub(s: &mut CpuState, a: u64, b: u64, borrow_in: u64, size: u8) -> u64 {
     let m = mask(size);
     let (a, b) = (a & m, b & m);
@@ -78,8 +64,6 @@ pub fn sub(s: &mut CpuState, a: u64, b: u64, borrow_in: u64, size: u8) -> u64 {
     res
 }
 
-/// Bitwise result (AND/OR/XOR/TEST): clears CF and OF, sets SF/ZF/PF, and
-/// clears AF (architecturally undefined, but real CPUs leave it 0 here).
 pub fn logic(s: &mut CpuState, res: u64, size: u8) -> u64 {
     let r = res & mask(size);
     s.set_flag(flags::CF, false);
@@ -89,7 +73,6 @@ pub fn logic(s: &mut CpuState, res: u64, size: u8) -> u64 {
     r
 }
 
-/// INC: like `add(.., 1)` but leaves CF untouched.
 pub fn inc(s: &mut CpuState, a: u64, size: u8) -> u64 {
     let cf = s.flag(flags::CF);
     let r = add(s, a, 1, 0, size);
@@ -97,7 +80,6 @@ pub fn inc(s: &mut CpuState, a: u64, size: u8) -> u64 {
     r
 }
 
-/// DEC: like `sub(.., 1)` but leaves CF untouched.
 pub fn dec(s: &mut CpuState, a: u64, size: u8) -> u64 {
     let cf = s.flag(flags::CF);
     let r = sub(s, a, 1, 0, size);
@@ -105,7 +87,6 @@ pub fn dec(s: &mut CpuState, a: u64, size: u8) -> u64 {
     r
 }
 
-/// SHLD: shift `dst` left by `count`, feeding in the high bits of `src`.
 pub fn shld(s: &mut CpuState, dst: u64, src: u64, count: u64, size: u8) -> u64 {
     let bits = size as u32 * 8;
     let count = (count & if size == 8 { 0x3f } else { 0x1f }) as u32;
@@ -115,7 +96,6 @@ pub fn shld(s: &mut CpuState, dst: u64, src: u64, count: u64, size: u8) -> u64 {
     let m = mask(size);
     let (dst, src) = (dst & m, src & m);
     let res = if count >= bits {
-        // Undefined for count >= width; approximate with src shifted.
         (src << (count - bits)) & m
     } else {
         ((dst << count) | (src >> (bits - count))) & m
@@ -126,7 +106,6 @@ pub fn shld(s: &mut CpuState, dst: u64, src: u64, count: u64, size: u8) -> u64 {
     res
 }
 
-/// SHRD: shift `dst` right by `count`, feeding in the low bits of `src`.
 pub fn shrd(s: &mut CpuState, dst: u64, src: u64, count: u64, size: u8) -> u64 {
     let bits = size as u32 * 8;
     let count = (count & if size == 8 { 0x3f } else { 0x1f }) as u32;
@@ -146,7 +125,6 @@ pub fn shrd(s: &mut CpuState, dst: u64, src: u64, count: u64, size: u8) -> u64 {
     res
 }
 
-/// Shift/rotate kinds selected by the ModRM `reg` field of group 2.
 #[derive(Clone, Copy)]
 pub enum Shift {
     Rol,
@@ -165,18 +143,15 @@ impl Shift {
             1 => Shift::Ror,
             2 => Shift::Rcl,
             3 => Shift::Rcr,
-            4 | 6 => Shift::Shl, // /6 (SAL) is an alias of SHL
+            4 | 6 => Shift::Shl,
             5 => Shift::Shr,
             _ => Shift::Sar,
         }
     }
 }
 
-/// Execute a shift/rotate, updating CF/OF/SF/ZF/PF per x86 rules for the
-/// common shift cases. Rotates update CF/OF only.
 pub fn shift(s: &mut CpuState, kind: Shift, val: u64, count: u64, size: u8) -> u64 {
     let bits = size as u32 * 8;
-    // Count is masked to 5 bits (6 for 64-bit operands).
     let count = (count & if size == 8 { 0x3f } else { 0x1f }) as u32;
     if count == 0 {
         return val & mask(size);
@@ -239,8 +214,6 @@ pub fn shift(s: &mut CpuState, kind: Shift, val: u64, count: u64, size: u8) -> u
             }
             res
         }
-        // RCL/RCR (rotate through carry) are uncommon in compiled code; a
-        // faithful-enough implementation without the intermediate CF cascade.
         Shift::Rcl | Shift::Rcr => {
             let mut res = v;
             let mut cf = s.flag(flags::CF);
@@ -259,10 +232,6 @@ pub fn shift(s: &mut CpuState, kind: Shift, val: u64, count: u64, size: u8) -> u
                 }
             }
             s.set_flag(flags::CF, cf);
-            // OF is defined only for the single-bit rotates. For RCL it is
-            // MSB(result) XOR CF(result); for RCR it is the XOR of the two most
-            // significant bits of the result. (Undefined for multi-bit — left
-            // untouched, matching real CPUs.)
             if count == 1 {
                 let msb = res & sb != 0;
                 let of = match kind {
@@ -278,26 +247,11 @@ pub fn shift(s: &mut CpuState, kind: Shift, val: u64, count: u64, size: u8) -> u
 
 #[cfg(test)]
 mod tests {
-    //! Flag-accuracy matrix (roadmap P0.3).
-    //!
-    //! Each ALU helper is checked against an *independent* derivation of every
-    //! status flag, so a bug in the helper is not masked by a test that merely
-    //! restates the helper's own formula:
-    //!
-    //! * CF — 128-bit wide add/sub, inspect the bit above the operand width.
-    //! * OF — width-clamped *signed* range check (sign-extend, compute in i128,
-    //!   test whether the true result fits the signed width).
-    //! * AF — low-nibble arithmetic (`(a&0xf)+(b&0xf)+c > 0xf`), never the
-    //!   `a^b^res` trick the implementation uses.
-    //! * SF/ZF/PF — from the masked result directly.
 
     use super::*;
 
     const SIZES: [u8; 4] = [1, 2, 4, 8];
 
-    /// A spread of operands per width that exercises the flag edges: zero, one,
-    /// the sign bit, max unsigned, low-nibble carry boundaries, and a couple of
-    /// arbitrary middles.
     fn operands(size: u8) -> Vec<u64> {
         let m = mask(size);
         let sb = sign_bit(size);
@@ -325,8 +279,6 @@ mod tests {
         CpuState::new()
     }
 
-    // ---- independent reference flag derivations --------------------------
-
     fn ref_add(a: u64, b: u64, cin: u64, size: u8) -> (u64, bool, bool, bool) {
         let m = mask(size);
         let (a, b) = (a & m, b & m);
@@ -334,8 +286,6 @@ mod tests {
         let res = (full as u64) & m;
         let cf = (full >> (size as u32 * 8)) & 1 != 0;
         let af = (a & 0xf) + (b & 0xf) + cin > 0xf;
-        // OF via signed range clamp. Cast through i64 so the u64 from `sext`
-        // sign-extends into i128 rather than zero-extending.
         let sa = sext(a, size) as i64 as i128;
         let sb = sext(b, size) as i64 as i128;
         let sres = sa + sb + cin as i128;
@@ -414,7 +364,6 @@ mod tests {
             for &a in &operands(size) {
                 for &b in &operands(size) {
                     let mut st = fresh();
-                    // Seed CF/OF/AF set, to prove `logic` clears them.
                     st.set_flag(flags::CF, true);
                     st.set_flag(flags::OF, true);
                     st.set_flag(flags::AF, true);
@@ -463,21 +412,18 @@ mod tests {
             let bits = size as u32 * 8;
             for &v in &operands(size) {
                 for count in 1..=bits.min(31) as u64 {
-                    // SHL
                     let mut st = fresh();
                     let r = shift(&mut st, Shift::Shl, v, count, size);
                     assert_eq!(r, (v << count) & m, "SHL res v={v:#x} n={count} sz={size}");
                     let exp_cf = count <= bits as u64 && ((v & m) >> (bits as u64 - count)) & 1 != 0;
                     assert_eq!(st.flag(flags::CF), exp_cf, "SHL CF v={v:#x} n={count} sz={size}");
 
-                    // SHR
                     let mut st = fresh();
                     let r = shift(&mut st, Shift::Shr, v, count, size);
                     assert_eq!(r, (v & m) >> count, "SHR res v={v:#x} n={count} sz={size}");
                     let exp_cf = ((v & m) >> (count - 1)) & 1 != 0;
                     assert_eq!(st.flag(flags::CF), exp_cf, "SHR CF v={v:#x} n={count} sz={size}");
 
-                    // SAR
                     let mut st = fresh();
                     let r = shift(&mut st, Shift::Sar, v, count, size);
                     let signed = sext(v, size);

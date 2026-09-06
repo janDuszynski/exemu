@@ -1,13 +1,8 @@
-//! Window-independent dialog rendering into a 32-bit software framebuffer.
-//! Shared by the live [`crate::MinifbGui`] window and the offscreen
-//! [`crate::OffscreenGui`] (which saves PNGs for headless testing).
-
 use std::collections::{HashMap, HashSet};
 
 use exemu_core::gui::{Control, ControlKind, DialogTemplate};
 use font8x8::UnicodeFonts;
 
-// Dialog-unit → pixel scale (approximate MS Shell Dlg base units).
 pub const SX: f32 = 1.75;
 pub const SY: f32 = 1.8;
 pub const PAD: usize = 8;
@@ -22,8 +17,6 @@ const C_BORDER: u32 = 0x00A0_A0A0;
 const C_DKBORDER: u32 = 0x0050_5050;
 const C_PROGRESS: u32 = 0x0006_B025;
 
-/// Extra pixels added around a button's clickable area, so a near-miss still
-/// registers.
 const HIT_PAD: usize = 5;
 
 #[derive(Clone)]
@@ -40,17 +33,14 @@ impl Rect {
     }
 }
 
-/// A framebuffer plus the geometry needed to draw a dialog and hit-test it.
 pub struct Renderer {
     pub buf: Vec<u32>,
     pub w: usize,
     pub h: usize,
-    /// Clickable control hit rectangles in pixels, refreshed on each paint.
     pub hits: Vec<(u32, Rect)>,
 }
 
 impl Renderer {
-    /// Pixel size for a dialog of `cx` x `cy` dialog units, clamped sanely.
     pub fn size_for(tpl: &DialogTemplate) -> (usize, usize) {
         let w = (PAD * 2) + (tpl.cx as f32 * SX) as usize;
         let h = (PAD * 2) + (tpl.cy as f32 * SY) as usize;
@@ -120,8 +110,6 @@ impl Renderer {
         self.text(s, tx, ty, c);
     }
 
-    /// Paint the whole dialog from `tpl` + current `texts`, refreshing `hits`.
-    /// Controls in `disabled` are greyed and not clickable.
     pub fn paint(&mut self, tpl: &DialogTemplate, texts: &HashMap<u32, String>, disabled: &HashSet<u32>) {
         for px in self.buf.iter_mut() {
             *px = C_BG;
@@ -156,7 +144,6 @@ impl Renderer {
                         let inner = Rect { x: r.x + 1, y: r.y + 1, w: r.w.saturating_sub(2), h: r.h.saturating_sub(2) };
                         self.frame(&inner, C_DKBORDER);
                     }
-                    // Drop the '&' accelerator marker for display.
                     self.text_centered(&text.replace('&', ""), &r, if off { C_GRAY_TEXT } else { C_TEXT });
                     if !off {
                         push_hit(&mut self.hits, ctl.id, &r);
@@ -192,8 +179,6 @@ impl Renderer {
         self.hits.iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| *id)
     }
 
-    /// Apply one emulated-GDI drawing op to the framebuffer (for custom
-    /// windows). Negative coordinates are clamped into the buffer.
     pub fn apply(&mut self, op: &exemu_core::DrawOp) {
         use exemu_core::DrawOp::*;
         let clamp = |v: i32| v.max(0) as usize;
@@ -214,7 +199,6 @@ impl Renderer {
     }
 
     fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
-        // Bresenham.
         let (mut x0, mut y0) = (x0, y0);
         let dx = (x1 - x0).abs();
         let dy = -(y1 - y0).abs();
@@ -240,7 +224,6 @@ impl Renderer {
         }
     }
 
-    /// The framebuffer as tightly-packed RGBA bytes (for PNG output).
     pub fn to_rgba(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.w * self.h * 4);
         for &p in &self.buf {

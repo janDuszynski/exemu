@@ -1,13 +1,3 @@
-//! W2.14 — the NT time syscalls (`NtQuerySystemTime`/`NtQueryPerformanceCounter`),
-//! driven end-to-end through the real interpreter + the W2.3 SSDT dispatcher
-//! exactly as a Wine PE `Nt*` stub would (`mov r10,rcx; mov eax,N; syscall`).
-//!
-//! De-risk (roadmap W2.14 "clock read"): `NtQuerySystemTime` returns a FILETIME
-//! bracketed by the host clock taken before/after the call; `NtQueryPerformance-
-//! Counter` returns a monotonically non-decreasing counter and the fixed QPC
-//! frequency. (`NtGetTickCount` is not a syscall on x64 — it is an inline
-//! KUSER_SHARED_DATA read — so there is no syscall path to drive here.)
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use exemu_core::{Cpu, Exit, Memory, Perm, Region};
@@ -15,14 +5,12 @@ use exemu_cpu::{Bits, Interpreter, GS_BASE};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
 
-// SSDT indices recovered from the pinned guest ntdll.dll stubs' `mov eax,N`.
 const NT_QUERY_SYSTEM_TIME: u32 = 0x5a;
 const NT_QUERY_PERFORMANCE_COUNTER: u32 = 0x31;
 
 const STATUS_SUCCESS: u64 = 0x0000_0000;
 const STATUS_ACCESS_VIOLATION: u64 = 0xC000_0005;
 
-// QueryPerformanceFrequency value (time.rs QPC_FREQ = 10 MHz).
 const QPC_FREQ: u64 = 10_000_000;
 const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
 
@@ -49,14 +37,10 @@ fn setup() -> (WinOs, VirtualMemory) {
     (os, mem)
 }
 
-/// Assemble `mov rcx,arg0; mov r10,rcx; mov eax,N; syscall; hlt`, run it, return RAX.
 fn syscall(os: &mut WinOs, mem: &mut VirtualMemory, index: u32, args: &[u64]) -> u64 {
     syscall_on(os, mem, index, args, None)
 }
 
-/// As [`syscall`], but optionally running the interpreter on `clock` so the
-/// retired instructions of the stub itself advance the virtual clock — the way
-/// they do inside a real run (roadmap W9.6).
 fn syscall_on(
     os: &mut WinOs,
     mem: &mut VirtualMemory,
@@ -65,13 +49,13 @@ fn syscall_on(
     clock: Option<&exemu_core::GuestClock>,
 ) -> u64 {
     let mut asm: Vec<u8> = Vec::new();
-    asm.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
+    asm.extend_from_slice(&[0x48, 0xB9]);
     asm.extend_from_slice(&args.first().copied().unwrap_or(0).to_le_bytes());
-    asm.extend_from_slice(&[0x49, 0x89, 0xCA]); // mov r10, rcx
-    asm.extend_from_slice(&[0xB8]); // mov eax, imm32
+    asm.extend_from_slice(&[0x49, 0x89, 0xCA]);
+    asm.extend_from_slice(&[0xB8]);
     asm.extend_from_slice(&index.to_le_bytes());
-    asm.extend_from_slice(&[0x0F, 0x05]); // syscall
-    asm.push(0xF4); // hlt
+    asm.extend_from_slice(&[0x0F, 0x05]);
+    asm.push(0xF4);
     mem.poke(CODE, &asm).unwrap();
 
     let mut cpu = Interpreter::with_bits(Bits::B64);
@@ -114,10 +98,8 @@ fn nt_query_system_time_matches_host_clock() {
     let after = filetime_host_now();
 
     let t = mem.read_u64(out).unwrap();
-    // The reported FILETIME is bracketed by the host clock either side of the call.
     assert!(before <= t && t <= after, "system time {t} not in [{before}, {after}]");
 
-    // NULL out-pointer → STATUS_ACCESS_VIOLATION.
     assert_eq!(syscall(&mut os, &mut mem, NT_QUERY_SYSTEM_TIME, &[0]), STATUS_ACCESS_VIOLATION);
 }
 
@@ -127,7 +109,6 @@ fn nt_query_performance_counter_is_monotonic_and_reports_frequency() {
     let counter = SCRATCH;
     let freq = SCRATCH + 0x40;
 
-    // Counter + frequency in one call.
     assert_eq!(
         syscall(&mut os, &mut mem, NT_QUERY_PERFORMANCE_COUNTER, &[counter, freq]),
         STATUS_SUCCESS
@@ -135,7 +116,6 @@ fn nt_query_performance_counter_is_monotonic_and_reports_frequency() {
     let first = mem.read_u64(counter).unwrap();
     assert_eq!(mem.read_u64(freq).unwrap(), QPC_FREQ);
 
-    // A later call is monotonically non-decreasing.
     assert_eq!(
         syscall(&mut os, &mut mem, NT_QUERY_PERFORMANCE_COUNTER, &[counter, 0]),
         STATUS_SUCCESS
@@ -143,20 +123,12 @@ fn nt_query_performance_counter_is_monotonic_and_reports_frequency() {
     let second = mem.read_u64(counter).unwrap();
     assert!(second >= first, "counter went backwards: {second} < {first}");
 
-    // NULL counter → STATUS_ACCESS_VIOLATION (frequency-only is not a valid call).
     assert_eq!(
         syscall(&mut os, &mut mem, NT_QUERY_PERFORMANCE_COUNTER, &[0, freq]),
         STATUS_ACCESS_VIOLATION
     );
 }
 
-// ---- the deterministic clock (roadmap W9.6) --------------------------------
-
-/// `NtQuerySystemTime` under the virtual clock reports the **fixed epoch plus
-/// the instruction count**, not the host's now — and two runs of the identical
-/// syscall sequence agree bit for bit. That equality is the property W8.7 needs:
-/// a JIT can only be diffed against the interpreter if the guest's clock reads
-/// are replayable.
 #[test]
 fn the_virtual_clock_replays_the_nt_time_syscalls_exactly() {
     let one_pass = || {
@@ -183,9 +155,6 @@ fn the_virtual_clock_replays_the_nt_time_syscalls_exactly() {
     let (wall_b, qpc_b, instret_b) = one_pass();
     assert_eq!((wall_a, qpc_a, instret_a), (wall_b, qpc_b, instret_b), "the run replays exactly");
 
-    // The performance counter IS the instruction count (one 100-ns tick each),
-    // and the wall clock is that same count offset from the fixed epoch — so
-    // neither can encode anything about the host.
     assert!(qpc_a > 0 && qpc_a < instret_a, "counter is the retired count at the time of the read");
     let uptime = wall_a - exemu_core::VIRTUAL_EPOCH_FILETIME;
     assert!(
