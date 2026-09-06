@@ -180,3 +180,233 @@ fn delivered_context_round_trips_through_nt_continue() {
     assert_eq!(s.reg(Reg::Rbx), 0xB16B_00B5, "the live GPR round-tripped through the CONTEXT");
     assert_eq!(s.rflags & flags::CF, flags::CF, "RFLAGS.CF round-tripped through the CONTEXT");
 }
+
+// ---- the last resort: an exception nothing handles (roadmap W5.12) ---------
+
+/// SSDT index of `NtRaiseException`, from the pinned `ntdll.dll` stub at RVA
+/// 0x10310 (`mov r10,rcx; mov eax,0xcf; … syscall`).
+const SSDT_NT_RAISE_EXCEPTION: u32 = 0xCF;
+/// SSDT index of `NtContinue` (`ZwContinue` @ RVA 0xf190, `mov eax,0x43`).
+const SSDT_NT_CONTINUE: u32 = 0x43;
+/// `EXCEPTION_RECORD` field offsets (x64), as `write_exception_record` lays them.
+const REC_CODE: u64 = 0x00;
+const REC_ADDRESS: u64 = 0x10;
+const REC_NUM_PARAMS: u64 = 0x18;
+
+/// Emit `mov r10,rcx; mov eax,<index>; syscall` — the shape every `Nt*` stub in
+/// the pinned ntdll has, so the syscall is dispatched exactly as guest code
+/// dispatches it.
+fn syscall_stub(index: u32) -> Vec<u8> {
+    let mut asm = vec![0x49, 0x89, 0xCA]; // mov r10, rcx
+    asm.push(0xB8); // mov eax, imm32
+    asm.extend_from_slice(&index.to_le_bytes());
+    asm.extend_from_slice(&[0x0F, 0x05]); // syscall
+    asm
+}
+
+fn seated(cpu: &mut Interpreter, rip: u64) {
+    let s = cpu.state_mut();
+    s.rip = rip;
+    s.set_rsp(STACK_TOP);
+    s.gs_base = GS_BASE;
+    s.fs_base = GS_BASE;
+}
+
+/// **The W5.12 gate, at the syscall.** `NtRaiseException(rec, ctx,
+/// FirstChance = FALSE)` is the last resort: Wine's `dispatch_exception`
+/// tail-jumps to it when `call_function_handlers` returned
+/// `STATUS_UNHANDLED_EXCEPTION`, and in NT it never returns — the kernel ends
+/// the process with the exception code.
+///
+/// Letting it return is what made an unhandled fault spin for ever:
+/// `KiUserExceptionDispatcher` is `call dispatch_exception; int3`, so the return
+/// ran the `int3`, exemu delivered the resulting `STATUS_BREAKPOINT` to the same
+/// dispatcher, and round it went. This asserts the two halves of the fix: the
+/// run **ends**, and the exception it ends with is the one in the record.
+#[test]
+fn last_resort_raise_terminates_the_process_with_the_exception() {
+    let code_va: u64 = 0x0000_0000_0040_0000;
+    let rec_va: u64 = 0x0000_0000_0050_0000;
+    let fault_addr: u64 = 0x0000_0001_4000_1234;
+
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("stack", STACK_TOP - 0x10000, 0x10000, Perm::RW)).unwrap();
+    mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW)).unwrap();
+    mem.map(Region::new("code", code_va, 0x1000, Perm::RX)).unwrap();
+    mem.map(Region::new("rec", rec_va, 0x1000, Perm::RW)).unwrap();
+    mem.poke(code_va, &syscall_stub(SSDT_NT_RAISE_EXCEPTION)).unwrap();
+    mem.write_u32(rec_va + REC_CODE, 0xC000_0005).unwrap();
+    mem.write_u64(rec_va + REC_ADDRESS, fault_addr).unwrap();
+    mem.write_u32(rec_va + REC_NUM_PARAMS, 2).unwrap();
+
+    let mut os =
+        WinOs::new(WinConfig { is_64bit: true, echo: false, teb_base: GS_BASE, ..WinConfig::default() });
+    let mut cpu = Interpreter::with_bits(Bits::B64);
+    seated(&mut cpu, code_va);
+    {
+        let s = cpu.state_mut();
+        s.set_reg(Reg::Rcx, rec_va); // ExceptionRecord
+        s.set_reg(Reg::Rdx, 0); // ContextRecord (unread on this path)
+        s.set_reg(Reg::R8, 0); // FirstChance = FALSE — the last resort
+    }
+
+    let mut exit = None;
+    for _ in 0..64 {
+        match cpu.step(&mut mem, &mut os).unwrap() {
+            Exit::Continue => continue,
+            other => {
+                exit = Some(other);
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        exit,
+        Some(Exit::ProcessExit(0xC000_0005u32 as i32)),
+        "a non-first-chance raise must END the process with the exception code, not return to \
+         the guest — returning is what ran KiUserExceptionDispatcher's int3 and started the loop",
+    );
+
+    let u = os.take_unhandled_exception().expect("the killing exception is recorded for the report");
+    assert_eq!(u.code, 0xC000_0005, "the report names the record's ExceptionCode");
+    assert_eq!(u.address, fault_addr, "…and its ExceptionAddress");
+    assert_eq!(u.how, exemu_os::UnhandledException::LAST_RESORT, "the guest asked for it itself");
+    assert!(os.take_unhandled_exception().is_none(), "taking it clears it");
+}
+
+/// A first-chance raise with no Wine `ntdll` mapped has no dispatcher to enter,
+/// so it answers `STATUS_NOT_IMPLEMENTED` rather than quietly claiming success —
+/// and it must **not** terminate the process. (The emulated corpus, which maps
+/// no Wine core, is on this branch.)
+#[test]
+fn first_chance_raise_without_a_dispatcher_is_refused_not_fatal() {
+    let code_va: u64 = 0x0000_0000_0040_0000;
+    let rec_va: u64 = 0x0000_0000_0050_0000;
+
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("stack", STACK_TOP - 0x10000, 0x10000, Perm::RW)).unwrap();
+    mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW)).unwrap();
+    mem.map(Region::new("code", code_va, 0x1000, Perm::RX)).unwrap();
+    mem.map(Region::new("rec", rec_va, 0x1000, Perm::RW)).unwrap();
+    // `syscall` then `hlt`, so a service that *returns* is observable.
+    let mut asm = syscall_stub(SSDT_NT_RAISE_EXCEPTION);
+    asm.push(0xF4);
+    mem.poke(code_va, &asm).unwrap();
+    mem.write_u32(rec_va + REC_CODE, 0xC000_0005).unwrap();
+
+    let mut os =
+        WinOs::new(WinConfig { is_64bit: true, echo: false, teb_base: GS_BASE, ..WinConfig::default() });
+    let mut cpu = Interpreter::with_bits(Bits::B64);
+    seated(&mut cpu, code_va);
+    {
+        let s = cpu.state_mut();
+        s.set_reg(Reg::Rcx, rec_va);
+        s.set_reg(Reg::R8, 1); // FirstChance = TRUE
+    }
+    let mut halted = false;
+    for _ in 0..64 {
+        match cpu.step(&mut mem, &mut os).unwrap() {
+            Exit::Continue => continue,
+            Exit::Halted => {
+                halted = true;
+                break;
+            }
+            other => panic!("a first-chance raise must not end the process: {other:?}"),
+        }
+    }
+    assert!(halted, "the service returned to its caller");
+    assert_eq!(cpu.state().reg(Reg::Rax), 0xC000_0002, "STATUS_NOT_IMPLEMENTED");
+    assert!(os.take_unhandled_exception().is_none(), "nothing was killed");
+}
+
+/// The re-delivery bound: the *same* exception, at the *same* instruction, with
+/// the guest never resuming, is a loop — and the exception it reports is the one
+/// that **opened** the chain, not whatever the dispatcher did afterwards.
+///
+/// This is the shape the 300M-instruction hang had: an access violation, then
+/// `STATUS_BREAKPOINT` at `ntdll+0x10a5b` for ever. Reporting the breakpoint
+/// would name the `int3` and hide the access violation that caused it.
+#[test]
+fn re_delivery_bound_reports_the_exception_that_opened_the_chain() {
+    let mut os =
+        WinOs::new(WinConfig { is_64bit: true, echo: false, teb_base: GS_BASE, ..WinConfig::default() });
+
+    // The original fault gets through.
+    os.note_exception_delivery(0xC000_0005, 0xDEAD, 0x1_4000_1000).expect("the first delivery");
+    // Then the dispatcher's int3, over and over, at one fixed rip.
+    let bp_rip = 0x6_0001_0A5A;
+    os.note_exception_delivery(0x8000_0003, bp_rip + 1, bp_rip).expect("a second exception is normal");
+    let mut more = 0;
+    let u = loop {
+        more += 1;
+        assert!(more < 64, "the bound must fire — that is the whole point");
+        match os.note_exception_delivery(0x8000_0003, bp_rip + 1, bp_rip) {
+            Ok(()) => continue,
+            Err(u) => break u,
+        }
+    };
+    assert_eq!(u.code, 0xC000_0005, "the ORIGINAL access violation, not the int3's STATUS_BREAKPOINT");
+    assert_eq!(u.address, 0xDEAD, "…at the address the guest actually faulted on");
+    assert_eq!(u.how, exemu_os::UnhandledException::RE_DELIVERY_BOUND);
+    assert_eq!(
+        os.take_unhandled_exception().map(|u| u.code),
+        Some(0xC000_0005),
+        "the run loop can pick it up to build the report",
+    );
+}
+
+/// **The mutation check on the bound**: a guest that keeps *handling* its
+/// exceptions is never bounded, however many it takes.
+///
+/// `NtContinue` is the reset, and it is the right one because every way a Wine
+/// guest successfully finishes with an exception goes through it —
+/// `dispatch_exception` calls it directly when a handler returned
+/// `STATUS_SUCCESS`, and a catch reached via `RtlUnwindEx` ends in
+/// `RtlRestoreContext`'s tail `jmp NtContinue` (both read off the pinned
+/// `ntdll.dll`). So this drives the **real** `NtContinue` syscall between
+/// deliveries, not a private reset hook: 200 identical faults at one address,
+/// each resumed, and the bound never fires — where three in a row without one
+/// does (the test above).
+#[test]
+fn a_guest_that_keeps_resuming_is_never_bounded() {
+    let code_va: u64 = 0x0000_0000_0040_0000;
+    let landing: u64 = 0x0000_0001_4000_1234;
+
+    let mut mem = VirtualMemory::new();
+    mem.map(Region::new("stack", STACK_TOP - 0x10000, 0x10000, Perm::RW)).unwrap();
+    mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW)).unwrap();
+    mem.map(Region::new("code", code_va, 0x1000, Perm::RX)).unwrap();
+    mem.map(Region::new("landing", landing & !0xfff, 0x1000, Perm::RX)).unwrap();
+    mem.poke(landing, &[0xF4]).unwrap(); // hlt where NtContinue resumes
+    mem.poke(code_va, &syscall_stub(SSDT_NT_CONTINUE)).unwrap();
+
+    let mut os =
+        WinOs::new(WinConfig { is_64bit: true, echo: false, teb_base: GS_BASE, ..WinConfig::default() });
+    let mut cpu = Interpreter::with_bits(Bits::B64);
+
+    for round in 0..200u32 {
+        // One fault, delivered.
+        os.note_exception_delivery(0xC000_0005, 0xDEAD, landing)
+            .unwrap_or_else(|u| panic!("round {round}: bounded a guest that keeps resuming ({u:?})"));
+        // The guest's handler resolves it: build the CONTEXT the bridge would
+        // have written, and hand it to a real `NtContinue`.
+        let mut faulted = CpuState::new();
+        faulted.rip = landing;
+        faulted.set_rsp(STACK_TOP - 0x1000);
+        os.deliver_hw_exception(&mut faulted, &mut mem, NTDLL_BASE,
+            Trap { code: 0xC000_0005, address: 0xDEAD, info: &[0, 0xDEAD], mode: TrapMode::Long })
+            .unwrap();
+        let frame = faulted.rsp();
+        seated(&mut cpu, code_va);
+        cpu.state_mut().set_reg(Reg::Rcx, frame);
+        loop {
+            match cpu.step(&mut mem, &mut os).unwrap() {
+                Exit::Continue => continue,
+                Exit::Halted => break,
+                other => panic!("round {round}: unexpected exit {other:?}"),
+            }
+        }
+        assert_eq!(cpu.state().rip, landing, "round {round}: NtContinue resumed the guest");
+    }
+    assert!(os.take_unhandled_exception().is_none(), "nothing was ever declared unhandled");
+}

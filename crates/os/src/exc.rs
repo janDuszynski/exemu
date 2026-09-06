@@ -112,6 +112,144 @@ pub(crate) const STATUS_CXX_EXCEPTION: u32 = 0xE06D_7363;
 /// faulting instruction re-executed (it fixed up the state).
 pub(crate) const EXCEPTION_CONTINUE_EXECUTION: u64 = 0;
 
+// ---- the last resort: an exception nothing handled (roadmap W5.12) ----------
+
+/// SSDT index of `NtRaiseException` (`ZwRaiseException`), recovered from the
+/// pinned guest `ntdll.dll` stub at RVA 0x10310, whose body is
+/// `mov r10,rcx; mov eax,0xcf; …; syscall` (the same U9 recovery every other
+/// index in this crate comes from).
+pub(crate) const SSDT_NT_RAISE_EXCEPTION: u32 = 0xCF;
+
+/// `STATUS_SUCCESS`, the NTSTATUS a service that never actually returns to its
+/// caller still has to hand the dispatcher.
+const STATUS_SUCCESS_NT: u32 = 0x0000_0000;
+/// `STATUS_NOT_IMPLEMENTED`, for a raise exemu genuinely cannot service.
+const STATUS_NOT_IMPLEMENTED_NT: u32 = 0xC000_0002;
+
+/// SSDT thunk: `NtRaiseException(ExceptionRecord, ContextRecord, FirstChance)`.
+pub(crate) fn ssdt_nt_raise_exception(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    os.nt_raise_exception(cpu, mem)
+}
+
+/// An exception the guest could not handle, on its way to killing the process.
+///
+/// This is the *original* exception — the access violation, not whatever the
+/// guest's dispatcher did afterwards while giving up on it. Naming the original
+/// is the whole point: Wine's `KiUserExceptionDispatcher` executes an `int3`
+/// when `dispatch_exception` returns, and reporting *that* `STATUS_BREAKPOINT`
+/// tells a reader nothing about why the process died.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnhandledException {
+    /// `EXCEPTION_RECORD.ExceptionCode` of the original exception.
+    pub code: u32,
+    /// `EXCEPTION_RECORD.ExceptionAddress` of the original exception.
+    pub address: u64,
+    /// How exemu established that nothing handled it — the sentence a fault
+    /// report appends so the reader knows whether the guest said so itself
+    /// (the last-resort syscall) or exemu had to bound a loop.
+    pub how: &'static str,
+}
+
+impl UnhandledException {
+    /// The guest's own last-resort path: its `dispatch_exception` found no
+    /// handler and asked the kernel to finish the process off, exactly as a
+    /// real NT kernel is asked to.
+    pub const LAST_RESORT: &'static str =
+        "the guest's own exception dispatcher found no handler and asked the kernel to \
+         terminate the process (NtRaiseException, FirstChance = FALSE)";
+    /// exemu bounded a re-delivery loop: the same exception kept coming back at
+    /// the same instruction with no `NtContinue` in between.
+    pub const RE_DELIVERY_BOUND: &'static str =
+        "exemu stopped re-delivering it: the guest never resumed from it, so nothing \
+         handled it";
+}
+
+/// The chain of exceptions the guest is currently failing to resolve, and the
+/// bound that stops exemu re-delivering one for ever (roadmap W5.12).
+///
+/// **Why a bound exists at all.** Wine's `KiUserExceptionDispatcher`
+/// (`ntdll` RVA 0x10a30) ends `call dispatch_exception; int3` — the `int3` at
+/// RVA 0x10a5a is unreachable in a working system, because every exit from
+/// `dispatch_exception` is a no-return call: `NtContinue` when a handler
+/// resolved it, `RtlRaiseStatus` on an error status, and a tail
+/// `jmp NtRaiseException(rec, ctx, FirstChance = FALSE)` on
+/// `STATUS_UNHANDLED_EXCEPTION`. When exemu answered that last syscall with
+/// `STATUS_NOT_IMPLEMENTED` the call *returned*, the `int3` executed, exemu
+/// delivered the resulting `STATUS_BREAKPOINT` to the same dispatcher, and the
+/// process span for ever — measured as one `0xC0000005` followed by
+/// `0x80000003 at ntdll+0x10a5b` without end. [`WinOs::nt_raise_exception`]
+/// fixes the cause; this bounds every other shape of the same loop.
+///
+/// **Why `NtContinue` is the reset.** Every way a Wine guest *successfully*
+/// finishes with an exception passes through it: `dispatch_exception` calls
+/// `NtContinue` directly when a handler returned `STATUS_SUCCESS`, and a catch
+/// reached through `RtlUnwindEx` → `RtlRestoreContext` ends in a tail
+/// `jmp NtContinue` (both read off the pinned `ntdll.dll`). So "deliveries
+/// since the last `NtContinue`" is exactly "exceptions the guest has not got
+/// out from under", and a guest that handles a million exceptions never
+/// approaches the bound.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ExcChain {
+    /// The exception that opened the still-unresolved chain — what a fault
+    /// report must name.
+    first: Option<(u32, u64)>,
+    /// The most recent `(code, address, faulting rip)` delivered.
+    last: Option<(u32, u64, u64)>,
+    /// How many times in a row that exact triple has been delivered.
+    repeats: u32,
+    /// Deliveries in this chain, of any shape.
+    depth: u32,
+}
+
+/// How many times the *identical* `(code, address, rip)` may be delivered
+/// before exemu calls it a loop. Two is a legal retry (a handler that fixed the
+/// state up and let the instruction fault again once); a third with nothing
+/// resumed in between is not progress.
+const MAX_IDENTICAL_DELIVERIES: u32 = 3;
+
+/// How many exceptions of *any* shape may be delivered without one `NtContinue`
+/// in between. This catches a loop that alternates between two or more faults,
+/// which the identical-triple counter alone cannot see. Deliberately far above
+/// anything a working dispatch does: a resolved exception resets the chain, so
+/// this only counts exceptions the guest never got out from under.
+const MAX_CHAIN_DELIVERIES: u32 = 32;
+
+impl ExcChain {
+    /// Record one delivery. Returns `Some(UnhandledException)` — naming the
+    /// exception that *opened* the chain — when the bound says the guest is
+    /// never going to handle this.
+    fn note_delivery(&mut self, code: u32, address: u64, rip: u64) -> Option<UnhandledException> {
+        if self.first.is_none() {
+            self.first = Some((code, address));
+        }
+        if self.last == Some((code, address, rip)) {
+            self.repeats += 1;
+        } else {
+            self.last = Some((code, address, rip));
+            self.repeats = 1;
+        }
+        self.depth += 1;
+        if self.repeats >= MAX_IDENTICAL_DELIVERIES || self.depth > MAX_CHAIN_DELIVERIES {
+            let (code, address) = self.first.unwrap_or((code, address));
+            return Some(UnhandledException {
+                code,
+                address,
+                how: UnhandledException::RE_DELIVERY_BOUND,
+            });
+        }
+        None
+    }
+
+    /// The guest resumed (`NtContinue`): whatever was being dispatched is over.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Write an `EXCEPTION_RECORD` at `addr`. `params` are the
 /// `ExceptionInformation` slots (truncated to 15).
 pub(crate) fn write_exception_record(
@@ -691,6 +829,143 @@ impl WinOs {
         cpu.set_rsp(new_rsp);
         cpu.rip = ntdll_base + RVA_KI_USER_EXCEPTION_DISPATCHER;
         Ok(())
+    }
+
+    /// Record that `(code, address)` is being delivered to the guest's
+    /// dispatcher from `rip`, and say whether the delivery may go ahead.
+    ///
+    /// `Ok(())` — deliver it. `Err(UnhandledException)` — the re-delivery bound
+    /// says the guest is never going to handle this one; the caller must stop
+    /// the process and report the returned (original) exception. See
+    /// [`ExcChain`] for what the bound is and why `NtContinue` resets it.
+    pub fn note_exception_delivery(
+        &mut self,
+        code: u32,
+        address: u64,
+        rip: u64,
+    ) -> std::result::Result<(), UnhandledException> {
+        match self.exc_chain.note_delivery(code, address, rip) {
+            Some(u) => {
+                self.unhandled_exception = Some(u.clone());
+                Err(u)
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// The guest resumed out of an exception (`NtContinue`): the dispatch chain
+    /// is resolved, so the re-delivery bound starts again from zero.
+    pub(crate) fn note_exception_resumed(&mut self) {
+        self.exc_chain.clear();
+    }
+
+    /// Take the exception that killed the process, if one did. Set either by
+    /// the guest's own last-resort [`WinOs::nt_raise_exception`] or by the
+    /// re-delivery bound; the run loop turns it into a fault report naming the
+    /// *original* exception instead of a bare exit status.
+    pub fn take_unhandled_exception(&mut self) -> Option<UnhandledException> {
+        self.unhandled_exception.take()
+    }
+
+    /// `NtRaiseException(ExceptionRecord = R10, ContextRecord = RDX,
+    /// FirstChance = R8)` (roadmap W5.12) — the syscall the guest's own
+    /// exception dispatcher hands an exception back to the kernel through.
+    ///
+    /// Recovered from the pinned Wine 11.0 `ntdll.dll`, which reaches it from
+    /// exactly two places:
+    ///
+    /// ```text
+    ///   dispatch_exception (rva 0x479b0), tail:
+    ///     call call_function_handlers          ; walk the guest's frames
+    ///     STATUS_SUCCESS               -> call NtContinue(ctx, FALSE)      (no return)
+    ///     STATUS_UNHANDLED_EXCEPTION   -> jmp  NtRaiseException(rec, ctx, FALSE)
+    ///     anything else                -> call RtlRaiseStatus(status)      (no return)
+    ///
+    ///   RtlRaiseException (rva 0x10b84):
+    ///     if (!PEB->BeingDebugged) call dispatch_exception(rec, ctx)
+    ///     call NtRaiseException(rec, ctx, TRUE)
+    ///     call RtlRaiseStatus(status)
+    /// ```
+    ///
+    /// **`FirstChance = FALSE` must not return.** It is the last resort: the
+    /// frame walk found nothing, and in NT the kernel ends the process with the
+    /// exception code (Wine's unix side does the same, after its
+    /// `err:seh:` report). exemu ends the run the same way, and remembers the
+    /// record so the fault reporter names the *original* exception.
+    ///
+    /// Letting it return is what made an unhandled fault spin for ever:
+    /// `KiUserExceptionDispatcher` is `call dispatch_exception; int3`, so the
+    /// return runs the `int3` at rva 0x10a5a, exemu delivered the resulting
+    /// `STATUS_BREAKPOINT` to the same dispatcher, and around it went.
+    ///
+    /// **`FirstChance = TRUE`** is a request to re-enter user mode at
+    /// `KiUserExceptionDispatcher` with this record and context — so restore the
+    /// context the caller captured and build the dispatcher frame on it, which
+    /// is precisely [`WinOs::deliver_hw_exception`]. Like `NtContinue` it does
+    /// not return to its caller, so the dispatcher's phase-4 restore is skipped.
+    pub(crate) fn nt_raise_exception(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+    ) -> Result<u32> {
+        const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+        let rec = self.syscall_arg(cpu, mem, 0)?;
+        let ctx = self.syscall_arg(cpu, mem, 1)?;
+        let first_chance = self.syscall_arg(cpu, mem, 2)? & 0xff != 0;
+        if rec == 0 {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        let (Ok(code), Ok(address)) = (mem.read_u32(rec + ER_CODE), mem.read_u64(rec + ER_ADDRESS))
+        else {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        };
+
+        if !first_chance {
+            // The guest gave up on it. Terminate with the exception code — what
+            // NT does — and keep the record for the fault report.
+            self.unhandled_exception = Some(UnhandledException {
+                code,
+                address,
+                how: UnhandledException::LAST_RESORT,
+            });
+            self.exc_chain.clear();
+            self.pending_syscall_exit = Some(code as i32);
+            return Ok(STATUS_SUCCESS_NT);
+        }
+
+        // First chance: re-enter user mode at the dispatcher with this record.
+        let Some(ntdll) = self.module_base("ntdll.dll") else {
+            // No Wine ntdll is mapped, so there is no dispatcher to enter. Say
+            // so rather than pretending the exception was raised.
+            return Ok(STATUS_NOT_IMPLEMENTED_NT);
+        };
+        let nparams = mem.read_u32(rec + ER_NUM_PARAMS).unwrap_or(0).min(15) as u64;
+        let mut info = Vec::with_capacity(nparams as usize);
+        for i in 0..nparams {
+            info.push(mem.read_u64(rec + ER_INFO + i * 8).unwrap_or(0));
+        }
+        // Restore the context the raiser captured, the way NtContinue does:
+        // the architectural registers only, so this thread's segment bases
+        // (which no CONTEXT carries) keep pointing at its own TEB.
+        if ctx != 0 {
+            if let Ok(restored) = read_context(mem, ctx) {
+                cpu.gpr = restored.gpr;
+                cpu.xmm = restored.xmm;
+                cpu.rip = restored.rip;
+                cpu.rflags = restored.rflags;
+            }
+        }
+        if let Err(u) = self.note_exception_delivery(code, address, cpu.rip) {
+            self.pending_syscall_exit = Some(u.code as i32);
+            return Ok(STATUS_SUCCESS_NT);
+        }
+        let trap = Trap { code, address, info: &info, mode: TrapMode::Long };
+        if self.deliver_hw_exception(cpu, mem, ntdll, trap).is_err() {
+            return Ok(STATUS_ACCESS_VIOLATION);
+        }
+        // Resume where the frame put us, not where the syscall came from.
+        self.syscall_resume_as_is = true;
+        Ok(STATUS_SUCCESS_NT)
     }
 
     /// Allocate the five guest buffers a dispatch needs (record, orig/work/

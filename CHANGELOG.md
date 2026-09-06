@@ -23,9 +23,53 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 1024, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1031, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### An exception nothing handles ends the process, instead of spinning (W5.12)
+- **An unhandled guest fault used to run for ever** — measured as one
+  `0xC0000005`, then `0x80000003` at `ntdll+0x10a5b` without end until the step
+  budget. The cost was not the hang itself but what it did to every other change:
+  anything that let a guest reach a *new* fault turned a clean stop into a
+  300M-instruction one, and a GDI change was once bisected out for a hang that
+  had nothing to do with GDI.
+- The cause was one unserviced syscall. Wine's `KiUserExceptionDispatcher` is
+  `call dispatch_exception; int3`, and that `int3` is unreachable in a working
+  system because `dispatch_exception` never returns: it tail-calls
+  `NtRaiseException(rec, ctx, FirstChance = FALSE)` when nothing handled the
+  exception. exemu answered that with `STATUS_NOT_IMPLEMENTED`, so the call
+  returned, the `int3` ran, and exemu delivered the resulting `STATUS_BREAKPOINT`
+  back to the same dispatcher.
+- `NtRaiseException` is now serviced. A last-resort raise **ends the process with
+  the exception code**, which is what the NT kernel does — and exemu ends the run
+  through its fault reporter, naming the *original* exception with its module
+  attribution and rip trail rather than the `int3` that followed it. Behind that,
+  a bound on re-delivery keyed on `NtContinue`, so no other shape of the same
+  loop can come back.
+
+### Wine can read a directory: `FILE_BOTH_DIR_INFORMATION.FileName` is at +0x5E (W6.1)
+- **Every filename Wine read back from `NtQueryDirectoryFile` was empty.** The
+  field follows `ShortName[12]` at 0x46 and so begins at 0x5E; `sizeof` is 0x60
+  only because the struct is padded past its trailing `WCHAR FileName[1]`.
+- **`FileInformationClass` was ignored outright.** Wine's own `FindFirstFileW`
+  asks for `FileIdExtdBothDirectoryInformation`, whose name is at 0x72, and got
+  the other class's layout. Both are now written in their own shape and anything
+  else is refused rather than answered with a struct of the wrong kind. A third
+  bug behind those: `Length`, `FileInformationClass` and `RestartScan` are 32-bit
+  parameters in 8-byte stack slots, and exemu was reading the caller's stale
+  upper halves along with them.
+- What that turns on: **a real start-menu shortcut now records its shell-namespace
+  target**. `IShellLink::SetPath` builds the `.lnk`'s PIDL by walking the
+  namespace, which enumerates every directory on the way down — impossible while
+  the names came back empty. Wine's shell32 now writes a shortcut carrying
+  `C:\` → `windows` → `system32` → `notepad.exe`.
+
+### A WoW64 process's section views are 32-bit addressable (W5.7)
+- `wow64.dll` narrows the base `NtMapViewOfSection` returns into the 32-bit
+  guest's pointer cell **without checking**, so a view placed above 4 GiB is not
+  refused — it is truncated into a pointer to nothing and the guest faults
+  somewhere else entirely on its first read. Image views and the NLS blob already
+  allowed for that; ordinary file views did not.
 ### The JIT's memory cache stops skipping the last page of every region (W8.6)
 - **A guest access cache entry used to need its page *plus seven bytes*** — the
   reach of an 8-byte access at the page's last byte — so that the emitted check

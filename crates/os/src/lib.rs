@@ -58,7 +58,9 @@ use exemu_core::{CpuState, Exit, Hooks, ImportSymbol, Memory, Reg, Result};
 pub use api::Api;
 pub use apiset::{api_set_hash, build_populated_namespace, ApiSetNamespace, HASH_FACTOR};
 pub use boot::{RVA_LDR_INITIALIZE_THUNK, RVA_RTL_USER_THREAD_START, RVA_WINE_UNIX_CALL_DISPATCHER};
-pub use exc::{Trap, TrapMode, EXC_FRAME_BYTES, RVA_KI_USER_EXCEPTION_DISPATCHER};
+pub use exc::{
+    Trap, TrapMode, UnhandledException, EXC_FRAME_BYTES, RVA_KI_USER_EXCEPTION_DISPATCHER,
+};
 pub use syscall::SyscallHandler;
 pub use sync::{SignalOp, SyncKind};
 pub use unixlib::{UnixEntry, Unixlib};
@@ -464,6 +466,17 @@ pub struct WinOs {
     /// returning to guest code (roadmap W0.7).
     pending_process_exit: Option<i32>,
 
+    /// The exception the guest is currently failing to resolve, and the bound
+    /// that stops exemu re-delivering it for ever (roadmap W5.12). Reset by
+    /// `NtContinue` — see [`crate::exc::ExcChain`].
+    exc_chain: exc::ExcChain,
+
+    /// Set when an exception nothing handled ended the process: either the
+    /// guest's own last-resort `NtRaiseException(…, FirstChance = FALSE)` or
+    /// exemu's re-delivery bound. The run loop turns it into a fault report
+    /// naming the ORIGINAL exception rather than a bare exit status.
+    unhandled_exception: Option<exc::UnhandledException>,
+
     /// Set by `NtTerminateProcess` on the current process (roadmap W3.2): the
     /// syscall dispatcher observes it after the handler returns and yields
     /// `Exit::ProcessExit(code)` to the run loop instead of returning the
@@ -631,6 +644,8 @@ impl WinOs {
             unix_call_wow64: false,
             pending_process_exit: None,
             pending_syscall_exit: None,
+            exc_chain: exc::ExcChain::default(),
+            unhandled_exception: None,
             children: Vec::new(),
             next_pid: FIRST_CHILD_PROCESS_ID,
             spawner: Box::new(exemu_core::NoSpawner),
@@ -814,6 +829,11 @@ impl WinOs {
         // ends in. Index recovered from the pinned guest ntdll stub (`ZwContinue`
         // @ RVA 0xf190, `mov eax,0x43`). See [`crate::boot`].
         os.set_syscall_handler(boot::SSDT_NT_CONTINUE, boot::ssdt_nt_continue);
+        // NtRaiseException (roadmap W5.12): the guest's own dispatcher hands an
+        // exception back to the kernel through this. FirstChance = FALSE is the
+        // last resort and terminates the process with the exception — leaving it
+        // unserviced is what made an unhandled fault spin for ever.
+        os.set_syscall_handler(exc::SSDT_NT_RAISE_EXCEPTION, exc::ssdt_nt_raise_exception);
         // win32k (USER/GDI) skeleton (roadmap W4.1): the second SSDT table,
         // reached only via a guest win32u `SYSCALL` (index carries the `0x1000`
         // bit). The emulated corpus never issues these, so registering them is

@@ -486,13 +486,18 @@ pub struct Process {
     /// Image base, kept for virtual unwinding in the fault reporter (the
     /// unwind table itself is owned by the OS layer — see `os.unwind_table`).
     image_base: u64,
-    /// Nesting depth of the hardware→software exception bridge (roadmap W3.3):
-    /// how many guest faults are currently being dispatched through
-    /// `KiUserExceptionDispatcher` without an intervening `NtContinue`. A fault
-    /// that occurs while already inside the dispatcher (a corrupt/double fault)
-    /// must NOT be re-delivered forever — past a small bound the bridge gives up
-    /// and falls through to the fault reporter. Reset to 0 whenever `NtContinue`
-    /// resumes the guest (a handled exception).
+    /// How many faults have been delivered **without the guest getting off the
+    /// dispatcher's entry instruction** (roadmap W3.3). A fault that recurs
+    /// right there is a double fault that can never make progress, so past a
+    /// small bound the bridge gives up and falls through to the fault reporter.
+    /// Reset the moment the guest executes anything *other* than the dispatcher
+    /// entry — which is also why this alone cannot bound a
+    /// fault→dispatcher→`int3`→fault loop: that loop does make progress every
+    /// lap. The bound that catches *that* is the OS-side chain, keyed on
+    /// `NtContinue` (roadmap W5.12, `exemu_os::WinOs::note_exception_delivery`).
+    ///
+    /// It also gates JIT block chaining: nonzero means the run loop is
+    /// inspecting the rip of every block it enters, so chaining is off.
     exc_depth: u32,
     /// The WoW64 process model, when this is a 32-bit guest on Wine's 64-bit PE
     /// set (roadmap W5.4). `None` on every other path.
@@ -1526,7 +1531,16 @@ impl Process {
                         self.exc_depth = 0;
                     }
                 }
-                Ok(Exit::ProcessExit(code)) => break code,
+                Ok(Exit::ProcessExit(code)) => {
+                    // A process the kernel ended *because of an exception* is not
+                    // a clean exit, even though NT gives it the exception code as
+                    // its exit status (roadmap W5.12). Report it.
+                    if let Some(u) = self.os.take_unhandled_exception() {
+                        let t = self.rip_trail(&recent);
+                        return Err(self.unhandled_fault(debugging, u, steps, &t));
+                    }
+                    break code;
+                }
                 Ok(Exit::Halted) => break 0,
                 Ok(Exit::Interrupt(n)) => {
                     // Hardware→software exception bridge (roadmap W3.3): on the
@@ -1536,6 +1550,9 @@ impl Process {
                     let t = tail();
                     if self.try_deliver_hw_exception(ExcSource::Interrupt(n), steps, &t)? {
                         continue;
+                    }
+                    if let Some(u) = self.os.take_unhandled_exception() {
+                        return Err(self.unhandled_fault(debugging, u, steps, &t));
                     }
                     let e = EmuError::Os(format!("unhandled interrupt {n:#x}"));
                     return Err(self.fault_debugged(debugging, e, steps, &t));
@@ -1552,6 +1569,9 @@ impl Process {
                     let t = tail();
                     if self.try_deliver_hw_exception(ExcSource::Error(&e), steps, &t)? {
                         continue;
+                    }
+                    if let Some(u) = self.os.take_unhandled_exception() {
+                        return Err(self.unhandled_fault(debugging, u, steps, &t));
                     }
                     return Err(self.fault_debugged(debugging, e, steps, &t));
                 }
@@ -1829,6 +1849,36 @@ impl Process {
         err
     }
 
+    /// The run ends because the guest hit an exception nothing handled
+    /// (roadmap W5.12).
+    ///
+    /// A real NT process dies here with the exception code as its exit status
+    /// and no further explanation. exemu is a debugging tool as well as a
+    /// runtime, so it ends the run through the fault reporter instead — the
+    /// module-attributed rip, the bytes there and the rip trail are exactly what
+    /// makes an access violation inside Wine's own code diagnosable.
+    ///
+    /// The exception named is the one that *opened* the dispatch, recovered from
+    /// the `EXCEPTION_RECORD` the guest's own dispatcher handed back to the
+    /// kernel. That matters: the last thing to happen before this is Wine's
+    /// `KiUserExceptionDispatcher` executing its `int3`, and reporting that
+    /// `STATUS_BREAKPOINT` at `ntdll+0x10a5b` says nothing about why the process
+    /// died.
+    fn unhandled_fault(
+        &mut self,
+        debugging: bool,
+        u: exemu_os::UnhandledException,
+        steps: u64,
+        recent: &[u64],
+    ) -> EmuError {
+        let exemu_os::UnhandledException { code, address, how } = u;
+        let e = EmuError::Os(format!(
+            "unhandled guest exception {code:#010x} at {} — {how}",
+            self.addr_note(address)
+        ));
+        self.fault_debugged(debugging, e, steps, recent)
+    }
+
     /// Disarm everything, so a detached run costs the attached-but-unarmed
     /// minimum on the memory hot path and no stop can fire after the front-end
     /// has stopped listening.
@@ -1934,6 +1984,19 @@ impl Process {
             // Any other interrupt vector (int n, #GP synthesis, …) isn't bridged.
             ExcSource::Interrupt(_) => return Ok(false),
         };
+
+        // Re-delivery bound (roadmap W5.12). The guard above only sees a fault
+        // that recurs *at the dispatcher entry*; the loop that actually cost 300M
+        // instructions made forward progress every time round — fault →
+        // dispatcher → `int3` at ntdll+0x10a5a → #BP → dispatcher → … — so its
+        // depth reset on every lap. The OS-side chain counts deliveries between
+        // `NtContinue`s instead, which is exactly "exceptions the guest has not
+        // got out from under". Hitting it means nothing is going to handle this:
+        // stop bridging and let the fault reporter name the exception that
+        // *opened* the chain (the access violation, not the `int3` after it).
+        if self.os.note_exception_delivery(code, address, cpu.rip).is_err() {
+            return Ok(false);
+        }
 
         // Two levels of fault visibility, because a bridged exception is
         // *delivered to the guest* and so the emulator normally says nothing —

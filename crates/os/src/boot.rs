@@ -111,6 +111,13 @@ impl WinOs {
         cpu.xmm = restored.xmm;
         cpu.rip = restored.rip;
         cpu.rflags = restored.rflags;
+        // The guest is resuming, so whatever exception was being dispatched is
+        // resolved: the re-delivery bound starts again from zero (roadmap
+        // W5.12). Every successful end of a Wine dispatch passes through here —
+        // `dispatch_exception` calls NtContinue directly when a handler returned
+        // STATUS_SUCCESS, and a catch reached via RtlUnwindEx gets here through
+        // RtlRestoreContext's tail `jmp NtContinue`.
+        self.note_exception_resumed();
         // Skip the dispatcher's restore/return: resume the guest as we left it,
         // on CONTEXT.Rip / CONTEXT.Rsp (already loaded via gpr[Rsp]).
         self.syscall_resume_as_is = true;

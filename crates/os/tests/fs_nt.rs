@@ -239,6 +239,29 @@ fn nt_create_write_readback_and_queries() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Byte offset of `FILE_BOTH_DIR_INFORMATION.FileName` (class 3).
+///
+/// **0x5E, not 0x60.** The field follows `ShortName[12]` at 0x46, so it starts
+/// at 0x46 + 0x18 = 0x5E; `sizeof(FILE_BOTH_DIR_INFORMATION)` is 0x60 only
+/// because the struct is padded past its trailing `WCHAR FileName[1]`. This test
+/// asserted 0x60 and so agreed with the writer's identical mistake — every name
+/// Wine read back was empty, and `ntdll!lookup_winsxs`'s
+/// `*wcsrchr(file,'.') = 0` wrote through the NULL that came of it.
+///
+/// The number is recovered from the pinned prefix's own consumer, both halves:
+/// `ntdll` 64-bit `lea r14,[r15+0x5e]` (rva 0x55e6e) and 32-bit
+/// `lea ebx,[esi+0x5e]` (rva 0x53f67), each walking the buffer it just asked
+/// `NtQueryDirectoryFile` for with class 3.
+const BOTH_DIR_FILE_NAME: u64 = 0x5E;
+
+/// Byte offset of `FILE_ID_EXTD_BOTH_DIR_INFORMATION.FileName` (class 0x3F) —
+/// the class Wine's own `FindFirstFileW`/`FindNextFileW` request. `ShortName`
+/// sits at 0x5A after a 16-byte `FILE_ID_128` at 0x48, so the name starts at
+/// 0x5A + 0x18 = 0x72. Recovered from `kernelbase!FindNextFileW` (rva 0x1fa90),
+/// which passes class `0x3f` and then compares `[r14+0x72]`/`[r14+0x74]`
+/// against `'.'` for the dot-entry skip.
+const ID_EXTD_BOTH_DIR_FILE_NAME: u64 = 0x72;
+
 /// NtQueryDirectoryFile enumerates the sandbox directory the handle opened.
 #[test]
 fn nt_query_directory_enumerates() {
@@ -267,27 +290,57 @@ fn nt_query_directory_enumerates() {
     let handle = mem.read_u64(handle_ptr).unwrap();
 
     // Enumerate: two files, sorted. name_ptr=0 (no wildcard → "*"), restart=1.
-    let mut names = Vec::new();
-    for i in 0..3 {
-        let restart = if i == 0 { 1 } else { 0 };
-        let st = syscall(
-            &mut os,
-            &mut mem,
-            NT_QUERY_DIRECTORY_FILE,
-            &[handle, 0, 0, 0, iosb_ptr, info_ptr, 0x200, 3, 0, 0, restart],
-        );
-        if st == STATUS_NO_MORE_FILES {
-            break;
+    // Both classes are driven over the same directory, so the name offset is the
+    // only thing that differs — and each is read at the offset the *pinned Wine
+    // consumer of that class* reads it at, not at the one exemu writes.
+    for (class, name_off) in
+        [(3u64, BOTH_DIR_FILE_NAME), (0x3F, ID_EXTD_BOTH_DIR_FILE_NAME)]
+    {
+        let mut names = Vec::new();
+        let mut lengths = Vec::new();
+        for i in 0..3 {
+            let restart = if i == 0 { 1 } else { 0 };
+            // Poison the whole entry first: a name read out of a buffer that was
+            // never written would otherwise pass as an empty string, which is
+            // exactly how the +0x60 bug hid.
+            mem.write(info_ptr, &[0xCCu8; 0x200]).unwrap();
+            let st = syscall(
+                &mut os,
+                &mut mem,
+                NT_QUERY_DIRECTORY_FILE,
+                &[handle, 0, 0, 0, iosb_ptr, info_ptr, 0x200, class, 0, 0, restart],
+            );
+            if st == STATUS_NO_MORE_FILES {
+                break;
+            }
+            assert_eq!(st, STATUS_SUCCESS, "NtQueryDirectoryFile class {class:#x} entry {i}");
+            let name_len = mem.read_u32(info_ptr + 0x3C).unwrap() as u64;
+            let mut units = Vec::new();
+            for j in 0..name_len / 2 {
+                units.push(mem.read_u16(info_ptr + name_off + j * 2).unwrap());
+            }
+            names.push(String::from_utf16_lossy(&units));
+            // The IOSB reports what was written: the fixed part UP TO the name
+            // plus the name, never the padded `sizeof`.
+            lengths.push((mem.read_u64(iosb_ptr + 8).unwrap(), name_off + name_len));
         }
-        assert_eq!(st, STATUS_SUCCESS, "NtQueryDirectoryFile entry {i}");
-        let name_len = mem.read_u32(info_ptr + 0x3C).unwrap() as usize;
-        let mut units = Vec::new();
-        for j in 0..name_len / 2 {
-            units.push(mem.read_u16(info_ptr + 0x60 + (j as u64) * 2).unwrap());
+        assert_eq!(names, vec!["a.txt", "b.txt"], "class {class:#x}: both files, in order");
+        for (reported, expected) in lengths {
+            assert_eq!(reported, expected, "class {class:#x}: IOSB.Information = name_off + name");
         }
-        names.push(String::from_utf16_lossy(&units));
     }
-    assert_eq!(names, vec!["a.txt", "b.txt"], "both files enumerated in order");
+
+    // A class exemu does not implement is refused, not answered in some other
+    // class's layout. FileNamesInformation (0xC) is a real class with a
+    // completely different shape — silently writing class 3 over it would hand
+    // the guest a name at an offset it never reads.
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_QUERY_DIRECTORY_FILE,
+        &[handle, 0, 0, 0, iosb_ptr, info_ptr, 0x200, 0xC, 0, 0, 1],
+    );
+    assert_eq!(st, 0xC000_0003, "an unimplemented class is STATUS_INVALID_INFO_CLASS");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
