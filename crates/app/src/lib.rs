@@ -1014,6 +1014,19 @@ impl Process {
             })?;
             os.set_client_callback_dispatcher(dispatcher);
 
+            // …and the pair a fresh 32-bit thread is seated on (roadmap W5.11).
+            // The same two entry points `seat_wine_loader` uses for the initial
+            // thread: exemu does per thread exactly what it does for that one.
+            os.set_wow64_threading(exemu_os::wow64::Wow64Threading {
+                ldrp_initialize: boot.wow64.export("Wow64LdrpInitialize").ok_or_else(|| {
+                    EmuError::Os("WoW64 boot: wow64.dll does not export Wow64LdrpInitialize".into())
+                })?,
+                rtl_user_thread_start32: boot
+                    .ntdll32
+                    .export("RtlUserThreadStart")
+                    .ok_or_else(|| EmuError::Os("WoW64 boot: ntdll32 exports no RtlUserThreadStart".into()))?,
+            });
+
             // The 32-bit ntdll's own unixlib handle (roadmap W5.3). A 32-bit
             // `__wine_unix_call` reaches the *same* 64-bit dispatcher as a
             // 64-bit one — `wow64cpu`'s BOP handler (rva 0x1255) just
@@ -1183,6 +1196,13 @@ impl Process {
             }
 
             let step_rip = self.cpu.state().rip;
+            // The CPU's *mode* is not part of `CpuState`, so a thread switch
+            // inside the OS layer cannot save or restore it on its own (roadmap
+            // W5.11). Publish it here — once per step or per JIT chain, never
+            // per instruction — and apply whatever mode a switch asks for below.
+            // In a WoW64 process the two threads genuinely differ: one can be
+            // mid-32-bit-guest while the other is inside Wine's 64-bit thunks.
+            self.os.set_guest_mode32(self.cpu.bits() == Bits::B32);
             // --- The block JIT (roadmap W8), when it is switched on --------
             //
             // A compiled block runs many guest instructions per call, so
@@ -1249,6 +1269,7 @@ impl Process {
                         self.cpu.state_mut(),
                         &mut self.mem,
                     )?;
+                    self.apply_thread_mode_switch();
                     if refresh_kuser && steps >= next_kuser_refresh {
                         refresh_kuser_time(&mut self.mem, &self.clock)?;
                         next_kuser_refresh =
@@ -1268,6 +1289,7 @@ impl Process {
                 }
             }
             let outcome = self.cpu.step(&mut self.mem, &mut self.os);
+            self.apply_thread_mode_switch();
             let tail = || self.rip_trail(&recent);
             match outcome {
                 Ok(Exit::Continue) => {
@@ -1510,6 +1532,19 @@ impl Process {
         }
         self.exc_depth += 1;
         Ok(true)
+    }
+
+    /// Put the CPU in the mode the thread the scheduler just switched to was
+    /// saved in (roadmap W5.11). A no-op whenever no switch happened.
+    ///
+    /// Without it the incoming thread runs the outgoing one's mode, and in a
+    /// WoW64 process that is fatal in one instruction: a fresh 32-bit thread's
+    /// entry is `wow64!Wow64LdrpInitialize` at `0x7_0000_2ce0`, which a 32-bit
+    /// CPU truncates to `0x2ce0` and executes as zeroes.
+    fn apply_thread_mode_switch(&mut self) {
+        if let Some(mode32) = self.os.take_thread_mode_switch() {
+            self.cpu.set_bits(if mode32 { Bits::B32 } else { Bits::B64 });
+        }
     }
 
     /// Wrap a fault with a diagnostic snapshot: the faulting instruction

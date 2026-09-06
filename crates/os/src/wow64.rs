@@ -397,6 +397,23 @@ pub struct Start32 {
     pub ebx: u32,
 }
 
+/// The two entry points a fresh **WoW64 thread** is seated on (roadmap W5.11).
+///
+/// A 32-bit thread is a *64-bit* thread that starts in
+/// `wow64!Wow64LdrpInitialize` — three calls: the process-init once-block
+/// (already run), its own per-thread init, then `for(;;) BTCpuSimulate()` —
+/// with its 32-bit register file coming out of a CPU-reserved area the kernel
+/// seeded. The 32-bit half of that seed is `ntdll32!RtlUserThreadStart`, whose
+/// three instructions define the i386 convention (`Eax` = entry, `Ebx` = arg).
+#[derive(Debug, Clone, Copy)]
+pub struct Wow64Threading {
+    /// `wow64!Wow64LdrpInitialize` — the 64-bit `Rip` a fresh WoW64 thread
+    /// starts on.
+    pub ldrp_initialize: u64,
+    /// `ntdll32!RtlUserThreadStart` — its 32-bit `Eip`.
+    pub rtl_user_thread_start32: u64,
+}
+
 /// Lay out the WoW64 CPU-reserved area for a fresh 32-bit guest thread (roadmap
 /// W5.4): publish the area pointer at `teb_base + 0x1488`, clear the machine-type
 /// header (so `BTCpuSimulate` takes the fast forward path), and seed the

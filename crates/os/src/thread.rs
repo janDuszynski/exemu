@@ -46,6 +46,16 @@ const TIMESLICE: u64 = 50_000; // instructions between preemptive yields
 /// +0x1ec0 regardless: `frame_base` uses the fixed `TEB_REGION_SIZE`, not this.)
 const THREAD_TEB_SIZE: u64 = 0x4000;
 
+/// A **WoW64** thread's own block: `TEB64` (`THREAD_TEB_SIZE`), then `TEB32`,
+/// then its CPU-reserved area — one sub-4 GiB mapping, so `TEB64.WowTebOffset`
+/// (a *signed 32-bit* delta) reaches the TEB32 and 32-bit code can hold it
+/// (roadmap W5.11).
+const WOW64_THREAD_BLOCK: u64 = 0x8000;
+/// Offset of the CPU-reserved area within that block. Past the 32-bit `TEB`
+/// *and* the inline `ACTIVATION_CONTEXT_STACK` `seed_teb32` lays at
+/// `TEB32 + 0x1800`.
+const WOW64_THREAD_CPU_AREA: u64 = THREAD_TEB_SIZE + 0x2000;
+
 /// x64 TEB field offsets Wine's PE `ntdll` walks (public `winternl.h`/NT_TIB
 /// layout; confirmed against the pinned guest binary's `gs:`-relative reads).
 /// The fields [`WinOs::seed_teb_64`] populates so the ~0x1838-byte 64-bit TEB is
@@ -199,6 +209,19 @@ pub(crate) struct Thread {
     /// callbacks have run (roadmap W0.3). `None` once consumed / for the main
     /// thread.
     pub pending_entry: Option<(u64, u64)>,
+    /// Whether this thread's saved state is **32-bit** guest code (roadmap
+    /// W5.11). The CPU's mode is not part of [`CpuState`] — it lives in the
+    /// interpreter — so a scheduler that only swapped registers would resume a
+    /// thread in whatever mode the *previous* one happened to be in. In a WoW64
+    /// process that is the difference between `Wow64LdrpInitialize` and its own
+    /// rva: a 32-bit CPU truncates the 64-bit entry to `0x2ce0` and executes
+    /// zeroes.
+    pub mode32: bool,
+    /// A **WoW64** thread's own sub-4 GiB TEB64/TEB32/CPU-area block, or 0
+    /// (roadmap W5.11). Freed as one region rather than as a plain TEB.
+    pub wow64_block: u64,
+    /// …and its 32-bit stack `(base, size)`, or `(0, 0)`.
+    pub wow64_stack32: (u64, u64),
 }
 
 impl Thread {
@@ -221,6 +244,9 @@ impl Thread {
             msgs: VecDeque::new(),
             quit_code: None,
             pending_entry: None,
+            mode32: false,
+            wow64_block: 0,
+            wow64_stack32: (0, 0),
         }
     }
 
@@ -281,6 +307,13 @@ impl WinOs {
 
     /// Install thread `next` as the running thread.
     fn activate(&mut self, cpu: &mut CpuState, next: usize) {
+        // The CPU *mode* is not in `CpuState`, so the scheduler has to carry it
+        // itself (roadmap W5.11). The outgoing thread's mode is whatever the run
+        // loop last published; the incoming thread's is whatever it was saved
+        // in, and the loop applies it after this returns.
+        let cur = self.current;
+        self.threads[cur].mode32 = self.guest_mode32;
+        self.pending_mode_switch = Some(self.threads[next].mode32);
         *cpu = self.threads[next].saved.clone();
         self.threads[next].state = ThreadState::Running;
         self.threads[next].wait = None;
@@ -556,6 +589,120 @@ impl WinOs {
             msgs: VecDeque::new(),
             quit_code: None,
             pending_entry,
+            // A plain thread starts in the process's own mode; a WoW64 one
+            // starts in long mode (see `spawn_wow64_thread`).
+            mode32: !self.cfg.is_64bit,
+            wow64_block: 0,
+            wow64_stack32: (0, 0),
+        });
+        Ok(Some((handle, tid)))
+    }
+
+    /// Spawn a **WoW64** thread (roadmap W5.11).
+    ///
+    /// A 32-bit thread is not a thread with a smaller stack. It is a *64-bit*
+    /// thread that starts in `wow64!Wow64LdrpInitialize`, which builds that
+    /// thread's own BOP/`WOW64INFO` links and then runs `for(;;)
+    /// BTCpuSimulate()` — exactly what
+    /// [`wow64_boot::seat_wine_loader`](../../exemu_app/wow64_boot/fn.seat_wine_loader.html)
+    /// does for the initial thread, per thread. What a kernel owes it is the
+    /// state that simulate loop reads:
+    ///
+    /// * a **sub-4 GiB** 32-bit stack, because 32-bit code can only address the
+    ///   low half of one from the 64-bit `VirtualAlloc` arena (that is the
+    ///   measured `Firefox Installer.exe` failure: a stack top of
+    ///   `0x40_0013_0000` reaching `msvcrt!__beginthreadex_trampoline`'s first
+    ///   `push ebp` as `0x0012_fef8`, where nothing is mapped);
+    /// * a **TEB pair** in one low block, so `TEB64.WowTebOffset` — a *signed
+    ///   32-bit* delta — can reach the TEB32 and 32-bit code can hold it;
+    /// * its own **CPU-reserved area** at `TEB64+0x1488`, seeded with the i386
+    ///   thread-start convention recovered from `ntdll32!RtlUserThreadStart`
+    ///   (`Eax` = entry, `Ebx` = argument, `Eip` on that routine) — *not* the
+    ///   64-bit `Rcx`/`Rdx` pair, which is the second defect this replaces.
+    ///
+    /// Everything after that is Wine's: its per-thread init re-seats the
+    /// context's `Eip` on `ntdll32!LdrInitializeThunk` and hands the copied
+    /// `CONTEXT` back through `NtContinue`.
+    fn spawn_wow64_thread(
+        &mut self,
+        mem: &mut dyn Memory,
+        req_stack: u64,
+        entry: u64,
+        param: u64,
+        suspended: bool,
+    ) -> Result<Option<(u64, u32)>> {
+        let Some(w) = self.wow64_threading else {
+            return Ok(None);
+        };
+        // The 32-bit stack, and the 64-bit one the WoW64 thunk layer runs on.
+        let stack32_size = align_up(req_stack.max(THREAD_STACK_SIZE), 0x1000);
+        let Some(stack32) = self.map_anywhere_low(mem, stack32_size, Perm::RW, "wow64-thread-stack32") else {
+            self.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+            return Ok(None);
+        };
+        let Some(stack64) = self.map_anywhere(mem, THREAD_STACK_SIZE, Perm::RWX, "wow64-thread-stack64") else {
+            let _ = mem.unmap(stack32, stack32_size);
+            self.last_error = 8;
+            return Ok(None);
+        };
+        // TEB64 + TEB32 + the CPU-reserved area, in one sub-4 GiB block so the
+        // signed 32-bit `WowTebOffset` between the two TEBs is trivially valid.
+        let Some(block) = self.map_anywhere_low(mem, WOW64_THREAD_BLOCK, Perm::RW, "wow64-thread-teb") else {
+            let _ = mem.unmap(stack32, stack32_size);
+            let _ = mem.unmap(stack64, THREAD_STACK_SIZE);
+            self.last_error = 8;
+            return Ok(None);
+        };
+        let (teb64, teb32, area) = (block, block + THREAD_TEB_SIZE, block + WOW64_THREAD_CPU_AREA);
+
+        let tid = self.next_tid;
+        self.next_tid += 1;
+        let stack32_top = stack32 + stack32_size;
+        self.seed_teb_64(mem, teb64, tid, self.cfg.peb_addr, stack64 + THREAD_STACK_SIZE, stack64)?;
+        crate::wow64::seed_teb32(mem, teb32, self.wow64_peb32, stack32, stack32_top)?;
+        crate::wow64::link_teb32(mem, teb64, teb32)?;
+        crate::wow64::init_cpu_area(
+            mem,
+            teb64,
+            area,
+            crate::wow64::Start32 {
+                eip: w.rtl_user_thread_start32 as u32,
+                esp: ((stack32_top - 0x100) & !0xf) as u32,
+                eax: entry as u32,
+                ebx: param as u32,
+            },
+        )?;
+
+        // The thread itself starts in long mode inside Wine's own WoW64 entry.
+        let mut st = CpuState::new();
+        st.gs_base = teb64; // 64-bit code reads its TEB through gs:
+        st.fs_base = teb32; // …and 32-bit code reads TEB32 through fs:
+        st.set_rsp(((stack64 + THREAD_STACK_SIZE - 0x100) & !0xf) - 8);
+        st.set_reg(Reg::Rcx, 0); // its CONTEXT argument is unused (it `lea`s over rcx)
+        st.rip = w.ldrp_initialize;
+
+        let handle = self.alloc_khandle();
+        self.kobjects.insert(handle, KObject::Thread { exited: false });
+        self.threads.push(Thread {
+            tid,
+            handle,
+            state: if suspended { ThreadState::Suspended } else { ThreadState::Ready },
+            saved: st,
+            exit_code: STILL_ACTIVE,
+            stack_base: stack64,
+            stack_size: THREAD_STACK_SIZE,
+            teb_base: teb64,
+            teb_owned: 0, // freed with the whole block below, not as a plain TEB
+            mode32: false, // it starts in LONG mode, inside wow64!Wow64LdrpInitialize
+            wow64_block: block,
+            wow64_stack32: (stack32, stack32_size),
+            suspend_count: u32::from(suspended),
+            wait: None,
+            tls: HashMap::new(),
+            fls: HashMap::new(),
+            msgs: VecDeque::new(),
+            quit_code: None,
+            pending_entry: None,
         });
         Ok(Some((handle, tid)))
     }
@@ -590,6 +737,16 @@ impl WinOs {
         let teb = self.threads[i].teb_owned;
         if teb != 0 {
             let _ = mem.unmap(teb, THREAD_TEB_SIZE);
+        }
+        // A WoW64 thread owns one block for its TEB pair + CPU-reserved area,
+        // and a separate sub-4 GiB 32-bit stack (roadmap W5.11).
+        let block = self.threads[i].wow64_block;
+        if block != 0 {
+            let _ = mem.unmap(block, WOW64_THREAD_BLOCK);
+        }
+        let (s32, n32) = self.threads[i].wow64_stack32;
+        if s32 != 0 {
+            let _ = mem.unmap(s32, n32);
         }
     }
 
@@ -841,11 +998,17 @@ impl WinOs {
         if handle_out == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        if self.is_wow64() {
-            return Ok(STATUS_NOT_IMPLEMENTED);
-        }
         let suspended = create_flags & (CREATE_SUSPENDED_NT as u64) != 0;
-        match self.spawn_thread(mem, stack_size, entry, param, suspended)? {
+        // A 32-bit thread is a 64-bit thread entering `wow64!Wow64LdrpInitialize`
+        // with its own CPU-reserved area — not a thread with a smaller stack
+        // (roadmap W5.11). `cfg.is_64bit` structurally cannot answer this: a
+        // WoW64 process *is* 64-bit.
+        let spawned = if self.is_wow64() {
+            self.spawn_wow64_thread(mem, stack_size, entry, param, suspended)?
+        } else {
+            self.spawn_thread(mem, stack_size, entry, param, suspended)?
+        };
+        match spawned {
             Some((handle, _tid)) => {
                 self.write_ptr(mem, handle_out, handle)?;
                 Ok(STATUS_SUCCESS)
@@ -1335,30 +1498,110 @@ mod tests {
         (os, mem)
     }
 
-    /// **A WoW64 process refuses to create a thread — the pinned W5.11 gap.**
+    /// **A WoW64 process creates a real 32-bit thread** (roadmap W5.11) — the
+    /// positive half of what used to be pinned as a gap.
     ///
     /// The control matters as much as the assertion: the *same* call in a plain
-    /// 64-bit process succeeds, so the refusal is a property of the process
-    /// model and not of the arguments. See `nt_create_thread_ex`'s doc comment
-    /// for why a 32-bit thread cannot be spawned by `spawn_thread` at all — it
-    /// would get the 64-bit start frame and a stack above 4 GiB that 32-bit
-    /// code sees only the low half of.
+    /// 64-bit process takes the ordinary path, so what is asserted below is a
+    /// property of the process model and not of the arguments. What the kernel
+    /// owes a 32-bit thread is all here — a sub-4 GiB stack, a TEB pair its
+    /// signed 32-bit `WowTebOffset` can span, its own CPU-reserved area seeded
+    /// with the i386 start convention, and long mode at Wine's own entry.
     #[test]
-    fn a_wow64_process_refuses_to_create_a_thread() {
+    fn a_wow64_process_creates_a_real_32bit_thread() {
         const OUT: u64 = 0x2_0100;
+        const LDRP: u64 = 0x7_0000_2ce0; // wow64!Wow64LdrpInitialize
+        const START32: u64 = 0x6000_e1d0; // ntdll32!RtlUserThreadStart
+        const ENTRY: u64 = 0x40_1000; // the guest's start routine (arg4)
 
         let (mut os, mut mem) = os_and_mem();
         assert_eq!(create_thread_ex(&mut os, &mut mem, OUT), STATUS_SUCCESS, "control: 64-bit");
         assert_ne!(mem.read_u64(OUT).unwrap(), 0, "the control really produced a handle");
+        let plain = os.threads.last().expect("the control thread");
+        assert_eq!(plain.saved.rip, ENTRY, "a plain thread starts at its own start routine");
+        assert_eq!(plain.wow64_block, 0, "…and owns no WoW64 block");
 
         let (mut os, mut mem) = os_and_mem();
         os.set_wow64_peb32(0x7f00_8000); // this process is now WoW64
+        os.set_wow64_threading(crate::wow64::Wow64Threading {
+            ldrp_initialize: LDRP,
+            rtl_user_thread_start32: START32,
+        });
         assert!(os.is_wow64());
+        assert_eq!(create_thread_ex(&mut os, &mut mem, OUT), STATUS_SUCCESS);
+        assert_ne!(mem.read_u64(OUT).unwrap(), 0, "a handle was written");
+
+        let t = os.threads.last().expect("the WoW64 thread");
+        // It starts in **long** mode, inside Wine's own WoW64 thread entry —
+        // not at the guest's 32-bit start routine.
+        assert_eq!(t.saved.rip, LDRP, "a WoW64 thread starts in wow64!Wow64LdrpInitialize");
+        assert!(!t.mode32, "…and in 64-bit mode, so that entry is not truncated to 0x2ce0");
+
+        // Its TEB pair is one sub-4 GiB block, linked the way `wow64.dll` reads
+        // it, and 32-bit code can hold the TEB32 it finds through `fs:`.
+        let (teb64, teb32) = (t.saved.gs_base, t.saved.fs_base);
+        assert_eq!(teb64, t.teb_base);
+        assert!(teb32 <= u32::MAX as u64, "TEB32 must be 32-bit addressable");
         assert_eq!(
-            create_thread_ex(&mut os, &mut mem, OUT),
-            STATUS_NOT_IMPLEMENTED,
-            "a WoW64 thread is Wine's Wow64LdrpInitialize to start, not spawn_thread's",
+            crate::wow64::teb32_of(&mem, teb64).unwrap(),
+            Some(teb32),
+            "TEB64 + (i32)WowTebOffset resolves to this thread's TEB32",
         );
-        assert_eq!(mem.read_u64(OUT).unwrap(), 0, "no handle was written");
+        assert_ne!(teb64, 0x7f00_0000, "…and it is this thread's own pair, not the process's");
+
+        // Its 32-bit stack is below 4 GiB — the whole point. A stack from the
+        // 64-bit VirtualAlloc arena is what made the spawned thread die on its
+        // own `push ebp` at the truncated address.
+        let (s32, n32) = t.wow64_stack32;
+        assert!(s32 != 0 && s32 + n32 <= u32::MAX as u64, "32-bit stack {s32:#x}+{n32:#x} is low");
+        assert_eq!(
+            mem.read_u32(teb32 + crate::wow64::TEB32_STACK_BASE).unwrap() as u64,
+            s32 + n32,
+            "TEB32.NtTib.StackBase is that stack's top",
+        );
+
+        // …and its CPU-reserved area carries the i386 start convention:
+        // Eip on RtlUserThreadStart, Eax = entry, Ebx = argument.
+        let area = mem.read_u64(teb64 + crate::wow64::TEB_CPU_AREA_PTR_OFF).unwrap();
+        assert_ne!(area, 0, "TEB64+0x1488 points at this thread's own CPU-reserved area");
+        let ctx = area + crate::wow64::CPU_AREA_HEADER_LEN;
+        assert_eq!(mem.read_u32(ctx + crate::wow64::CTX_EIP).unwrap() as u64, START32);
+        assert_eq!(mem.read_u32(ctx + crate::wow64::CTX_EAX).unwrap() as u64, ENTRY);
+        assert_eq!(mem.read_u32(ctx + crate::wow64::CTX_SEGCS).unwrap(), crate::wow64::SEL_CS32);
+        let esp = mem.read_u32(ctx + crate::wow64::CTX_ESP).unwrap() as u64;
+        assert!(esp > s32 && esp <= s32 + n32, "Esp {esp:#x} is inside the 32-bit stack");
+
+        // Without the published entry points there is no thread to hand back —
+        // an honest failure, not a corrupted one.
+        let (mut os, mut mem) = os_and_mem();
+        os.set_wow64_peb32(0x7f00_8000);
+        assert_eq!(create_thread_ex(&mut os, &mut mem, OUT), STATUS_NO_MEMORY);
+    }
+
+    /// The scheduler carries the CPU **mode** across a switch (roadmap W5.11).
+    /// `CpuState` has no `bits` field, so without this a WoW64 process's second
+    /// thread would resume in whichever mode the first happened to be in.
+    #[test]
+    fn a_thread_switch_carries_the_cpu_mode() {
+        let (mut os, mut mem) = os_and_mem();
+        os.set_wow64_peb32(0x7f00_8000);
+        os.set_wow64_threading(crate::wow64::Wow64Threading {
+            ldrp_initialize: 0x7_0000_2ce0,
+            rtl_user_thread_start32: 0x6000_e1d0,
+        });
+        assert_eq!(create_thread_ex(&mut os, &mut mem, 0x2_0100), STATUS_SUCCESS);
+
+        // The main thread is mid-32-bit-guest; the new one must come up in long
+        // mode, and the main thread's mode must be remembered for its turn.
+        let mut cpu = CpuState::default();
+        os.set_guest_mode32(true);
+        assert!(os.take_thread_mode_switch().is_none(), "no switch has happened yet");
+        assert!(os.yield_and_switch(&mut cpu), "the new thread is runnable");
+        assert_eq!(os.take_thread_mode_switch(), Some(false), "it resumes in long mode");
+        assert!(os.take_thread_mode_switch().is_none(), "…and the request is taken once");
+
+        os.set_guest_mode32(false);
+        assert!(os.yield_and_switch(&mut cpu), "back to the main thread");
+        assert_eq!(os.take_thread_mode_switch(), Some(true), "which was in 32-bit mode");
     }
 }

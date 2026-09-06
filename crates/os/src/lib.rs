@@ -507,6 +507,17 @@ pub struct WinOs {
     /// mode on to run a **client callback** (roadmap W5.10). Zero on a boot that
     /// has no real ntdll, in which case win32k falls back to the direct call.
     client_cb_dispatcher: u64,
+    /// Whether the guest is currently executing **32-bit** code, published by
+    /// the run loop (roadmap W5.11). The CPU's mode lives in the interpreter,
+    /// not in [`CpuState`], so the scheduler cannot read it — but it has to save
+    /// it with the rest of a thread's state.
+    guest_mode32: bool,
+    /// Set by a thread switch: the mode the newly running thread must resume in.
+    /// The run loop takes it and applies it to the CPU.
+    pending_mode_switch: Option<bool>,
+    /// The two entry points a fresh **WoW64 thread** is seated on (roadmap
+    /// W5.11), or `None` on a boot that has no Wine WoW64 set.
+    wow64_threading: Option<wow64::Wow64Threading>,
     /// A **sub-4 GiB** scratch region for by-pointer data a 32-bit client
     /// callback is handed (a `CREATESTRUCTW`). The 64-bit stack of a WoW64
     /// process lives at `0x10_0000_0000`, so a struct parked there reaches the
@@ -626,6 +637,9 @@ impl WinOs {
             wow64_peb32: 0,
             wow64_modules: HashMap::new(),
             client_cb_dispatcher: 0,
+            guest_mode32: false,
+            pending_mode_switch: None,
+            wow64_threading: None,
             wow64_cb_scratch: 0,
         };
         // Reserve the driver thunks up front so their addresses are stable.
@@ -814,6 +828,26 @@ impl WinOs {
     /// `wow64.dll`'s process init uses to discover its own personality.
     pub fn set_wow64_peb32(&mut self, peb32: u64) {
         self.wow64_peb32 = peb32;
+    }
+
+    /// Tell the OS layer which mode the CPU is currently executing in, so a
+    /// thread switch can save and restore it (roadmap W5.11). Called by the run
+    /// loop before it lets the guest run; a cheap store, never per instruction.
+    pub fn set_guest_mode32(&mut self, mode32: bool) {
+        self.guest_mode32 = mode32;
+    }
+
+    /// Take the mode a thread switch asks the CPU to resume in, if one happened.
+    /// `Some(true)` = 32-bit compat, `Some(false)` = long mode.
+    pub fn take_thread_mode_switch(&mut self) -> Option<bool> {
+        self.pending_mode_switch.take()
+    }
+
+    /// Publish the two entry points a fresh **WoW64 thread** is seated on
+    /// (roadmap W5.11). Absent, `NtCreateThreadEx` in a WoW64 process fails
+    /// rather than handing the guest a thread it cannot run.
+    pub fn set_wow64_threading(&mut self, t: wow64::Wow64Threading) {
+        self.wow64_threading = Some(t);
     }
 
     /// Publish `ntdll!KiUserCallbackDispatcher`, the entry a kernel resumes user
