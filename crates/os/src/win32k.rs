@@ -275,6 +275,7 @@ const BLACKNESS: u32 = 0x0000_0042;
 const WHITENESS: u32 = 0x00FF_0062;
 
 const GDI_PEB_TABLE_PTR_OFF: u64 = 0xF8;
+const GDI_PEB32_TABLE_PTR_OFF: u64 = 0x94;
 const GDI_ENTRY_SIZE: u64 = 24;
 const GDI_ENTRY_GENERATION_OFF: u64 = 0xC;
 const GDI_ENTRY_TYPE_OFF: u64 = 0xE;
@@ -2129,21 +2130,40 @@ fn ensure_gdi_table(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
     if peb == 0 {
         return false;
     }
+    let peb32 = os.wow64_peb32();
     let table_size = GDI_TABLE_SLOTS * GDI_ENTRY_SIZE;
-    let Some(table) = os.map_anywhere(mem, table_size, Perm::RW, "gdi-handle-table") else {
+    let Some(table) = map_gdi_arena(os, mem, table_size, "gdi-handle-table", peb32 != 0) else {
         return false;
     };
     let arena_size = GDI_TABLE_SLOTS * GDI_DC_OBJECT_SIZE;
-    let Some(arena) = os.map_anywhere(mem, arena_size, Perm::RW, "gdi-dc-arena") else {
+    let Some(arena) = map_gdi_arena(os, mem, arena_size, "gdi-dc-arena", peb32 != 0) else {
         return false;
     };
     if mem.write_u64(peb + GDI_PEB_TABLE_PTR_OFF, table).is_err() {
+        return false;
+    }
+    if peb32 != 0 && mem.write_u32(peb32 + GDI_PEB32_TABLE_PTR_OFF, table as u32).is_err() {
         return false;
     }
     os.win32k_state.gdi_table_base = table;
     os.win32k_state.gdi_dc_arena = arena;
     os.win32k_state.gdi_next_slot = STOCK_SLOT_LAST + 1;
     publish_stock_objects(os, mem).is_ok()
+}
+
+fn map_gdi_arena(
+    os: &mut WinOs,
+    mem: &mut dyn Memory,
+    size: u64,
+    name: &str,
+    below_4g: bool,
+) -> Option<u64> {
+    if below_4g {
+        if let Some(base) = os.map_anywhere_low(mem, size, Perm::RW, name) {
+            return Some(base);
+        }
+    }
+    os.map_anywhere(mem, size, Perm::RW, name)
 }
 
 fn publish_stock_objects(os: &mut WinOs, mem: &mut dyn Memory) -> Result<()> {
@@ -3896,6 +3916,123 @@ mod tests {
         mem.map(Region::new("scratch", 0x10_0000, 0x10_000, Perm::RW)).unwrap();
         os.set_syscall_guest_rsp_for_test(0x10_8000);
         (os, mem)
+    }
+
+    #[test]
+    fn a_created_font_answers_get_object_with_the_logfont_it_was_given() {
+        let (mut os, mut mem) = os_with_gdi();
+        let lf = 0x10_2000u64;
+        let out = 0x10_3000u64;
+        mem.write_u32(lf + LOGFONT_HEIGHT as u64, (-11i32) as u32).unwrap();
+        mem.write_u32(lf + LOGFONT_WEIGHT as u64, 700).unwrap();
+        mem.write_u8(lf + LOGFONT_ITALIC as u64, 1).unwrap();
+        for (i, unit) in "Tahoma".encode_utf16().enumerate() {
+            mem.write_u16(lf + LOGFONT_FACE_NAME as u64 + i as u64 * 2, unit).unwrap();
+        }
+
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, lf);
+        cpu.set_reg(Reg::Rdx, 0x1a4);
+        let hfont = nt_gdi_hfont_create(&mut os, &mut cpu, &mut mem).unwrap();
+        assert_ne!(hfont, 0, "NtGdiHfontCreate answers a handle");
+        assert_eq!(
+            hfont >> 16,
+            gdi_type::FONT as u32,
+            "gdi32 dispatches SelectObject by the handle's NTGDI type"
+        );
+
+        cpu.set_reg(Reg::R10, hfont as u64);
+        cpu.set_reg(Reg::Rdx, LOGFONTW_SIZE as u64);
+        cpu.set_reg(Reg::R8, out);
+        assert_eq!(
+            nt_gdi_ext_get_object_w(&mut os, &mut cpu, &mut mem).unwrap(),
+            LOGFONTW_SIZE,
+            "uniscribe asks for exactly 0x5c bytes and refuses a font that answers 0"
+        );
+        assert_eq!(mem.read_u32(out + LOGFONT_HEIGHT as u64).unwrap(), (-11i32) as u32);
+        assert_eq!(mem.read_u32(out + LOGFONT_WEIGHT as u64).unwrap(), 700);
+        assert_eq!(mem.read_u8(out + LOGFONT_ITALIC as u64).unwrap(), 1);
+        assert_ne!(
+            mem.read_u16(out + LOGFONT_FACE_NAME as u64).unwrap(),
+            0,
+            "init_script_cache rejects a LOGFONTW whose lfFaceName[0] is 0"
+        );
+    }
+
+    #[test]
+    fn a_dc_reports_a_font_before_anything_is_selected_into_it() {
+        let (mut os, mut mem) = os_with_gdi();
+        let hdc = alloc_memory_dc(&mut os, &mut mem).unwrap();
+        assert_ne!(hdc, 0);
+
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, hdc as u64);
+        cpu.set_reg(Reg::Rdx, (gdi_type::FONT as u64) << 16);
+        let stock = nt_gdi_get_dc_object(&mut os, &mut cpu, &mut mem).unwrap();
+        assert_eq!(stock, STOCK_SYSTEM_FONT, "a fresh DC carries SYSTEM_FONT, as Wine's dc_init does");
+
+        let lf = 0x10_2000u64;
+        mem.write_u32(lf + LOGFONT_HEIGHT as u64, (-13i32) as u32).unwrap();
+        mem.write_u16(lf + LOGFONT_FACE_NAME as u64, u16::from(b'X')).unwrap();
+        cpu.set_reg(Reg::R10, lf);
+        let hfont = nt_gdi_hfont_create(&mut os, &mut cpu, &mut mem).unwrap();
+
+        cpu.set_reg(Reg::R10, hdc as u64);
+        cpu.set_reg(Reg::Rdx, hfont as u64);
+        assert_eq!(
+            nt_gdi_select_font(&mut os, &mut cpu, &mut mem).unwrap(),
+            stock,
+            "SelectObject answers the font that was there before"
+        );
+
+        cpu.set_reg(Reg::Rdx, (gdi_type::FONT as u64) << 16);
+        assert_eq!(nt_gdi_get_dc_object(&mut os, &mut cpu, &mut mem).unwrap(), hfont);
+
+        let tm = 0x10_4000u64;
+        cpu.set_reg(Reg::R10, hdc as u64);
+        cpu.set_reg(Reg::Rdx, tm);
+        assert_eq!(nt_gdi_get_text_metrics_w(&mut os, &mut cpu, &mut mem).unwrap(), 1);
+        assert_eq!(
+            mem.read_u32(tm + TM_HEIGHT).unwrap(),
+            17,
+            "tmHeight follows the selected font's lfHeight, not a fixed cell"
+        );
+        assert_eq!(mem.read_u32(tm + TM_INTERNAL_LEADING).unwrap(), 4);
+        assert_eq!(
+            mem.read_u32(tm + TM_ASCENT).unwrap() + mem.read_u32(tm + TM_DESCENT).unwrap(),
+            mem.read_u32(tm + TM_HEIGHT).unwrap(),
+            "ascent + descent is the cell, which is what a line-height calculation adds up"
+        );
+    }
+
+    #[test]
+    fn a_wow64_guest_can_reach_the_gdi_table_through_its_own_peb() {
+        const PEB: u64 = 0x7F00_0000;
+        const PEB32: u64 = 0x0020_0000;
+        let mut os =
+            WinOs::new(crate::WinConfig { is_64bit: true, peb_addr: PEB, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("peb", PEB, 0x1000, Perm::RW)).unwrap();
+        mem.map(Region::new("peb32", PEB32, 0x1000, Perm::RW)).unwrap();
+        os.set_wow64_peb32(PEB32);
+
+        assert!(ensure_gdi_table(&mut os, &mut mem));
+        let table = os.win32k_state.gdi_table_base;
+        assert_eq!(mem.read_u64(PEB + GDI_PEB_TABLE_PTR_OFF).unwrap(), table);
+        assert_eq!(
+            mem.read_u32(PEB32 + GDI_PEB32_TABLE_PTR_OFF).unwrap() as u64,
+            table,
+            "32-bit gdi32 indexes PEB32->GdiSharedHandleTable and faults on a 0 there"
+        );
+        assert!(
+            table + GDI_TABLE_SLOTS * GDI_ENTRY_SIZE <= u32::MAX as u64,
+            "the whole table must be addressable by a 32-bit pointer"
+        );
+        assert!(
+            os.win32k_state.gdi_dc_arena + GDI_TABLE_SLOTS * GDI_DC_OBJECT_SIZE
+                <= u32::MAX as u64,
+            "…and so must every object the entries point at"
+        );
     }
 
     #[test]
