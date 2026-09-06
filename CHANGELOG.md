@@ -96,6 +96,39 @@ end-to-end on the default path.
   executable — now dispatches as `exemu run <path>` instead of erroring
   "unknown command".
 
+### The JIT's guest memory path, profiled (W8.6)
+- **Profiled rather than guessed.** Sampling the 7-Zip `--jit` run put 249 of
+  614 main-thread samples — **40% of the whole process** — in the two guest
+  memory helpers and the `Memory` methods they call. That is where the JIT's
+  time is now, and every instruction on that path is paid ~500M times.
+- **The single biggest win was in the compiler, not the compiled code.** The
+  ARM64 logical-immediate encoder brute-forced all 8192 `(N, immr, imms)`
+  triples through the architecture's decoder. `and #0xff` — which nearly every
+  compiled arithmetic instruction emits — needs ~4100 of them, so this alone was
+  **4.6% of the run**. It is now the closed form, with the derived triple still
+  verified against the decoder before it is used, and a test that walks the whole
+  triple space proves no encodable value was lost.
+- **The guest memory path no longer dispatches through a vtable.** `BlockCtx`
+  held `&mut dyn Memory`, so every guest load and store was two indirect calls.
+  It now carries the backend as a type parameter and `Jit::run` is generic over
+  it; no call site changed. Semantics are untouched — same implementation, same
+  order, same bounds, permission, watchpoint and fault behaviour.
+- **A store hashes one address into the compiled-code page table, not two.** The
+  second probe is made only when the store really spans two pages.
+- **Measured, four-way interleaved in one session, 5 reps, min user+sys:**
+  22.030 G → 21.108 G → 20.889 G → **20.782 G** retired host instructions,
+  **−5.7%** overall, 0.78 s → 0.73 s. The same binary spans 0.73–1.15 s across
+  reps depending on machine load, so the instruction count is the number that
+  means anything; it varies by under 0.3%. 7-Zip still retires exactly
+  496,505,572 guest instructions and emits the same 771 KiB of native code.
+- **What is still on the table, and what it needs.** The remaining ~35% is a
+  software TLB in emitted code — about seven instructions and no call in place
+  of a helper call and a region lookup. It cannot be built inside the JIT: the
+  emitted code needs a host pointer to a region's bytes, which neither the
+  `Memory` trait nor its implementation exposes. Zero divergences in 2.4M
+  JIT-vs-interpreter differential trials across both address-space layouts and
+  both bitnesses; corpus 10/10 at drift 0.
+
 ### Native block linking and indirect-branch inline caches (W8.5)
 - **7-Zip `--jit` goes from 0.95 s to 0.76 s of CPU — 28.5 G to 21.7 G retired
   host instructions — on exactly the same 496,505,572 guest instructions and the
