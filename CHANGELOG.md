@@ -23,8 +23,18 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 1037, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1038, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### The win32u trace says which index is *unserviced* (W6.2)
+- win32k fills its **whole** syscall-index range with an honest-zero stub before
+  overriding the slots it really services, so an `EXEMU_W32K_TRACE` transcript
+  could not tell "serviced" from "answered zero" — every index looked identical.
+- The service table now records which slots something actually **wrote** a
+  handler for, as opposed to which the blanket fill covered, and the trace marks
+  the rest `<UNSERVICED>`. Nothing about how a guest runs changes; this is a
+  diagnostic, and it is what turns "the dialog stops somewhere" into a named
+  list of missing primitives in one run.
 
 ### A guest finally gets comctl32 **v6**: the WinSxS store is materialised (W6.1)
 - **Every Wine-path guest silently got comctl32 v5.** Wine ships two builds —

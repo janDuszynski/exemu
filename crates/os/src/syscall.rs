@@ -88,6 +88,12 @@ type Handler = SyscallHandler;
 /// `Nt*` groups (W2.6+) install real handlers with [`Ssdt::set`].
 pub(crate) struct Ssdt {
     handlers: Vec<Handler>,
+    /// Which slots something has actually claimed. Kept beside `handlers`
+    /// because a slot's *identity* cannot be recovered from the function pointer
+    /// without comparing addresses, and this is what lets the `EXEMU_W32K_TRACE`
+    /// transcript mark an index `<UNSERVICED>` — which is how the missing
+    /// primitive behind a stuck control gets found (roadmap W6.2).
+    claimed: Vec<bool>,
 }
 
 impl Ssdt {
@@ -95,6 +101,7 @@ impl Ssdt {
     pub(crate) fn new() -> Self {
         Ssdt {
             handlers: vec![Ssdt::unimplemented as Handler; SSDT_LEN],
+            claimed: vec![false; SSDT_LEN],
         }
     }
 
@@ -104,6 +111,7 @@ impl Ssdt {
     pub(crate) fn new_win32k() -> Self {
         Ssdt {
             handlers: vec![Ssdt::unimplemented as Handler; WIN32K_LEN],
+            claimed: vec![false; WIN32K_LEN],
         }
     }
 
@@ -113,7 +121,24 @@ impl Ssdt {
     pub(crate) fn set(&mut self, index: u32, handler: Handler) {
         if let Some(slot) = self.handlers.get_mut(index as usize) {
             *slot = handler;
+            self.claimed[index as usize] = true;
         }
+    }
+
+    /// Install `handler` at `index` **without** claiming the slot — the blanket
+    /// "honest stub" fill win32k lays down over its whole index range before
+    /// overriding the serviced slots. Leaving these unclaimed is the whole point:
+    /// it is what makes [`Ssdt::implemented`] mean "someone wrote a handler for
+    /// this" rather than "the range was filled".
+    pub(crate) fn set_stub(&mut self, index: u32, handler: Handler) {
+        if let Some(slot) = self.handlers.get_mut(index as usize) {
+            *slot = handler;
+        }
+    }
+
+    /// Whether anything has claimed `index`. Only the trace consults this.
+    pub(crate) fn implemented(&self, index: u32) -> bool {
+        self.claimed.get(index as usize).copied().unwrap_or(false)
     }
 
     /// The handler for an SSDT slot with no implementation yet.
@@ -387,6 +412,13 @@ impl WinOs {
         self.win32k.set(index & !WIN32K_TABLE_BIT, handler);
     }
 
+    /// As [`WinOs::set_win32k_handler`], but for the blanket range fill: the slot
+    /// gets the handler and stays **unclaimed**, so an `EXEMU_W32K_TRACE`
+    /// transcript still marks it `<UNSERVICED>` (roadmap W6.2).
+    pub fn set_win32k_stub(&mut self, index: u32, handler: SyscallHandler) {
+        self.win32k.set_stub(index & !WIN32K_TABLE_BIT, handler);
+    }
+
     /// Return a full 64-bit value from the running syscall (roadmap W4.8).
     ///
     /// The SSDT handler signature returns a `u32` NTSTATUS, which is right for
@@ -444,8 +476,10 @@ impl WinOs {
             if win32k_trace() {
                 // Registers are still the guest's here (the frame save and the
                 // unix-stack switch happen below), so arg0..2 read straight out.
+                let masked = index & !WIN32K_TABLE_BIT;
+                let mark = if self.win32k.implemented(masked) { "" } else { "  <UNSERVICED>" };
                 eprintln!(
-                    "[w32k] {index:#06x} {:#x} {:#x} {:#x}",
+                    "[w32k] {index:#06x} {:#x} {:#x} {:#x}{mark}",
                     cpu.reg(Reg::R10),
                     cpu.reg(Reg::Rdx),
                     cpu.reg(Reg::R8)
@@ -563,5 +597,34 @@ mod tests {
         cpu.set_rsp(0x1_0000);
         os.dispatch_syscall(0x123, &mut cpu, &mut mem).unwrap();
         assert_eq!(cpu.reg(Reg::Rax), STATUS_NOT_IMPLEMENTED as u64);
+    }
+
+    /// The `<UNSERVICED>` signal the `EXEMU_W32K_TRACE` transcript carries
+    /// (roadmap W6.2), at its source.
+    ///
+    /// win32k fills its **whole** index range with an honest-zero stub before
+    /// overriding the slots it really services, so "does this index have a
+    /// handler installed" cannot tell the two apart — every index does. What the
+    /// trace needs is "did anyone *write* a handler for this", which is what
+    /// [`Ssdt::set`] records and [`Ssdt::set_stub`] deliberately does not. This
+    /// is the difference that makes an `EXEMU_W32K_TRACE` transcript name the
+    /// next missing primitive instead of listing every call the guest makes.
+    #[test]
+    fn only_a_claimed_slot_counts_as_serviced() {
+        fn answer(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
+            Ok(0)
+        }
+        let mut t = Ssdt::new_win32k();
+        // The blanket fill: every slot gets the stub, and none is claimed.
+        for i in 0..8 {
+            t.set_stub(i, answer);
+        }
+        assert!(!t.implemented(3), "the blanket fill does not make a slot serviced");
+        // …then one real handler is written over it.
+        t.set(3, answer);
+        assert!(t.implemented(3), "a written handler is serviced");
+        assert!(!t.implemented(4), "and its neighbour still is not");
+        // Out of range is not serviced either (and does not panic).
+        assert!(!t.implemented(WIN32K_LEN as u32 + 1));
     }
 }
