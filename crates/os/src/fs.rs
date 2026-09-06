@@ -645,6 +645,9 @@ const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 /// `STATUS_BUFFER_TOO_SMALL` — the caller's buffer cannot hold the fixed part
 /// of the requested information class.
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
+/// `STATUS_INVALID_INFO_CLASS` — a `FileInformationClass` exemu does not
+/// implement. Honest refusal beats answering with a struct of another shape.
+const STATUS_INVALID_INFO_CLASS: u32 = 0xC000_0003;
 
 // NtCreateFile `CreateDisposition` (arg — distinct from the Win32 disposition).
 const FILE_SUPERSEDE: u32 = 0;
@@ -1271,10 +1274,17 @@ impl WinOs {
     /// arg7=FileInformationClass, arg8=ReturnSingleEntry, arg9=*FileName,
     /// arg10=RestartScan.
     ///
-    /// Emits **FILE_BOTH_DIR_INFORMATION** (class 3) — the class Wine's
-    /// `FindFirstFile`/readdir path requests — one entry per call. The directory
-    /// handle carries the enumeration cursor (a `FindState` keyed by the handle),
-    /// (re)built on the first call or when `RestartScan` is set.
+    /// Answers the two classes the pinned Wine prefix actually asks for, one
+    /// entry per call: **`FileBothDirectoryInformation`** (3), which
+    /// `ntdll!lookup_winsxs` uses, and
+    /// **`FileIdExtdBothDirectoryInformation`** (0x3F), which
+    /// `kernelbase!FindFirstFileExW`/`FindNextFileW` use — see
+    /// [`FILE_BOTH_DIRECTORY_INFORMATION`] and
+    /// [`FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION`] for the layouts and where
+    /// each was recovered from. Any other class is refused.
+    ///
+    /// The directory handle carries the enumeration cursor (a `FindState` keyed
+    /// by the handle), (re)built on the first call or when `RestartScan` is set.
     pub(crate) fn nt_query_directory_file(
         &mut self,
         cpu: &mut CpuState,
@@ -1283,12 +1293,25 @@ impl WinOs {
         let handle = self.syscall_arg(cpu, mem, 0)?;
         let iosb_ptr = self.syscall_arg(cpu, mem, 4)?;
         let info = self.syscall_arg(cpu, mem, 5)?;
-        let length = self.syscall_arg(cpu, mem, 6)?;
+        // Length / FileInformationClass / RestartScan are ULONG and BOOLEAN, so
+        // only their low 32 bits are the guest's — see `syscall_arg_u32`, and
+        // `kernelbase!FindNextFileW`, which writes all three as `mov dword`.
+        let length = self.syscall_arg_u32(cpu, mem, 6)? as u64;
+        let class_id = self.syscall_arg_u32(cpu, mem, 7)? as u64;
         let name_ptr = self.syscall_arg(cpu, mem, 9)?;
-        let restart = self.syscall_arg(cpu, mem, 10)? != 0;
+        let restart = self.syscall_arg_u32(cpu, mem, 10)? != 0;
         if !self.is_file_handle(handle) {
             return Ok(STATUS_INVALID_HANDLE);
         }
+        // The class decides the layout, and getting it wrong is silent — so an
+        // unknown one is refused rather than answered with the class-3 struct.
+        // (`FileInformationClass` was previously ignored altogether, which meant
+        // Wine's own FindFirstFileW — class 0x3F, name at +0x72 — was handed a
+        // name at +0x5E and read zeroes.)
+        let Some(&class) = DIR_INFO_CLASSES.iter().find(|c| c.class == class_id) else {
+            write_iosb(mem, iosb_ptr, STATUS_INVALID_INFO_CLASS, 0)?;
+            return Ok(STATUS_INVALID_INFO_CLASS);
+        };
 
         // The wildcard (optional): a UNICODE_STRING* naming the search pattern.
         let pattern = if name_ptr != 0 {
@@ -1319,15 +1342,16 @@ impl WinOs {
         };
 
         let name_units: Vec<u16> = entry.name.encode_utf16().collect();
-        let name_bytes = name_units.len() * 2;
-        // FILE_BOTH_DIR_INFORMATION fixed part = 0x60 bytes, then the name.
-        let need = 0x60 + name_bytes;
-        if length < need as u64 {
+        let name_bytes = name_units.len() as u64 * 2;
+        // The entry is the fixed part UP TO the name, then the name — not the
+        // struct's padded `sizeof`.
+        let need = class.name_off + name_bytes;
+        if length < need {
             write_iosb(mem, iosb_ptr, STATUS_BUFFER_TOO_SMALL, 0)?;
             return Ok(STATUS_BUFFER_TOO_SMALL);
         }
-        write_both_dir_information(mem, info, &entry, &name_units)?;
-        write_iosb(mem, iosb_ptr, STATUS_SUCCESS, need as u64)?;
+        write_dir_information(mem, info, class, &entry, &name_units)?;
+        write_iosb(mem, iosb_ptr, STATUS_SUCCESS, need)?;
         Ok(STATUS_SUCCESS)
     }
 
@@ -1399,9 +1423,24 @@ fn write_iosb(mem: &mut dyn Memory, ptr: u64, status: u32, information: u64) -> 
     Ok(())
 }
 
-/// Write a `FILE_BOTH_DIR_INFORMATION` (fixed part 0x60 bytes, then the file
-/// name) into guest memory for one directory entry. `NextEntryOffset` is 0
-/// (single-entry-per-call model).
+/// A directory-entry information class `NtQueryDirectoryFile` can answer:
+/// which `FileInformationClass` value asks for it, and **where its
+/// variable-length `FileName` starts**.
+///
+/// `name_off` is the size of the fixed part that precedes the name. It is
+/// **not** `sizeof(struct)`: every one of these ends in `WCHAR FileName[1]`, so
+/// its `sizeof` is padded past the field. Writing the name at the padded
+/// `sizeof` is a real bug and it is silent — the reader gets a `FileNameLength`
+/// that says there is a name and finds zeroes there.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DirInfoClass {
+    /// The `FileInformationClass` value the guest passes.
+    class: u64,
+    /// Byte offset of `FileName[0]`.
+    name_off: u64,
+}
+
+/// `FileBothDirectoryInformation` (3) — `FILE_BOTH_DIR_INFORMATION`.
 ///
 /// ```text
 ///   0x00 NextEntryOffset   ULONG   (0 — last/only entry)
@@ -1416,19 +1455,67 @@ fn write_iosb(mem: &mut dyn Memory, ptr: u64, status: u32, information: u64) -> 
 ///   0x3C FileNameLength    ULONG   (bytes)
 ///   0x40 EaSize            ULONG
 ///   0x44 ShortNameLength   CCHAR
-///   0x46 ShortName         WCHAR[12] (0x18 bytes)
-///   0x5E (pad to)          0x60
-///   0x60 FileName          WCHAR[]
+///   0x46 ShortName         WCHAR[12]   (0x18 bytes, ends at 0x5E)
+///   0x5E FileName          WCHAR[]     ← sizeof is 0x60 only because of tail pad
 /// ```
-fn write_both_dir_information(
+///
+/// **Recovered from the pinned prefix's own consumer, not from the header.**
+/// `ntdll!lookup_winsxs` reads the entry it just asked for with
+/// `mov eax,[r15]; lea r14,[r15+0x5e]` (64-bit, rva 0x55e6e) and
+/// `mov eax,[esi]; lea ebx,[esi+0x5e]` (32-bit, rva 0x53f67) — `r15`/`esi` walk
+/// the buffer by `NextEntryOffset`, and `[r15+0x3c]` is read later as
+/// `FileNameLength`. Both halves agree, and both ask for class 3
+/// (`mov dword ptr [rsp+0x38], 3` / `mov dword ptr [esp+0x1c], 3`).
+const FILE_BOTH_DIRECTORY_INFORMATION: DirInfoClass = DirInfoClass { class: 3, name_off: 0x5E };
+
+/// `FileIdExtdBothDirectoryInformation` (0x3F) —
+/// `FILE_ID_EXTD_BOTH_DIR_INFORMATION`. Same head through `EaSize`, then:
+///
+/// ```text
+///   0x44 ReparsePointTag   ULONG
+///   0x48 FileId            FILE_ID_128 (0x10 bytes)
+///   0x58 ShortNameLength   CCHAR
+///   0x5A ShortName         WCHAR[12]   (0x18 bytes, ends at 0x72)
+///   0x72 FileName          WCHAR[]
+/// ```
+///
+/// **This is the class Wine's own `FindFirstFileW`/`FindNextFileW` use**, so it
+/// is the one nearly every Wine-hosted guest's directory enumeration goes
+/// through — and answering it with the class-3 layout put the name 0x14 bytes
+/// short of where the reader looks. Recovered from `kernelbase!FindNextFileW`
+/// (rva 0x1fa90): it passes `mov dword ptr [rsp+0x38], 0x3f`, then reads
+/// `[r14+0x3c]` (FileNameLength), `[r14+0x72]`/`[r14+0x74]` (the `.`/`..`
+/// check on `FileName[0..1]`), `[r14+0x44]` into `WIN32_FIND_DATAW.dwReserved0`
+/// (the reparse tag), `movsx rax, byte [r14+0x58]` (ShortNameLength) and
+/// `lea rsi,[r14+0x5a]` (ShortName).
+const FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION: DirInfoClass =
+    DirInfoClass { class: 0x3F, name_off: 0x72 };
+
+/// The classes exemu answers. Anything else gets `STATUS_INVALID_INFO_CLASS`
+/// rather than a struct of the wrong shape: a guest told "success" over a
+/// layout it did not ask for reads garbage and blames itself.
+const DIR_INFO_CLASSES: [DirInfoClass; 2] =
+    [FILE_BOTH_DIRECTORY_INFORMATION, FILE_ID_EXTD_BOTH_DIRECTORY_INFORMATION];
+
+/// Write one directory entry in `class`'s layout into guest memory.
+/// `NextEntryOffset` is 0 (single-entry-per-call model).
+///
+/// The head through `FileNameLength` is identical in every class here; what
+/// differs is only where the name goes, which is what [`DirInfoClass`] carries.
+/// Everything between `EaSize` and the name (`ShortName`, the reparse tag, the
+/// 128-bit file id) is left zeroed — `ShortNameLength = 0` is what tells a
+/// reader there is no 8.3 alias, and Wine's `FindNextFileW` honours it.
+fn write_dir_information(
     mem: &mut dyn Memory,
     ptr: u64,
+    class: DirInfoClass,
     entry: &FindEntry,
     name_units: &[u16],
 ) -> Result<()> {
     let name_bytes = name_units.len() * 2;
-    // Zero the fixed part (also clears ShortName and the pad).
-    mem.write(ptr, &[0u8; 0x60])?;
+    // Zero the fixed part (also clears ShortName and everything before the name).
+    let zero = vec![0u8; class.name_off as usize];
+    mem.write(ptr, &zero)?;
     mem.write_u32(ptr, 0)?; // NextEntryOffset
     mem.write_u64(ptr + 0x08, entry.ctime)?;
     mem.write_u64(ptr + 0x10, entry.atime)?;
@@ -1439,9 +1526,8 @@ fn write_both_dir_information(
     let attrs: u32 = if entry.is_dir { FILE_ATTRIBUTE_DIRECTORY as u32 } else { FILE_ATTRIBUTE_NORMAL as u32 };
     mem.write_u32(ptr + 0x38, attrs)?;
     mem.write_u32(ptr + 0x3C, name_bytes as u32)?;
-    // FileName at 0x60.
     for (i, u) in name_units.iter().enumerate() {
-        mem.write_u16(ptr + 0x60 + (i as u64) * 2, *u)?;
+        mem.write_u16(ptr + class.name_off + (i as u64) * 2, *u)?;
     }
     Ok(())
 }

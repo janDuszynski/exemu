@@ -214,6 +214,30 @@ impl WinOs {
         })
     }
 
+    /// Argument `i` of the current NT syscall as a **32-bit** value — for every
+    /// parameter the NT prototype declares `ULONG`, `BOOLEAN` or an enum.
+    ///
+    /// This is not cosmetic truncation. A stack argument occupies a full 8-byte
+    /// slot, but a caller storing a 32-bit value writes only the low half and
+    /// **leaves the upper half holding whatever was on its stack**. Wine's own
+    /// `kernelbase!FindNextFileW` does exactly that for four of
+    /// `NtQueryDirectoryFile`'s arguments —
+    /// `mov dword ptr [rsp+0x30], eax` (Length),
+    /// `mov dword ptr [rsp+0x38], 0x3f` (FileInformationClass),
+    /// `mov dword ptr [rsp+0x40], 0` (ReturnSingleEntry) and
+    /// `mov dword ptr [rsp+0x50], 0` (RestartScan) — so a handler reading those
+    /// slots with [`WinOs::syscall_arg`] sees values like `0x2_0000_003f` for a
+    /// class of `3f` and `0x10_0000_0272` for a length of `0x272`. Measured, not
+    /// theorised: those are real values off the shell-link gate's run.
+    ///
+    /// The consequences are silent and shaped like guest bugs — a class
+    /// comparison that never matches, a `BOOLEAN` that reads true when the guest
+    /// passed zero. Register-passed arguments (`i < 4`) have the same rule: the
+    /// caller may have set only the 32-bit half.
+    pub(crate) fn syscall_arg_u32(&self, cpu: &CpuState, mem: &dyn Memory, i: usize) -> Result<u32> {
+        Ok(self.syscall_arg(cpu, mem, i)? as u32)
+    }
+
     /// Lazily reserve the dispatcher's dedicated unix stack and return the
     /// initial (top) RSP. Allocated 16-byte aligned; grows down. Returns 0 (and
     /// the dispatcher then keeps the guest stack) if the arena is exhausted —

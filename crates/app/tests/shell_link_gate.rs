@@ -146,25 +146,44 @@ fn shell_link_sample_writes_a_start_menu_shortcut_on_wine() {
     assert_ne!(link_flags & 0x02, 0, "LinkFlags.HasLinkInfo — the target is recorded ({link_flags:#x})");
     assert_eq!(u32_at(0x3C), 1, "ShowCommand = SW_SHOWNORMAL");
 
-    // LinkInfo (present because HasLinkInfo is set), starting right after the
-    // header. Its LocalBasePath is a NUL-terminated *ANSI* string at
+    // **LinkTargetIDList — the shell-namespace PIDL (roadmap W6.6).** This used
+    // to be absent and was pinned as a gap: `SetPath` builds the PIDL by walking
+    // the namespace (`SHGetDesktopFolder` → `IShellFolder::ParseDisplayName`),
+    // and that walk enumerates each directory on the way down. It could not
+    // work while `NtQueryDirectoryFile` answered every class with the class-3
+    // layout and put `FileName` at the struct's padded `sizeof` — Wine's own
+    // `FindFirstFileW` asks for `FileIdExtdBothDirectoryInformation` and reads
+    // the name at +0x72, so every name came back empty and the walk resolved
+    // nothing. With the layouts right the walk completes, and the PIDL below
+    // spells out `C:\` → `windows` → `system32` → `notepad.exe`.
+    assert_ne!(
+        link_flags & 0x01,
+        0,
+        "LinkFlags.HasLinkTargetIDList — the shell-namespace walk resolved the target ({link_flags:#x})",
+    );
+    let idlist_size = u16::from_le_bytes(b[0x4C..0x4E].try_into().unwrap()) as usize;
+    assert!(idlist_size > 0, "IDListSize");
+    let idlist = &b[0x4E..0x4E + idlist_size];
+    for want in ["windows", "system32", "notepad.exe"] {
+        assert!(
+            idlist.windows(want.len()).any(|w| w.eq_ignore_ascii_case(want.as_bytes())),
+            "the PIDL names {want} — it was built by walking the sandbox with Wine's own \
+             FindFirstFileW, so an empty directory enumeration cannot produce it",
+        );
+    }
+
+    // LinkInfo (present because HasLinkInfo is set) starts after the header and
+    // the IDList. Its LocalBasePath is a NUL-terminated *ANSI* string at
     // `LinkInfo + LocalBasePathOffset`, and it must be exactly the target the
     // sample gave SetPath — a full round trip: guest string → Wine's shell link
     // object → a file on disk → back out here.
-    let li = 0x4Cusize;
+    let li = 0x4Eusize + idlist_size;
     assert!(li + u32_at(li) <= b.len(), "LinkInfoSize fits the file");
     assert_ne!(u32_at(li + 0x08) & 0x01, 0, "LinkInfoFlags.VolumeIDAndLocalBasePath");
     let base = li + u32_at(li + 0x10); // LocalBasePathOffset
     let end = b[base..].iter().position(|&c| c == 0).expect("LocalBasePath is NUL-terminated") + base;
     let target = std::str::from_utf8(&b[base..end]).expect("LocalBasePath is ASCII here");
     assert_eq!(target, shell_link_sample::TARGET_PATH, "the .lnk records the target SetPath was given");
-
-    // PINNED GAP: no `LinkTargetIDList`. Real Windows also stores the target as
-    // a PIDL (LinkFlags bit 0), which `SetPath` builds by walking the shell
-    // namespace — `SHGetDesktopFolder` → `IShellFolder::ParseDisplayName`. That
-    // walk does not produce one here, so the shortcut resolves by path only.
-    // When this starts holding, this assertion fails and the docs must say so.
-    assert_eq!(link_flags & 0x01, 0, "GAP (no shell-namespace PIDL) appears to be FIXED — update this test and the W6.6 notes; LinkFlags={link_flags:#x}");
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
