@@ -4,6 +4,8 @@ use exemu_cpu::{Bits, Interpreter};
 use exemu_jit::{Jit, Mode, Run};
 use exemu_memory::VirtualMemory;
 
+const DECLINED: u8 = 0xF4;
+
 const TOP32: u64 = 0xFFFF_F000;
 const ZERO: u64 = 0x0;
 const HIGH64: u64 = 0x1_0000_0000;
@@ -178,7 +180,7 @@ fn the_stack_pointer_wraps_at_2_32() {
     let code = [
         0x50,
         0x5B,
-        0xC3,
+        DECLINED,
     ];
     let mut s = seed(Bits::B32);
     s.gpr[4] = 0;
@@ -193,11 +195,11 @@ fn the_stack_pointer_wraps_at_2_32() {
     let mut s2 = seed(Bits::B32);
     s2.gpr[5] = 0xFFFF_FFFC;
     s2.gpr[4] = 0x10;
-    parity(Bits::B32, TOP32, &[0xC9, 0xC3], "leave across 2^32", &s2);
+    parity(Bits::B32, TOP32, &[0xC9, DECLINED], "leave across 2^32", &s2);
 
     let mut pushi = vec![0x68];
     pushi.extend_from_slice(&0x1234_5678u32.to_le_bytes());
-    pushi.push(0xC3);
+    pushi.push(DECLINED);
     let mut s3 = seed(Bits::B32);
     s3.gpr[4] = 0;
     parity(Bits::B32, TOP32, &pushi, "push imm32 across 2^32", &s3);
@@ -209,7 +211,7 @@ fn an_effective_address_wraps_at_2_32() {
         0x8B, 0x43, 0x10,
         0x89, 0x43, 0x20,
         0x8D, 0x4B, 0x30,
-        0xC3,
+        DECLINED,
     ];
     let mut s = seed(Bits::B32);
     s.gpr[3] = 0xFFFF_FFF8;
@@ -226,7 +228,7 @@ fn an_effective_address_wraps_at_2_32() {
     let sib = [
         0x8B, 0x04, 0x73,
         0x8D, 0x14, 0xB3,
-        0xC3,
+        DECLINED,
     ];
     let mut s2 = seed(Bits::B32);
     s2.gpr[3] = 0xFFFF_FFF0;
@@ -235,7 +237,7 @@ fn an_effective_address_wraps_at_2_32() {
 
     let mut abs = vec![0x8B, 0x05];
     abs.extend_from_slice(&(-0x10i32).to_le_bytes());
-    abs.push(0xC3);
+    abs.push(DECLINED);
     parity(Bits::B32, TOP32, &abs, "negative absolute disp32", &s);
 }
 
@@ -247,7 +249,7 @@ fn addresses_above_4_gib_survive_in_long_mode() {
         0x48, 0x8D, 0x4B, 0x30,
         0x50,
         0x5A,
-        0xC3,
+        DECLINED,
     ];
     let mut s = seed(Bits::B64);
     s.gpr[3] = HIGH64 + 0x100;

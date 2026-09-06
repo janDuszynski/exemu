@@ -4,6 +4,8 @@ use exemu_cpu::{Bits, Interpreter};
 use exemu_jit::{Jit, Mode, Run};
 use exemu_memory::VirtualMemory;
 
+const DECLINED: u8 = 0xF4;
+
 const CODE: u64 = 0x1_0000;
 const DATA: u64 = 0x2_0000;
 const TEB32: u64 = exemu_core::cpu::DEFAULT_FS_BASE;
@@ -133,7 +135,7 @@ fn rip_relative_operands() {
     let d3 = (DATA as i64 + 0x80 - (CODE as i64 + 19)) as i32;
     code.extend_from_slice(&[0x0F, 0xB6, 0x0D]);
     code.extend_from_slice(&d3.to_le_bytes());
-    code.push(0xC3);
+    code.push(DECLINED);
     let n = parity(Bits::B64, &code, "rip-relative", &seed(Bits::B64));
     assert!(n == 3 || !jit_available(), "expected all three compiled, got {n}");
 }
@@ -144,7 +146,7 @@ fn gs_relative_teb_access_64bit() {
         0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00,
         0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0x00, 0x00, 0x00,
         0x65, 0x48, 0x89, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00,
-        0xC3,
+        DECLINED,
     ];
     parity(Bits::B64, &code, "gs: TEB access", &seed(Bits::B64));
 }
@@ -153,13 +155,13 @@ fn gs_relative_teb_access_64bit() {
 fn fs_relative_teb_access_32bit() {
     let code = [
         0x64, 0xA1, 0x18, 0x00, 0x00, 0x00,
-        0xC3,
+        DECLINED,
     ];
     let code2 = [
         0x64, 0x8B, 0x05, 0x18, 0x00, 0x00, 0x00,
         0x64, 0x8B, 0x0D, 0x00, 0x00, 0x00, 0x00,
         0x64, 0x89, 0x05, 0x04, 0x00, 0x00, 0x00,
-        0xC3,
+        DECLINED,
     ];
     let _ = code;
     parity(Bits::B32, &code2, "fs: TEB access", &seed(Bits::B32));
@@ -172,7 +174,7 @@ fn high_byte_registers() {
         0x88, 0xE1,
         0x30, 0xCE,
         0x38, 0xF4,
-        0xC3,
+        DECLINED,
     ];
     parity(Bits::B64, &code, "high-8 registers (64-bit)", &seed(Bits::B64));
     parity(Bits::B32, &code, "high-8 registers (32-bit)", &seed(Bits::B32));
@@ -186,7 +188,7 @@ fn byte_and_word_arithmetic_flags() {
         0x66, 0x05, 0xFF, 0x7F,
         0x66, 0x81, 0xEA, 0x00, 0x80,
         0x38, 0xFB,
-        0xC3,
+        DECLINED,
     ];
     parity(Bits::B64, &code, "8/16-bit flags", &seed(Bits::B64));
     parity(Bits::B32, &code, "8/16-bit flags (32-bit)", &seed(Bits::B32));
@@ -198,7 +200,7 @@ fn shift_of_zero_touches_no_flag() {
         0xC1, 0xE0, 0x00,
         0xC1, 0xE9, 0x00,
         0xC1, 0xFA, 0x00,
-        0xC3,
+        DECLINED,
     ];
     parity(Bits::B64, &code, "shift by zero", &seed(Bits::B64));
 }
@@ -213,7 +215,7 @@ fn shift_edges() {
         0xC0, 0xE6, 0x1F,
         0x48, 0xC1, 0xEF, 0x3F,
         0x48, 0xC1, 0xFE, 0x3F,
-        0xC3,
+        DECLINED,
     ];
     parity(Bits::B64, &code, "shift edges", &seed(Bits::B64));
 }
@@ -225,7 +227,7 @@ fn inc_dec_preserve_carry() {
         0x48, 0xFF, 0xC9,
         0xFE, 0xC2,
         0x66, 0xFF, 0xCB,
-        0xC3,
+        DECLINED,
     ];
     let mut s = seed(Bits::B64);
     parity(Bits::B64, &code, "inc/dec with CF set", &s);
@@ -239,7 +241,7 @@ fn cmov_writes_its_destination_either_way() {
         0x0F, 0x44, 0xC1,
         0x0F, 0x45, 0xD3,
         0x48, 0x0F, 0x42, 0xF7,
-        0xC3,
+        DECLINED,
     ];
     let mut s = seed(Bits::B64);
     parity(Bits::B64, &code, "cmov (ZF clear)", &s);
@@ -256,7 +258,7 @@ fn push_pop_including_the_stack_pointer_itself() {
         0x5C,
         0x55,
         0x5D,
-        0xC3,
+        DECLINED,
     ];
     parity(Bits::B64, &code, "push/pop 64-bit", &seed(Bits::B64));
     parity(Bits::B32, &code, "push/pop 32-bit", &seed(Bits::B32));
@@ -269,7 +271,7 @@ fn imul_overflow_flags() {
         0x48, 0x0F, 0xAF, 0xD3,
         0x6B, 0xF7, 0x7F,
         0x69, 0xFE, 0x00, 0x00, 0x01, 0x00,
-        0xC3,
+        DECLINED,
     ];
     parity(Bits::B64, &code, "imul", &seed(Bits::B64));
 }
@@ -282,7 +284,7 @@ fn absolute_disp32_addressing_in_32bit_mode() {
     code.extend_from_slice(&a.to_le_bytes());
     code.extend_from_slice(&[0x01, 0x05]);
     code.extend_from_slice(&b.to_le_bytes());
-    code.push(0xC3);
+    code.push(DECLINED);
     parity(Bits::B32, &code, "absolute disp32", &seed(Bits::B32));
 }
 
@@ -295,7 +297,7 @@ fn sib_addressing_with_every_scale() {
         0x8B, 0x3C, 0xF3,
         0x8B, 0x6B, 0xF0,
         0x8B, 0x83, 0x00, 0x01, 0x00, 0x00,
-        0xC3,
+        DECLINED,
     ];
     let mut s = seed(Bits::B64);
     s.gpr[6] = 8;
@@ -363,11 +365,11 @@ fn a_superseded_flag_result_costs_no_code() {
     if !jit_available() {
         return;
     }
-    let one = compile_len(&[0x01, 0xC8, 0xC3]);
+    let one = compile_len(&[0x01, 0xC8, DECLINED]);
     let eight = compile_len(&[
         0x01, 0xC8, 0x01, 0xC8, 0x01, 0xC8, 0x01, 0xC8,
         0x01, 0xC8, 0x01, 0xC8, 0x01, 0xC8, 0x01, 0xC8,
-        0xC3,
+        DECLINED,
     ]);
     let marginal = (eight - one) as f64 / 7.0;
     assert!(
@@ -390,7 +392,7 @@ fn push_immediate_and_leave() {
         0x6A, 0x7F,
         0x68, 0xEF, 0xBE, 0xAD, 0xDE,
         0xC9,
-        0xC3,
+        DECLINED,
     ];
     parity(Bits::B64, &code, "push imm / leave 64", &seed(Bits::B64));
     parity(Bits::B32, &code, "push imm / leave 32", &seed(Bits::B32));
@@ -407,14 +409,14 @@ fn mov_to_and_from_an_absolute_offset() {
     code.extend_from_slice(&(a + 0x20).to_le_bytes());
     code.push(0xA2);
     code.extend_from_slice(&(a + 0x21).to_le_bytes());
-    code.push(0xC3);
+    code.push(DECLINED);
     parity(Bits::B64, &code, "moffs 64", &seed(Bits::B64));
 
     let mut code32 = vec![0xA1];
     code32.extend_from_slice(&(a as u32).to_le_bytes());
     code32.push(0xA3);
     code32.extend_from_slice(&((a + 4) as u32).to_le_bytes());
-    code32.push(0xC3);
+    code32.push(DECLINED);
     parity(Bits::B32, &code32, "moffs 32", &seed(Bits::B32));
 }
 
@@ -422,7 +424,7 @@ fn mov_to_and_from_an_absolute_offset() {
 fn mov_from_an_absolute_offset_through_a_segment_base() {
     let mut code = vec![0x65, 0x48, 0xA1];
     code.extend_from_slice(&0x28u64.to_le_bytes());
-    code.push(0xC3);
+    code.push(DECLINED);
     parity(Bits::B64, &code, "gs moffs 64", &seed(Bits::B64));
 
     let mut code32 = vec![0x64, 0xA1];
@@ -430,7 +432,7 @@ fn mov_from_an_absolute_offset_through_a_segment_base() {
     code32.push(0x64);
     code32.push(0xA3);
     code32.extend_from_slice(&0x1Cu32.to_le_bytes());
-    code32.push(0xC3);
+    code32.push(DECLINED);
     parity(Bits::B32, &code32, "fs moffs 32", &seed(Bits::B32));
 }
 
@@ -438,7 +440,7 @@ fn mov_from_an_absolute_offset_through_a_segment_base() {
 fn a_direct_call_pushes_the_return_address_and_lands_on_its_target() {
     let mut code = vec![0xE8, 0x05, 0x00, 0x00, 0x00];
     code.extend_from_slice(&[0x90; 5]);
-    code.push(0xC3);
+    code.push(DECLINED);
     parity(Bits::B64, &code, "call rel32 64", &seed(Bits::B64));
     parity(Bits::B32, &code, "call rel32 32", &seed(Bits::B32));
 }
@@ -495,7 +497,7 @@ fn a_conditional_branch_lands_on_the_right_side() {
             0x39, 0xC0,
             0x74, 0x02,
             0xB8, 0x01, 0x00, 0x00, 0x00,
-            0xC3,
+            DECLINED,
         ];
         let mut s = seed(Bits::B64);
         if !seed_flags {
@@ -554,19 +556,19 @@ fn store_fault_parity(bits: Bits, code: &[u8], expect_retired: u32, what: &str) 
 
 #[test]
 fn a_store_only_fault_rewinds_the_flags_it_had_already_computed() {
-    store_fault_parity(Bits::B64, &[0xFE, 0x07, 0xC3], 0, "inc byte [rdi] 64-bit");
-    store_fault_parity(Bits::B32, &[0xFE, 0x07, 0xC3], 0, "inc byte [rdi] 32-bit");
-    store_fault_parity(Bits::B64, &[0x01, 0x07, 0xC3], 0, "add [rdi], eax");
-    store_fault_parity(Bits::B64, &[0x29, 0x07, 0xC3], 0, "sub [rdi], eax");
-    store_fault_parity(Bits::B64, &[0x21, 0x07, 0xC3], 0, "and [rdi], eax");
-    store_fault_parity(Bits::B64, &[0xF6, 0x1F, 0xC3], 0, "neg byte [rdi]");
-    store_fault_parity(Bits::B64, &[0xD1, 0x27, 0xC3], 0, "shl dword [rdi], 1");
-    store_fault_parity(Bits::B64, &[0x31, 0x07, 0xC3], 0, "xor [rdi], eax");
+    store_fault_parity(Bits::B64, &[0xFE, 0x07, DECLINED], 0, "inc byte [rdi] 64-bit");
+    store_fault_parity(Bits::B32, &[0xFE, 0x07, DECLINED], 0, "inc byte [rdi] 32-bit");
+    store_fault_parity(Bits::B64, &[0x01, 0x07, DECLINED], 0, "add [rdi], eax");
+    store_fault_parity(Bits::B64, &[0x29, 0x07, DECLINED], 0, "sub [rdi], eax");
+    store_fault_parity(Bits::B64, &[0x21, 0x07, DECLINED], 0, "and [rdi], eax");
+    store_fault_parity(Bits::B64, &[0xF6, 0x1F, DECLINED], 0, "neg byte [rdi]");
+    store_fault_parity(Bits::B64, &[0xD1, 0x27, DECLINED], 0, "shl dword [rdi], 1");
+    store_fault_parity(Bits::B64, &[0x31, 0x07, DECLINED], 0, "xor [rdi], eax");
 }
 
 #[test]
 fn a_store_only_fault_rewinds_to_a_deferred_flag_state() {
-    let code = [0x83, 0xC0, 0x01, 0x01, 0x07, 0xC3];
+    let code = [0x83, 0xC0, 0x01, 0x01, 0x07, DECLINED];
     store_fault_parity(Bits::B64, &code, 1, "deferred then a faulting store 64-bit");
     store_fault_parity(Bits::B32, &code, 1, "deferred then a faulting store 32-bit");
 }
