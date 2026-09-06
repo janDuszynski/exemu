@@ -675,6 +675,190 @@ fn align_up_page(v: u64) -> u64 {
     (v + 0xfff) & !0xfff
 }
 
+// --- The user-mode client callback (roadmap W5.10) --------------------------
+//
+// The one path by which a kernel calls *back* into user mode. exemu's win32k is
+// the kernel, so every `WM_NCCREATE` a `NtUserCreateWindowEx` owes its window
+// travels this way in a WoW64 process. Everything below was read out of the
+// pinned binaries; `crates/app/tests/wow64_callback_abi.rs` re-derives all of
+// it on every run.
+
+/// `PEB64.KernelCallbackTable` — the array `ntdll!KiUserCallbackDispatcher`
+/// indexes with the callback id the kernel names.
+///
+/// Recovered from that dispatcher's own bytes (64-bit ntdll rva 0x10a88):
+/// `mov rax, gs:[0x60]` (the TEB's PEB pointer) `; mov rax,[rax+0x58] ; call
+/// qword ptr [rax + r8*8]`.
+pub const PEB64_KERNEL_CALLBACK_TABLE: u64 = 0x58;
+
+/// The `KiUserCallbackDispatcher` **entry frame**: the kernel resumes user mode
+/// with `rsp` pointing at a block whose first `0x20` bytes are the callee's
+/// shadow area and whose three fields follow.
+///
+/// Recovered verbatim from the dispatcher's first three instructions:
+///
+/// ```text
+///   mov  rcx, qword ptr [rsp+0x20]     ; args
+///   mov  edx, dword  ptr [rsp+0x28]    ; len
+///   mov  r8d, dword  ptr [rsp+0x2c]    ; id
+///   mov  rax, gs:[0x60]                ; PEB
+///   mov  rax, [rax+0x58]               ; PEB.KernelCallbackTable
+///   call qword ptr [rax + r8*8]        ; table[id]( args, len )
+///   xor  rcx,rcx ; xor edx,edx ; mov r8d,eax
+///   call NtCallbackReturn              ; …which never returns
+/// ```
+pub mod cb_frame {
+    /// `void *args` — the parameter block the callback is handed.
+    pub const ARGS: u64 = 0x20;
+    /// `ULONG len` — its length in bytes.
+    pub const LEN: u64 = 0x28;
+    /// `ULONG id` — the index into `PEB.KernelCallbackTable`.
+    pub const ID: u64 = 0x2c;
+    /// Bytes of frame the kernel must leave below the callee's own stack use.
+    pub const SIZE: u64 = 0x30;
+}
+
+/// `NtCallbackReturn` — SSDT index **5** in this pinned Wine build, read off the
+/// 64-bit `ntdll!NtCallbackReturn` stub's own `mov eax, 5`. The 32-bit ntdll's
+/// stub carries the same index (the two share one index space), so a WoW64
+/// guest's return arrives through `wow64.dll`'s table-0 slot 5 and then, from
+/// the 64-bit side, as this syscall.
+pub const SSDT_NT_CALLBACK_RETURN: u32 = 5;
+
+/// `NtUserCallWinProc` — the user-callback id that runs a window procedure.
+///
+/// Recovered by name, not by counting: `wow64win.dll`'s COFF symbol table names
+/// the table `user_callbacks` (rva 0x16620) and its entries
+/// `wow64_NtUser…`; the fifth is `wow64_NtUserCallWinProc` (rva 0xc6e0), and
+/// that thunk passes literal `4` as the 32-bit callback id it forwards to
+/// `Wow64KiUserCallbackDispatcher`. So the 64-bit index and the 32-bit id are
+/// the same number.
+pub const NT_USER_CALL_WIN_PROC: u32 = 4;
+
+/// `NTUSER_DPI_UNAWARE` — a `dpi_context` value user32 accepts.
+///
+/// Not a guess and not zero: `user32!SetThreadDpiAwarenessContext` maps the
+/// pseudo-handle `DPI_AWARENESS_CONTEXT_UNAWARE` (-1) through its own jump table
+/// to `mov eax, 0x6010`, and `user32!is_valid_dpi_awareness_context` accepts a
+/// value exactly when `(v & 0xf) == 0 && (v & 0x3ffe0000) == 0 && (v & 0xf0) ==
+/// 0x10 && (v & 0x1ff00) == 0x6000` — which `0x6010` satisfies and `0` does not.
+/// A zero here would make `dispatch_win_proc_params` set `ERROR_INVALID_PARAMETER`
+/// before every single window message.
+pub const NTUSER_DPI_UNAWARE: u32 = 0x6010;
+
+/// Wine's **64-bit** `struct win_proc_params` — the block `NtUserCallWinProc`
+/// carries, and the only structure exemu's kernel has to build for the callback
+/// path. `wow64win!win_proc_params_64to32` narrows it to the 32-bit form before
+/// the guest ever sees it, so exemu writes the 64-bit shape in both cases.
+///
+/// Field roles come from the two consumers, which agree field for field:
+/// `user32!dispatch_win_proc_params` (x86_64 rva 0x5ddb0) and its i386 twin
+/// (rva 0x63680). Sizes come from `win_proc_params_64to32` (rva 0x3d30), whose
+/// map is `{0x00,0x08,0x10,0x18,0x20}→{0x00,0x04,0x08,0x0c,0x10}` (five
+/// pointer-width fields narrowed), `0x28..0x30` copied as one qword to
+/// `0x14..0x1c` (two dwords), then `{0x30,0x34,0x38,0x40}→{0x1c,0x20,0x24,0x28}`.
+pub mod win_proc_params {
+    /// `WNDPROC func` — the procedure the A/W wrappers target.
+    pub const FUNC: u64 = 0x00;
+    /// `HWND hwnd`.
+    pub const HWND: u64 = 0x08;
+    /// `UINT msg`.
+    pub const MSG: u64 = 0x10;
+    /// `WPARAM wparam`.
+    pub const WPARAM: u64 = 0x18;
+    /// `LPARAM lparam`.
+    pub const LPARAM: u64 = 0x20;
+    /// `ULONG size` of the packed message data that follows the struct. Zero
+    /// means "nothing to unpack" — `dispatch_win_proc_params` branches on it
+    /// first (`mov eax,[params+0x28]; test eax,eax`).
+    pub const SIZE: u64 = 0x28;
+    /// `BOOL ansi` — non-zero routes through `WINPROC_CallProcAtoW`/`WtoA`.
+    pub const ANSI: u64 = 0x2c;
+    /// `enum wm_char_mapping mapping` — only read on the ANSI path.
+    pub const MAPPING: u64 = 0x30;
+    /// `ULONG dpi_context` — handed straight to `SetThreadDpiAwarenessContext`.
+    pub const DPI_CONTEXT: u64 = 0x34;
+    /// `WNDPROC procA`.
+    pub const PROC_A: u64 = 0x38;
+    /// `WNDPROC procW` — **the pointer actually called** when `ansi` is clear
+    /// (`call_window_proc`'s sixth argument). A value of `1` is the sentinel
+    /// that selects the dialog-procedure path instead.
+    pub const PROC_W: u64 = 0x40;
+    /// `LRESULT result` — written by user32 when the packed form is in use.
+    pub const RESULT: u64 = 0x48;
+    /// `sizeof(struct win_proc_params)`. Passing exactly this as the callback
+    /// `len` is what makes `wow64win` marshal no trailing message data
+    /// (`cmp r9d,0x48; jbe`) and 32-bit user32 take its short return
+    /// (`cmp esi,0x2c; ja`).
+    pub const SIZE_OF: u64 = 0x50;
+    /// The `len` exemu passes: the struct up to but excluding `result`.
+    pub const CALL_LEN: u32 = 0x48;
+}
+
+/// Publish `PEB64.KernelCallbackTable` from `wow64win.dll`'s own `user_callbacks`
+/// array, and return the table's address (roadmap W5.10).
+///
+/// On Windows — and in Wine — `wow64win!DllMain` does this itself on
+/// `DLL_PROCESS_ATTACH`. exemu's WoW64 boot maps `wow64win` directly and never
+/// runs a `DllMain` (its `LdrLoadDll` hands back the pre-mapped base), so the
+/// table would stay null and `KiUserCallbackDispatcher` would `call [0 + id*8]`.
+/// This publishes it exactly as that `DllMain` would.
+///
+/// **The table address is decoded out of `DllMain`'s own bytes, never
+/// hardcoded.** From the module entry point (one `jmp rel32` thunk in the pinned
+/// build), the first occurrence of
+///
+/// ```text
+///   lea rdx, [rip+disp32]        ; 48 8D 15 <disp32>   → user_callbacks
+///   mov rax, gs:[0x30]           ; 65 48 8B 04 25 30 00 00 00
+///   mov rax, [rax+0x60]          ; 48 8B 40 60          → TEB.ProcessEnvironmentBlock
+///   mov [rax+0x58], rdx          ; 48 89 50 58          → PEB.KernelCallbackTable
+/// ```
+///
+/// yields both the array and — as a cross-check that this really is the publish
+/// site — the two PEB offsets. A drifted prologue fails loudly here instead of
+/// leaving a null table for the first `WM_NCCREATE` to fall into.
+pub fn publish_kernel_callback_table(mem: &mut dyn Memory, wow64win_base: u64, entry: u64, peb64: u64) -> Result<u64> {
+    /// `mov rax, gs:[0x30]; mov rax,[rax+0x60]; mov [rax+0x58], rdx`.
+    const TAIL: [u8; 17] = [
+        0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00, // mov rax, gs:[0x30]
+        0x48, 0x8B, 0x40, 0x60, // mov rax, [rax+0x60]
+        0x48, 0x89, 0x50, 0x58, // mov [rax+0x58], rdx
+    ];
+    // The entry point is a `jmp rel32` thunk to DllMain in this build; follow it
+    // once so the scan window starts at the real body.
+    let mut head = [0u8; 5];
+    mem.read(entry, &mut head)?;
+    let body = if head[0] == 0xE9 {
+        let rel = i32::from_le_bytes(head[1..5].try_into().unwrap());
+        (entry + 5).wrapping_add(rel as i64 as u64)
+    } else {
+        entry
+    };
+    let mut win = vec![0u8; 0x100];
+    mem.read(body, &mut win)?;
+    for i in 0..win.len() - (7 + TAIL.len()) {
+        if win[i] != 0x48 || win[i + 1] != 0x8D || win[i + 2] != 0x15 {
+            continue;
+        }
+        if win[i + 7..i + 7 + TAIL.len()] != TAIL {
+            continue;
+        }
+        let disp = i32::from_le_bytes(win[i + 3..i + 7].try_into().unwrap());
+        let table = (body + i as u64 + 7).wrapping_add(disp as i64 as u64);
+        if table < wow64win_base {
+            break;
+        }
+        mem.write_u64(peb64 + PEB64_KERNEL_CALLBACK_TABLE, table)?;
+        return Ok(table);
+    }
+    Err(EmuError::Os(format!(
+        "WoW64 boot: wow64win.dll's DllMain at {body:#x} does not publish PEB.KernelCallbackTable in \
+         the recovered shape (lea rdx,[rip+d32]; mov rax,gs:[0x30]; mov rax,[rax+0x60]; mov [rax+0x58],rdx) \
+         — the user-callback table cannot be located"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

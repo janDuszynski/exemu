@@ -1,0 +1,591 @@
+//! W5.10 — **the WoW64 user-callback protocol, re-derived from the pinned
+//! binaries.**
+//!
+//! A kernel calls back into user mode exactly one way, and exemu's win32k *is*
+//! the kernel: every `WM_NCCREATE` a `NtUserCreateWindowEx` owes its window has
+//! to travel it. In a WoW64 process the chain is
+//!
+//! ```text
+//!   exemu win32k  (the kernel side of a win32u SYSCALL)
+//!     → ntdll64!KiUserCallbackDispatcher      resume user mode, id + args on the stack
+//!     → PEB64.KernelCallbackTable[id]         = wow64win!user_callbacks[id]
+//!     → wow64win!wow64_NtUserCallWinProc      narrows win_proc_params 64→32
+//!     → wow64!Wow64KiUserCallbackDispatcher   builds a 32-bit frame, BTCpuSetContext,
+//!                                             setjmp, for(;;) BTCpuSimulate()
+//!     → ntdll32!KiUserCallbackDispatcher      32-bit, in 32-bit mode
+//!     → PEB32.KernelCallbackTable[id]         = user32(i386)!User32CallWinProc
+//!     → dispatch_win_proc_params → call_window_proc → the guest's WndProc
+//!     → ntdll32!NtCallbackReturn → the BOP → wow64.dll table 0 slot 5
+//!     → wow64_NtCallbackReturn: fill the frame at TEB64+0x14a8, longjmp
+//!     → back out through wow64win, which issues the 64-bit NtCallbackReturn
+//!     → exemu's SSDT handler resumes the interrupted syscall
+//! ```
+//!
+//! Every constant exemu's implementation depends on is read back out of
+//! `example_exe/wine-dlls/{i386,x86_64}-windows/*.dll` here, on every run. A
+//! guessed callback id, a drifted struct offset or a wrong frame displacement is
+//! the class of defect that costs this project tens of millions of instructions
+//! before it shows up as a fault three layers down — so none of it is guessed.
+//!
+//! Skip-guarded on the git-ignored Wine DLL set.
+
+use std::collections::BTreeMap;
+
+use exemu_os::wow64;
+
+const DLLS64: &str = "../../example_exe/wine-dlls/x86_64-windows";
+const DLLS32: &str = "../../example_exe/wine-dlls/i386-windows";
+
+fn have_set() -> bool {
+    std::path::Path::new(DLLS32).join("user32.dll").is_file()
+        && std::path::Path::new(DLLS64).join("wow64win.dll").is_file()
+}
+
+/// A parsed pinned image: exports, section bytes by RVA, imports, and the COFF
+/// symbol table mingw leaves in the shipped file (which is how an *internal*
+/// routine like `wow64_NtUserCallWinProc` is named rather than counted).
+struct Img {
+    image_base: u64,
+    exports: BTreeMap<String, u32>,
+    sections: Vec<(u32, Vec<u8>)>,
+    imports: Vec<(u32, String, String)>,
+    syms: BTreeMap<String, u32>,
+}
+
+fn load(path: &str) -> Img {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let img = exemu_loader::parse(&bytes).expect("pinned DLL parses");
+    let mut exports = BTreeMap::new();
+    for e in &img.exports {
+        if e.forwarder.is_none() {
+            if let Some(n) = &e.name {
+                exports.insert(n.clone(), e.rva);
+            }
+        }
+    }
+    let mut sections: Vec<(u32, Vec<u8>)> = img
+        .sections
+        .iter()
+        .filter(|s| !s.data.is_empty())
+        .map(|s| (s.rva, s.data.clone()))
+        .collect();
+    sections.sort_by_key(|(r, _)| *r);
+    let imports = img
+        .imports
+        .iter()
+        .filter_map(|i| match &i.symbol {
+            exemu_core::ImportSymbol::Named(n) => Some((i.iat_rva, i.dll.to_ascii_lowercase(), n.clone())),
+            exemu_core::ImportSymbol::Ordinal(_) => None,
+        })
+        .collect();
+    Img { image_base: img.image_base, exports, sections, imports, syms: coff_symbols(&bytes, &img) }
+}
+
+/// The COFF symbol table: 18-byte records at `PointerToSymbolTable`, names
+/// either inline (8 bytes) or an offset into the string table that follows.
+fn coff_symbols(bytes: &[u8], image: &exemu_core::PeImage) -> BTreeMap<String, u32> {
+    let pe = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
+    let symptr = u32::from_le_bytes(bytes[pe + 12..pe + 16].try_into().unwrap()) as usize;
+    let nsyms = u32::from_le_bytes(bytes[pe + 16..pe + 20].try_into().unwrap()) as usize;
+    let mut out = BTreeMap::new();
+    if symptr == 0 || nsyms == 0 || symptr + 18 * nsyms > bytes.len() {
+        return out;
+    }
+    let strtab = &bytes[symptr + 18 * nsyms..];
+    let mut i = 0usize;
+    while i < nsyms {
+        let e = &bytes[symptr + 18 * i..symptr + 18 * i + 18];
+        let name = if e[..4] == [0, 0, 0, 0] {
+            let off = u32::from_le_bytes(e[4..8].try_into().unwrap()) as usize;
+            let end = strtab[off..].iter().position(|b| *b == 0).unwrap_or(0) + off;
+            String::from_utf8_lossy(&strtab[off..end]).into_owned()
+        } else {
+            let end = e[..8].iter().position(|b| *b == 0).unwrap_or(8);
+            String::from_utf8_lossy(&e[..end]).into_owned()
+        };
+        let value = u32::from_le_bytes(e[8..12].try_into().unwrap());
+        let secnum = i16::from_le_bytes(e[12..14].try_into().unwrap());
+        let naux = e[17] as usize;
+        if secnum >= 1 && (secnum as usize) <= image.sections.len() && !name.starts_with('.') {
+            out.entry(name).or_insert(image.sections[secnum as usize - 1].rva + value);
+        }
+        i += 1 + naux;
+    }
+    out
+}
+
+impl Img {
+    fn at(&self, rva: u32, len: usize) -> &[u8] {
+        for (base, data) in &self.sections {
+            if rva >= *base && (rva - *base) as usize <= data.len() {
+                let off = (rva - *base) as usize;
+                return &data[off..(off + len).min(data.len())];
+            }
+        }
+        &[]
+    }
+
+    fn export(&self, name: &str) -> u32 {
+        *self.exports.get(name).unwrap_or_else(|| panic!("the pinned DLL does not export {name}"))
+    }
+
+    /// An internal routine, by its own COFF name (mingw keeps the table). i386
+    /// images carry cdecl/stdcall decoration (`_name`, `_name@N`), so try that
+    /// too rather than making every call site spell it.
+    fn sym(&self, name: &str) -> u32 {
+        if let Some(rva) = self.syms.get(name) {
+            return *rva;
+        }
+        let under = format!("_{name}");
+        if let Some(rva) = self.syms.get(&under) {
+            return *rva;
+        }
+        let at = format!("{under}@");
+        self.syms
+            .iter()
+            .find(|(k, _)| k.starts_with(&at))
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("the pinned DLL's COFF symbol table names {name}"))
+    }
+
+    fn u32_at(&self, rva: u32) -> u32 {
+        u32::from_le_bytes(self.at(rva, 4).try_into().expect("4 bytes at rva"))
+    }
+
+    fn u64_at(&self, rva: u32) -> u64 {
+        u64::from_le_bytes(self.at(rva, 8).try_into().expect("8 bytes at rva"))
+    }
+
+    /// A relocated 64-bit pointer stored in the file, as an RVA.
+    fn ptr_rva(&self, rva: u32) -> u32 {
+        let v = self.u64_at(rva);
+        assert!(v >= self.image_base, "{rva:#x} holds a pointer into this image");
+        (v - self.image_base) as u32
+    }
+
+    fn iat(&self, dll: &str, symbol: &str) -> u32 {
+        self.imports
+            .iter()
+            .find(|(_, d, s)| d == dll && s == symbol)
+            .map(|(r, _, _)| *r)
+            .unwrap_or_else(|| panic!("the pinned DLL imports {dll}!{symbol}"))
+    }
+}
+
+/// The RVA a `call`/`jmp rel32` at `rva` (whose opcode is `len` bytes in)
+/// targets.
+fn rel32_target(img: &Img, rva: u32, insn_len: u32) -> u32 {
+    let b = img.at(rva, insn_len as usize);
+    let disp = i32::from_le_bytes(b[insn_len as usize - 4..].try_into().unwrap());
+    (rva as i64 + insn_len as i64 + disp as i64) as u32
+}
+
+/// The RVA a RIP-relative instruction at `rva` of length `insn_len` refers to.
+fn rip_target(img: &Img, rva: u32, insn_len: u32) -> u32 {
+    rel32_target(img, rva, insn_len)
+}
+
+// ---------------------------------------------------------------------------
+
+/// **1 — the 64-bit entry.** `ntdll!KiUserCallbackDispatcher` is what a kernel
+/// resumes user mode on. Its whole body is eight instructions, and they define
+/// the frame exemu has to build: `args` at `rsp+0x20`, `len` at `+0x28`, `id` at
+/// `+0x2c`, the callee's shadow area below, and the table at `PEB+0x58`.
+#[test]
+fn the_64bit_callback_dispatcher_defines_the_frame_and_the_table() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let ntdll = load(&format!("{DLLS64}/ntdll.dll"));
+    let entry = ntdll.export("KiUserCallbackDispatcher");
+    let body = ntdll.at(entry, 0x2c);
+
+    // mov rcx,[rsp+0x20] / mov edx,[rsp+0x28] / mov r8d,[rsp+0x2c]
+    assert_eq!(&body[0..5], &[0x48, 0x8B, 0x4C, 0x24, wow64::cb_frame::ARGS as u8], "args at rsp+0x20");
+    assert_eq!(&body[5..9], &[0x8B, 0x54, 0x24, wow64::cb_frame::LEN as u8], "len at rsp+0x28");
+    assert_eq!(&body[9..14], &[0x44, 0x8B, 0x44, 0x24, wow64::cb_frame::ID as u8], "id at rsp+0x2c");
+    // …and the frame exemu reserves covers every field it reads.
+    assert_eq!(wow64::cb_frame::SIZE, wow64::cb_frame::ID + 4);
+
+    // mov rax, gs:[0x60]  (TEB.ProcessEnvironmentBlock)
+    assert_eq!(&body[14..23], &[0x65, 0x48, 0x8B, 0x04, 0x25, 0x60, 0x00, 0x00, 0x00], "PEB from gs:[0x60]");
+    // mov rax,[rax+0x58]  (PEB.KernelCallbackTable) ; call [rax+r8*8]
+    assert_eq!(
+        &body[23..27],
+        &[0x48, 0x8B, 0x40, wow64::PEB64_KERNEL_CALLBACK_TABLE as u8],
+        "PEB.KernelCallbackTable is at PEB+0x58",
+    );
+    assert_eq!(&body[27..31], &[0x42, 0xFF, 0x14, 0xC0], "call qword ptr [rax + r8*8] — table[id]");
+
+    // …and if the callback ever *does* return, the dispatcher itself reports the
+    // result through NtCallbackReturn(NULL, 0, eax).
+    assert_eq!(&body[31..39], &[0x48, 0x31, 0xC9, 0x31, 0xD2, 0x41, 0x89, 0xC0], "the result becomes arg3");
+    assert_eq!(body[39], 0xE8, "call rel32");
+    assert_eq!(
+        rel32_target(&ntdll, entry + 39, 5),
+        ntdll.export("NtCallbackReturn"),
+        "the dispatcher's own tail is NtCallbackReturn",
+    );
+}
+
+/// **2 — `NtCallbackReturn` is SSDT index 5**, in both ntdlls (they share one
+/// index space, which is what makes `wow64.dll`'s table-0 dispatch work).
+#[test]
+fn nt_callback_return_is_ssdt_index_five_on_both_sides() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let ntdll64 = load(&format!("{DLLS64}/ntdll.dll"));
+    let b = ntdll64.at(ntdll64.export("NtCallbackReturn"), 8);
+    assert_eq!(&b[..3], &[0x4C, 0x8B, 0xD1], "mov r10, rcx");
+    assert_eq!(b[3], 0xB8, "mov eax, imm32");
+    assert_eq!(
+        u32::from_le_bytes(b[4..8].try_into().unwrap()),
+        wow64::SSDT_NT_CALLBACK_RETURN,
+        "the 64-bit stub's own service index",
+    );
+
+    let ntdll32 = load(&format!("{DLLS32}/ntdll.dll"));
+    let b = ntdll32.at(ntdll32.export("NtCallbackReturn"), 16);
+    assert_eq!(b[0], 0xB8, "mov eax, imm32");
+    assert_eq!(
+        u32::from_le_bytes(b[1..5].try_into().unwrap()),
+        wow64::SSDT_NT_CALLBACK_RETURN,
+        "the 32-bit stub carries the same index",
+    );
+    // …and takes three stdcall args (ret 0xc), the (ret_ptr, ret_len, status)
+    // triple wow64.dll's slot-5 thunk reads back out of the arg block.
+    assert_eq!(&b[12..15], &[0xC2, 0x0C, 0x00], "ret 0xc — three 4-byte arguments");
+}
+
+/// **3 — `PEB.KernelCallbackTable` is `wow64win!user_callbacks`,** published by
+/// `wow64win!DllMain`; entry **4** is `wow64_NtUserCallWinProc`, and the thunk
+/// forwards the same id `4` to `Wow64KiUserCallbackDispatcher`.
+#[test]
+fn the_kernel_callback_table_is_wow64wins_and_win_proc_is_entry_four() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let win = load(&format!("{DLLS64}/wow64win.dll"));
+    let table = win.sym("user_callbacks");
+
+    // The publish site, in the shape exemu's `publish_kernel_callback_table`
+    // scans for: `lea rdx,[rip+d32]; mov rax,gs:[0x30]; mov rax,[rax+0x60];
+    // mov [rax+0x58],rdx`. Located by searching DllMain, not by a fixed rva.
+    let dllmain = win.sym("DllMain");
+    let window = win.at(dllmain, 0x100);
+    let tail: [u8; 17] = [
+        0x65, 0x48, 0x8B, 0x04, 0x25, 0x30, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x40, 0x60, 0x48, 0x89, 0x50, 0x58,
+    ];
+    let site = (0..window.len() - 24)
+        .find(|&i| window[i..i + 3] == [0x48, 0x8D, 0x15] && window[i + 7..i + 7 + 17] == tail)
+        .expect("wow64win!DllMain publishes PEB.KernelCallbackTable in the recovered shape");
+    assert_eq!(
+        rip_target(&win, dllmain + site as u32, 7),
+        table,
+        "the published array is `user_callbacks`",
+    );
+
+    // 25 live entries, then the array ends.
+    let live = (0..64).take_while(|i| win.u64_at(table + 8 * i) != 0).count();
+    assert_eq!(live, 25, "wow64win publishes 25 user callbacks");
+
+    // Entry 4 is the window-procedure callback, by its own COFF name.
+    let winproc = win.sym("wow64_NtUserCallWinProc");
+    assert_eq!(
+        win.ptr_rva(table + 8 * wow64::NT_USER_CALL_WIN_PROC),
+        winproc,
+        "user_callbacks[NtUserCallWinProc] is wow64_NtUserCallWinProc",
+    );
+
+    // The thunk's own body: it forwards the *same* id, hands 0x2c as the 32-bit
+    // length on the no-extra-data path, and ends at Wow64KiUserCallbackDispatcher.
+    let body = win.at(winproc, 0x70);
+    assert!(
+        body.windows(6).any(|w4| w4 == [0x41, 0xB8, 0x2C, 0x00, 0x00, 0x00]),
+        "mov r8d, 0x2c — the 32-bit struct size",
+    );
+    let mov_ecx = (0..body.len() - 5)
+        .find(|&i| body[i] == 0xB9 && u32::from_le_bytes(body[i + 1..i + 5].try_into().unwrap()) < 0x20)
+        .expect("the thunk loads a literal callback id into ecx");
+    assert_eq!(
+        u32::from_le_bytes(body[mov_ecx + 1..mov_ecx + 5].try_into().unwrap()),
+        wow64::NT_USER_CALL_WIN_PROC,
+        "the 32-bit id equals the 64-bit table index",
+    );
+    // …and the very next instruction is the call to the WoW64 dispatcher.
+    let call = winproc + mov_ecx as u32 + 5 + 5; // skip `mov [rsp+0x20], rax`
+    assert_eq!(win.at(call, 1)[0], 0xE8, "call rel32");
+    let thunk = rel32_target(&win, call, 5);
+    assert_eq!(win.at(thunk, 2), &[0xFF, 0x25], "an import thunk: jmp qword ptr [rip+d32]");
+    assert_eq!(
+        rip_target(&win, thunk, 6),
+        win.iat("wow64.dll", "Wow64KiUserCallbackDispatcher"),
+        "…through wow64.dll!Wow64KiUserCallbackDispatcher",
+    );
+    // The thunk's own return path is the 64-bit NtCallbackReturn.
+    assert!(win.imports.iter().any(|(_, d, s)| d == "ntdll.dll" && s == "NtCallbackReturn"));
+}
+
+/// **4 — `Wow64KiUserCallbackDispatcher` builds the 32-bit frame** at
+/// `(ctx.Esp - 0x1c - len) & ~15` and re-seats `Eip` on the 32-bit
+/// `KiUserCallbackDispatcher` it reads out of `LdrSystemDllInitBlock+0x30`.
+#[test]
+fn the_wow64_dispatcher_builds_the_32bit_frame_from_the_cpu_area() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let w = load(&format!("{DLLS64}/wow64.dll"));
+    let disp = w.export("Wow64KiUserCallbackDispatcher");
+    let body = w.at(disp, 0x320);
+
+    // It reads this thread's CPU-reserved area (TEB64+0x1488) and its TEB32
+    // through the signed WowTebOffset — the same two links the rest of W5 uses.
+    assert!(
+        body.windows(7).any(|w4| w4 == [0x48, 0x8B, 0xB8, 0x88, 0x14, 0x00, 0x00]),
+        "mov rdi,[rax+0x1488] — the WoW64 CPU-reserved area",
+    );
+    assert!(
+        body.windows(7).any(|w4| w4 == [0x48, 0x63, 0x90, 0x0C, 0x18, 0x00, 0x00]),
+        "movsxd rdx,[rax+0x180c] — TEB64.WowTebOffset",
+    );
+
+    // The i386 arm: zero a 0x2cc-byte WOW64_CONTEXT (0x59 qwords + a dword),
+    // ask BTCpuGetContext for the live one, keep a copy, then compute the frame.
+    let i386_arm = body
+        .windows(6)
+        .position(|w4| w4 == [0x31, 0xC0, 0xB9, 0x59, 0x00, 0x00])
+        .expect("the i386 arm zeroes 0x59 qwords of WOW64_CONTEXT");
+    assert_eq!(
+        0x59 * 8 + 4,
+        wow64::WOW64_CONTEXT_SIZE,
+        "0x59 qwords + a dword is exactly sizeof(WOW64_CONTEXT)",
+    );
+
+    let arm = &body[i386_arm..];
+    // ContextFlags = 0x10007 (CONTEXT_i386 | CONTROL | INTEGER | SEGMENTS).
+    assert!(
+        arm.windows(4).any(|w4| w4 == [0x07, 0x00, 0x01, 0x00]),
+        "it asks for a CONTROL|INTEGER|SEGMENTS 32-bit context",
+    );
+    // esi = (ctx.Esp - 0x1c) - len, aligned down to 16: `lea esi,[rax-0x1c];
+    // sub esi,ebx; and esi,0xfffffff0`.
+    assert!(
+        arm.windows(8).any(|w4| w4 == [0x8D, 0x70, 0xE4, 0x29, 0xDE, 0x83, 0xE6, 0xF0]),
+        "lea esi,[eax-0x1c]; sub esi,ebx; and esi,~15 — the 32-bit frame base",
+    );
+    assert_eq!(WOW64_CB_STACK_HEADER, 0x1c, "the header the frame base reserves");
+
+    // The frame's own fields: [+0x18] takes the *original* Esp, and the copied
+    // argument block starts at +0x1c.
+    assert!(
+        arm.windows(3).any(|w4| w4 == [0x89, 0x50, 0x18]),
+        "mov [eax+0x18], edx — the saved 32-bit Esp",
+    );
+    assert!(
+        arm.windows(4).any(|w4| w4 == [0x48, 0x8D, 0x48, 0x1C]),
+        "lea rcx,[rax+0x1c] — the memcpy destination for the argument block",
+    );
+
+    // Eip ← LdrSystemDllInitBlock.Wow64SharedInformation[KiUserCallbackDispatcher].
+    assert!(
+        arm.windows(4).any(|w4| w4 == [0x48, 0x8B, 0x40, wow64::SYSDLL_KI_USER_CALLBACK_DISPATCHER as u8]),
+        "mov rax,[block+0x30] — the 32-bit KiUserCallbackDispatcher",
+    );
+
+    // It then runs the guest with `for(;;) BTCpuSimulate()` and only leaves by a
+    // longjmp, so it imports both halves of setjmp.
+    assert!(w.imports.iter().any(|(_, d, s)| d == "ntdll.dll" && s == "_setjmpex"));
+    assert!(w.imports.iter().any(|(_, d, s)| d == "ntdll.dll" && s == "longjmp"));
+}
+
+/// The bytes `Wow64KiUserCallbackDispatcher` reserves below the 32-bit `Esp`
+/// before the copied argument block — `{eip, id, args, len, unk[2], esp}`.
+const WOW64_CB_STACK_HEADER: u64 = 0x1c;
+
+/// **5 — the return.** `wow64.dll`'s table-0 slot **5** is the thunk that fills
+/// the callback frame at `TEB64+0x14a8` and `longjmp`s out of the dispatcher.
+#[test]
+fn wow64s_slot_five_fills_the_callback_frame_and_longjmps() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let w = load(&format!("{DLLS64}/wow64.dll"));
+    // Table 0's descriptor is statically initialised in `.data` at rva 0x16080:
+    // {ServiceTable, CounterTable, ServiceLimit, ArgumentTable}.
+    let desc = 0x16080u32;
+    let service_table = w.ptr_rva(desc);
+    let limit = w.u64_at(desc + 0x10);
+    let arg_table = w.ptr_rva(desc + 0x18);
+    assert!(limit > wow64::SSDT_NT_CALLBACK_RETURN as u64, "slot 5 is inside table 0");
+    assert_eq!(
+        w.at(arg_table + wow64::SSDT_NT_CALLBACK_RETURN, 1)[0],
+        12,
+        "NtCallbackReturn takes 12 bytes of 32-bit stdcall arguments",
+    );
+
+    let thunk = w.ptr_rva(service_table + 8 * wow64::SSDT_NT_CALLBACK_RETURN);
+    let b = w.at(thunk, 0x50);
+    // (ret_ptr, ret_len, status) out of the 32-bit argument block in rcx.
+    assert_eq!(&b[13..16], &[0x44, 0x8B, 0x09], "mov r9d,[rcx]      — the guest's result pointer");
+    assert_eq!(&b[16..20], &[0x44, 0x8B, 0x41, 0x04], "mov r8d,[rcx+4]   — its length");
+    assert_eq!(&b[20..23], &[0x8B, 0x51, 0x08], "mov edx,[rcx+8]    — the NTSTATUS");
+    // The active frame lives at TEB64+0x14a8; a null one is STATUS_NO_CALLBACK_ACTIVE.
+    assert_eq!(&b[23..30], &[0x48, 0x8B, 0x88, 0xA8, 0x14, 0x00, 0x00], "mov rcx,[teb+0x14a8]");
+    assert!(
+        b.windows(5).any(|w4| w4 == [0xB8, 0x58, 0x02, 0x00, 0xC0]),
+        "mov eax, 0xC0000258 (STATUS_NO_CALLBACK_ACTIVE) when no frame is active",
+    );
+    // frame+0x10 → *ret_ptr, frame+0x18 → *ret_len, frame+0x20 = status,
+    // frame+0x30 = the jmp_buf.
+    assert_eq!(&b[35..39], &[0x48, 0x8B, 0x41, 0x10], "rax = frame+0x10 (the caller's ret_ptr slot)");
+    assert_eq!(&b[39..43], &[0x48, 0x83, 0xC1, 0x30], "rcx = frame+0x30 (the jmp_buf)");
+    assert_eq!(&b[46..50], &[0x48, 0x8B, 0x41, 0xE8], "rax = frame+0x18 (the caller's ret_len slot)");
+    assert_eq!(&b[53..56], &[0x89, 0x51, 0xF0], "[frame+0x20] = status");
+}
+
+/// **6 — the 32-bit dispatcher** reads the frame `Wow64KiUserCallbackDispatcher`
+/// built: `{eip, id, args, len}` at `{0, 4, 8, 0xc}` off its entry `esp`, and
+/// answers with `NtCallbackReturn(0, 0, result)`.
+#[test]
+fn the_32bit_dispatcher_reads_the_frame_it_was_given() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let n = load(&format!("{DLLS32}/ntdll.dll"));
+    let d = n.export("KiUserCallbackDispatcher");
+    let b = n.at(d, 0x40);
+    // push ebp; mov ebp,esp; sub esp,0xc  → [ebp+8] = entry [esp+4] = id.
+    assert_eq!(&b[..6], &[0x55, 0x89, 0xE5, 0x83, 0xEC, 0x0C]);
+    assert_eq!(&b[6..9], &[0x8B, 0x45, 0x08], "id  at frame+0x04");
+    assert_eq!(&b[13..16], &[0x8B, 0x45, 0x10], "len at frame+0x0c");
+    assert_eq!(&b[20..23], &[0x8B, 0x45, 0x0C], "args at frame+0x08");
+    // …then the cdecl call to the body that indexes PEB32.KernelCallbackTable,
+    // and NtCallbackReturn(0, 0, result).
+    assert_eq!(b[26], 0xE8, "call the dispatch body");
+    let ret = (0..b.len() - 5).rev().find(|&i| b[i] == 0xE8 && rel32_target(&n, d + i as u32, 5) == n.export("NtCallbackReturn"));
+    assert!(ret.is_some(), "the 32-bit dispatcher returns through NtCallbackReturn");
+}
+
+/// **7 — `struct win_proc_params`.** The layout exemu fills, confirmed from
+/// three independent places: the 64-bit consumer, the 32-bit consumer, and
+/// `wow64win`'s own narrowing routine, which has to agree with both.
+#[test]
+fn win_proc_params_layout_is_agreed_by_all_three_consumers() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    use wow64::win_proc_params as p;
+
+    // --- the 64-bit consumer -------------------------------------------------
+    let u64img = load(&format!("{DLLS64}/user32.dll"));
+    let call = u64img.sym("User32CallWinProc");
+    let b = u64img.at(call, 0x80);
+    // `cmp edx, 0x48; ja <unpack>` — the length below which nothing is packed.
+    assert_eq!(&b[11..14], &[0x83, 0xFA, p::CALL_LEN as u8], "len is compared against 0x48");
+    // The unpack arm reads size at +0x28, msg at +0x10, hwnd at +8, and points
+    // at the wparam/lparam cells and the trailing data at +0x50.
+    assert_eq!(&b[0x38..0x3b], &[0x8B, 0x43, p::SIZE as u8], "size   at +0x28");
+    assert_eq!(&b[0x3b..0x3e], &[0x8B, 0x51, p::MSG as u8], "msg    at +0x10");
+    assert_eq!(&b[0x3e..0x42], &[0x4C, 0x8D, 0x4B, p::LPARAM as u8], "lparam at +0x20");
+    assert_eq!(&b[0x42..0x46], &[0x4C, 0x8D, 0x43, p::WPARAM as u8], "wparam at +0x18");
+    assert_eq!(&b[0x46..0x4a], &[0x48, 0x8B, 0x49, p::HWND as u8], "hwnd   at +0x08");
+    assert_eq!(&b[0x4e..0x52], &[0x48, 0x8D, 0x43, p::SIZE_OF as u8], "packed data at +0x50");
+    assert!(
+        b.windows(4).any(|w4| w4 == [0x48, 0x89, 0x43, p::RESULT as u8]),
+        "the LRESULT is stored at +0x48",
+    );
+
+    let disp = u64img.sym("dispatch_win_proc_params");
+    let d = u64img.at(disp, 0x140);
+    assert_eq!(&d[9..12], &[0x8B, 0x49, p::DPI_CONTEXT as u8], "dpi_context at +0x34 → SetThreadDpiAwarenessContext");
+    assert_eq!(
+        rel32_target(&u64img, disp + 12, 5),
+        u64img.sym("SetThreadDpiAwarenessContext"),
+        "…and that is exactly what it is passed to",
+    );
+    assert_eq!(&d[0x1d..0x20], &[0x8B, 0x43, p::SIZE as u8], "size at +0x28 selects the unpack arm");
+    assert_eq!(&d[0x24..0x28], &[0x48, 0x8B, 0x43, p::PROC_W as u8], "procW at +0x40 is the proc actually called");
+    assert!(
+        d.windows(4).any(|w4| w4 == [0x44, 0x8B, 0x5B, p::ANSI as u8]),
+        "ansi at +0x2c selects the A/W wrappers",
+    );
+    assert!(d.windows(3).any(|w4| w4 == [0x48, 0x8B, 0x03]), "func at +0x00 is the wrappers' target");
+
+    // --- the 32-bit consumer -------------------------------------------------
+    let u32img = load(&format!("{DLLS32}/user32.dll"));
+    let d32 = u32img.sym("dispatch_win_proc_params");
+    let c = u32img.at(d32, 0x50);
+    assert_eq!(&c[0x0c..0x0f], &[0x8B, 0x43, 0x20], "dpi_context at 32-bit +0x20");
+    assert_eq!(&c[0x20..0x23], &[0x8B, 0x43, 0x14], "size        at 32-bit +0x14");
+    assert_eq!(&c[0x2d..0x30], &[0x8B, 0x43, 0x28], "procW       at 32-bit +0x28");
+    assert!(c.windows(4).any(|w4| w4 == [0x83, 0x7B, 0x18, 0x00]), "ansi at 32-bit +0x18");
+
+    // --- and the narrowing that has to agree with both -----------------------
+    let win = load(&format!("{DLLS64}/wow64win.dll"));
+    let conv = win.at(win.sym("win_proc_params_64to32"), 0x80);
+    // The fields it narrows to 32 bits are exactly {func, hwnd, msg, wparam,
+    // lparam}; the 32-bit struct they land in is 0x2c bytes, which is why the
+    // thunk passes 0x2c as the 32-bit length.
+    assert!(
+        conv.windows(4).any(|w4| w4 == [0x66, 0x0F, 0x6E, 0x01]),
+        "the converter narrows func (+0x00)",
+    );
+    for (off, name) in [(p::HWND, "hwnd"), (p::MSG, "msg"), (p::WPARAM, "wparam")] {
+        assert!(
+            conv.windows(5)
+                .any(|w4| w4[..3] == [0x66, 0x0F, 0x6E] && (w4[3] & 0xC7) == 0x41 && w4[4] as u64 == off),
+            "the converter narrows {name} (+{off:#x})",
+        );
+    }
+    assert!(
+        conv.windows(4).any(|w4| w4 == [0x48, 0x8B, 0x41, p::LPARAM as u8]),
+        "…reads lparam (+0x20) whole and stores its low dword",
+    );
+    assert!(
+        conv.windows(4).any(|w4| w4 == [0x48, 0x8B, 0x41, p::SIZE as u8]),
+        "…and copies size/ansi (+0x28..0x30) as one qword",
+    );
+}
+
+/// **8 — the DPI context exemu passes is a *valid* one.** Zero is not: it fails
+/// `is_valid_dpi_awareness_context` and makes `dispatch_win_proc_params` set
+/// `ERROR_INVALID_PARAMETER` before every message.
+#[test]
+fn the_dpi_context_exemu_passes_is_the_one_user32_maps_unaware_to() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    // The predicate, read out of `user32!is_valid_dpi_awareness_context`'s
+    // `ctx & 0xf == 0` arm: `(v & 0x3ffe0000) == 0`, `(v & 0xf0) == 0x10`,
+    // `(v & 0x1ff00) == 0x6000`.
+    let valid = |v: u32| v & 0xf == 0 && v & 0x3ffe_0000 == 0 && v & 0xf0 == 0x10 && v & 0x1ff00 == 0x6000;
+    assert!(valid(wow64::NTUSER_DPI_UNAWARE), "the value exemu passes is accepted");
+    assert!(!valid(0), "zero is rejected — which is why exemu does not pass it");
+
+    // And it is the value `SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_
+    // UNAWARE = -1)` selects, through its own five-entry jump table for -5..-1.
+    let u32img = load(&format!("{DLLS32}/user32.dll"));
+    let set = u32img.sym("SetThreadDpiAwarenessContext");
+    let b = u32img.at(set, 0x20);
+    assert_eq!(&b[9..12], &[0x83, 0xF8, 0xFB], "cmp eax, -5");
+    assert_eq!(&b[14..17], &[0x8D, 0x50, 0x05], "lea edx,[eax+5] — the table index");
+    assert_eq!(&b[17..20], &[0xFF, 0x24, 0x95], "jmp dword ptr [edx*4 + table]");
+    let table = u32::from_le_bytes(b[20..24].try_into().unwrap()) - u32img.image_base as u32;
+    let unaware = u32img.u32_at(table + 4 * 4) - u32img.image_base as u32; // index for -1
+    let arm = u32img.at(unaware, 5);
+    assert_eq!(arm[0], 0xB8, "mov eax, imm32");
+    assert_eq!(
+        u32::from_le_bytes(arm[1..5].try_into().unwrap()),
+        wow64::NTUSER_DPI_UNAWARE,
+        "DPI_AWARENESS_CONTEXT_UNAWARE is 0x6010",
+    );
+}
