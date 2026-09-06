@@ -230,6 +230,57 @@ fn stack_imm_at_call(dll: &Dll, begin: u32, end: u32, iat_slot: u32, slot: u8) -
     None
 }
 
+/// Every immediate standing at `[rsp+slot]` at each call/jmp through
+/// `iat_slot` in `[begin, end)` — [`stack_imm_at_call`] without the "first one
+/// only", so a routine that issues two different `NtUserMessageCall` types
+/// (`user32!bcast_childwindow`, `user32!post_dde_message`) reports both.
+fn stack_imms_at_calls(dll: &Dll, begin: u32, end: u32, iat_slot: u32, slot: u8) -> Vec<u32> {
+    let body = dll.slice(begin, end);
+    let mut last: BTreeMap<u8, u32> = BTreeMap::new();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < body.len() {
+        let at = begin + i as u32;
+        if let Some((disp, imm, len)) = mov_stack_imm32(body, i) {
+            last.insert(disp, imm);
+            i += len;
+            continue;
+        }
+        if rip_indirect(body, i, dll.text_rva, at) == Some(iat_slot) {
+            if let Some(v) = last.get(&slot) {
+                out.push(*v);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `NtUserMessageCall`'s 6th argument — the first stack slot past the shadow
+/// space plus one (the `type`).
+const MESSAGE_CALL_TYPE_SLOT: u8 = 0x28;
+
+/// Every pinned PE that imports `NtUserMessageCall`. `wow64win.dll` is in the
+/// list because its 32→64 thunk is the only evidence for type `0x307`.
+const MESSAGE_CALL_CALLERS: [&str; 5] =
+    ["user32.dll", "imm32.dll", "wintab32.dll", "wow64win.dll", "explorer.exe"];
+
+fn message_call_dlls_present() -> bool {
+    MESSAGE_CALL_CALLERS.iter().all(|d| std::path::Path::new(WINE_DLLS).join(d).exists())
+}
+
+/// Every `NtUserMessageCall` type exemu names, from the ABI table plus the two
+/// members that table cannot key by caller.
+fn message_call_space() -> Vec<u64> {
+    abi::MESSAGE_CALL_TYPES
+        .iter()
+        .map(|(_, _, t)| *t)
+        .chain([abi::MESSAGE_CALL_DISPATCH, abi::MESSAGE_CALL_DRIVER_307])
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Targets of the `call rel32`s (`E8`) inside `[begin, end)`, in order. A bare
 /// byte scan finds `E8` bytes that are really immediates, so only targets that
 /// land exactly on a `.pdata` function start are kept.
@@ -626,45 +677,49 @@ fn thread_state_indices_match_the_pinned_user32_wrappers() {
 }
 
 /// **`NtUserMessageCall` is a whole family behind one index**, and the `type`
-/// argument in its 6th slot is what selects the member. Each user32 wrapper
-/// stores that type as a `mov dword ptr [rsp+0x28], imm32` right before the
-/// syscall — including `DefWindowProcW`, which *is* nothing but this call.
+/// argument in its 6th slot is what selects the member. Each caller stores that
+/// type as a `mov dword ptr [rsp+0x28], imm32` right before the syscall —
+/// including `DefWindowProcW`, which *is* nothing but this call.
 ///
 /// The `dword` matters as much as the value: the upper half of the qword slot is
 /// never written, so a handler that reads the argument 64 bits wide picks up the
 /// previous frame's bytes.
+///
+/// The family is **not** all sends. `SPY_EnterMessage`/`SPY_ExitMessage` bracket
+/// every message user32 delivers, `SPY_GetMsgName` is a string query, and the
+/// IME / systray / tablet / DDE members are not message deliveries at all — so
+/// each is pinned here by the routine that issues it, which is what lets
+/// `nt_user_message_call` dispatch on an allow-list instead of guessing.
 #[test]
-fn message_call_types_match_the_pinned_user32_wrappers() {
-    if !wine_dlls_present() {
+fn message_call_types_match_the_pinned_callers() {
+    if !wine_dlls_present() || !message_call_dlls_present() {
         eprintln!("SKIP: {WINE_DLLS} not present (Wine DLL set is git-ignored)");
         return;
     }
     let user32 = Dll::load("user32.dll");
-    let iat = user32.iat("NtUserMessageCall");
-    /// `NtUserMessageCall`'s 6th argument — the first stack slot past the
-    /// shadow space plus one.
-    const TYPE_SLOT: u8 = 0x28;
 
-    for (export, expected) in abi::MESSAGE_CALL_TYPES {
-        let (begin, end) = user32.func_at(user32.code_rva(export));
-        let got = stack_imm_at_call(&user32, begin, end, iat, TYPE_SLOT).unwrap_or_else(|| {
-            panic!("user32!{export} reaches NtUserMessageCall with a type immediate")
-        });
+    for (dll, routine, expected) in abi::MESSAGE_CALL_TYPES {
+        let d = Dll::load(dll);
+        let iat = d.iat("NtUserMessageCall");
+        let (begin, end) = d.func_at(d.code_rva(routine));
+        let got = stack_imm_at_call(&d, begin, end, iat, MESSAGE_CALL_TYPE_SLOT)
+            .unwrap_or_else(|| panic!("{dll}!{routine} reaches NtUserMessageCall with a type"));
         assert_eq!(
             got as u64, expected,
-            "user32!{export} passes NtUserMessageCall type {got:#x}, exemu maps {expected:#x}"
+            "{dll}!{routine} passes NtUserMessageCall type {got:#x}, exemu maps {expected:#x}"
         );
     }
 
     // The dispatch type has no exported wrapper: `DispatchMessageW` tail-calls an
     // internal `dispatch_message`, and that is where 0x3001 lives. Follow the
     // call rather than trusting the number.
+    let iat = user32.iat("NtUserMessageCall");
     let (db, de) = user32.func_at(user32.export("DispatchMessageW"));
     let dispatch_type = direct_calls(&user32, db, de)
         .into_iter()
         .filter_map(|t| {
             let (b, e) = user32.func_at(t);
-            stack_imm_at_call(&user32, b, e, iat, TYPE_SLOT)
+            stack_imm_at_call(&user32, b, e, iat, MESSAGE_CALL_TYPE_SLOT)
         })
         .next()
         .expect("DispatchMessageW calls a helper that issues NtUserMessageCall");
@@ -675,13 +730,76 @@ fn message_call_types_match_the_pinned_user32_wrappers() {
         abi::MESSAGE_CALL_DISPATCH
     );
 
-    // Every type is distinct — the property that makes dispatching on it sound.
-    let mut all: Vec<u64> =
-        abi::MESSAGE_CALL_TYPES.iter().map(|(_, t)| *t).chain([abi::MESSAGE_CALL_DISPATCH]).collect();
-    let n = all.len();
-    all.sort_unstable();
-    all.dedup();
-    assert_eq!(all.len(), n, "two NtUserMessageCall members share a type");
+    // Each type gets exactly one disposition — the property that makes
+    // dispatching on it sound. A member in two lists, or in none, is a bug in
+    // exemu's table rather than in the binary.
+    for t in message_call_space() {
+        let n = [
+            abi::MESSAGE_CALL_SENDS.contains(&t),
+            abi::MESSAGE_CALL_KERNEL_PROCS.contains(&t),
+            abi::MESSAGE_CALL_NOT_A_MESSAGE.contains(&t),
+            t == abi::MESSAGE_CALL_DISPATCH,
+            t == abi::MESSAGE_CALL_CALL_WINDOW_PROC,
+        ]
+        .iter()
+        .filter(|b| **b)
+        .count();
+        assert_eq!(n, 1, "NtUserMessageCall type {t:#x} has {n} dispositions, not one");
+    }
+}
+
+/// **Nothing outside exemu's table reaches the syscall.** The per-routine pins
+/// above prove each named type is right; this proves the *set* is complete, by
+/// sweeping every `.pdata` function of every pinned PE that imports
+/// `NtUserMessageCall` and collecting the immediate stored at the type slot
+/// before each call site.
+///
+/// `wow64win!wow64_NtUserMessageCall` is swept for the same reason and is the
+/// only evidence for one member: type `0x307` has no caller anywhere in the
+/// pinned PE set, and would otherwise be invisible.
+///
+/// A Wine bump that adds a member fails here — which matters because an
+/// unrecognised type is answered with a zero, not dispatched to a WndProc, so
+/// without this test a new member would silently stop working instead of
+/// silently recursing.
+#[test]
+fn the_pinned_binaries_issue_no_message_call_type_exemu_does_not_know() {
+    if !wine_dlls_present() || !message_call_dlls_present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (Wine DLL set is git-ignored)");
+        return;
+    }
+    let known = message_call_space();
+    let mut seen: Vec<(String, u32)> = Vec::new();
+    for dll in MESSAGE_CALL_CALLERS {
+        let d = Dll::load(dll);
+        let iat = d.iat("NtUserMessageCall");
+        for (begin, end) in d.funcs.clone() {
+            for imm in stack_imms_at_calls(&d, begin, end, iat, MESSAGE_CALL_TYPE_SLOT) {
+                seen.push((format!("{dll}+{begin:#x}"), imm));
+            }
+        }
+    }
+    assert!(
+        seen.len() >= abi::MESSAGE_CALL_TYPES.len(),
+        "the sweep found only {} call sites — it is not finding the stores",
+        seen.len()
+    );
+    for (site, imm) in &seen {
+        assert!(
+            known.contains(&(*imm as u64)),
+            "{site} issues NtUserMessageCall type {imm:#x}, which exemu does not name"
+        );
+    }
+    // Every type exemu names, except the two the sweep cannot see, is actually
+    // issued: `DISPATCH_MESSAGE`'s caller is reached above, and `0x307` has no
+    // caller at all outside wow64win's thunk (which the sweep does cover).
+    let issued: std::collections::BTreeSet<u64> = seen.iter().map(|(_, i)| *i as u64).collect();
+    for t in known {
+        assert!(
+            issued.contains(&t) || t == abi::MESSAGE_CALL_DISPATCH,
+            "exemu names NtUserMessageCall type {t:#x}, which no pinned binary issues"
+        );
+    }
 }
 
 /// **`DefWindowProc` is the kernel's, hit test included.**
@@ -729,7 +847,8 @@ fn def_window_proc_forwards_the_hit_test_and_trusts_call_hwnd_0x10() {
     let iat = user32.iat("NtUserMessageCall");
     let ty = stack_imm_at_call(&user32, begin, end, iat, 0x28)
         .expect("DefWindowProcW reaches NtUserMessageCall");
-    let expected = abi::MESSAGE_CALL_TYPES.iter().find(|(n, _)| *n == "DefWindowProcW").unwrap().1;
+    let expected =
+        abi::MESSAGE_CALL_TYPES.iter().find(|(_, n, _)| *n == "DefWindowProcW").unwrap().2;
     assert_eq!(ty as u64, expected, "DefWindowProcW forwards with type {ty:#x}");
 
     // The handle it forwards is the result of `NtUserCallHwnd(hwnd, 0x10)`:

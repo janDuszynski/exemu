@@ -1470,6 +1470,43 @@ mod tests {
     use exemu_core::Region;
     use exemu_memory::VirtualMemory;
 
+    /// **A spawned thread gets Wine's debug scratch too.** `__wine_dbg_strdup`
+    /// keeps its ring at a fixed offset from the *running thread's* TEB — a
+    /// different offset for each bitness — so every per-thread block has to
+    /// leave room for it, and for a WoW64 thread that means room after **both**
+    /// TEBs without colliding with the CPU-reserved area between them.
+    #[test]
+    fn a_spawned_threads_block_leaves_room_for_the_debug_string_ring() {
+        use crate::winedebug::{STRDUP_RING_OFF_32, STRDUP_RING_OFF_64, STRDUP_RING_SIZE};
+        // A plain 64-bit thread: the ring lives inline in its own TEB region,
+        // which is why THREAD_TEB_SIZE is 0x4000 and not 0x2000.
+        const {
+            assert!(
+                STRDUP_RING_OFF_64 + STRDUP_RING_SIZE <= THREAD_TEB_SIZE,
+                "a spawned thread's TEB region cannot hold its debug-string ring"
+            )
+        };
+        // A WoW64 thread: TEB64 then TEB32 then the CPU-reserved area, all in
+        // one block. Each TEB's ring must fit before whatever follows it.
+        let (teb64, teb32, area) = (0u64, THREAD_TEB_SIZE, WOW64_THREAD_CPU_AREA);
+        assert!(
+            teb64 + STRDUP_RING_OFF_64 + STRDUP_RING_SIZE <= teb32,
+            "the 64-bit ring runs into TEB32"
+        );
+        assert!(
+            teb32 + STRDUP_RING_OFF_32 + STRDUP_RING_SIZE <= area,
+            "the 32-bit ring runs into the CPU-reserved area"
+        );
+        const {
+            assert!(
+                STRDUP_RING_OFF_32 + STRDUP_RING_SIZE
+                    <= crate::wow64::TEB32_ACTIVATION_CONTEXT_STACK,
+                "the 32-bit ring overlaps TEB32's activation-context stack"
+            )
+        };
+        assert!(area < WOW64_THREAD_BLOCK, "the CPU-reserved area is inside the block");
+    }
+
     /// `NtCreateThreadEx(&h, …, StartRoutine, Arg, flags, 0, stack, …)` with the
     /// out-handle in the arg0 register and the rest on the syscall stack.
     fn create_thread_ex(os: &mut WinOs, mem: &mut VirtualMemory, handle_out: u64) -> u32 {

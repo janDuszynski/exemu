@@ -23,8 +23,103 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 915, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 931, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### Wine's debug channels resolve through Wine's own mechanism (W6.4)
+- **What a `TRACE()` costs in a Wine builtin is decided by a per-process array
+  exemu never wrote.** Every channel is a 16-byte `{ unsigned char flags;
+  char name[15]; }` object in the DLL's `.data`, shipped with `flags = 0xff` —
+  bit 7 is a "not resolved yet" sentinel, and bits 0–3 are the classes
+  `fixme, err, warn, trace`. A guard is a bare `test byte [chan], 1<<class`, so
+  an unresolved channel reads as *every class on* and takes the logging branch.
+  The branch calls `ntdll!__wine_dbg_get_channel_flags`, which looks the channel
+  up in the array and **caches the answer back into the object**, after which
+  every guard on it is one failing `testb`. exemu is what stands in for
+  `ntdll.so`, so exemu has to write that array.
+- **The array's address differs between the two bitnesses**, and that had gone
+  unnoticed: `ntdll.dll` x86-64 computes it as `lea rdi,[peb+0x2000]` and
+  `ntdll.dll` i386 as `lea ecx,[peb+0x1000]`. exemu wrote a zeroed page at
+  `PEB64+0x2000` and nothing at all at `PEB32+0x1000` — where the **WoW64
+  CPU-reserved area** happened to sit, so every 32-bit builtin resolved its
+  channel flags out of the live 32-bit register save area. Measured: the byte
+  read as `0x00` most of the time and `0x01` after a mode switch had left the
+  reset-state flag set. The WoW64 block now spaces `PEB32` the way it spaces
+  `TEB32` (whose `+0x1000` is `__wine_dbg_strdup`'s per-thread ring), and
+  `wow64_boot.rs` carries a layout test that fails if anything is placed on
+  either region again.
+- **The default is `err+fixme`, not "all off"** — recovered, not assumed. Each
+  builtin carries a fallback resolver for the case where ntdll's export is
+  unreachable (i386 `user32!fallback__wine_dbg_get_channel_flags`); it parses
+  `WINEDEBUG` against its own `fixme,err,warn,trace` table and falls back to a
+  `default_flags` byte that **ships as `0x03`**. That is the documented
+  `wine(1)` default. exemu's zeroed page meant `0x00`, i.e. Wine's own
+  diagnostics were silently suppressed; `exemu run --trace` now shows them.
+- **`WINEDEBUG` works.** `exemu_os::winedebug` parses the documented syntax
+  (`[class][+|-]channel,…`, `all` for the default) and publishes the array for
+  both PEBs, sorted by name because ntdll binary-searches it and always
+  terminated so ntdll cannot walk past it.
+- **New `crates/app/tests/wine_debug_abi.rs`** re-derives all of it from the
+  pinned binaries on every run: the sign test that makes `0x80` the sentinel,
+  both PEB offsets and the `shl 4` stride, the `{0xff, name}` shape of every
+  `__wine_dbch_*` in user32's data, the class bit order, the shipped `0x03`
+  default, and both `__wine_dbg_strdup` ring offsets.
+- **Turning them on found a latent marshalling bug.** With `err` live, the
+  64-bit Wine boot started faulting *inside* the unixlib: `wine_dbg_write`'s
+  params block is `{ const char *str; unsigned int len; }`, and both pinned
+  producers fill it with a `movq` for the pointer and a **`movl`** for the
+  length (`ntdll!__wine_dbg_write` rva 0x3f440, `__wine_dbg_output` rva
+  0x3f300), leaving the slot's upper half as whatever the frame's uninitialised
+  stack held. exemu read it as a qword, so a stale upper half made the copy walk
+  off the mapped page — the same 32/64 slot trap as `NtUserMessageCall`'s
+  `type`. Invisible until now only because nothing ever emitted. Fixed, and
+  pinned from the producer's own bytes.
+- **Corpus:** the two Wine WoW64 entries move and nothing else does —
+  SteamSetup 7,692,064 → **7,712,812** (+20,748), Firefox 14,466,327 →
+  **14,480,727** (+14,400), deterministic across three runs. The attribution is
+  exact rather than inferred: on the same build `WINEDEBUG=-all` reproduces both
+  old pins to the instruction, so the whole delta is Wine's `err`/`fixme`
+  channels doing work a real Wine process does, and the layout move contributes
+  nothing. The eight non-Wine entries, 7-Zip's 496,505,572 included, are Δ0.
+
+### `NtUserMessageCall` dispatches on an allow-list (W6.3)
+- **`NtUserMessageCall` is not a family of sends.** The `type` argument in its
+  6th slot selects one of 19 members, and only nine of them deliver a message to
+  a window procedure. exemu used to dispatch every *unrecognised* type to the
+  target window's WndProc, which is a self-feeding loop rather than a
+  conservative default: `user32!DefWindowProcW` brackets every message with
+  `SPY_EnterMessage`/`SPY_ExitMessage`, and each of those is another
+  `NtUserMessageCall` — so answering one of them with a send re-delivers the
+  message that is already being handled. Measured on `SteamSetup.exe` for the
+  one member that was already named (`SpyGetMsgName`): 461 nested callbacks in
+  ~200k instructions, into a 2 MiB stack overflow.
+- **The whole type space was recovered from the pinned Wine 11.0 PE set**, not
+  from a header. Every caller fills the slot with a `mov dword ptr [rsp+0x28],
+  imm32` (i386: `[esp+0x14]`) right before the win32u thunk, so sweeping each PE
+  that imports `NtUserMessageCall` enumerates it; the 64-bit and 32-bit builds
+  agree entry for entry. The members and the routine that issues each:
+  `0x29a` `USER_ScrollBarProc`, `0x29c` `PopupMenuWndProc`, `0x29d`
+  `DesktopWndProc`, `0x29e` `DefWindowProc`/`NC_HandleSysCommand`, `0x2ab`
+  `CallWindowProc`, `0x2b1` `SendMessage`, `0x2b3` `SendMessageTimeout`, `0x2b7`
+  `SendNotifyMessage`, `0x2b8` `SendMessageCallback`, `0x300`
+  `explorer!clipboard_wndproc`, `0x303`/`0x304` `SPY_Enter`/`ExitMessage`,
+  `0x305` `imm32!ImeProcessKey`, `0x306` explorer's systray, `0x308`
+  `post_dde_message`, `0x309` `wintab32!WTInfoW`, `0x3001` `dispatch_message`,
+  `0x3002` `SPY_GetMsgName`. `0x307` has **no caller in the pinned set** and is
+  recovered from `wow64win!wow64_NtUserMessageCall`'s own switch instead.
+- **Three dispositions, no fall-through to a WndProc.** The five kernel-side
+  window procedures (`DefWindowProc` and the scroll-bar / menu / desktop /
+  clipboard procedures) run exemu's own `def_window_proc`; the four sends plus
+  `dispatch_message` and `CallWindowProc` reach a procedure; everything else —
+  the spy hooks, the IME / systray / tablet driver calls, the DDE post, and any
+  type this build has never seen — answers the module's honest zero, the same
+  clean "no object" `honest_stub` gives.
+- **Two new pins in `crates/app/tests/win32k_abi.rs`**: one asserts each named
+  type against the routine that issues it, the other sweeps every `.pdata`
+  function of all five pinned PEs that import the syscall and fails if any of
+  them issues a type exemu does not name. Three unit tests in
+  `crates/os/src/win32k.rs` pin the behaviour itself, including that an unknown
+  type installs no callback frame. Corpus Δ0 on all ten entries.
 
 ### comdlg32's file dialog, measured and root-caused (W6.2)
 - **A guest actually calls `GetOpenFileNameW`** now — `crates/app/src/

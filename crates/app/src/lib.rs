@@ -37,7 +37,7 @@ use exemu_core::{Cpu, EmuError, Exit, GuestClock, Memory, Perm, Region, Result};
 use exemu_cpu::{Bits, Interpreter, FS_BASE_32, GS_BASE};
 use exemu_loader as loader;
 use exemu_memory::VirtualMemory;
-use exemu_os::{WinConfig, WinOs};
+use exemu_os::{winedebug, WinConfig, WinOs};
 
 // ---- Address-space layout policy -------------------------------------------
 
@@ -2268,34 +2268,42 @@ fn env_opt_in(name: &str) -> bool {
     }
 }
 
-/// Map the zeroed scratch pages Wine's ntdll touches through its debug (TRACE)
-/// machinery during `loader_init`, so those reads/writes don't fault. Only used
-/// on the `EXEMU_WINE_BOOT` path; the emulated corpus never runs this.
+/// Give Wine's debug (`TRACE`/`WARN`/`ERR`/`FIXME`) machinery the two per-process
+/// regions it reads, and **publish the channel options into one of them**
+/// (roadmap W6.4). Only used on the `EXEMU_WINE_BOOT` / WoW64 paths; the
+/// emulated corpus never runs this.
 ///
-/// Both regions are fixed offsets Wine hard-codes (confirmed from the pinned
-/// `ntdll.dll` disassembly), and both sit in the currently-unmapped gap between
-/// the single-page PEB (at `teb_base + 0x2000`) and the DLL arena:
+/// Both offsets are hard-coded in the pinned `ntdll.dll`, and both sit in the
+/// unmapped gap between the single-page PEB (at `teb_base + 0x2000`) and the
+/// DLL arena:
 ///
-/// - **`TEB + 0x3000`** — `__wine_dbg_strdup` (RVA 0x3f3c0) keeps a per-thread
-///   debug-string ring buffer here: a `u32` write position at `TEB+0x3000` and
-///   the ring bytes from `TEB+0x3008`, both bounded to `0x3fc`. A zeroed page
-///   (position 0, empty ring) is a valid empty starting state.
-/// - **`PEB + 0x2000`** — `__wine_dbg_get_channel_flags` reads the per-process
-///   `__wine_debug_options` array here. A zero default entry (empty name) means
-///   zero configured channels, so the lookup returns the default (all-off) flags
-///   — the correct behaviour with no `WINEDEBUG` set.
+/// - **`TEB + `[`STRDUP_RING_OFF_64`]** — `__wine_dbg_strdup` (rva 0x3f3c0)
+///   keeps a per-thread debug-string ring here: a `u32` write position at
+///   `TEB+0x3000` and the ring bytes from `TEB+0x3008`, both bounded to `0x3fc`.
+///   A zeroed page (position 0, empty ring) is a valid empty starting state.
+/// - **`PEB + `[`OPTIONS_OFF_64`]** — the `__wine_debug_options` array
+///   `__wine_dbg_get_channel_flags` resolves every channel against. **A zeroed
+///   page is not the right content**: it reads as "no channels named, default
+///   flags 0", i.e. `err` and `fixme` off, where a real Wine process with no
+///   `WINEDEBUG` set has both on. [`winedebug::Options::from_env`] builds the
+///   real array — see that module for how the whole mechanism was recovered.
 ///
-/// Per-thread note: the `TEB+0x3000` ring is relative to *each* thread's TEB.
-/// This seeds the main thread; spawned Wine threads (NtCreateThreadEx) need the
-/// same page relative to their own TEB — a follow-up for when the Wine boot
-/// spawns threads (the boot is single-threaded through `loader_init` today).
+/// Per-thread note: the ring is relative to *each* thread's TEB. This seeds the
+/// main thread; a spawned Wine thread gets its own from `THREAD_TEB_SIZE`, which
+/// is 0x4000 precisely so `map_anywhere` zero-fills `TEB+0x3000..` for it.
 fn map_wine_debug_pages(mem: &mut VirtualMemory, teb_base: u64, peb_addr: u64) -> Result<()> {
     // TEB+0x3000 ring lands in [teb_base+0x3000, teb_base+0x4000); with the PEB
     // one page at teb_base+0x2000 and the dbgopts page at peb_addr+0x2000 (=
     // teb_base+0x4000), this gap is guaranteed unmapped.
-    mem.map(Region::new("wine-dbgstr", teb_base + 0x3000, PAGE, Perm::RW))?;
-    mem.map(Region::new("wine-dbgopts", peb_addr + 0x2000, PAGE, Perm::RW))?;
-    Ok(())
+    mem.map(Region::new("wine-dbgstr", teb_base + winedebug::STRDUP_RING_OFF_64, PAGE, Perm::RW))?;
+    mem.map(Region::new("wine-dbgopts", peb_addr + winedebug::OPTIONS_OFF_64, PAGE, Perm::RW))?;
+    winedebug::write_options(
+        mem,
+        peb_addr,
+        winedebug::OPTIONS_OFF_64,
+        PAGE,
+        &winedebug::Options::from_env(),
+    )
 }
 
 /// Seconds between the FILETIME epoch (1601-01-01) and the Unix epoch, for
@@ -2532,11 +2540,18 @@ mod tests {
         mem.read_u8(teb_base + 0x3008 + 0x3fc)
             .expect("ring tail is mapped");
 
-        // The __wine_debug_options page at PEB+0x2000 defaults to all zero.
+        // The `__wine_debug_options` array is *published*, not left zeroed: the
+        // page holds the terminator record — an empty name, and the flags byte
+        // every unnamed channel resolves to.
+        let opts = peb_addr + winedebug::OPTIONS_OFF_64;
         assert_eq!(
-            mem.read_u32(peb_addr + 0x2000)
-                .expect("read debug-options page"),
-            0
+            mem.read_u8(opts).expect("read debug-options page"),
+            winedebug::DEFAULT_FLAGS,
+            "the default record carries err+fixme, as a real Wine process does"
         );
+        assert_eq!(mem.read_u8(opts + 1).expect("read the name"), 0, "the terminator's name is empty");
+        // The whole page is reachable, so an array that grows with WINEDEBUG
+        // cannot run off the end of the region.
+        mem.read_u8(opts + PAGE - 1).expect("the options page tail is mapped");
     }
 }
