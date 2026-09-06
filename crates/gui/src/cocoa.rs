@@ -11,7 +11,7 @@ use objc2::{MainThreadMarker, MainThreadOnly};
 
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSEvent, NSEventMask,
-    NSEventType, NSView, NSWindow, NSWindowStyleMask,
+    NSEventModifierFlags, NSEventType, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
 use objc2_core_foundation::{CFString, CGPoint, CGSize};
@@ -26,7 +26,10 @@ use objc2_quartz_core::{CALayer, CAMetalDrawable, CAMetalLayer};
 
 use exemu_core::{InputEvent, MouseButton, TextBitmap, UserDriver, WindowParams};
 
-use crate::{bgra_to_rgba, Presenter};
+use crate::host::{HostAction, WindowModel};
+use crate::{bgra_to_rgba, Presenter, WindowCommand};
+
+const WS_VISIBLE: u32 = 0x1000_0000;
 
 fn full_region(w: u32, h: u32) -> MTLRegion {
     MTLRegion {
@@ -49,6 +52,8 @@ impl CocoaWindow {
 
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        static LAUNCHED: std::sync::Once = std::sync::Once::new();
+        LAUNCHED.call_once(|| app.finishLaunching());
 
         let device = MTLCreateSystemDefaultDevice()?;
         let queue = device.newCommandQueue()?;
@@ -82,11 +87,55 @@ impl CocoaWindow {
         window.setContentView(Some(&view));
         window.setTitle(&NSString::from_str(title));
         window.setAcceptsMouseMovedEvents(true);
+        unsafe { window.setReleasedWhenClosed(false) };
         window.center();
-        window.makeKeyAndOrderFront(None);
-        app.activate();
 
         Some(CocoaWindow { _app: app, window, layer, device, queue })
+    }
+
+    pub fn order_front(&self) {
+        self._app.activate();
+        self.window.makeKeyAndOrderFront(None);
+    }
+
+    pub fn synth_click(&self, x: f64, y: f64) {
+        let h = self.window.contentView().map(|v| v.bounds().size.height).unwrap_or(0.0);
+        let loc = NSPoint::new(x, h - y);
+        for (t, up) in [(NSEventType::LeftMouseDown, false), (NSEventType::LeftMouseUp, true)] {
+            let ev = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+                t,
+                loc,
+                NSEventModifierFlags::empty(),
+                0.0,
+                self.window.windowNumber(),
+                None,
+                0,
+                1,
+                if up { 0.0 } else { 1.0 },
+            );
+            if let Some(ev) = ev {
+                self._app.postEvent_atStart(&ev, false);
+            }
+        }
+        eprintln!("[exemu-gui] synthetic click at ({x}, {y})");
+    }
+
+    pub fn order_out(&self) {
+        self.window.orderOut(None);
+    }
+
+    pub fn close(&self) {
+        self.window.orderOut(None);
+        self.window.close();
+    }
+
+    pub fn resize(&self, w: u32, h: u32) {
+        self.window.setContentSize(NSSize::new(w.max(1) as f64, h.max(1) as f64));
+        self.layer.setDrawableSize(NSSize::new(w.max(1) as f64, h.max(1) as f64));
+    }
+
+    pub fn window_number(&self) -> isize {
+        self.window.windowNumber()
     }
 
     pub fn present(&mut self, bgra: &[u8], w: u32, h: u32) {
@@ -162,6 +211,7 @@ fn pump_runloop(seconds: f64) {
 pub fn run_demo(w: u32, h: u32, title: &str, bgra: &[u8], hold_secs: f64) -> Result<(), String> {
     let mut win = CocoaWindow::open(w, h, title)
         .ok_or("cannot open a Cocoa window (not the main thread, or no Metal device)")?;
+    win.order_front();
     let start = std::time::Instant::now();
     while start.elapsed().as_secs_f64() < hold_secs.max(0.1) {
         win.present(bgra, w, h);
@@ -170,27 +220,25 @@ pub fn run_demo(w: u32, h: u32, title: &str, bgra: &[u8], hold_secs: f64) -> Res
     Ok(())
 }
 
+fn client_point(x: f64, y: f64, view_height: f64) -> (i32, i32) {
+    (x.round() as i32, (view_height - y).round() as i32)
+}
+
 fn event_client_pos(event: &NSEvent, mtm: MainThreadMarker) -> Option<(i32, i32)> {
     let win = event.window(mtm)?;
     let view = win.contentView()?;
     let loc = event.locationInWindow();
     let p = view.convertPoint_fromView(loc, None);
-    let bounds = view.bounds();
-    let x = p.x.round() as i32;
-    let y = (bounds.size.height - p.y).round() as i32;
-    Some((x, y))
+    Some(client_point(p.x, p.y, view.bounds().size.height))
 }
 
-fn event_vk(event: &NSEvent) -> Option<u32> {
-    if let Some(s) = event.charactersIgnoringModifiers() {
-        if let Some(c) = s.to_string().chars().next() {
-            let up = c.to_ascii_uppercase();
-            if up.is_ascii_alphanumeric() {
-                return Some(up as u32);
-            }
-        }
-    }
-    let vk = match event.keyCode() {
+fn vk_from_char(c: char) -> Option<u32> {
+    let up = c.to_ascii_uppercase();
+    up.is_ascii_alphanumeric().then_some(up as u32)
+}
+
+fn vk_from_key_code(code: u16) -> Option<u32> {
+    let vk = match code {
         0x24 => 0x0D,
         0x30 => 0x09,
         0x31 => 0x20,
@@ -203,6 +251,14 @@ fn event_vk(event: &NSEvent) -> Option<u32> {
         _ => return None,
     };
     Some(vk)
+}
+
+fn event_vk(event: &NSEvent) -> Option<u32> {
+    let typed = event
+        .charactersIgnoringModifiers()
+        .and_then(|s| s.to_string().chars().next())
+        .and_then(vk_from_char);
+    typed.or_else(|| vk_from_key_code(event.keyCode()))
 }
 
 fn translate_event(event: &NSEvent, mtm: MainThreadMarker) -> Option<InputEvent> {
@@ -223,7 +279,18 @@ fn translate_event(event: &NSEvent, mtm: MainThreadMarker) -> Option<InputEvent>
     }
 }
 
-fn pump_events(input_tx: &Sender<InputEvent>, seconds: f64) {
+const SYNTH_CLICK_DELAY_MS: u128 = 1500;
+
+fn parse_point(spec: &str) -> Option<(f64, f64)> {
+    let (x, y) = spec.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+fn forwards_event(target: Option<isize>, window_number: isize) -> bool {
+    target.is_some_and(|n| n == window_number)
+}
+
+fn pump_events(target: Option<isize>, input_tx: &Sender<InputEvent>, seconds: f64) {
     let Some(mtm) = MainThreadMarker::new() else {
         pump_runloop(seconds);
         return;
@@ -240,8 +307,10 @@ fn pump_events(input_tx: &Sender<InputEvent>, seconds: f64) {
             )
         };
         let Some(event) = event else { break };
-        if let Some(ev) = translate_event(&event, mtm) {
-            let _ = input_tx.send(ev);
+        if forwards_event(target, event.windowNumber()) {
+            if let Some(ev) = translate_event(&event, mtm) {
+                let _ = input_tx.send(ev);
+            }
         }
         app.sendEvent(&event);
         until = NSDate::distantPast();
@@ -251,6 +320,7 @@ fn pump_events(input_tx: &Sender<InputEvent>, seconds: f64) {
 #[derive(Default)]
 pub struct WindowHost {
     windows: HashMap<u32, CocoaWindow>,
+    model: WindowModel,
 }
 
 impl WindowHost {
@@ -262,40 +332,80 @@ impl WindowHost {
         self.windows.is_empty()
     }
 
-    fn ensure(&mut self, hwnd: u32, w: u32, h: u32, title: &str) {
-        if let std::collections::hash_map::Entry::Vacant(slot) = self.windows.entry(hwnd) {
-            if let Some(win) = CocoaWindow::open(w.max(1), h.max(1), title) {
-                slot.insert(win);
+    pub fn input_target(&self) -> Option<isize> {
+        self.windows.get(&self.model.primary()?).map(|w| w.window_number())
+    }
+
+    pub fn primary_window(&self) -> Option<&CocoaWindow> {
+        self.windows.get(&self.model.primary()?)
+    }
+
+    fn run(&mut self, action: HostAction, cmd: &WindowCommand) {
+        match action {
+            HostAction::Open { hwnd, w, h, title } => {
+                if let Some(win) = CocoaWindow::open(w, h, &title) {
+                    eprintln!(
+                        "[exemu-gui] window {hwnd:#010x} \"{title}\" {w}x{h} num={}",
+                        win.window_number()
+                    );
+                    self.windows.insert(hwnd, win);
+                }
+            }
+            HostAction::Title { hwnd, title } => {
+                if let Some(win) = self.windows.get(&hwnd) {
+                    win.set_title(&title);
+                }
+            }
+            HostAction::Front { hwnd } => {
+                if let Some(win) = self.windows.get(&hwnd) {
+                    win.order_front();
+                }
+            }
+            HostAction::Hide { hwnd } => {
+                if let Some(win) = self.windows.get(&hwnd) {
+                    win.order_out();
+                }
+            }
+            HostAction::Resize { hwnd, w, h } => {
+                if let Some(win) = self.windows.get(&hwnd) {
+                    win.resize(w, h);
+                }
+            }
+            HostAction::Present { hwnd } => {
+                let WindowCommand::Present { w, h, bgra, .. } = cmd else { return };
+                if let Some(win) = self.windows.get_mut(&hwnd) {
+                    win.present(bgra, *w, *h);
+                }
+            }
+            HostAction::Close { hwnd } => {
+                if let Some(win) = self.windows.remove(&hwnd) {
+                    win.close();
+                }
             }
         }
     }
 
     pub fn apply(&mut self, cmd: WindowCommand) {
-        match cmd {
-            WindowCommand::Create { hwnd, w, h, ref title, .. } => self.ensure(hwnd, w, h, title),
-            WindowCommand::SetTitle { hwnd, ref title } => {
-                if let Some(win) = self.windows.get(&hwnd) {
-                    win.set_title(title);
-                }
-            }
-            WindowCommand::Show { .. } | WindowCommand::Pos { .. } => {}
-            WindowCommand::Present { hwnd, w, h, bgra } => {
-                self.ensure(hwnd, w, h, "exemu");
-                if let Some(win) = self.windows.get_mut(&hwnd) {
-                    win.present(&bgra, w, h);
-                }
-            }
-            WindowCommand::Destroy { hwnd } => {
-                self.windows.remove(&hwnd);
-            }
+        for action in self.model.plan(&cmd) {
+            self.run(action, &cmd);
         }
     }
 
     pub fn reap_closed(&mut self, input_tx: &Sender<InputEvent>) {
-        let closed: Vec<u32> =
-            self.windows.iter().filter(|(_, w)| !w.is_visible()).map(|(h, _)| *h).collect();
-        for hwnd in closed {
+        let gone: Vec<u32> = self
+            .model
+            .visible_windows()
+            .into_iter()
+            .filter(|h| !self.windows.get(h).is_some_and(|w| w.is_visible()))
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for hwnd in gone {
             self.windows.remove(&hwnd);
+            self.model.forget(hwnd);
+        }
+        if self.model.visible_windows().is_empty() {
             let _ = input_tx.send(InputEvent::Close);
         }
     }
@@ -310,16 +420,36 @@ pub fn run_live(
 
     let auto_close_ms: Option<u128> =
         std::env::var("EXEMU_COCOA_MAX_MS").ok().and_then(|s| s.parse().ok());
+    let synth_click: Option<(f64, f64)> =
+        std::env::var("EXEMU_COCOA_SYNTH_CLICK").ok().and_then(|s| parse_point(&s));
     let start = std::time::Instant::now();
     let mut auto_close_sent = false;
 
     let mut host = WindowHost::new();
+    let mut synth_sent = false;
+    let mut last_pump = std::time::Instant::now();
     loop {
         match cmd_rx.try_recv() {
-            Ok(cmd) => host.apply(cmd),
+            Ok(cmd) => {
+                host.apply(cmd);
+                if last_pump.elapsed() >= PUMP_INTERVAL {
+                    pump_events(host.input_target(), &input_tx, 0.0);
+                    host.reap_closed(&input_tx);
+                    last_pump = std::time::Instant::now();
+                }
+            }
             Err(TryRecvError::Empty) => {
-                pump_events(&input_tx, 0.01);
+                pump_events(host.input_target(), &input_tx, 0.01);
                 host.reap_closed(&input_tx);
+                last_pump = std::time::Instant::now();
+                if let Some((x, y)) = synth_click {
+                    if !synth_sent && start.elapsed().as_millis() >= SYNTH_CLICK_DELAY_MS {
+                        if let Some(win) = host.primary_window() {
+                            win.synth_click(x, y);
+                            synth_sent = true;
+                        }
+                    }
+                }
                 if let Some(ms) = auto_close_ms {
                     if !auto_close_sent && start.elapsed().as_millis() >= ms {
                         let _ = input_tx.send(InputEvent::Close);
@@ -335,6 +465,8 @@ pub fn run_live(
         pump_runloop(0.02);
     }
 }
+
+const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
 
 pub fn metal_bgra_roundtrip(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     let n = (w as usize) * (h as usize) * 4;
@@ -376,16 +508,6 @@ pub fn metal_bgra_roundtrip(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
         );
     }
     Some(out)
-}
-
-#[derive(Debug, Clone)]
-pub enum WindowCommand {
-    Create { hwnd: u32, x: i32, y: i32, w: u32, h: u32, title: String },
-    SetTitle { hwnd: u32, title: String },
-    Show { hwnd: u32, cmd: i32 },
-    Pos { hwnd: u32, rect: [i32; 4] },
-    Present { hwnd: u32, w: u32, h: u32, bgra: Vec<u8> },
-    Destroy { hwnd: u32 },
 }
 
 struct Frame {
@@ -460,10 +582,12 @@ impl UserDriver for CocoaPresenter {
     fn create_window(&mut self, hwnd: u32, params: &WindowParams) {
         self.send(WindowCommand::Create {
             hwnd,
+            parent: params.parent,
             x: params.x,
             y: params.y,
             w: params.cx.max(0) as u32,
             h: params.cy.max(0) as u32,
+            visible: params.style & WS_VISIBLE != 0,
             title: params.title.clone(),
         });
     }
@@ -569,6 +693,51 @@ mod tests {
     use crate::OffscreenPresenter;
 
     #[test]
+    fn client_points_flip_from_appkit_bottom_left_to_win32_top_down() {
+        assert_eq!(client_point(150.0, 170.0, 260.0), (150, 90));
+        assert_eq!(client_point(0.0, 260.0, 260.0), (0, 0), "the view's top-left is the origin");
+        assert_eq!(client_point(479.0, 0.0, 260.0), (479, 260), "the bottom edge is y = height");
+        assert_eq!(client_point(23.6, 41.4, 260.0), (24, 219), "sub-pixel locations round");
+        assert_eq!(client_point(-4.0, 300.0, 260.0), (-4, -40), "outside the client stays signed");
+    }
+
+    #[test]
+    fn a_synthetic_click_point_parses_or_is_refused() {
+        assert_eq!(parse_point("150,90"), Some((150.0, 90.0)));
+        assert_eq!(parse_point(" 12.5 , 7 "), Some((12.5, 7.0)));
+        assert_eq!(parse_point("150"), None);
+        assert_eq!(parse_point("150,"), None);
+        assert_eq!(parse_point("x,90"), None);
+    }
+
+    #[test]
+    fn only_the_routing_targets_own_events_are_forwarded() {
+        assert!(forwards_event(Some(42), 42));
+        assert!(!forwards_event(Some(42), 43), "another window's event is dropped, not rerouted");
+        assert!(!forwards_event(Some(42), 0), "a windowless event carries no client point");
+        assert!(!forwards_event(None, 42), "with no window on screen nothing is forwarded");
+    }
+
+    #[test]
+    fn key_codes_map_to_windows_virtual_keys() {
+        for (c, vk) in [('a', 0x41u32), ('Z', 0x5A), ('7', 0x37)] {
+            assert_eq!(vk_from_char(c), Some(vk), "{c} is VK {vk:#x}");
+        }
+        assert_eq!(vk_from_char('!'), None, "punctuation has no bare VK mapping");
+        for (code, vk) in
+            [(0x24u16, 0x0Du32), (0x30, 0x09), (0x31, 0x20), (0x33, 0x08), (0x35, 0x1B)]
+        {
+            assert_eq!(vk_from_key_code(code), Some(vk), "keyCode {code:#x} is VK {vk:#x}");
+        }
+        assert_eq!(
+            [0x7Bu16, 0x7C, 0x7D, 0x7E].map(|c| vk_from_key_code(c).unwrap()),
+            [0x25, 0x27, 0x28, 0x26],
+            "left/right/down/up arrows"
+        );
+        assert_eq!(vk_from_key_code(0x3F), None, "an unmapped key is dropped, not mis-delivered");
+    }
+
+    #[test]
     fn coretext_rasterizes_a_run_to_coverage() {
         let tb = coretext_rasterize("Hi!", 16).expect("CoreText rasterizes on macOS");
         assert!(tb.width >= 8 && tb.width <= 200, "plausible run width: {}", tb.width);
@@ -643,11 +812,19 @@ mod tests {
             y: 130,
             cx: 480,
             cy: 260,
-            style: 0,
+            style: WS_VISIBLE,
             ex_style: 0,
             parent: 0,
         };
+        let child = WindowParams {
+            title: "button".into(),
+            cx: 60,
+            cy: 24,
+            parent: 7,
+            ..params.clone()
+        };
         p.create_window(7, &params);
+        p.create_window(8, &child);
         p.set_window_text(7, "world");
         p.show_window(7, 5);
         p.window_pos_changed(7, [120, 130, 480, 260]);
@@ -661,17 +838,38 @@ mod tests {
         let cmds: Vec<_> = rx.iter().collect();
         assert!(matches!(
             cmds[0],
-            WindowCommand::Create { hwnd: 7, x: 120, y: 130, w: 480, h: 260, .. }
+            WindowCommand::Create {
+                hwnd: 7,
+                parent: 0,
+                x: 120,
+                y: 130,
+                w: 480,
+                h: 260,
+                visible: true,
+                ..
+            }
         ));
-        assert!(matches!(&cmds[1], WindowCommand::SetTitle { hwnd: 7, title } if title == "world"));
-        assert!(matches!(cmds[2], WindowCommand::Show { hwnd: 7, cmd: 5 }));
-        assert!(matches!(cmds[3], WindowCommand::Pos { hwnd: 7, rect: [120, 130, 480, 260] }));
-        match &cmds[4] {
+        assert!(matches!(
+            cmds[1],
+            WindowCommand::Create { hwnd: 8, parent: 7, w: 60, h: 24, visible: true, .. }
+        ));
+        assert!(matches!(&cmds[2], WindowCommand::SetTitle { hwnd: 7, title } if title == "world"));
+        assert!(matches!(cmds[3], WindowCommand::Show { hwnd: 7, cmd: 5 }));
+        assert!(matches!(cmds[4], WindowCommand::Pos { hwnd: 7, rect: [120, 130, 480, 260] }));
+        match &cmds[5] {
             WindowCommand::Present { hwnd: 7, w: 2, h: 2, bgra } => assert_eq!(bgra, &test_frame().0),
             other => panic!("expected Present, got {other:?}"),
         }
-        assert!(matches!(cmds[5], WindowCommand::Destroy { hwnd: 7 }));
-        assert_eq!(cmds.len(), 6);
+        assert!(matches!(cmds[6], WindowCommand::Destroy { hwnd: 7 }));
+        assert_eq!(cmds.len(), 7);
+
+        let mut model = WindowModel::new();
+        let plan: Vec<_> = cmds.iter().flat_map(|c| model.plan(c)).collect();
+        assert_eq!(
+            plan.iter().filter(|a| matches!(a, HostAction::Open { .. })).count(),
+            1,
+            "the parent plus its control open exactly one NSWindow"
+        );
     }
 
     #[test]

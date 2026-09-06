@@ -1,13 +1,16 @@
 mod render;
 
 pub mod graphics;
+pub mod host;
+
+pub use host::{HostAction, WindowCommand, WindowModel, SW_HIDE};
 
 #[cfg(target_os = "macos")]
 pub mod cocoa;
 #[cfg(target_os = "macos")]
 pub use cocoa::{
     metal_bgra_roundtrip, run_demo as cocoa_demo, run_live, CocoaPresenter, CocoaWindow,
-    WindowCommand, WindowHost,
+    WindowHost,
 };
 
 use std::collections::{HashMap, HashSet};

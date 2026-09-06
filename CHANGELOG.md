@@ -26,6 +26,72 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 1059, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### One host window per top-level, and input that goes only where it is routed (W4.6)
+- **A real `NSWindow` was confirmed on screen, by looking at it.** `exemu run
+  --gui --wine-boot <dir> <gui-sample.exe>` puts up a titled 480×260 window
+  carrying the guest's CoreText text and GDI rectangles; `exemu cocoa-demo` puts
+  up its test frame. Neither had ever been observed before — only inferred from
+  exit codes. The window opens on the *default* Space, so with a full-screen app
+  frontmost a plain `screencapture` of the screen shows nothing; the window is
+  there, and `screencapture -l <windowNumber>` proves it. The presenter now
+  prints the window's title, size and `windowNumber` when it opens, which is what
+  makes that check possible.
+- **Every window the guest created used to become its own `NSWindow`** — win32k
+  calls `UserDriver::create_window` for children as well as top-levels, and the
+  host opened one per call. A dialog with three controls meant four windows, and
+  because a window vanishing was read as "the user closed it", the first one
+  reaped killed the guest. The host now keeps a `WindowModel` (`crates/gui/src/
+  host.rs`): a window whose parent is a window it already knows is a **control**,
+  and a control shares its parent's `NSWindow` and client coordinate space, which
+  is exactly the space win32k hit-tests in (`WM_NCHITTEST`, capture, the deepest
+  topmost child). One top-level plus its controls opens one window.
+- **A window created without `WS_VISIBLE` no longer pops up.** `Create` records
+  the geometry, `ShowWindow` opens and fronts it, `SW_HIDE` orders it out without
+  destroying it, a later `SW_SHOW` reuses it, and only a real `Destroy` closes it.
+  Only the last visible window disappearing quits the guest.
+- **Input is forwarded only from the window win32k will route it to.** An
+  `NSEvent` belonging to any other window is dropped rather than delivered to the
+  wrong one at the wrong coordinates. With several top-level windows that target
+  is still the first shown one: `InputEvent` carries no window identity, so
+  closing that gap needs a field in `exemu_core` and a matching lookup in
+  win32k's `window_from_point`/`keyboard_target`.
+- **A guest that redraws continuously no longer starves its own window.** The
+  old loop pumped `NSEvent`s only when the command channel ran dry, so a stream
+  of `Present`s meant no events at all; the pump now runs on a fixed 8 ms
+  interval regardless.
+- **The window now comes to the front and takes the keyboard**, and the reason it
+  did not is an ordering AppKit does not document: `NSApplication::activate` must
+  be called **before** `makeKeyAndOrderFront`, not after. Called after, the window
+  is ordered in while the app is still inactive, so the window server puts it on
+  the Space the app is assigned to rather than the one in front of the user, and
+  it never becomes key — measured as `isOnActiveSpace=false` with a full-screen
+  app frontmost, and visible as grey traffic lights in a window capture. Swapping
+  the two lines gives `isOnActiveSpace=true`, coloured traffic lights, and
+  `exemu` in the menu bar.
+- **The live input chain was driven end to end and watched.**
+  `EXEMU_COCOA_SYNTH_CLICK=x,y` posts one synthetic left click into the
+  application's own `NSEvent` queue at that client point, so the click travels the
+  real path — `nextEventMatchingMask` dequeues it, the window-number filter
+  accepts it, `event_client_pos` converts it through the real `NSWindow`'s content
+  view, the channel carries it, win32k routes it, Wine's `DispatchMessageW`
+  lowers it through `NtUserMessageCall`, and the guest's `WndProc` handles it.
+  On `gui-sample` the guest draws its click rectangle with the corner exactly at
+  `x,y` (checked at two different points), and the run grows from 1,596,465 to
+  1,597,073 instructions — the guest really executed its handler. This is the
+  first time anything but an injected `InputEvent` has been shown to reach the
+  guest; only the physical mouse itself is still unexercised.
+- **Two AppKit correctness fixes.** `setReleasedWhenClosed(false)` — the host
+  holds a `Retained<NSWindow>`, so letting AppKit release it on close left a
+  dangling pointer for the next visibility check. And `finishLaunching`, which is
+  the app's responsibility when it drives `nextEventMatchingMask` itself instead
+  of calling `NSApplication::run`.
+- Pinned headlessly by 12 new tests: nine in `crates/gui/tests/window_host.rs`
+  over the pure `WindowModel`, three unit tests over the AppKit→Win32 mappings
+  (the bottom-left→top-down client flip, the keyCode→VK table, the event filter).
+  Each was mutation-checked: treating a control as a top-level, dropping the
+  coordinate flip, forwarding every window's events, and routing to the newest
+  window instead of the first each turn its test red.
+
 ### The JIT compiles `ret`, and the reason to compile it was not the one on record (W8)
 - **`ret` and `ret imm16` now compile** — a stack pop reusing the software TLB
   plus an exit through the indirect-branch inline cache that W8.5 built for
