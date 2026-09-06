@@ -70,6 +70,11 @@ pub const WOW64_SEH_FAIL_CODE_EXIT: i32 = 83;
 /// address in `ExceptionInformation[1]`.
 pub const WOW64_SEH_FAIL_INFO_EXIT: i32 = 84;
 
+/// Exit code the [`Program::UnhandledFault`] guest would use if it somehow ran
+/// past an access violation that nothing handled. Reaching it is a failure: the
+/// process is supposed to die on the fault.
+pub const WOW64_FAULT_SURVIVED_EXIT: i32 = 85;
+
 /// The marker the guest's SEH handler writes so the gate can tell "it ran" from
 /// "the fault was silently swallowed".
 pub const WOW64_SEH_HANDLED: u32 = 0x5E_48_00_01;
@@ -132,7 +137,7 @@ fn iat_off() -> u32 {
     IMPORT_DIR_SIZE + (N + 1) * 4
 }
 
-/// Which of the two PE32 WoW64 proof binaries to emit.
+/// Which of the three PE32 WoW64 proof binaries to emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Program {
     /// The W5.5 allocator: one `NtAllocateVirtualMemory` round trip through
@@ -142,6 +147,11 @@ pub enum Program {
     /// The W5.9 exception guest: install a 32-bit `fs:[0]` SEH frame, read
     /// through an unmapped address, and let the handler resume execution.
     Seh,
+    /// The W5.12 exception guest: the **same** faulting instruction as
+    /// [`Program::Seh`] with **no handler installed anywhere**, so the whole
+    /// dispatch — both ntdlls' `RtlDispatchException` — genuinely finds nothing
+    /// and the process must die on it.
+    UnhandledFault,
 }
 
 /// Build the PE32 WoW64 sample ([`Program::Alloc`]).
@@ -154,7 +164,13 @@ pub fn build_seh() -> Vec<u8> {
     build_program(Program::Seh)
 }
 
-/// Build one of the PE32 WoW64 proof binaries. Both share every byte of the PE
+/// Build the PE32 WoW64 **unhandled**-exception sample
+/// ([`Program::UnhandledFault`], roadmap W5.12).
+pub fn build_unhandled_fault() -> Vec<u8> {
+    build_program(Program::UnhandledFault)
+}
+
+/// Build one of the PE32 WoW64 proof binaries. All share every byte of the PE
 /// scaffolding — same import table, same sections — so a difference in outcome
 /// is a difference in the *program*, not in how it was loaded.
 pub fn build_program(program: Program) -> Vec<u8> {
@@ -200,6 +216,7 @@ pub fn build_program(program: Program) -> Vec<u8> {
     let text = match program {
         Program::Alloc => build_text(iat(0), iat(1)),
         Program::Seh => build_text_seh(iat(1)),
+        Program::UnhandledFault => build_text_unhandled_fault(iat(1)),
     };
 
     // --- assemble the file ------------------------------------------------
@@ -452,6 +469,31 @@ fn build_text_seh(iat_terminate: u32) -> Vec<u8> {
     emit_store_imm(&mut c, cell(data::SEH_HANDLED), WOW64_SEH_HANDLED);
     c.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax → ExceptionContinueExecution
     c.push(0xC3); // ret
+    c
+}
+
+/// The [`Program::UnhandledFault`] text (roadmap W5.12): fault at exactly the
+/// address [`Program::Seh`] faults at, with **no `fs:[0]` frame of its own**.
+///
+/// The point is the *negative* one. Everything downstream is Wine's own code
+/// and it really does run: `ntdll32!RtlDispatchException` walks the exception
+/// registration chain, finds only the terminator Wine's own thread startup
+/// installed, returns `STATUS_UNHANDLED_EXCEPTION`, and its `dispatch_exception`
+/// tail-calls `NtRaiseException(rec, ctx, FirstChance = FALSE)` — the last
+/// resort. So this guest *cannot* survive, and how long it takes to die is a
+/// property of exemu, not of the program.
+///
+/// The `NtTerminateProcess` after the fault is unreachable by construction. It
+/// is there so a run that somehow swallowed the exception exits with a code the
+/// gate can tell apart from a fault, instead of falling off the end of `.text`.
+fn build_text_unhandled_fault(iat_terminate: u32) -> Vec<u8> {
+    let mut c: Vec<u8> = Vec::new();
+    // mov eax, WOW64_SEH_FAULT_ADDR ; mov eax, [eax]  ← the access violation
+    c.push(0xB8);
+    c.extend_from_slice(&WOW64_SEH_FAULT_ADDR.to_le_bytes());
+    c.extend_from_slice(&[0x8B, 0x00]);
+    emit_exit(&mut c, iat_terminate, WOW64_FAULT_SURVIVED_EXIT as u32);
+    c.push(0xF4); // hlt — NtTerminateProcess does not return
     c
 }
 
