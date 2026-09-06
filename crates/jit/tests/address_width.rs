@@ -206,6 +206,48 @@ fn the_stack_pointer_wraps_at_2_32() {
 }
 
 #[test]
+fn a_return_wraps_the_stack_pointer_at_2_32() {
+    let mut s = seed(Bits::B32);
+    s.gpr[4] = 0xFFFF_FFFC;
+    let n = parity(Bits::B32, TOP32, &[0xC3], "ret across 2^32", &s);
+    if jit_available() {
+        assert_eq!(n, 1, "the ret compiles");
+        assert_eq!(
+            jit_only(Bits::B32, TOP32, &[0xC3], &s).gpr[4],
+            0,
+            "ESP wraps back to zero over the region's last dword"
+        );
+    }
+
+    let mut s2 = seed(Bits::B32);
+    s2.gpr[4] = 0xFFFF_FFF0;
+    let released = [0xC2, 0x10, 0x00];
+    parity(Bits::B32, TOP32, &released, "ret 0x10 across 2^32", &s2);
+    if jit_available() {
+        assert_eq!(
+            jit_only(Bits::B32, TOP32, &released, &s2).gpr[4],
+            4,
+            "ESP wraps through the released bytes too"
+        );
+    }
+}
+
+#[test]
+fn a_return_keeps_a_stack_pointer_above_4_gib() {
+    let mut s = seed(Bits::B64);
+    s.gpr[4] = HIGH64 + 0x1000;
+    let n = parity(Bits::B64, HIGH64, &[0xC3], "ret above 4 GiB", &s);
+    if jit_available() {
+        assert_eq!(n, 1);
+        assert_eq!(
+            jit_only(Bits::B64, HIGH64, &[0xC3], &s).gpr[4],
+            HIGH64 + 0x1008,
+            "RSP keeps its high half"
+        );
+    }
+}
+
+#[test]
 fn an_effective_address_wraps_at_2_32() {
     let code = [
         0x8B, 0x43, 0x10,

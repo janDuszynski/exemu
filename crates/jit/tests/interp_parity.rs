@@ -475,6 +475,75 @@ fn an_indirect_call_through_the_stack_reads_its_operand_before_it_pushes() {
 }
 
 #[test]
+fn a_return_lands_on_the_address_that_was_pushed() {
+    let mut code = vec![0x68];
+    code.extend_from_slice(&((CODE + 0x40) as u32).to_le_bytes());
+    code.push(0xC3);
+    for (bits, mode) in [(Bits::B64, Mode::Long), (Bits::B32, Mode::Protected)] {
+        let s = seed(bits);
+        let n = parity(bits, &code, "push then ret", &s);
+        if !jit_available() {
+            continue;
+        }
+        assert_eq!(n, 2, "the push and the ret both compile");
+        let (mut mem, mut cpu) = build_with(bits, &code, &s, Perm::RX);
+        let mut jit = Jit::new(64 * 1024).expect("JIT should be available");
+        jit.run(cpu.state_mut(), &mut mem, mode, 1);
+        assert_eq!(cpu.state().rip, CODE + 0x40, "the ret took the pushed address");
+        assert_eq!(cpu.state().gpr[4], s.gpr[4], "a push and a ret leave rsp where it was");
+    }
+}
+
+#[test]
+fn a_return_releases_the_bytes_its_immediate_names() {
+    for extra in [0u16, 8, 0x0FF8, 0x1000, 0xFFFF] {
+        let mut code = vec![0x68];
+        code.extend_from_slice(&((CODE + 0x40) as u32).to_le_bytes());
+        code.push(0xC2);
+        code.extend_from_slice(&extra.to_le_bytes());
+        let what = format!("push then ret {extra:#x}");
+        for (bits, mode) in [(Bits::B64, Mode::Long), (Bits::B32, Mode::Protected)] {
+            let s = seed(bits);
+            let n = parity(bits, &code, &what, &s);
+            if !jit_available() {
+                continue;
+            }
+            assert_eq!(n, 2, "{what}: both compile");
+            let (mut mem, mut cpu) = build_with(bits, &code, &s, Perm::RX);
+            let mut jit = Jit::new(64 * 1024).expect("JIT should be available");
+            jit.run(cpu.state_mut(), &mut mem, mode, 1);
+            assert_eq!(cpu.state().rip, CODE + 0x40, "{what}: target");
+            assert_eq!(
+                cpu.state().gpr[4],
+                s.gpr[4] + u64::from(extra),
+                "{what}: rsp released the immediate on top of the return address"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_return_whose_pop_faults_rewinds_onto_the_ret() {
+    if !jit_available() {
+        return;
+    }
+    for (bits, mode) in [(Bits::B64, Mode::Long), (Bits::B32, Mode::Protected)] {
+        let mut s = seed(bits);
+        s.gpr[4] = 0xDEAD_0000;
+        let (mut mem, mut cpu) = build_with(bits, &[0xC3], &s, Perm::RX);
+        let mut jit = Jit::new(64 * 1024).expect("JIT should be available");
+        let run = jit.run(cpu.state_mut(), &mut mem, mode, 1);
+        assert_eq!(run, Run::Faulted { insns: 0 }, "{bits:?}: the faulting ret must rewind");
+        assert_eq!(cpu.state().rip, CODE, "{bits:?}: rip rewound onto the ret");
+        assert_eq!(cpu.state().gpr[4], 0xDEAD_0000, "{bits:?}: rsp is untouched");
+
+        let (mut mem_i, mut cpu_i) = build_with(bits, &[0xC3], &s, Perm::RX);
+        let mut hooks = NoHooks;
+        assert!(cpu_i.step(&mut mem_i, &mut hooks).is_err(), "{bits:?}: the interpreter faults too");
+    }
+}
+
+#[test]
 fn an_indirect_call_whose_push_faults_rewinds() {
     if !jit_available() {
         return;

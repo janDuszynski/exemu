@@ -1088,6 +1088,72 @@ mod tests {
         assert!(jit.stats().unlinks > 0, "the store never broke the links");
     }
 
+    const CALL_LOOP: [u8; 17] = [
+        0xB9, 0x08, 0x00, 0x00, 0x00,
+        0xE8, 0x06, 0x00, 0x00, 0x00,
+        0xFF, 0xC9,
+        0x75, 0xF7,
+        DECLINED,
+        0x90,
+        0xC3,
+    ];
+
+    #[test]
+    fn a_warm_return_reaches_its_caller_without_returning_to_rust() {
+        let mut mem = mem_with(&CALL_LOOP);
+        mem.map(Region::new("stack", 0x8000, 0x1000, Perm::RW)).unwrap();
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        st.rip = CODE;
+        st.gpr[4] = 0x8800;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1000), Run::SideExit { insns: 33 });
+        assert_eq!(st.gpr[1], 0, "ecx counted down to zero");
+        assert_eq!(st.rip, CODE + 14, "left on the declined opcode");
+        assert_eq!(st.gpr[4], 0x8800, "every call was matched by its ret");
+
+        let taken = jit.stats().links_taken;
+        let chains = jit.stats().chains;
+        st = CpuState::new();
+        st.rip = CODE;
+        st.gpr[4] = 0x8800;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1000), Run::SideExit { insns: 33 });
+        assert_eq!(jit.stats().chains - chains, 1, "one entry into native code");
+        assert_eq!(
+            jit.stats().links_taken - taken,
+            23,
+            "every transition, the eight returns included, was a native link"
+        );
+    }
+
+    #[test]
+    fn a_return_to_a_new_target_misses_the_cache_and_still_lands() {
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("code", CODE, 0x1000, Perm::RX)).unwrap();
+        mem.map(Region::new("stack", 0x8000, 0x1000, Perm::RW)).unwrap();
+        mem.poke(CODE, &[0xC3]).unwrap();
+        mem.poke(CODE + 0x40, &[0xB8, 0x07, 0x00, 0x00, 0x00, DECLINED]).unwrap();
+        mem.poke(CODE + 0x80, &[0xB8, 0x09, 0x00, 0x00, 0x00, DECLINED]).unwrap();
+        let mut jit = Jit::new(64 * 1024).unwrap();
+
+        for (round, (slot, want, links)) in
+            [(CODE + 0x40, 7u64, 0), (CODE + 0x40, 7, 1), (CODE + 0x80, 9, 0)].iter().enumerate()
+        {
+            mem.write_u64(0x8800, *slot).unwrap();
+            let before = jit.stats().links_taken;
+            let mut st = CpuState::new();
+            st.rip = CODE;
+            st.gpr[4] = 0x8800;
+            jit.run(&mut st, &mut mem, Mode::Long, 1000);
+            assert_eq!(st.gpr[0], *want, "round {round}: the ret to {slot:#x} ran the wrong block");
+            assert_eq!(st.gpr[4], 0x8808, "round {round}: rsp moved by exactly one slot");
+            assert_eq!(
+                jit.stats().links_taken - before,
+                *links,
+                "round {round}: the cached target must be taken only when it is the one popped"
+            );
+        }
+    }
+
     #[test]
     fn a_data_store_next_to_the_code_does_not_break_the_links() {
         let mut mem = mem_with(&LOOP);
