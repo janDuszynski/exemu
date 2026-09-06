@@ -3167,22 +3167,54 @@ fn nt_user_end_paint(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -
     Ok(1)
 }
 
+/// **A run with no input channel has no window host, so its queue quits**
+/// (roadmap W6.2).
+///
+/// [`WinOs::drain_input`] already takes exactly this view of a channel that has
+/// been *disconnected* — "the window host went away … so the guest never
+/// spins". A run that never had one is the same situation, only more so: there
+/// is no user, no window host and no second thread, so nothing can ever put a
+/// message in this queue. Seeding the quit code makes the pump below deliver a
+/// real `WM_QUIT`, which is the message a modal loop and a `while (GetMessage)`
+/// loop are both documented to stop on.
+///
+/// **Delivering `WM_QUIT` is not the same as returning 0, and the difference is
+/// what this fixes.** Both handlers used to answer `Ok(0)` straight from the top
+/// without ever reading `lpMsg`, let alone writing it. Windows fills the `MSG`
+/// on the way out, and a pump that reads the struct without first checking the
+/// return value re-dispatches whatever the previous message was. Total
+/// Commander's does: with the dialog-info selectors serviced it reaches its main
+/// loop and burns a whole 50,000,000-instruction budget on **172,999 identical
+/// rounds** of `PeekMessage` → `IsDialogMessageW` → `TranslateMessage` →
+/// `DispatchMessage(hwnd = 0, message = 0)`, the tail of an `MSG` exemu had left
+/// untouched since it was stack garbage. That spin was mis-attributed to a
+/// parent walk inside `IsDialogMessageW`; the walk is fine, and the win32u
+/// transcript shows the same eleven-syscall round repeating without progress.
+///
+/// Messages the OS itself posted were stranded by the same early return, so a
+/// headless run could not be handed even its own synthesized `WM_PAINT`.
+fn quit_when_headless(os: &mut WinOs) {
+    if !os.has_input() {
+        os.threads[os.current].quit_code.get_or_insert(0);
+    }
+}
+
 /// `NtUserGetMessage(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax)`.
 ///
-/// Headless / console / emulated-corpus runs (no input channel attached) keep
-/// the W4.1 behaviour: return 0 = `WM_QUIT` at once, so a GUI guest's
-/// `while (GetMessage(...))` loop exits immediately.
+/// Headless / console / emulated-corpus runs (no input channel attached) get a
+/// `WM_QUIT` — written into the caller's `MSG` and reported as 0 — so a GUI
+/// guest's `while (GetMessage(...))` loop exits at once and a guest that reads
+/// the `MSG` regardless sees a message that means "stop". See
+/// [`quit_when_headless`].
 ///
 /// On the live Cocoa path (roadmap W4.5c) an input channel is attached: deliver
 /// a queued message or `WM_QUIT`, otherwise **park the interpreter thread** on
 /// native input until one arrives. The window stays live (no busy-spin) until
 /// the user closes it (close → `WM_QUIT`).
 fn nt_user_get_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
-    if !os.has_input() {
-        return Ok(0);
-    }
     let lp = os.syscall_arg(cpu, mem, 0)?; // lpMsg
     loop {
+        quit_when_headless(os);
         os.drain_input();
         // A shown window owes an initial WM_PAINT; synthesize it when the queue
         // is otherwise empty (roadmap W4.6) so the guest's WM_PAINT handler runs.
@@ -3693,15 +3725,14 @@ fn nt_user_dispatch_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
 /// only looks at what is already queued: routing an event *consumes* it, and a
 /// caller that asked not to remove anything must not lose it.
 ///
-/// Without an input channel it keeps the W4.1 answer (0 = nothing), which is what
-/// every headless and emulated-corpus run sees.
+/// Without an input channel it reports the `WM_QUIT` of a queue nothing can ever
+/// feed — see [`quit_when_headless`] — rather than the bare 0 it used to answer
+/// without writing the caller's `MSG` at all.
 fn nt_user_peek_message(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     const PM_REMOVE: u32 = 0x0001;
-    if !os.has_input() {
-        return Ok(0);
-    }
     let lp = os.syscall_arg(cpu, mem, 0)?;
     let remove = os.syscall_arg(cpu, mem, 4)? as u32 & PM_REMOVE != 0;
+    quit_when_headless(os);
     os.drain_input();
     synthesize_paint(os);
     if !os.threads[os.current].msgs.is_empty() {
@@ -3873,6 +3904,7 @@ fn nt_user_msg_wait_for_multiple_objects_ex(
     mem: &mut dyn Memory,
 ) -> Result<u32> {
     let count = os.syscall_arg(cpu, mem, 0)? as u32;
+    quit_when_headless(os);
     os.drain_input();
     synthesize_paint(os);
     let idle = os.threads[os.current].msgs.is_empty() && os.threads[os.current].quit_code.is_none();
@@ -5565,6 +5597,61 @@ mod tests {
         };
         assert_eq!(call(&mut os, &mut mem, hwnd as u64), hwnd, "a live handle widens to itself");
         assert_eq!(call(&mut os, &mut mem, 0xDEAD), 0, "an unknown handle stays 0");
+    }
+
+    /// **A headless pump is handed a real `WM_QUIT`, written into its `MSG`**
+    /// (roadmap W6.2) — not a bare 0 over an untouched buffer.
+    ///
+    /// The distinction is the whole bug. A guest whose loop checks the return
+    /// value stops either way; one that reads the `MSG` regardless — Total
+    /// Commander's Delphi pump does — used to re-dispatch whatever bytes were
+    /// on its stack, for ever. This asserts the *contents*, so the old
+    /// behaviour cannot come back disguised as a passing return code.
+    #[test]
+    fn a_run_with_no_window_host_is_handed_wm_quit_not_an_untouched_msg() {
+        const WM_QUIT: u32 = 0x0012;
+        const POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        let lp = 0x2_0100u64;
+        // Seed the MSG with something no handler could produce, standing in for
+        // the stack garbage a real pump's `MSG` starts out as.
+        mem.write_u64(lp, POISON).unwrap();
+        mem.write_u32(lp + 8, 0xC0DE).unwrap();
+
+        let call = |os: &mut WinOs, mem: &mut VirtualMemory, index_get: bool| -> u32 {
+            let mut cpu = CpuState::default();
+            cpu.set_rsp(0x2_0800);
+            cpu.set_reg(exemu_core::Reg::R10, lp);
+            if index_get {
+                nt_user_get_message(os, &mut cpu, mem).unwrap()
+            } else {
+                // `wRemoveMsg` is argument 4, i.e. the first stack slot.
+                os.syscall_guest_rsp = 0x2_0800;
+                mem.write_u64(0x2_0800 + 0x28, 0).unwrap(); // PM_NOREMOVE
+                nt_user_peek_message(os, &mut cpu, mem).unwrap()
+            }
+        };
+
+        // GetMessage: 0 is "the loop ends", and the MSG says why.
+        assert_eq!(call(&mut os, &mut mem, true), 0, "GetMessage reports the quit");
+        assert_eq!(mem.read_u64(lp).unwrap(), 0, "hwnd — a thread message, so NULL");
+        assert_eq!(mem.read_u32(lp + 8).unwrap(), WM_QUIT, "…and the message really is WM_QUIT");
+
+        // PeekMessage: TRUE, because a message *was* available. A pump that
+        // switches on `msg.message` (rather than on the return value) needs
+        // this leg — it is the one Total Commander takes.
+        mem.write_u64(lp, POISON).unwrap();
+        mem.write_u32(lp + 8, 0xC0DE).unwrap();
+        assert_eq!(call(&mut os, &mut mem, false), 1, "PeekMessage found a message");
+        assert_eq!(mem.read_u32(lp + 8).unwrap(), WM_QUIT, "…the same WM_QUIT");
+
+        // And it keeps saying so: a headless queue can never be fed, so every
+        // subsequent round must answer the same way rather than falling back to
+        // "nothing here" and leaving the guest to spin.
+        assert_eq!(call(&mut os, &mut mem, true), 0);
+        assert_eq!(mem.read_u32(lp + 8).unwrap(), WM_QUIT, "…on every later round too");
     }
 
     /// **`IsChild`'s two arguments, pinned in the order `user32!IsChild`
