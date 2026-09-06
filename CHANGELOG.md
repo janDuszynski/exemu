@@ -26,6 +26,50 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 931, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### Breakpoints and watchpoints are honoured in compiled code (W9.3)
+- **The JIT's whole contribution to the debugger is a negative guarantee** —
+  never run past an armed address — not a second breakpoint implementation. It
+  still cannot report a hit, get the reported `rip` wrong, or disagree with the
+  interpreter about which instruction was reached, because it never decides:
+  every stop is decided at the run loop's head, the one point the interpreter
+  path and the compiled chain converge at.
+- **Arming a breakpoint splits a block; it does not de-optimise one.** The
+  compiler is handed the next armed address and ends the block *before* it, so
+  the instructions in front of a breakpoint still run as native code and the one
+  at it is interpreted. A breakpoint at a block entry compiles to nothing, which
+  already means "the caller interprets this one". The block cache is keyed on the
+  debug handle's generation, so arming or disarming costs a flush at human speed
+  and nothing per block.
+- **A compiled block refuses a watched access rather than performing it.** Two
+  memory helpers are swapped in behind the function pointers a block already
+  calls through — no emitted-code change at all — and they return a fault
+  *before* the access, so the block rewinds having changed nothing and the
+  interpreter performs it, records the hit and reports it. The access happens
+  exactly once, on the reference engine. The guest-memory fast path is disabled
+  while anything is watched, so it cannot cache a page and thereby hide a later
+  access on it.
+- **Attaching is still free.** With nothing armed the emitted code is
+  byte-identical and the block count, the link count, the cache-fill count and
+  the emitted-byte count are all asserted equal to a detached run. The corpus is
+  unmoved: 11 of 11 pins at Δ = 0, with 7-Zip at exactly 496,505,572
+  instructions on all three of its rows.
+- **A store-only fault used to lose its flags.** A store is the last thing a
+  read-modify-write instruction does, so by the time it can fault the flags are
+  already computed — and the rewind restored a state that means "emit nothing".
+  `inc byte [rdi]` into a read-only page came back with `rflags = 0x2` instead of
+  what it went in with, and that value lands in the `CONTEXT` an access-violation
+  handler is given. Every data region the differential maps is writable, so a
+  faulting store there is always one whose load would have faulted too — and a
+  load faults before anything has been computed. An armed data watchpoint is the
+  first thing that can fault a store whose load succeeded, which is how this
+  surfaced. Fixed; the block frame now carries a small flag-state spill for it.
+- **The differential grew a debugger dimension.** Every trial can arm one
+  breakpoint or one watchpoint, and the expected instruction count is computed
+  from the *interpreter's* trace, so a JIT that "honoured" a breakpoint by
+  refusing to compile would fail rather than pass. Zero divergences over 500,000
+  trials per bitness in each of the plain, breakpoint and watchpoint modes, on
+  both the low and the address-boundary layouts.
+
 ### Wine's debug channels resolve through Wine's own mechanism (W6.4)
 - **What a `TRACE()` costs in a Wine builtin is decided by a per-process array
   exemu never wrote.** Every channel is a 16-byte `{ unsigned char flags;

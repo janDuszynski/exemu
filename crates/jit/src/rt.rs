@@ -15,6 +15,7 @@
 //! link-slot array, the block trail and the self-modification report all live
 //! here so that compiled code can maintain them itself.
 
+use exemu_core::debug::{DebugControl, WatchKind};
 use exemu_core::{Memory, Perm};
 
 /// Entries in the block-entry ring [`BlockCtx::trail`] points at. A power of two
@@ -288,6 +289,17 @@ pub struct BlockCtx<'a, M: Memory + ?Sized> {
     /// those happen is the thing worth knowing rather than guessing at.
     pub tlb_fills: u64,
     pub tlb_denied: u64,
+    /// Accesses [`jit_read_watched`] / [`jit_write_watched`] refused because
+    /// they land in an armed watchpoint. Reported, like the two above.
+    pub watch_stops: u64,
+    /// The process's shared debug handle, when one is attached (roadmap W9.3).
+    ///
+    /// Read **only** by [`jit_read_watched`] / [`jit_write_watched`], which are
+    /// installed in `read`/`write` above only while a watchpoint is actually
+    /// armed — so on every ordinary run this field is `None`, nothing loads it,
+    /// and the emitted code does not know it exists. Emitted code never reads
+    /// it at all: it has no offset in [`ctx_off`].
+    pub debug: Option<&'a DebugControl>,
     /// Guest memory. Only the helpers below dereference it.
     ///
     /// **Last on purpose.** `M` is a type parameter (roadmap W8.6), so this is
@@ -430,6 +442,80 @@ pub unsafe extern "C" fn jit_read<M: Memory + ?Sized>(
     }
 }
 
+/// Guest load, with the debug handle's data watchpoints honoured
+/// (roadmap W9.3, step S6).
+///
+/// Installed in [`BlockCtx::read`] by [`crate::Jit::run`] **only** while a
+/// watchpoint is actually armed, so the disarmed cost is not "a cheap check per
+/// access" but no check and no different code at all — the emitted block is
+/// byte-identical either way, because the helper is reached through a pointer.
+///
+/// The check is made **before** the access and a hit returns [`status::FAULT`]
+/// *without performing it*. That is deliberate and it is the only status that
+/// works:
+///
+/// * `FAULT` is the one answer that returns control to the engine's caller at
+///   the instruction in question — the block rewinds to the start of that
+///   instruction having changed nothing, and the caller's run loop hands
+///   exactly that instruction to the **interpreter**, which performs the access,
+///   records the hit on the shared handle, and lets the run-loop head report it
+///   *after* the instruction completes (trap-after, matching x86 data
+///   breakpoints).
+/// * A "commit, then stop" status would end the *block*, but the chain loop
+///   would simply go round to the next one, so the stop would surface a whole
+///   chain late and against the wrong instruction count.
+///
+/// The access therefore happens exactly **once**, on the interpreter, and this
+/// crate reports nothing about it: the reported address, kind and count all come
+/// from the reference engine.
+///
+/// # Safety
+/// As [`jit_read`].
+pub unsafe extern "C" fn jit_read_watched<M: Memory + ?Sized>(
+    ctx: *mut BlockCtx<'_, M>,
+    addr: u64,
+    size: u32,
+) -> ReadResult {
+    // SAFETY: as `jit_read` — and this reads two `Copy` fields before handing
+    // the same pointer on, so no borrow of `*ctx` is live across the call.
+    let watched = unsafe {
+        (*ctx).debug.is_some_and(|d| d.is_watched(addr, u64::from(size), WatchKind::Read))
+    };
+    if watched {
+        // SAFETY: as above.
+        unsafe { (*ctx).watch_stops += 1 };
+        return ReadResult { value: 0, status: status::FAULT };
+    }
+    // SAFETY: the caller's contract, unchanged.
+    unsafe { jit_read(ctx, addr, size) }
+}
+
+/// Guest store, with the debug handle's data watchpoints honoured
+/// (roadmap W9.3, step S6). See [`jit_read_watched`] — the rule is the same one,
+/// and the store is refused *before* it lands, so the interpreter is the only
+/// thing that ever performs it.
+///
+/// # Safety
+/// As [`jit_read`].
+pub unsafe extern "C" fn jit_write_watched<M: Memory + ?Sized>(
+    ctx: *mut BlockCtx<'_, M>,
+    addr: u64,
+    size: u32,
+    value: u64,
+) -> u64 {
+    // SAFETY: as `jit_read_watched`.
+    let watched = unsafe {
+        (*ctx).debug.is_some_and(|d| d.is_watched(addr, u64::from(size), WatchKind::Write))
+    };
+    if watched {
+        // SAFETY: as above.
+        unsafe { (*ctx).watch_stops += 1 };
+        return status::FAULT;
+    }
+    // SAFETY: the caller's contract, unchanged.
+    unsafe { jit_write(ctx, addr, size, value) }
+}
+
 /// Guest store. Returns a [`status`] word.
 ///
 /// # Safety
@@ -529,6 +615,8 @@ mod tests {
             tlb_on,
             tlb_fills: 0,
             tlb_denied: 0,
+            watch_stops: 0,
+            debug: None,
             mem,
         }
     }

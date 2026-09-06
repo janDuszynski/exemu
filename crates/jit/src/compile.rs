@@ -99,6 +99,26 @@ const R_MASK: u32 = 28; // 0x8D5 = CF|PF|AF|ZF|SF|OF
 const TLB_ENTRY_SHIFT: u32 = 5;
 
 /// Scratch registers, dead across any helper call.
+/// The block's stack frame, in bytes. 80 of it is the ten callee-saved role
+/// registers plus `x30`; the last 32 are [`FSPILL`], the rewind's scratch.
+/// 16-byte aligned, as AAPCS64 requires.
+const FRAME: i32 = 128;
+
+/// Frame offset of the four-register **flag spill** (roadmap W8.4 + W9.3).
+///
+/// A guest store can fault *after* its instruction has already computed its
+/// flags — the store is the last thing an RMW does — and the rewind must show
+/// the flags as of the instruction's **start**. Those live only in registers the
+/// instruction has by then overwritten, so a flag-setting instruction with a
+/// memory operand parks all four here first: `R_FLAGS`/`R_FR` in the low pair,
+/// `R_FA`/`R_FB` in the high one, two `stp`s in all.
+///
+/// The cold path reloads them and the ordinary rewind machinery then works
+/// unchanged, including for an instruction whose *entry* flag state was itself
+/// deferred (roadmap W8.4) — which is precisely the case that cannot be
+/// reconstructed from anything else.
+const FSPILL: i32 = 96;
+
 const T0: u32 = 9;
 const T1: u32 = 10;
 const T2: u32 = 11;
@@ -151,6 +171,16 @@ pub enum StopReason {
     /// self-modification check and the engine's two-page generation check are
     /// built on — so the block stops here rather than becoming two ranges.
     Wrapped,
+    /// The next instruction is at an address with an **armed breakpoint**
+    /// (roadmap W9.3). The block ends *before* it, so the debugger's one
+    /// decision point — the caller's run-loop head — sees `rip` sitting on the
+    /// armed address instead of the block running straight through it.
+    ///
+    /// A breakpoint at what would have been a block *entry* stops the loop on
+    /// its first turn and yields `insns == 0`, which is already defined as
+    /// "nothing here could be compiled and the caller must interpret". So
+    /// arming **splits** a block; it never de-optimises one.
+    Breakpoint { rip: u64 },
 }
 
 /// A compiled block, before it is written into the code buffer.
@@ -384,6 +414,10 @@ struct StoreStub {
     before: Flags,
     /// … and as of after it (the "committed, now stop" path).
     after: Flags,
+    /// Did this instruction park the four flag registers in [`FSPILL`] before
+    /// touching them? Then the rewind reloads them first, because `before` is
+    /// expressed in terms of registers the instruction has since overwritten.
+    spilled: bool,
 }
 
 /// The block being built.
@@ -403,6 +437,10 @@ pub struct Compiler {
     /// Whether the instruction being lowered should leave its flags pending.
     /// Purely a cost decision — either answer is correct.
     defer: bool,
+    /// Whether the instruction being lowered has parked the flag registers in
+    /// [`FSPILL`]. See that constant: it is what makes a **store** fault rewind
+    /// to the right flags, as a load fault already did.
+    spilled: bool,
     fault_stubs: Vec<FaultStub>,
     store_stubs: Vec<StoreStub>,
     /// Branches to the shared epilogue.
@@ -457,12 +495,23 @@ impl Compiler {
     /// Compile a straight-line block starting at `start`. A plan with
     /// `insns == 0` means nothing here could be compiled and the caller must
     /// interpret.
+    ///
+    /// `stop_before` is the lowest guest address the block may **not** compile
+    /// (roadmap W9.3): the engine computes it once per block from
+    /// [`DebugControl::next_break_at_or_after`], and `u64::MAX` — the value a
+    /// detached handle yields — is "no such address", which no instruction can
+    /// start at. It costs the loop below one integer compare per instruction
+    /// and the emitted code nothing at all.
+    ///
+    /// [`DebugControl::next_break_at_or_after`]:
+    ///     exemu_core::debug::DebugControl::next_break_at_or_after
     pub fn compile<M: Memory + ?Sized>(
         mem: &M,
         mode: Mode,
         start: u64,
         max_insns: u32,
         slot_base: Option<u32>,
+        stop_before: u64,
     ) -> BlockPlan {
         let mut c = Compiler {
             asm: Asm::new(),
@@ -472,6 +521,7 @@ impl Compiler {
             flags: Flags::Live,
             insn_flags: Flags::Live,
             defer: false,
+            spilled: false,
             fault_stubs: Vec::new(),
             store_stubs: Vec::new(),
             exits: Vec::new(),
@@ -499,6 +549,17 @@ impl Compiler {
         let mut stop = StopReason::Full;
         let mut rip = start;
         while c.insns < max_insns {
+            // The debugger's one negative guarantee (roadmap W9.3): a compiled
+            // block never contains an armed breakpoint's instruction, so a
+            // chain cannot run past one. The *decision* to stop is not made
+            // here and is not made by this crate at all — the block simply ends
+            // with `rip` on the armed address, and the caller's run-loop head,
+            // which is where the interpreter path and the chain path converge,
+            // is the single place that sees it.
+            if rip == stop_before {
+                stop = StopReason::Breakpoint { rip };
+                break;
+            }
             c.rip = rip;
             let mut window = [0u8; 16];
             // How many bytes of `window` are really guest memory. The rest are
@@ -537,8 +598,28 @@ impl Compiler {
             let next = rip.wrapping_add(insn.len as u64) & mode.addr_mask();
             // Deferring this instruction's flags only pays when a later one
             // overwrites them first (roadmap W8.4); either answer is correct.
-            c.defer = flag_effect(&insn) != FlagEffect::Neutral
-                && defer_pays(mem, mode, next, DEFER_SCAN);
+            let sets_flags = flag_effect(&insn) != FlagEffect::Neutral;
+            c.defer = sets_flags && defer_pays(mem, mode, next, DEFER_SCAN);
+            // An instruction that both touches memory and moves the flags may
+            // have to be *rewound* after it has already moved them: its store
+            // is the last thing it does, and a store can fault (a read-only
+            // page, or an armed data watchpoint — roadmap W9.3). Park the flag
+            // state where the rewind can find it. Two `stp`s, and only for the
+            // instructions that can actually need it. See `FSPILL`.
+            c.spilled = sets_flags && matches!(insn.rm, Rm::Mem(_));
+            if c.spilled {
+                c.asm.stp(R_FLAGS, R_FR, crate::a64::SP, FSPILL);
+                // The pending operands only matter when there *is* a pending
+                // state to rewind to — one `stp` in the common case, two in the
+                // rare one. (Today `overwriter_settles` happens to keep a
+                // deferred state from ever reaching a memory-destination RMW,
+                // so this second pair is belt to that heuristic's braces: it
+                // makes the rewind correct by construction rather than by a
+                // property of a cost decision.)
+                if c.flags != Flags::Live {
+                    c.asm.stp(R_FA, R_FB, crate::a64::SP, FSPILL + 16);
+                }
+            }
             match c.lower(&insn, next) {
                 Lowered::Ok => {
                     c.insns += 1;
@@ -573,10 +654,12 @@ impl Compiler {
         if stop != StopReason::Terminator {
             // Only a block that stopped because it was *full* (or wrapped past
             // the top of the address space) has a compiled successor to link to.
-            // The other two reasons — an opcode this compiler declines, and a
-            // fetch that failed — are precisely the addresses where nothing can
-            // be compiled, so the chain has to hand that instruction to the
-            // interpreter.
+            // The other three reasons — an opcode this compiler declines, a
+            // fetch that failed, and an armed breakpoint — are precisely the
+            // addresses where nothing can be compiled, so the chain has to hand
+            // that instruction back rather than jump into it. For a breakpoint
+            // that is the whole point: a native link is exactly the path that
+            // would carry a chain past the caller's run-loop head.
             let linkable = matches!(stop, StopReason::Full | StopReason::Wrapped);
             c.exit_to(c.flags, end_rip, insns, ExitKind::of(linkable));
         }
@@ -613,7 +696,7 @@ impl Compiler {
 
     fn prologue(&mut self) {
         let a = &mut self.asm;
-        a.stp_pre(19, 20, crate::a64::SP, -96);
+        a.stp_pre(19, 20, crate::a64::SP, -FRAME);
         a.stp(21, 22, crate::a64::SP, 16);
         a.stp(23, 24, crate::a64::SP, 32);
         a.stp(25, 26, crate::a64::SP, 48);
@@ -639,7 +722,7 @@ impl Compiler {
         a.ldp(25, 26, crate::a64::SP, 48);
         a.ldp(27, 28, crate::a64::SP, 64);
         a.ldr(8, 30, crate::a64::SP, 80);
-        a.ldp_post(19, 20, crate::a64::SP, 96);
+        a.ldp_post(19, 20, crate::a64::SP, FRAME);
         a.ret();
     }
 
@@ -791,6 +874,15 @@ impl Compiler {
                 }
             }
             self.asm.bind(is_fault);
+            // The store faulted, so the instruction never happened — but it had
+            // already computed its flags into the very registers `s.before` is
+            // written in terms of. Put them back before rewinding.
+            if s.spilled {
+                self.asm.ldp(R_FLAGS, R_FR, crate::a64::SP, FSPILL);
+                if s.before != Flags::Live {
+                    self.asm.ldp(R_FA, R_FB, crate::a64::SP, FSPILL + 16);
+                }
+            }
             self.exit_to(s.before, s.rip, s.retired, ExitKind::Fault);
         }
         let faults = std::mem::take(&mut self.fault_stubs);
@@ -971,6 +1063,7 @@ impl Compiler {
             commit,
             before: self.insn_flags,
             after: self.flags,
+            spilled: self.spilled,
         });
         self.asm.bind(done);
         self.emit_commit(commit);
@@ -2366,6 +2459,7 @@ impl Compiler {
             commit: Commit::Gpr { idx: 4, size: 8, has_rex: true },
             before: self.insn_flags,
             after: self.flags,
+            spilled: self.spilled,
         });
         self.asm.bind(done);
         self.store_gpr(R_VAL, 4, 8, true);

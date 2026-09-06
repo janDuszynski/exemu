@@ -34,13 +34,14 @@
 use std::collections::{HashMap, HashSet};
 
 use exemu_core::cpu::CpuState;
+use exemu_core::debug::DebugControl;
 use exemu_core::Memory;
 
 use crate::buffer::{BlockCode, BufferError, CodeBuffer};
 use crate::compile::{Compiler, StopReason, MAX_INSNS, MAX_LINKS, RET_FAULT};
 use crate::rt::{
-    jit_read, jit_write, BlockCtx, LinkSlot, TlbEntry, CODE_PAGE_WORDS, LINK_EPOCH_DEAD, NO_SLOT,
-    NO_SMC, PARITY, TLB_SLOTS, TRAIL,
+    jit_read, jit_read_watched, jit_write, jit_write_watched, BlockCtx, LinkSlot, ReadFn, TlbEntry,
+    WriteFn, CODE_PAGE_WORDS, LINK_EPOCH_DEAD, NO_SLOT, NO_SMC, PARITY, TLB_SLOTS, TRAIL,
 };
 
 pub use crate::compile::Mode;
@@ -55,9 +56,16 @@ type BlockFn = unsafe extern "C" fn(*mut CpuState, *mut u8) -> u64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Run {
     /// `insns` guest instructions executed and the run stopped because the
-    /// **budget** ran out, not because it had to. `rip` sits on a boundary the
-    /// JIT could have carried on from, so the caller does its per-budget
-    /// bookkeeping and comes straight back.
+    /// **budget** ran out, or because the next address has an armed breakpoint
+    /// (roadmap W9.3) — never because the JIT could not carry on. `rip` sits on
+    /// a boundary the caller must **re-examine at its own loop head** before
+    /// anything executes: it does its per-budget bookkeeping and comes straight
+    /// back, and the breakpoint is decided there.
+    ///
+    /// That is why an armed address returns this and not
+    /// [`SideExit`](Run::SideExit): a caller answers `SideExit` by interpreting
+    /// one instruction *without* going round its loop again, which is precisely
+    /// how a breakpoint would be stepped over instead of reported.
     Executed { insns: u32 },
     /// `insns` executed, and then the chain reached an address with no compiled
     /// block. The caller must account `insns`, then interpret **one**
@@ -114,8 +122,19 @@ pub struct JitStats {
     /// any block was compiled from. The cost of a hash rather than an exact set
     /// on the store path — a broken chain, nothing more.
     pub smc_false_hits: u64,
-    /// Times the whole cache was thrown away because guest code changed.
+    /// Times the whole cache was thrown away because guest code changed, or
+    /// because a breakpoint was armed or disarmed (roadmap W9.3).
     pub flushes: u64,
+    /// Times a chain ended and handed control back **because the address it
+    /// reached has an armed breakpoint** (roadmap W9.3), rather than because
+    /// nothing could be compiled there. Zero in every undebugged run, and the
+    /// counter a test uses to prove the JIT — not the interpreter — is what
+    /// stopped.
+    pub breakpoint_stops: u64,
+    /// Guest accesses a compiled block refused to make because they land in an
+    /// armed watchpoint (roadmap W9.3). The block rewound and the caller's
+    /// interpreter performed the access, which is what records the hit.
+    pub watch_stops: u64,
     /// Guest-memory TLB entries filled, and fills the backend refused (roadmap
     /// W8.6). A refusal is a store into executable memory, or a page whose
     /// region ends inside the span an entry has to cover; both stay on the
@@ -250,6 +269,18 @@ pub struct Jit {
     /// Whether the helpers may fill the table at all. On by default; a test (or
     /// a bisect) turns it off to put every access back on the helper.
     tlb_on: bool,
+    /// The process's shared debug handle, or `None` when no debugger is
+    /// attached — which is every ordinary run, and which a **detached** handle
+    /// collapses to as well (see [`Jit::set_debug`]).
+    ///
+    /// `Option` rather than a bare handle for the same reason
+    /// `VirtualMemory::debug` is one: it takes the not-debugging path down to a
+    /// null test on one already-loaded word, with no atomic and no lock.
+    debug: Option<DebugControl>,
+    /// [`DebugControl::generation`] the compiled blocks were built against.
+    /// Compared once per block entry from Rust; a change means an arm or a
+    /// disarm happened and every block's `stop_before` is stale.
+    debug_gen: u64,
 }
 
 impl Jit {
@@ -283,6 +314,8 @@ impl Jit {
             tlb_watch: false,
             tlb_mem: 0,
             tlb_on: true,
+            debug: None,
+            debug_gen: 0,
         })
     }
 
@@ -315,6 +348,80 @@ impl Jit {
     /// this to compile exactly one instruction at a time).
     pub fn set_max_insns(&mut self, n: u32) {
         self.max_insns = n.max(1);
+    }
+
+    /// Install the process's shared debug handle (roadmap W9.3, step S3/S6).
+    ///
+    /// This is the JIT's **whole** contribution to the debugger, and it is a
+    /// negative guarantee rather than a second implementation: with a handle
+    /// installed, a compiled block never contains an armed breakpoint's
+    /// instruction and a chain never runs past a watched access. The JIT still
+    /// cannot report a hit, cannot get the reported `rip` wrong and cannot
+    /// disagree with the interpreter about which instruction was reached —
+    /// every stop is decided by the caller's run-loop head, which is the one
+    /// point the interpreter path and the chain path converge at.
+    ///
+    /// A **detached** handle collapses to `None`, exactly as
+    /// `VirtualMemory::set_debug` does, so a caller that always installs one
+    /// pays nothing for the ordinary case.
+    ///
+    /// # It must be installed on the memory backend too
+    ///
+    /// Watchpoints have two halves and this crate owns only one. The *stop* is
+    /// here; the *record* is `VirtualMemory`'s, which is what the run loop
+    /// drains. Installing the handle here and not there gives a run that
+    /// correctly refuses to compile past a watched access and then reports
+    /// nothing — slower, not wrong, but not a debugger either. The guest-memory
+    /// TLB is nonetheless gated on **both** views (see [`Jit::run`]), so the
+    /// fast path can never be the thing that hides an access.
+    pub fn set_debug(&mut self, debug: DebugControl) {
+        self.debug = debug.is_attached().then_some(debug);
+        self.debug_gen = self.debug.as_ref().map_or(0, DebugControl::generation);
+        // Blocks compiled before the handle arrived were compiled against "no
+        // breakpoints anywhere" and the table was filled against "nothing is
+        // watching". Neither is a claim this engine may keep making.
+        self.flush();
+        self.tlb_reset();
+    }
+
+    /// The lowest guest address at or after `rip` that a block starting there
+    /// may **not** compile: the next armed breakpoint, or `u64::MAX` when there
+    /// is none (and always `u64::MAX` when detached — one null test).
+    ///
+    /// Called once per **block compile**, not per block entry and not per
+    /// instruction, which is what lets [`Compiler::compile`]'s loop head be a
+    /// single integer compare.
+    #[inline]
+    fn stop_before(&self, rip: u64) -> u64 {
+        match &self.debug {
+            Some(d) => d.next_break_at_or_after(rip).unwrap_or(u64::MAX),
+            None => u64::MAX,
+        }
+    }
+
+    /// Has an arm or a disarm happened since the compiled blocks were built?
+    /// Then every block's `stop_before` is stale, and the cache goes.
+    ///
+    /// Detached this is one null test. Attached it is one relaxed load per
+    /// block entry from Rust, and the flush it guards is the *third* caller of
+    /// the same one-increment [`Jit::unlink_all`] a store into guest code
+    /// already uses — arming is a cache flush at human speed, not a per-block
+    /// cost.
+    ///
+    /// A natively linked chain enters blocks Rust never sees, so the bound this
+    /// gives is "within one chain", not "within one block". That is the tightest
+    /// bound native linking permits and it is the right one: a debugger arms
+    /// while parked at an instruction boundary, which is between calls to
+    /// [`Jit::run`], so the armed set cannot change mid-chain in the only
+    /// sequence the front-end protocol actually produces.
+    #[inline]
+    fn debug_generation_check(&mut self) {
+        let Some(d) = &self.debug else { return };
+        let g = d.generation();
+        if g != self.debug_gen {
+            self.debug_gen = g;
+            self.flush();
+        }
     }
 
     /// Bytes of native code emitted so far.
@@ -397,6 +504,12 @@ impl Jit {
     }
 
     /// Compile (or find) the block at `rip` in `mode` and return its index.
+    ///
+    /// A cached block is reused as it stands, including the `stop_before` it was
+    /// compiled against — which is sound because that value is a pure function
+    /// of `rip` and the armed set, and a change to the armed set moves
+    /// [`DebugControl::generation`] and so flushes the cache before this is
+    /// reached (see [`Jit::debug_generation_check`]).
     fn block_at<M: Memory + ?Sized>(&mut self, rip: u64, mode: Mode, mem: &M) -> u32 {
         let long = mode == Mode::Long;
         let line = Self::line_of(rip, long);
@@ -413,7 +526,11 @@ impl Jit {
         // them with a constant offset without any patching after the fact. The
         // one path that changes the index underneath us is a buffer-full flush,
         // which recompiles below against the new index.
-        let plan = Compiler::compile(mem, mode, rip, self.max_insns, self.slots_for(None));
+        // Only on a miss: a cache hit returned above without asking, so an armed
+        // breakpoint costs a set lookup once per *compile*, never per entry.
+        let stop_before = self.stop_before(rip);
+        let plan =
+            Compiler::compile(mem, mode, rip, self.max_insns, self.slots_for(None), stop_before);
         let lo = plan.start;
         // The end of the block's guest **byte range**, which is not always
         // `end_rip`: a block whose last instruction ends on the top of the
@@ -475,8 +592,14 @@ impl Jit {
                     // rather than pushed as it stands — emitted code addresses
                     // its slots by absolute index.
                     self.flush();
-                    let plan =
-                        Compiler::compile(mem, mode, rip, self.max_insns, self.slots_for(None));
+                    let plan = Compiler::compile(
+                        mem,
+                        mode,
+                        rip,
+                        self.max_insns,
+                        self.slots_for(None),
+                        stop_before,
+                    );
                     match self.buffer.push(&plan.code) {
                         Ok(code) => {
                             self.stats.blocks_compiled += 1;
@@ -598,7 +721,15 @@ impl Jit {
         // refuses).
         let mem_id = std::ptr::from_mut(mem).cast::<u8>() as usize;
         let layout_gen = mem.layout_generation();
-        let watching = mem.watchpoints_armed();
+        // Two views of the same question, OR-ed on purpose (roadmap W9.3, S6).
+        // The backend's is the authoritative one — it is what makes
+        // `Memory::host_span` refuse — but this engine may hold a debug handle
+        // the backend was not given, and in that configuration the fast path
+        // must still not be able to serve an access the watchpoint has to see.
+        // A table entry is exactly how an access becomes unobservable, so the
+        // cheap answer is to never have one while anything is watching.
+        let watching = mem.watchpoints_armed()
+            || self.debug.as_ref().is_some_and(DebugControl::any_watchpoints);
         if !self.tlb_live
             || layout_gen != self.tlb_gen
             || watching != self.tlb_watch
@@ -619,8 +750,28 @@ impl Jit {
         // than trusting every caller to. `u64::MAX` — the default budget of a
         // hook with no notion of time — lands here.
         let budget = budget.min(u32::MAX as u64 - MAX_INSNS as u64);
+        // Which pair of memory helpers the blocks in this chain call
+        // (roadmap W9.3, S6). Decided once per chain, because a debugger arms
+        // while parked at an instruction boundary — which is between calls to
+        // this function. Disarmed, the pointers are the same literals they have
+        // always been and the emitted code is byte-identical: there is no
+        // per-access cost at all, which is the property that matters on a path
+        // a store takes ~10% of guest instructions.
+        //
+        // The handle is cloned (one `Arc` bump, and nothing at all when
+        // detached) so the `BlockCtx` built per block can borrow it without
+        // pinning `self`.
+        let debug = self.debug.clone();
+        let (read, write): (ReadFn<M>, WriteFn<M>) = match &debug {
+            Some(d) if d.any_watchpoints() => (jit_read_watched, jit_write_watched),
+            _ => (jit_read, jit_write),
+        };
         let mut retired: u64 = 0;
         loop {
+            // An arm or a disarm since the last block entry invalidates every
+            // block's `stop_before`. One relaxed load when attached, one null
+            // test when not.
+            self.debug_generation_check();
             let rip = state.rip;
             // The block-entry trail, for the fault reporter: with chaining the
             // caller's run loop only sees one address per chain, so the JIT has
@@ -647,8 +798,30 @@ impl Jit {
                     // so a pending slot simply lapses.
                     self.pending = NO_SLOT;
                     self.stats.not_compiled += 1;
-                    return if retired == 0 {
-                        Run::NotCompiled
+                    if retired == 0 {
+                        return Run::NotCompiled;
+                    }
+                    // --- the one case that is not a side exit (roadmap W9.3) --
+                    //
+                    // There is no block here *because a breakpoint is armed
+                    // here*: `stop_before` made the compile stop on its first
+                    // turn. A caller answers `SideExit` by interpreting one
+                    // instruction **without** going round its loop again — that
+                    // is what the variant means — so returning it would step
+                    // straight over the armed address and the breakpoint would
+                    // never be reported. Missing a breakpoint is the one failure
+                    // a debugger may not have, and this is the only place in the
+                    // JIT it could happen.
+                    //
+                    // `Executed` says instead "here is what ran; look again
+                    // before anything else executes", which is exactly the
+                    // contract the run-loop head needs. The `retired == 0` case
+                    // above must NOT take this path: the caller has already
+                    // stopped on this address and resumed, so sending it back to
+                    // its loop head would wedge the run on its own breakpoint.
+                    return if debug.as_ref().is_some_and(|d| d.is_break(rip)) {
+                        self.stats.breakpoint_stops += 1;
+                        Run::Executed { insns: retired as u32 }
                     } else {
                         Run::SideExit { insns: retired as u32 }
                     };
@@ -683,8 +856,9 @@ impl Jit {
                     // not started yet has.
                     code_lo: 0,
                     code_hi: 0,
-                    read: jit_read,
-                    write: jit_write,
+                    read,
+                    write,
+                    debug: debug.as_ref(),
                     retired,
                     budget,
                     links: self.links.as_ptr(),
@@ -699,6 +873,7 @@ impl Jit {
                     tlb_on,
                     tlb_fills: 0,
                     tlb_denied: 0,
+                    watch_stops: 0,
                 };
                 // SAFETY: `code` was produced by this crate's emitter for exactly
                 // this signature and written into `self.buffer`, which is still
@@ -717,6 +892,7 @@ impl Jit {
                 };
                 self.stats.tlb_fills += ctx.tlb_fills;
                 self.stats.tlb_denied += ctx.tlb_denied;
+                self.stats.watch_stops += ctx.watch_stops;
                 (ret, ctx.retired, ctx.pending, (ctx.smc, ctx.smc_hits), ctx.trail_at)
             };
             // Every link the chain took wrote one trail entry, which is also how
