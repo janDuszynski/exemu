@@ -565,10 +565,14 @@ impl Jit {
             // caller may have moved `rip` anywhere in between.
             if self.pending != NO_SLOT && self.pending_long == long && self.pending_rip == rip {
                 let slot = self.pending as usize;
-                if self.links[slot].epoch != self.link_epoch || self.links[slot].code != chain {
+                let fill = LinkSlot { epoch: self.link_epoch, key: rip, code: chain };
+                if self.links[slot] != fill {
                     self.stats.links_made += 1;
                 }
-                self.links[slot] = LinkSlot { epoch: self.link_epoch, code: chain };
+                // `key` is only read back by an indirect exit's inline cache; a
+                // direct one knows its target from the encoding. Writing it
+                // either way keeps one filling rule for both.
+                self.links[slot] = fill;
             }
             self.pending = NO_SLOT;
 

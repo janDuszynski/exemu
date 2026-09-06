@@ -95,6 +95,14 @@ pub struct ReadResult {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LinkSlot {
     pub epoch: u64,
+    /// The guest address this slot caches a block for. A **direct** exit knows
+    /// its target at compile time and does not read this; an **indirect** one —
+    /// a computed `jmp`/`call` — compares the address the guest just produced
+    /// against it, and takes the link only if they agree. That comparison is the
+    /// inline cache: one load and one compare buys the whole chain when the
+    /// branch keeps going to the same place, and costs nothing but a return to
+    /// Rust when it does not.
+    pub key: u64,
     /// Address of the successor block's *chain entry* — its body, past the
     /// frame-building prologue the chain has already executed once.
     pub code: u64,

@@ -371,6 +371,10 @@ struct StoreStub {
     retired: u32,
     rip: u64,
     next_rip: u64,
+    /// Register holding the guest address to stop at, when the instruction is an
+    /// indirect `call` and its stop point is therefore not a constant. `None`
+    /// uses `next_rip`.
+    next_reg: Option<u32>,
     commit: Commit,
     /// Flag state as of the start of this instruction (the rewind path) …
     before: Flags,
@@ -409,6 +413,13 @@ pub struct Compiler {
 /// Outgoing native links one block may hold: a conditional branch has two edges,
 /// and no terminator this compiler accepts has more.
 pub const MAX_LINKS: u32 = 2;
+
+/// Bytes per [`crate::rt::LinkSlot`], which the emitter indexes by hand.
+pub const SLOT_BYTES: u32 = std::mem::size_of::<crate::rt::LinkSlot>() as u32;
+
+/// Recorded in [`BlockPlan::links`] for a slot whose target is not known until
+/// the block runs.
+pub const INDIRECT_TARGET: u64 = u64::MAX;
 
 /// How a block leaves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -672,49 +683,83 @@ impl Compiler {
     fn exit_to(&mut self, flags: Flags, rip: u64, retired: u32, kind: ExitKind) {
         self.emit_flags(flags);
         self.asm.mov_imm64(T2, rip);
+        let slot = if kind == ExitKind::Link { self.take_slot(rip) } else { None };
+        self.emit_exit_tail(retired, kind == ExitKind::Fault, slot, false);
+    }
+
+    /// Leave the block for the guest address in `target`, computed at run time.
+    ///
+    /// The only difference from [`Compiler::exit_to`] is that the slot has to
+    /// prove it cached a block for *that* address before the link can be taken —
+    /// the inline cache an indirect branch needs (roadmap W8.5). A branch that
+    /// keeps going to the same place (which is what a jump table, a virtual call
+    /// or a tail call through a thunk does most of the time) then costs one
+    /// extra load and compare; one that does not simply returns to the engine.
+    fn exit_indirect(&mut self, flags: Flags, target: u32, retired: u32) {
+        self.emit_flags(flags);
+        self.asm.mov_reg(true, T2, target);
+        let slot = self.take_slot(INDIRECT_TARGET);
+        self.emit_exit_tail(retired, false, slot, true);
+    }
+
+    /// The part every exit shares: publish `rip` (already in `T2`), add this
+    /// block's instructions to the chain's running total, then either link on or
+    /// branch to the epilogue.
+    fn emit_exit_tail(&mut self, retired: u32, fault: bool, slot: Option<u32>, indirect: bool) {
         self.asm.str(8, T2, R_STATE, st::RIP);
         self.asm.ldr(8, T0, R_CTX, ctx_off::RETIRED);
         if retired != 0 {
             self.asm.add_imm(true, T0, T0, retired, false);
             self.asm.str(8, T0, R_CTX, ctx_off::RETIRED);
         }
-        if kind == ExitKind::Link {
-            if let Some(slot) = self.take_slot(rip) {
-                self.asm.ldr(8, T1, R_CTX, ctx_off::BUDGET);
-                self.asm.cmp_reg(true, T0, T1);
-                let spent = self.asm.b_cond_forward(Cond::Cs);
-                // The slot pair, addressed off the array base in the context. An
-                // `ldr`'s scaled immediate reaches 32 760 bytes; past that, one
-                // page-granular `add` gets the base within range, which covers
-                // every slot the engine can hand out.
-                let off = slot * 16;
-                self.asm.ldr(8, T1, R_CTX, ctx_off::LINKS);
-                let bias = if off + 8 <= 32_760 { 0 } else { off & !0xFFF };
-                if bias != 0 {
-                    self.asm.add_imm(true, T1, T1, bias >> 12, true);
-                }
-                let at = off - bias;
-                self.asm.ldr(8, T3, T1, at);
-                self.asm.ldr(8, T1, T1, at + 8);
-                self.asm.ldr(8, T0, R_CTX, ctx_off::LINK_EPOCH);
-                self.asm.cmp_reg(true, T3, T0);
-                let stale = self.asm.b_cond_forward(Cond::Ne);
-                // The block trail, for the fault reporter.
-                self.asm.ldr(8, T3, R_CTX, ctx_off::TRAIL_AT);
-                self.asm.add_imm(true, T0, T3, 1, false);
-                self.asm.str(8, T0, R_CTX, ctx_off::TRAIL_AT);
-                let ok = self.asm.and_imm(true, T3, T3, crate::rt::TRAIL as u64 - 1);
-                debug_assert!(ok, "the trail ring size must be a logical immediate");
-                self.asm.ldr(8, T0, R_CTX, ctx_off::TRAIL);
-                self.asm.str_reg_lsl3(T2, T0, T3);
-                self.asm.br(T1);
-                self.asm.bind(stale);
-                self.asm.bind(spent);
-                self.asm.mov_imm64(T0, slot as u64);
-                self.asm.str(8, T0, R_CTX, ctx_off::PENDING);
+        if let Some(slot) = slot {
+            // Budget first: the chain stops at the first block boundary at which
+            // the running total has reached it, which is the boundary the
+            // block-at-a-time loop stopped at.
+            self.asm.ldr(8, T1, R_CTX, ctx_off::BUDGET);
+            self.asm.cmp_reg(true, T0, T1);
+            let spent = self.asm.b_cond_forward(Cond::Cs);
+            // The slot, addressed off the array base in the context. An `ldr`'s
+            // scaled immediate reaches 32 760 bytes; past that, one page-granular
+            // `add` gets the base within range, which covers every slot the
+            // engine can hand out.
+            let off = slot * SLOT_BYTES;
+            self.asm.ldr(8, T1, R_CTX, ctx_off::LINKS);
+            let bias = if off + 16 <= 32_760 { 0 } else { off & !0xFFF };
+            if bias != 0 {
+                self.asm.add_imm(true, T1, T1, bias >> 12, true);
             }
+            let at = off - bias;
+            self.asm.ldr(8, T3, T1, at);
+            self.asm.ldr(8, T0, R_CTX, ctx_off::LINK_EPOCH);
+            self.asm.cmp_reg(true, T3, T0);
+            let stale = self.asm.b_cond_forward(Cond::Ne);
+            // The inline cache's compare: did this slot cache a block for the
+            // address the guest actually computed?
+            let missed = indirect.then(|| {
+                self.asm.ldr(8, T3, T1, at + 8);
+                self.asm.cmp_reg(true, T3, T2);
+                self.asm.b_cond_forward(Cond::Ne)
+            });
+            self.asm.ldr(8, T1, T1, at + 16);
+            // The block trail, for the fault reporter.
+            self.asm.ldr(8, T3, R_CTX, ctx_off::TRAIL_AT);
+            self.asm.add_imm(true, T0, T3, 1, false);
+            self.asm.str(8, T0, R_CTX, ctx_off::TRAIL_AT);
+            let ok = self.asm.and_imm(true, T3, T3, crate::rt::TRAIL as u64 - 1);
+            debug_assert!(ok, "the trail ring size must be a logical immediate");
+            self.asm.ldr(8, T0, R_CTX, ctx_off::TRAIL);
+            self.asm.str_reg_lsl3(T2, T0, T3);
+            self.asm.br(T1);
+            self.asm.bind(stale);
+            if let Some(m) = missed {
+                self.asm.bind(m);
+            }
+            self.asm.bind(spent);
+            self.asm.mov_imm64(T0, slot as u64);
+            self.asm.str(8, T0, R_CTX, ctx_off::PENDING);
         }
-        self.asm.mov_imm64(0, if kind == ExitKind::Fault { RET_FAULT } else { 0 });
+        self.asm.mov_imm64(0, if fault { RET_FAULT } else { 0 });
         let l = self.asm.b_forward();
         self.exits.push(l);
     }
@@ -730,7 +775,17 @@ impl Compiler {
             // Never linked: the store landed on a page some compiled block was
             // built from, so the engine has to look at it before anything else
             // runs — including any block this one is linked to.
-            self.exit_to(s.after, s.next_rip, s.retired + 1, ExitKind::Return);
+            match s.next_reg {
+                None => self.exit_to(s.after, s.next_rip, s.retired + 1, ExitKind::Return),
+                Some(r) => {
+                    // An indirect `call` whose pushed return address landed in
+                    // code: the instruction has fully retired, and where it goes
+                    // is in a register rather than in the encoding.
+                    self.emit_flags(s.after);
+                    self.asm.mov_reg(true, T2, r);
+                    self.emit_exit_tail(s.retired + 1, false, None, false);
+                }
+            }
             self.asm.bind(is_fault);
             self.exit_to(s.before, s.rip, s.retired, ExitKind::Fault);
         }
@@ -861,6 +916,7 @@ impl Compiler {
             retired: self.insns,
             rip: self.rip,
             next_rip,
+            next_reg: None,
             commit,
             before: self.insn_flags,
             after: self.flags,
@@ -1324,7 +1380,7 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
             // above, so the mode alone decides its width).
             0xA0..=0xA3 => imm = if mode.is64() { c.u64()? } else { c.u32()? as u64 },
             0x70..=0x7F | 0xEB => imm = c.u8()? as i8 as i64 as u64,
-            0xE9 => imm = c.u32()? as i32 as i64 as u64,
+            0xE8 | 0xE9 => imm = c.u32()? as i32 as i64 as u64,
             0x80 => imm = c.u8()? as u64,
             0x81 => {
                 let size = opsize(&pfx);
@@ -1417,6 +1473,13 @@ fn flag_effect(insn: &Insn) -> FlagEffect {
         0x40..=0x4F => FlagEffect::Reads,
         0x50..=0x5F | 0x63 | 0x88..=0x8B | 0x8D | 0x90 | 0xB0..=0xBF => FlagEffect::Neutral,
         0x68 | 0x6A | 0xA0..=0xA3 | 0xC6 | 0xC7 | 0xC9 => FlagEffect::Neutral,
+        // A branch touches no flag, but it is deliberately *not* `Neutral`:
+        // this classification is also what `defer_pays` scans with, and that
+        // scan walks addresses in order. Past a branch the next address is not
+        // the next instruction, so letting the scan continue through one would
+        // decide whether deferring pays by reading bytes the guest will not
+        // execute. `Reads` stops the scan, which is the conservative answer and
+        // the one that was measured. (Making them `Neutral` cost ~1% on 7-Zip.)
         0x80 | 0x81 | 0x83 => match Alu::from_op(insn.reg & 7) {
             Some(_) => FlagEffect::Overwrites,
             None => FlagEffect::Reads,
@@ -1571,7 +1634,7 @@ impl Compiler {
                     let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
                     debug_assert!(ok);
                 }
-                self.emit_store_push(w, next);
+                self.emit_store_push(w, next, None);
                 Lowered::Ok
             }
             0x58..=0x5F => {
@@ -1610,7 +1673,7 @@ impl Compiler {
                     let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
                     debug_assert!(ok);
                 }
-                self.emit_store_push(w, next);
+                self.emit_store_push(w, next, None);
                 Lowered::Ok
             }
 
@@ -1836,6 +1899,30 @@ impl Compiler {
                 Lowered::Ok
             }
 
+            // ---- CALL rel32 ----------------------------------------------
+            //
+            // A direct branch that happens to push: the target is in the
+            // encoding, so it takes an ordinary link slot rather than an inline
+            // cache, and the chain runs straight on into the callee.
+            0xE8 if !p.p66 => {
+                let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
+                let w = self.mode.stack_width();
+                self.asm.mov_imm64(R_VAL, next);
+                self.asm.ldr(8, T0, R_STATE, gpr_off(4));
+                self.asm.sub_imm(true, R_ADDR, T0, w as u32, false);
+                if !self.mode.is64() {
+                    let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
+                    debug_assert!(ok);
+                }
+                // If the pushed return address lands in guest code the call has
+                // still fully retired, so the stub's stop point is the call's
+                // *target*, not the byte after it.
+                self.emit_store_push(w, target, None);
+                let f = self.flags;
+                self.exit_to(f, target, self.insns + 1, ExitKind::Link);
+                Lowered::Terminated
+            }
+
             // ---- JMP rel -------------------------------------------------
             0xE9 | 0xEB => {
                 let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
@@ -1882,11 +1969,52 @@ impl Compiler {
                 }
             }
 
+            // ---- group 5: CALL / JMP r/m --------------------------------
+            //
+            // The indirect branches: a call through the import table, a virtual
+            // call, a tail jump through a thunk, a switch table. The target is
+            // not known until the block runs, so the exit goes through an inline
+            // cache (roadmap W8.5) — one load and one compare against the
+            // address the slot cached, which is enough for a branch that keeps
+            // going to the same place, and no worse than before when it does not.
+            //
+            // 16-bit operand forms are refused: they truncate `rip` to 16 bits,
+            // which nothing in a Windows guest does and which nothing here is
+            // written to reproduce.
+            0xFF if matches!(insn.reg & 7, 2 | 4) && !p.p66 => {
+                // The branch target lives in `R_FA` across the push's helper
+                // call, so any pending flag state — whose operands live in the
+                // same register — has to be settled before it is overwritten.
+                self.materialize();
+                let size = if self.mode.is64() { 8 } else { 4 };
+                // x86 reads the operand *before* the push, which is visible when
+                // the operand is stack-relative.
+                if let Rm::Mem(m) = insn.rm {
+                    self.emit_addr(&m);
+                    self.emit_load(R_FA, size);
+                } else if let Rm::Reg(i) = insn.rm {
+                    self.load_gpr(R_FA, i, size, has_rex);
+                }
+                if insn.reg & 7 == 2 {
+                    let w = self.mode.stack_width();
+                    self.asm.mov_imm64(R_VAL, next);
+                    self.asm.ldr(8, T0, R_STATE, gpr_off(4));
+                    self.asm.sub_imm(true, R_ADDR, T0, w as u32, false);
+                    if !self.mode.is64() {
+                        let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
+                        debug_assert!(ok);
+                    }
+                    self.emit_store_push(w, next, Some(R_FA));
+                }
+                self.exit_indirect(Flags::Live, R_FA, self.insns + 1);
+                Lowered::Terminated
+            }
+
             // ---- group 4/5: INC/DEC r/m ---------------------------------
             0xFE | 0xFF => {
                 let sub = insn.reg & 7;
                 if sub > 1 {
-                    return Lowered::Unsupported; // call/jmp/push r/m
+                    return Lowered::Unsupported; // push r/m, far call/jmp
                 }
                 let size = if insn.opcode == 0xFE { 1 } else { self.opsize(&p) };
                 self.materialize();
@@ -2158,7 +2286,7 @@ impl Compiler {
     /// The store half of `push`: the address in [`R_ADDR`] *is* the new rsp and
     /// the value is in [`R_VAL`]; rsp is committed only after the store
     /// succeeds.
-    fn emit_store_push(&mut self, w: u8, next: u64) {
+    fn emit_store_push(&mut self, w: u8, next: u64, next_reg: Option<u32>) {
         self.asm.mov_reg(true, 0, R_CTX);
         self.asm.mov_reg(true, 1, R_ADDR);
         self.asm.mov_imm64(2, w as u64);
@@ -2175,6 +2303,7 @@ impl Compiler {
             retired: self.insns,
             rip: self.rip,
             next_rip: next,
+            next_reg,
             commit: Commit::Gpr { idx: 4, size: 8, has_rex: true },
             before: self.insn_flags,
             after: self.flags,

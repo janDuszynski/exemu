@@ -524,6 +524,81 @@ fn mov_from_an_absolute_offset_through_a_segment_base() {
     parity(Bits::B32, &code32, "fs moffs 32", &seed(Bits::B32));
 }
 
+// ---------------------------------------------------------------------------
+// The branches that leave a block for an address it did not compute itself
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_direct_call_pushes_the_return_address_and_lands_on_its_target() {
+    // `call rel32` is a direct branch that happens to push, so it has to agree
+    // with the interpreter about three separate things at once: the value
+    // pushed (the address *after* the call), the new stack pointer, and `rip`.
+    let mut code = vec![0xE8, 0x05, 0x00, 0x00, 0x00]; // call +5 -> CODE+10
+    code.extend_from_slice(&[0x90; 5]); // filler the call jumps over
+    code.push(0xC3);
+    parity(Bits::B64, &code, "call rel32 64", &seed(Bits::B64));
+    parity(Bits::B32, &code, "call rel32 32", &seed(Bits::B32));
+}
+
+#[test]
+fn an_indirect_jump_and_call_take_their_target_from_the_operand() {
+    // The shapes every Windows binary is full of: a call through the import
+    // table, a tail jump through a thunk, a virtual call through a register.
+    // The JIT reaches these through an inline cache, so what matters here is
+    // that the *architectural* answer is the interpreter's — the cache can only
+    // change how the address is reached, never what it is.
+    let target = CODE + 0x40;
+
+    // jmp rax / call rax, with the target in the register.
+    let mut s = seed(Bits::B64);
+    s.gpr[0] = target;
+    parity(Bits::B64, &[0xFF, 0xE0], "jmp rax", &s);
+    parity(Bits::B64, &[0xFF, 0xD0], "call rax", &s);
+    let mut s32 = seed(Bits::B32);
+    s32.gpr[0] = target;
+    parity(Bits::B32, &[0xFF, 0xE0], "jmp eax", &s32);
+    parity(Bits::B32, &[0xFF, 0xD0], "call eax", &s32);
+
+    // jmp [rbx] / call [rbx] — the operand is read from memory, and `rbx`
+    // already points into the data region, whose filler is the "address".
+    parity(Bits::B64, &[0xFF, 0x23], "jmp [rbx]", &seed(Bits::B64));
+    parity(Bits::B64, &[0xFF, 0x13], "call [rbx]", &seed(Bits::B64));
+    parity(Bits::B32, &[0xFF, 0x23], "jmp [ebx]", &seed(Bits::B32));
+    parity(Bits::B32, &[0xFF, 0x13], "call [ebx]", &seed(Bits::B32));
+}
+
+#[test]
+fn an_indirect_call_through_the_stack_reads_its_operand_before_it_pushes() {
+    // `call [rsp]` is where the order matters: x86 reads the operand with the
+    // *old* stack pointer and only then pushes, so a compiler that pushed first
+    // would call whatever it had just written over its own operand.
+    let mut s = seed(Bits::B64);
+    s.gpr[4] = 0x3_0F00;
+    parity(Bits::B64, &[0xFF, 0x14, 0x24], "call [rsp] 64", &s);
+    let mut s32 = seed(Bits::B32);
+    s32.gpr[4] = 0x3_0F00;
+    parity(Bits::B32, &[0xFF, 0x14, 0x24], "call [esp] 32", &s32);
+}
+
+#[test]
+fn an_indirect_call_whose_push_faults_rewinds() {
+    // The stack pointer is at the *base* of the stack region, so the pushed
+    // return address goes below it, into nothing. Nothing the call would have
+    // changed may have changed, and `rip` must be back on the call.
+    if !jit_available() {
+        return;
+    }
+    let mut s = seed(Bits::B64);
+    s.gpr[0] = CODE + 0x40;
+    s.gpr[4] = 0x3_0000; // the base of the stack region: a push goes below it
+    let (mut mem, mut cpu) = build_with(Bits::B64, &[0xFF, 0xD0], &s, Perm::RX);
+    let mut jit = Jit::new(64 * 1024).expect("JIT should be available");
+    let run = jit.run(cpu.state_mut(), &mut mem, Mode::Long, 1);
+    assert_eq!(run, Run::Faulted { insns: 0 }, "the faulting call must rewind");
+    assert_eq!(cpu.state().rip, CODE, "rip rewound onto the call");
+    assert_eq!(cpu.state().gpr[4], 0x3_0000, "rsp is untouched");
+}
+
 #[test]
 fn a_conditional_branch_lands_on_the_right_side() {
     // cmp eax, eax ; je +5 ; (skipped) ; ...

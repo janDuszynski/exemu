@@ -433,8 +433,39 @@ fn boundary_shape(rng: &mut Rng, bits: Bits, sp: &Space) -> (Vec<u8>, String, u6
                 (format!("j{cc:x} rel32"), 1)
             }
         }
+        // `call rel32 +0` — the get-EIP idiom, and the one call shape whose
+        // target is the next instruction, so the trial carries on afterwards
+        // instead of jumping into the middle of itself. It pushes the address
+        // *after* the call, which in a flush layout is on the boundary.
+        6 => {
+            mov_reg_imm(&mut b, bits, RSP, sp.push_sp);
+            b.push(0xE8);
+            b.extend_from_slice(&0u32.to_le_bytes());
+            (format!("mov esp,{:#x} ; call rel32 +0", sp.push_sp), 2)
+        }
+        // A computed jump to the instruction after itself: take the address the
+        // call just pushed, add the length of what follows, and `jmp` to it.
+        // This is the shape the indirect-branch inline cache exists for — the
+        // same branch going to the same place every time — and it lands on real
+        // code rather than on whatever a random register holds.
+        7 => {
+            mov_reg_imm(&mut b, bits, RSP, sp.push_sp);
+            b.push(0xE8);
+            b.extend_from_slice(&0u32.to_le_bytes()); // call +0: pushes `next`
+            b.push(0x58); // pop rax/eax
+            let wide = bits == Bits::B64;
+            if wide {
+                b.push(0x48);
+            }
+            // `add rax, imm8` then `jmp rax`: the distance from the popped
+            // address to the byte after the whole sequence.
+            let after = if wide { 1 + 4 + 2 } else { 1 + 3 + 2 };
+            b.extend_from_slice(&[0x83, 0xC0, after]);
+            b.extend_from_slice(&[0xFF, 0xE0]);
+            ("call +0 ; pop rax ; add rax,n ; jmp rax".into(), 4)
+        }
         // [rbp+disp8] load / store / lea, from a base on the boundary.
-        6..=8 => {
+        8 => {
             mov_reg_imm(&mut b, bits, RBP, sp.wrap_base);
             let disp = rng.next_u32() as u8;
             let reg = rng.below(8) as u8;
