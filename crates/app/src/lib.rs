@@ -32,6 +32,7 @@ pub mod spawn_sample;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use exemu_core::debug::{DebugCommand, DebugControl, DebugEvent, DebugSnapshot, StopReason, StopRequest};
 use exemu_core::{Cpu, EmuError, Exit, GuestClock, Memory, Perm, Region, Result};
 use exemu_cpu::{Bits, Interpreter, FS_BASE_32, GS_BASE};
 use exemu_loader as loader;
@@ -125,6 +126,36 @@ const JIT_CODE_BYTES: usize = 32 << 20;
 /// loop's own bookkeeping has disappeared into the noise, short enough that a
 /// runaway guest is still noticed promptly.
 const CHAIN_MAX_INSTRUCTIONS: u64 = 65_536;
+
+/// How close to an instruction-count breakpoint the run loop drops off the JIT,
+/// so the stop lands on **exactly** the instruction asked for (roadmap W9.3).
+///
+/// The chain loop is told how many instructions it may retire and stops at the
+/// first *block boundary* at or past that total; it deliberately does not refuse
+/// to start a block that would overshoot, because that is precisely what makes
+/// chaining invisible to preemption and the clock refresh. So the run loop
+/// interprets the last stretch instead. This window must stay comfortably above
+/// the JIT's longest block (64 guest instructions today,
+/// `crates/jit/src/compile.rs`'s `MAX_INSNS`); `debug.rs`'s exactness test runs
+/// with and without the JIT and is what would catch it falling behind.
+const JIT_EXACT_STOP_WINDOW: u64 = 128;
+
+/// Ceiling on one [`exemu_core::DebugCommand::ReadMemory`] answer (roadmap
+/// W9.3). A front-end renders a pane, not a core dump, and the emulator thread
+/// must not be talked into a huge allocation by a malformed request.
+const DEBUG_READ_MAX: u64 = 1 << 20;
+
+/// What a parked run loop was told to do next (roadmap W9.3).
+enum DebugAction {
+    /// Resume normally.
+    Continue,
+    /// Execute exactly one instruction, then park again.
+    Step,
+    /// Run to completion with no debugger.
+    Detach,
+    /// Abandon the run.
+    Kill,
+}
 
 /// Where the various regions live, chosen per bitness so 32-bit processes
 /// stay entirely within the low 4 GiB.
@@ -341,6 +372,25 @@ pub struct RunConfig {
     /// affect. `96` (the default) is 100% scaling, unchanged from before this
     /// field existed.
     pub dpi: u32,
+    /// Attach a debugger to this run (roadmap W9.2/W9.3).
+    ///
+    /// `None` — the default — is the path every corpus pin was measured
+    /// against, byte for byte: no handle is installed anywhere, and every site
+    /// that would consult one is inside an untaken branch.
+    ///
+    /// `Some(session)` hands the run loop the emulator-side half of a
+    /// [`exemu_core::DebugSession`]: the shared [`DebugControl`] (also cloned
+    /// into the memory backend, so a watched access records itself), the
+    /// command receiver the loop blocks on while parked, and the event sender
+    /// it publishes snapshots on. All three are `Send`, which is the point — a
+    /// [`Process`] is not, so the front-end lives on another thread and only
+    /// these cross.
+    ///
+    /// **Attaching without arming anything is free.** A detached-shaped run and
+    /// an attached-but-unarmed run execute the same instructions in the same
+    /// order — asserted field by field, including every `JitReport` counter, by
+    /// `crates/app/tests/debug.rs`.
+    pub debug: Option<exemu_core::DebugSession>,
 }
 
 impl Default for RunConfig {
@@ -366,6 +416,7 @@ impl Default for RunConfig {
             spawn_depth: 0,
             jit: false,
             dpi: 96,
+            debug: None,
         }
     }
 }
@@ -450,6 +501,23 @@ pub struct Process {
     /// platform has a W^X backend. `None` everywhere else — and `None` is the
     /// default, so the interpreter path is untouched.
     jit: Option<exemu_jit::Jit>,
+    /// The process's shared debug handle (roadmap W9.3) — the same one the
+    /// memory backend holds, and the one the front-end thread writes through.
+    ///
+    /// Always present, and [`DebugControl::detached`] unless
+    /// [`RunConfig::debug`] asked for a session. A detached handle's accessors
+    /// are a plain non-atomic `bool` read that short-circuits, so the run loop
+    /// hoists `is_attached()` into a local exactly the way it hoists
+    /// `clock.is_virtual()` and every added site sits inside an untaken branch.
+    dbg: DebugControl,
+    /// Commands from the front-end. `Some` only for an attached run; the run
+    /// loop's **only** blocking wait is a `recv` on this, taken while parked and
+    /// holding no lock.
+    dbg_cmds: Option<std::sync::mpsc::Receiver<DebugCommand>>,
+    /// Events to the front-end. `Some` only for an attached run. A `send` on a
+    /// disconnected channel is ignored: a front-end that went away must not be
+    /// able to fail the guest's run.
+    dbg_events: Option<std::sync::mpsc::Sender<DebugEvent>>,
 }
 
 impl Process {
@@ -1079,6 +1147,37 @@ impl Process {
             wow64 = Some(boot);
         }
 
+        // --- Optional W9.2/W9.3 debugger ----------------------------------
+        // One handle, shared exactly the way the clock is: the run loop decides
+        // every stop (§2.1 of the design note — the single point at which the
+        // interpreter path and the JIT chain path converge), and the memory
+        // backend records watched accesses onto it. `None` installs a *detached*
+        // handle, whose every accessor short-circuits on a plain `bool`, so the
+        // undebugged run is the one the corpus pins were measured against.
+        //
+        // `EXEMU_DEBUG_IDLE` attaches a handle with **nothing armed and no
+        // front-end**, which is the whole "attaching is free" claim made
+        // executable against real binaries: the same installer, the same flags,
+        // one env var apart, must produce the same instruction count and the
+        // same `JitReport`. It takes the same shape as the `EXEMU_JIT` /
+        // `EXEMU_VIRTUAL_CLOCK` opt-ins, and an explicit `RunConfig::debug` wins
+        // over it. (A `--debug-idle` flag and the matching corpus entry are the
+        // CLI's half of the same gate; this is the hook they will use.)
+        let idle = cfg.debug.is_none()
+            && std::env::var("EXEMU_DEBUG_IDLE").is_ok_and(|v| !v.is_empty() && v != "0");
+        if idle {
+            // The front-end half is dropped immediately: nothing is armed, so
+            // nothing ever parks, and if something somehow did it would see a
+            // disconnected channel and detach rather than hang.
+            let (session, _front) = exemu_core::DebugSession::pair(DebugControl::attached());
+            cfg.debug = Some(session);
+        }
+        let (dbg, dbg_cmds, dbg_events) = match cfg.debug.take() {
+            Some(s) => (s.control, Some(s.commands), Some(s.events)),
+            None => (DebugControl::detached(), None, None),
+        };
+        mem.set_debug(dbg.clone());
+
         Ok(Process {
             mem,
             cpu,
@@ -1091,6 +1190,9 @@ impl Process {
             exc_depth: 0,
             wow64,
             jit,
+            dbg,
+            dbg_cmds,
+            dbg_events,
         })
     }
 
@@ -1182,14 +1284,22 @@ impl Process {
         // history is the one the JIT keeps per block — see `jit_tail` below.
         const TAIL: usize = 24;
         let mut recent: std::collections::VecDeque<u64> = std::collections::VecDeque::with_capacity(TAIL + 1);
+        // The debugger (roadmap W9.3). Hoisted exactly the way `refresh_kuser`
+        // is above: on the default detached handle `is_attached()` is a plain
+        // non-atomic `bool` read, so every debug site in this loop sits inside a
+        // branch that is not taken and the undebugged run is unchanged.
+        let mut debugging = self.dbg.is_attached();
+        // True for the one iteration that a `Step` is being served, and the
+        // reason the JIT is skipped for it. NOT expressed through
+        // `retire_budget()` — see `Process::debug_needs_interpreter`.
+        let mut stepping = false;
+        // The retired-instruction count a pending single-step completes at.
+        let mut step_target = u64::MAX;
         let exit_code = loop {
             if self.max_steps != 0 && steps >= self.max_steps {
                 let tail = self.rip_trail(&recent);
-                return Err(self.fault(
-                    EmuError::Os(format!("instruction budget exhausted after {steps} steps")),
-                    steps,
-                    &tail,
-                ));
+                let e = EmuError::Os(format!("instruction budget exhausted after {steps} steps"));
+                return Err(self.fault_debugged(debugging, e, steps, &tail));
             }
             recent.push_back(self.cpu.state().rip);
             if recent.len() > TAIL {
@@ -1204,6 +1314,71 @@ impl Process {
             // In a WoW64 process the two threads genuinely differ: one can be
             // mid-32-bit-guest while the other is inside Wine's 64-bit thunks.
             self.os.set_guest_mode32(self.cpu.bits() == Bits::B32);
+            // --- The debugger's single decision point (roadmap W9.3) -------
+            //
+            // Every debugger stop is decided here, at the run-loop head, and
+            // nowhere else. That is deliberate on both counts: it is NOT behind
+            // `Hooks::intercept`, which only `Interpreter::step` calls and which
+            // `crates/jit` has no dependency on at all (a breakpoint there would
+            // be interpreter-only), and it is not inside the JIT, which
+            // therefore cannot report a hit, get the reported `rip` wrong, or
+            // disagree with the interpreter about which instruction was reached
+            // — it never decides. This line is the single point at which the
+            // interpreter path and the JIT chain path converge.
+            if debugging {
+                let mut reason = self.debug_pending_stop(steps, step_target);
+                if reason.is_none() {
+                    match self.dbg.take_request() {
+                        StopRequest::Pause => reason = Some(StopReason::Paused),
+                        // A `Step` asked for while the guest is *running* is a
+                        // one-instruction deadline, not a stop of its own: arm
+                        // it and let the `StepComplete` on the next pass park.
+                        StopRequest::Step => {
+                            step_target = steps + 1;
+                            stepping = true;
+                        }
+                        StopRequest::Run => {}
+                    }
+                }
+                if reason.is_none() && self.dbg.is_break(step_rip) {
+                    reason = Some(StopReason::Breakpoint { rip: step_rip });
+                }
+                if let Some(reason) = reason {
+                    let trail = self.rip_trail(&recent);
+                    // Note the fall-through: the parked loop resumes by
+                    // executing the instruction at `step_rip` in *this*
+                    // iteration, never by going round again. Re-testing the
+                    // same address after a resume is what would wedge a run on
+                    // its own breakpoint.
+                    match self.debug_stop(reason, steps, &trail) {
+                        DebugAction::Continue => {
+                            stepping = false;
+                            step_target = u64::MAX;
+                        }
+                        DebugAction::Step => {
+                            stepping = true;
+                            step_target = steps + 1;
+                        }
+                        DebugAction::Detach => {
+                            debugging = false;
+                            stepping = false;
+                            step_target = u64::MAX;
+                        }
+                        DebugAction::Kill => {
+                            return Err(EmuError::Os(format!(
+                                "the debugger abandoned the run after {steps} instructions"
+                            )));
+                        }
+                    }
+                }
+            }
+            // While the debugger has something armed that a compiled block
+            // cannot yet honour at instruction granularity, this one iteration
+            // runs on the interpreter — the JIT is bit-for-bit identical to it,
+            // so that costs speed and nothing else. See
+            // `Process::debug_needs_interpreter` for why this is expressed here
+            // and not through `Hooks::retire_budget`.
+            let interpret_only = debugging && self.debug_needs_interpreter(stepping, steps);
             // --- The block JIT (roadmap W8), when it is switched on --------
             //
             // A compiled block runs many guest instructions per call, so
@@ -1219,7 +1394,7 @@ impl Process {
             // `Memory::fetch` refuses and the block is not compiled — the
             // interpreter takes that address and `Hooks::intercept` fires as
             // usual.
-            if let Some(jit) = self.jit.as_mut() {
+            if let Some(jit) = self.jit.as_mut().filter(|_| !interpret_only) {
                 // The mode is the CPU's *current* one, not the image's: a WoW64
                 // process runs 32- and 64-bit code in one address space and the
                 // same bytes decode differently in each (roadmap W5.2).
@@ -1251,6 +1426,17 @@ impl Process {
                     }
                     if self.max_steps != 0 {
                         b = b.min(self.max_steps.saturating_sub(steps));
+                    }
+                    if debugging {
+                        // The instruction-count breakpoint is one more term of
+                        // exactly the shape `max_steps` has above — the budget
+                        // was already a min-reduction over instruction-
+                        // denominated deadlines, so this needs no JIT change at
+                        // all. Disabled reads as `u64::MAX`, so the term
+                        // vanishes. `debug_needs_interpreter` takes the last
+                        // stretch off the JIT so the stop is exact rather than
+                        // merely at-or-past.
+                        b = b.min(self.dbg.break_at_step().saturating_sub(steps));
                     }
                     b
                 };
@@ -1319,27 +1505,33 @@ impl Process {
                     if self.try_deliver_hw_exception(ExcSource::Interrupt(n), steps, &t)? {
                         continue;
                     }
-                    return Err(self.fault(EmuError::Os(format!("unhandled interrupt {n:#x}")), steps, &t));
+                    let e = EmuError::Os(format!("unhandled interrupt {n:#x}"));
+                    return Err(self.fault_debugged(debugging, e, steps, &t));
                 }
                 // A native SYSCALL is serviced inside `Cpu::step` (the OS layer's
                 // syscall seam, roadmap W2.2); an unserviced one surfaces here as
                 // `Interrupt(0x80)` from the default hook, not as `Syscall`.
                 Ok(Exit::Syscall(index)) => {
-                    return Err(self.fault(
-                        EmuError::Os(format!("SYSCALL {index:#x} escaped the dispatcher")),
-                        steps,
-                        &tail(),
-                    ));
+                    let t = tail();
+                    let e = EmuError::Os(format!("SYSCALL {index:#x} escaped the dispatcher"));
+                    return Err(self.fault_debugged(debugging, e, steps, &t));
                 }
                 Err(e) => {
                     let t = tail();
                     if self.try_deliver_hw_exception(ExcSource::Error(&e), steps, &t)? {
                         continue;
                     }
-                    return Err(self.fault(e, steps, &t));
+                    return Err(self.fault_debugged(debugging, e, steps, &t));
                 }
             }
         };
+
+        // Tell an attached front-end the run is over, so it stops waiting for a
+        // stop that will never come. Best-effort: a disconnected channel is not
+        // the guest's problem.
+        if let Some(tx) = self.dbg_events.as_ref() {
+            let _ = tx.send(DebugEvent::Exited { code: exit_code, steps });
+        }
 
         Ok(RunResult {
             exit_code,
@@ -1364,6 +1556,263 @@ impl Process {
             Some(jit) => jit.recent_blocks(),
             None => recent.iter().copied().collect(),
         }
+    }
+
+    // ---- the debugger (roadmap W9.2/W9.3) ---------------------------------
+
+    /// The process's shared debug handle. Detached unless [`RunConfig::debug`]
+    /// asked for a session — see that field for what "attached" costs.
+    pub fn debug(&self) -> &DebugControl {
+        &self.dbg
+    }
+
+    /// The stops that are a property of the run's *history* rather than of the
+    /// address about to execute: a watched access, a completed single-step, and
+    /// the instruction-count breakpoint. `None` when none of them applies.
+    ///
+    /// Split out from the loop head so the ordering is stated once: a watched
+    /// access belongs to the instruction that has already completed (trap-after,
+    /// matching x86 data breakpoints), so it outranks anything about to happen.
+    fn debug_pending_stop(&self, steps: u64, step_target: u64) -> Option<StopReason> {
+        // Drained every iteration, so a hit can never go stale: at most one
+        // instruction's worth is ever pending.
+        if let Some((addr, kind)) = self.dbg.take_watch_hit() {
+            return Some(StopReason::Watch { addr, kind });
+        }
+        if steps >= step_target {
+            return Some(StopReason::StepComplete);
+        }
+        if steps >= self.dbg.break_at_step() {
+            // One-shot. Left armed it would re-fire on the very next pass and
+            // the run could never be resumed past it; a front-end that wants
+            // another one arms another one.
+            self.dbg.set_break_at_step(None);
+            return Some(StopReason::StepCount { steps });
+        }
+        None
+    }
+
+    /// Must this iteration run on the interpreter instead of the JIT?
+    ///
+    /// **`Hooks::retire_budget` is deliberately not involved.** That hook means
+    /// "when must the *OS layer* next act", and a breakpoint is not an OS event.
+    /// Forcing it to 1 to get single-step would make the scheduler's preemption
+    /// boundary depend on where a human put a breakpoint — changing guest
+    /// scheduling, and with it every corpus pin. Single-step, and every stop the
+    /// JIT cannot yet honour at instruction granularity, are therefore expressed
+    /// as "skip the JIT for this one iteration". The JIT is required to be
+    /// bit-for-bit identical to the interpreter (the W8.7 contract), so this
+    /// changes speed and nothing else.
+    ///
+    /// Every term below is temporary except the first, and each names the step
+    /// that removes it.
+    fn debug_needs_interpreter(&self, stepping: bool, steps: u64) -> bool {
+        // Single-step: one instruction is one instruction, and a compiled block
+        // is many. Permanent.
+        stepping
+            // Until the JIT declines to chain past an armed address (S3 of the
+            // W9.3 design note) a compiled block would run straight through a
+            // breakpoint. Missing a breakpoint is the one failure a debugger may
+            // not have, so an armed address takes the run off the JIT for as
+            // long as it is armed: slower, never wrong, and self-lifting.
+            || self.dbg.any_breakpoints()
+            // Likewise for watchpoints. A compiled block already *records* the
+            // hit — `jit_read`/`jit_write` go through the same `read_uint` /
+            // `write_uint` the interpreter does — but it does not stop, so the
+            // hit would surface a whole chain late and be reported against the
+            // wrong instruction count. S6 is the stop half.
+            || self.dbg.any_watchpoints()
+            // The chain loop stops at or *past* its budget, so it can overshoot
+            // an instruction-count breakpoint by up to one block. Interpreting
+            // the last stretch is what makes "stop at instruction N" exact.
+            || self.dbg.break_at_step().saturating_sub(steps) <= JIT_EXACT_STOP_WINDOW
+    }
+
+    /// Park at this instruction boundary, publish a snapshot, and serve the
+    /// front-end's commands until it says to move.
+    ///
+    /// This is the emulator thread's only blocking wait, and it is taken while
+    /// holding no lock and calling no `UserDriver` method — the rule that makes
+    /// the AppKit-main-thread split deadlock-free.
+    fn debug_stop(&mut self, reason: StopReason, steps: u64, trail: &[u64]) -> DebugAction {
+        // Both channel ends come out for the duration so the command loop can
+        // touch `self` freely, and go back afterwards. `None` means a control
+        // handle was attached with no session behind it: there is nobody to ask,
+        // and the only honest answer is to keep running.
+        let Some(cmds) = self.dbg_cmds.take() else { return DebugAction::Continue };
+        let events = self.dbg_events.take();
+        let action = self.debug_serve(&cmds, events.as_ref(), reason, steps, trail);
+        if matches!(action, DebugAction::Detach) {
+            // Detaching drops both channel ends and disarms everything, so the
+            // memory backend goes back to the attached-but-unarmed cost — one
+            // relaxed load of a zero Bloom filter. This covers the front-end
+            // that *asked* to detach and the one that simply went away, which
+            // are the same situation from here.
+            self.debug_disarm_all();
+        } else {
+            self.dbg_cmds = Some(cmds);
+            self.dbg_events = events;
+        }
+        action
+    }
+
+    /// The command loop of [`Process::debug_stop`], with the channel ends held
+    /// as locals so `self` is free.
+    fn debug_serve(
+        &mut self,
+        cmds: &std::sync::mpsc::Receiver<DebugCommand>,
+        events: Option<&std::sync::mpsc::Sender<DebugEvent>>,
+        reason: StopReason,
+        steps: u64,
+        trail: &[u64],
+    ) -> DebugAction {
+        let snapshot = self.debug_snapshot(reason, steps, trail);
+        if let Some(tx) = events {
+            let _ = tx.send(DebugEvent::Stopped(Box::new(snapshot)));
+        }
+        loop {
+            let Ok(cmd) = cmds.recv() else {
+                // The front-end went away. Resuming is the only safe answer: a
+                // dropped debugger must not wedge the guest forever.
+                return DebugAction::Detach;
+            };
+            match cmd {
+                DebugCommand::Resume => {
+                    if let Some(tx) = events {
+                        let _ = tx.send(DebugEvent::Resumed);
+                    }
+                    return DebugAction::Continue;
+                }
+                DebugCommand::Step => {
+                    if let Some(tx) = events {
+                        let _ = tx.send(DebugEvent::Resumed);
+                    }
+                    return DebugAction::Step;
+                }
+                // Already stopped; asking again is not an error.
+                DebugCommand::Pause => {}
+                DebugCommand::ArmBreak(addr) => self.dbg.arm_break(addr),
+                DebugCommand::DisarmBreak(addr) => self.dbg.disarm_break(addr),
+                DebugCommand::ArmWatch { base, len, kind } => self.dbg.arm_watch(base, len, kind),
+                DebugCommand::DisarmWatch(base) => self.dbg.disarm_watch(base),
+                DebugCommand::BreakAtStep(n) => self.dbg.set_break_at_step(n),
+                DebugCommand::ReadMemory { addr, len } => {
+                    let bytes = self.debug_read(addr, len);
+                    if let Some(tx) = events {
+                        let _ = tx.send(DebugEvent::Memory { addr, bytes });
+                    }
+                }
+                DebugCommand::Disassemble { addr, .. } => {
+                    if let Some(tx) = events {
+                        let _ = tx.send(DebugEvent::Error(format!(
+                            "cannot disassemble at {addr:#x}: the decoder is not a public seam yet \
+                             (roadmap W9.2). Read the bytes with ReadMemory instead."
+                        )));
+                    }
+                }
+                DebugCommand::Detach => return DebugAction::Detach,
+                DebugCommand::Kill => return DebugAction::Kill,
+            }
+        }
+    }
+
+    /// Everything a front-end needs to render one stop, as plain data — nothing
+    /// here borrows from the `Process`, which cannot cross threads at all.
+    fn debug_snapshot(&self, stop: StopReason, steps: u64, trail: &[u64]) -> DebugSnapshot {
+        let regs = self.cpu.state().clone();
+        let table = self.os.unwind_table();
+        let backtrace = if table.is_empty() {
+            Vec::new()
+        } else {
+            exemu_core::unwind::backtrace(table, self.image_base, &regs, &self.mem, 24)
+        };
+        DebugSnapshot {
+            stop,
+            steps,
+            bits: match self.cpu.bits() {
+                Bits::B64 => 64,
+                Bits::B32 => 32,
+            },
+            rip_note: self.os.describe_addr(regs.rip),
+            trail: trail.to_vec(),
+            backtrace,
+            modules: self
+                .os
+                .loaded_modules()
+                .into_iter()
+                .map(|(name, base, size)| exemu_core::ModuleInfo { name, base, size })
+                .collect(),
+            // The thread and handle enumerators live in the OS layer and are a
+            // later step of the same design note; until they exist these are
+            // honestly empty rather than guessed at.
+            threads: Vec::new(),
+            handles: Vec::new(),
+            regions: self.mem.regions().cloned().collect(),
+            regs,
+        }
+    }
+
+    /// Answer a `ReadMemory`, through the permission-checked accessor and never
+    /// `VirtualMemory::poke`.
+    ///
+    /// A short answer is the contract: a range that runs out of mapped, readable
+    /// memory comes back truncated rather than as an error, so a front-end can
+    /// walk right up to the edge of a region without knowing where it is.
+    fn debug_read(&self, addr: u64, len: u64) -> Vec<u8> {
+        let len = len.min(DEBUG_READ_MAX) as usize;
+        let mut buf = vec![0u8; len];
+        if self.mem.read(addr, &mut buf).is_ok() {
+            return buf;
+        }
+        buf.clear();
+        for i in 0..len as u64 {
+            let mut b = [0u8; 1];
+            if self.mem.read(addr.wrapping_add(i), &mut b).is_err() {
+                break;
+            }
+            buf.push(b[0]);
+        }
+        buf
+    }
+
+    /// Build the fault the run is about to die of and, when a debugger is
+    /// attached, park on it first.
+    ///
+    /// A fault is the one stop the front-end cannot ask for and the most useful
+    /// one it can be handed: it is where the register file, the rip trail and
+    /// the backtrace are worth reading. The resume action is deliberately
+    /// ignored — nothing can un-fault the guest — so the front-end gets one look
+    /// at the state and the error is returned either way. `Kill` is honoured
+    /// only in the sense that the run was ending regardless.
+    fn fault_debugged(
+        &mut self,
+        debugging: bool,
+        err: EmuError,
+        steps: u64,
+        recent: &[u64],
+    ) -> EmuError {
+        let err = self.fault(err, steps, recent);
+        if debugging {
+            if let EmuError::Fault { report, .. } = &err {
+                let report = report.clone();
+                self.debug_stop(StopReason::Faulted { report }, steps, recent);
+            }
+        }
+        err
+    }
+
+    /// Disarm everything, so a detached run costs the attached-but-unarmed
+    /// minimum on the memory hot path and no stop can fire after the front-end
+    /// has stopped listening.
+    fn debug_disarm_all(&self) {
+        for addr in self.dbg.breakpoints() {
+            self.dbg.disarm_break(addr);
+        }
+        for w in self.dbg.watchpoints() {
+            self.dbg.disarm_watch(w.base);
+        }
+        self.dbg.set_break_at_step(None);
+        self.dbg.request(StopRequest::Run);
     }
 
     /// What the JIT did, if this process had one (roadmap W8).
