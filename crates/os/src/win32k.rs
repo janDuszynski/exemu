@@ -740,7 +740,26 @@ mod call_hwnd_param {
     pub const GET_WINDOW_RECT: u64 = 0x0d;
     /// `GetClientRect` — same `param` shape as [`GET_WINDOW_RECT`].
     pub const GET_CLIENT_RECT: u64 = 0x0e;
-    /// `IsChild` — `param` is the candidate parent HWND.
+    /// `IsChild` — **`hwnd` is the candidate *parent*, `param` the candidate
+    /// *child***, and not the other way round (roadmap W6.2).
+    ///
+    /// Read out of the pinned user32 rather than guessed: `user32!IsChild`
+    /// (RVA 0x34110) is four instructions and forwards its arguments in place —
+    ///
+    /// ```text
+    ///   sub  rsp, 0x28
+    ///   mov  r8d, 0x13          ; NtUserIsChild
+    ///   mov  edx, edx           ; arg1 (the child) zero-extended into param
+    ///   call NtUserCallHwndParam
+    /// ```
+    ///
+    /// — so `rcx` stays the first argument of the documented
+    /// `IsChild(hWndParent, hWnd)` and `param` is the second. exemu had the two
+    /// swapped, which made every `IsChild` in the process answer FALSE: the sole
+    /// caller that matters, `user32!IsDialogMessageW+0x82`, asks
+    /// `IsChild(hwndDlg, msg->hwnd)` — dialog first, control second — and takes
+    /// a FALSE as "this message is not mine" and declines to run the dialog's
+    /// keyboard interface at all.
     pub const IS_CHILD: u64 = 0x13;
 }
 
@@ -2715,14 +2734,19 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
             }
             Ok(1)
         }
+        // `hwnd` is the parent and `param` the child — see the constant, which
+        // reads the order out of `user32!IsChild` itself.
         call_hwnd_param::IS_CHILD => {
-            let ancestor = param as u32;
-            let mut cur = os.win32k_state.window(hwnd).map(|w| w.parent).unwrap_or(0);
+            let child = param as u32;
+            if os.win32k_state.window(hwnd).is_none() {
+                return Ok(0);
+            }
+            let mut cur = os.win32k_state.window(child).map(|w| w.parent).unwrap_or(0);
             for _ in 0..WINDOW_ANCESTRY_MAX {
                 if cur == 0 {
                     return Ok(0);
                 }
-                if cur == ancestor {
+                if cur == hwnd {
                     return Ok(1);
                 }
                 cur = os.win32k_state.window(cur).map(|w| w.parent).unwrap_or(0);
@@ -5541,6 +5565,58 @@ mod tests {
         };
         assert_eq!(call(&mut os, &mut mem, hwnd as u64), hwnd, "a live handle widens to itself");
         assert_eq!(call(&mut os, &mut mem, 0xDEAD), 0, "an unknown handle stays 0");
+    }
+
+    /// **`IsChild`'s two arguments, pinned in the order `user32!IsChild`
+    /// forwards them** (roadmap W6.2): `hwnd` is the candidate *parent* and
+    /// `param` the candidate *child*.
+    ///
+    /// This is deliberately a direct unit test of the parent walk rather than an
+    /// integration test, because **the corpus is blind to it**: both Wine WoW64
+    /// rows stay identical to the instruction whichever way round the arguments
+    /// are read. The one caller that notices is
+    /// `user32!IsDialogMessageW+0x82` — `IsChild(hwndDlg, msg->hwnd)`, dialog
+    /// first — and a swapped answer makes it decline every message aimed at a
+    /// control, which is to say it disables the dialog keyboard interface with
+    /// no visible error anywhere.
+    ///
+    /// The asymmetry is the whole point of the test: the true direction and the
+    /// false one are checked on the *same* pair, so an implementation that
+    /// merely answers "these two are related" cannot pass.
+    #[test]
+    fn is_child_reads_hwnd_as_the_parent_and_param_as_the_child() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        let top = child(&mut os, 0, [0, 0, 400, 300]);
+        let panel = child(&mut os, top, [10, 10, 200, 150]);
+        let button = child(&mut os, panel, [5, 5, 60, 24]);
+        let other = child(&mut os, 0, [0, 0, 100, 100]);
+
+        let is_child = |os: &mut WinOs, mem: &mut VirtualMemory, parent: u64, kid: u64| -> u32 {
+            let mut cpu = CpuState::default();
+            cpu.set_rsp(0x2_0800);
+            cpu.set_reg(exemu_core::Reg::R10, parent);
+            cpu.set_reg(exemu_core::Reg::Rdx, kid);
+            cpu.set_reg(exemu_core::Reg::R8, call_hwnd_param::IS_CHILD);
+            nt_user_call_hwnd_param(os, &mut cpu, mem).unwrap()
+        };
+
+        // The direction that matters: the dialog is the first argument.
+        assert_eq!(is_child(&mut os, &mut mem, top as u64, panel as u64), 1, "a direct child");
+        assert_eq!(is_child(&mut os, &mut mem, top as u64, button as u64), 1, "…however deeply nested");
+        assert_eq!(is_child(&mut os, &mut mem, panel as u64, button as u64), 1, "and at every level");
+        // …and the same pairs the other way round must be FALSE, which is what
+        // pins the order rather than merely the relationship.
+        assert_eq!(is_child(&mut os, &mut mem, panel as u64, top as u64), 0, "a parent is not its child's child");
+        assert_eq!(is_child(&mut os, &mut mem, button as u64, top as u64), 0, "…transitively either");
+
+        // Unrelated trees, a window's relation to itself, and dead handles.
+        assert_eq!(is_child(&mut os, &mut mem, top as u64, other as u64), 0, "different tree");
+        assert_eq!(is_child(&mut os, &mut mem, top as u64, top as u64), 0, "a window is not its own child");
+        assert_eq!(is_child(&mut os, &mut mem, 0xDEAD, button as u64), 0, "an unknown parent");
+        assert_eq!(is_child(&mut os, &mut mem, top as u64, 0xDEAD), 0, "an unknown child");
+        assert_eq!(is_child(&mut os, &mut mem, top as u64, 0), 0, "a null child — what a stale MSG carries");
     }
 
     /// **The child-window model.** A child has no surface of its own: it renders
