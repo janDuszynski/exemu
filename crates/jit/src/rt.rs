@@ -130,17 +130,24 @@ pub const TLB_SLOT_BITS: u32 = 9;
 /// Guest page shift. The same 4 KiB page the SMC seam uses.
 pub const TLB_PAGE_BITS: u32 = 12;
 
-/// Bytes an entry must cover for the page it caches: **the whole page plus the
-/// widest access minus one**.
+/// Bytes an entry must cover for the page it caches: **exactly the page**.
 ///
-/// This is what makes the emitted fast path a single tag compare with no
-/// end-of-access check. An 8-byte load at the page's last byte reaches 7 bytes
-/// into the next page — and because the span was resolved as one contiguous run
-/// inside *one* region, those bytes are at the same host offset and under the
-/// same permission, so the cached base is right for them too. A page whose
-/// region ends less than 7 bytes past it simply never gets an entry and stays
-/// on the helper.
-pub const TLB_SPAN: usize = (1 << TLB_PAGE_BITS) + 7;
+/// It used to be the page *plus seven*, so that an 8-byte access at the page's
+/// last byte could be served without an end-of-access check. That bought a
+/// cheap probe and cost almost everything: a region's **last** page could never
+/// be cached, because the probe ran seven bytes past the region's end — and a
+/// stack is used from its top down, so the hottest page in a process is exactly
+/// its region's last page. Measured on the first 1,000,000 refusals: 99.8% of
+/// 7-Zip's were one region's final page, and 69% of the Wine WoW64 path's were
+/// the 32-bit stack's.
+///
+/// The end-of-access check is now free instead of absent (see
+/// `Emitter::emit_tlb_probe`): the probe compares the page of the access's
+/// **last** byte against the tag, so an access that would leave the page cannot
+/// match the entry that page indexes, and falls back to the helper. A page
+/// therefore needs no slack past it at all, and a region that ends on a page
+/// boundary — every stack, and every PE section — is cacheable to its last byte.
+pub const TLB_SPAN: usize = 1 << TLB_PAGE_BITS;
 
 /// The tag of a slot that caches nothing. A real tag is a guest address shifted
 /// right by [`TLB_PAGE_BITS`], so it can never reach `u64::MAX` — which matters,
@@ -311,18 +318,45 @@ pub struct BlockCtx<'a, M: Memory + ?Sized> {
 }
 
 impl<M: Memory + ?Sized> BlockCtx<'_, M> {
+    /// Is `addr`'s page already cached in the half of its slot at `half`
+    /// ([`tlb_off::READ`] or [`tlb_off::WRITE`])?
+    ///
+    /// The helper still runs for a cached page whenever the access **straddles**
+    /// the page end, because the emitted probe declines those (see
+    /// `Emitter::emit_tlb_probe`). Without this test such an access would ask
+    /// the backend for the same span on every iteration of a loop; with it, a
+    /// straddling access costs exactly what it cost before there was a TLB.
+    fn tlb_has(&self, addr: u64, half: u32) -> bool {
+        // SAFETY: `tlb` is the engine's array, `TLB_SLOTS` entries long and
+        // alive for the whole call; `tlb_slot` masks to exactly that many, and
+        // `half` selects one of the two tags inside the entry it names.
+        let tag = unsafe {
+            let e = self.tlb.add(tlb_slot(addr));
+            if half == tlb_off::READ { (*e).read_tag } else { (*e).write_tag }
+        };
+        tag == tlb_tag(addr)
+    }
+
     /// Cache the host base of `addr`'s page for **reading**, if the backend
     /// will hand one out.
     ///
     /// Called from the slow path after an access has already succeeded, so the
     /// page is known to be mapped; what is being asked here is the stronger
-    /// question the fast path needs — is the *whole* page, plus the seven bytes
-    /// an 8-byte access at its last byte reaches, inside one region with this
-    /// permission, and is there nothing armed that must observe the access.
+    /// question the fast path needs — is the *whole* page inside one region with
+    /// this permission, and is there nothing armed that must observe the access.
     /// Every one of those is the backend's judgement, not this crate's.
+    ///
+    /// The access that got here may itself straddle the page end (that is one
+    /// of the two reasons it is here at all); the entry is still filled for the
+    /// page it *starts* on, because the next access to that page probably will
+    /// not straddle. A straddling access re-probes rather than re-fills, so a
+    /// loop made of them costs one `host_span` per iteration and no more.
     #[cold]
     #[inline(never)]
     fn tlb_fill_read(&mut self, addr: u64) {
+        if self.tlb_has(addr, tlb_off::READ) {
+            return;
+        }
         let page = tlb_page_base(addr);
         let Some(span) = self.mem.host_span(page, TLB_SPAN, Perm::READ) else {
             self.tlb_denied += 1;
@@ -350,6 +384,9 @@ impl<M: Memory + ?Sized> BlockCtx<'_, M> {
     #[cold]
     #[inline(never)]
     fn tlb_fill_write(&mut self, addr: u64) {
+        if self.tlb_has(addr, tlb_off::WRITE) {
+            return;
+        }
         let page = tlb_page_base(addr);
         let Some(span) = self.mem.host_span_mut(page, TLB_SPAN, Perm::WRITE) else {
             self.tlb_denied += 1;
@@ -802,41 +839,74 @@ mod tests {
         assert!(d.take_watch_hit().is_some(), "the watchpoint must still fire");
     }
 
-    /// A page whose region ends inside the span an entry has to cover is left
-    /// alone, which is what lets the emitted probe be a single tag compare with
-    /// no end-of-access check: an 8-byte load at the page's last byte reaches
-    /// seven bytes past it, and those bytes have to be in the same region.
+    /// **The W8.6 fill-probe fix.** A region's *last* page is the one a stack
+    /// spends its life on, and it used to be the one page that could never be
+    /// cached, because the probe asked for seven bytes past it. It asks for the
+    /// page now, so a region ending on a page boundary is cacheable to its last
+    /// byte; only a region ending *inside* a page leaves that page out.
     #[test]
-    fn a_page_at_the_tail_of_its_region_is_not_cached() {
+    fn the_last_page_of_a_region_is_cached_when_the_region_ends_on_a_page() {
         use exemu_core::{Perm, Region};
         let mut table = vec![0u64; CODE_PAGE_WORDS];
         let mut tlb = empty_tlb();
         let mut mem = exemu_memory::VirtualMemory::new();
-        // Exactly one page: the last byte's 8-byte access would leave it.
+        // Exactly one page — all of it tail, and the shape every region in the
+        // JIT differential has. Under the old +7 probe this was never cached.
         mem.map(Region::new("tight", 0x8000, 0x1000, Perm::RW)).unwrap();
-        // One page plus the slack: cacheable.
-        mem.map(Region::new("loose", 0xa000, 0x1000 + 8, Perm::RW)).unwrap();
+        // Ends 16 bytes into its second page: that page stays on the helper.
+        mem.map(Region::new("ragged", 0xa000, 0x1010, Perm::RW)).unwrap();
         let mut ctx = ctx_with_tlb(&mut mem, &mut table, &[], &mut tlb, 1);
         // SAFETY: as above.
         unsafe { jit_read(&mut ctx as *mut _, 0x8010, 4) };
-        assert_eq!(slot_of(&ctx, 0x8010).read_tag, TLB_EMPTY, "tight region");
-        assert_eq!(ctx.tlb_denied, 1);
+        assert_eq!(slot_of(&ctx, 0x8010).read_tag, tlb_tag(0x8010), "one-page region");
+        assert_eq!(ctx.tlb_denied, 0);
         // SAFETY: as above.
         unsafe { jit_read(&mut ctx as *mut _, 0xa010, 4) };
-        assert_eq!(slot_of(&ctx, 0xa010).read_tag, tlb_tag(0xa010), "loose region");
+        assert_eq!(slot_of(&ctx, 0xa010).read_tag, tlb_tag(0xa010), "its full first page");
+        // SAFETY: as above.
+        unsafe { jit_read(&mut ctx as *mut _, 0xb008, 4) };
+        assert_eq!(slot_of(&ctx, 0xb008).read_tag, TLB_EMPTY, "its ragged last page");
+        assert_eq!(ctx.tlb_denied, 1);
 
-        // The property that buys: every access of every width, anywhere on a
-        // cached page, lands inside the span the entry was filled from.
-        let e = slot_of(&ctx, 0xa010);
-        let span = ctx.mem.host_span(0xa000, TLB_SPAN, Perm::READ).unwrap();
+        // The property an entry buys: every access of every width that stays on
+        // a cached page lands inside the span the entry was filled from. The
+        // emitted probe declines the accesses that would not — see
+        // `Emitter::emit_tlb_probe` — which is what lets the span stop here.
+        let e = slot_of(&ctx, 0x8010);
+        let span = ctx.mem.host_span(0x8000, TLB_SPAN, Perm::READ).unwrap();
         let lo = span.as_ptr() as u64;
-        for off in [0u64, 1, 0xffe, 0xfff] {
+        for off in [0u64, 1, 0xff8, 0xffe, 0xfff] {
             for width in [1u64, 2, 4, 8] {
-                let host = e.read_base.wrapping_add(0xa000 + off);
+                if off + width > TLB_SPAN as u64 {
+                    continue; // straddles the page: the probe misses, so no entry is used
+                }
+                let host = e.read_base.wrapping_add(0x8000 + off);
                 assert!(host >= lo, "{off:#x}/{width} before the span");
                 assert!(host + width <= lo + TLB_SPAN as u64, "{off:#x}/{width} past the span");
             }
         }
+    }
+
+    /// An access that straddles the page end reaches the helper on every
+    /// iteration — the emitted probe declines it — so the helper must not ask
+    /// the backend for the same span each time. It re-probes; it does not
+    /// re-fill.
+    #[test]
+    fn a_straddling_access_does_not_refill_the_entry_it_cannot_use() {
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut tlb = empty_tlb();
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
+        let mut ctx = ctx_with_tlb(&mut mem, &mut table, &[], &mut tlb, 1);
+        for _ in 0..4 {
+            // 8 bytes at page offset 0xffe: four on this page, four on the next.
+            // SAFETY: as above.
+            unsafe { jit_read(&mut ctx as *mut _, 0x8ffe, 8) };
+        }
+        assert_eq!(ctx.tlb_fills, 1, "one fill for the page it starts on, then nothing");
+        assert_eq!(ctx.tlb_denied, 0);
+        assert_eq!(slot_of(&ctx, 0x8ffe).read_tag, tlb_tag(0x8ffe));
     }
 
     /// A tag is a guest address shifted right by the page bits, so it can never
