@@ -50,6 +50,7 @@
 
 use crate::gen::{self, Seed};
 use crate::rng::Rng;
+use exemu_core::debug::{DebugControl, WatchKind};
 use exemu_core::hooks::NoHooks;
 use exemu_core::{Cpu, CpuState, Exit, Memory, Perm, Region};
 use exemu_cpu::{Bits, Interpreter};
@@ -311,6 +312,47 @@ pub struct JitFuzzConfig {
     /// after it takes them, so the bytes compared against the interpreter are
     /// the ones a *linked chain* produced.
     pub laps: u32,
+    /// What the debugger has armed while the trial runs (roadmap W9.3).
+    pub debug: DebugMix,
+}
+
+/// The debugger dimension of a trial.
+///
+/// The JIT's contribution to the debugger is a **negative guarantee** — never
+/// run past an armed address — and a guarantee of that shape is exactly what a
+/// hand-written test set is bad at: it proves the cases someone thought of. The
+/// generator already produces the instruction stream, the layouts and the fault
+/// shapes, so arming one thing per trial reuses all of it and asks the question
+/// against the whole corpus instead.
+///
+/// The property checked is stronger than "the run still agrees". For each mode
+/// the expected retired count is computed **independently of the JIT** — from
+/// the interpreter's own trace — and the armed run must land on exactly it.
+/// A JIT that honoured breakpoints by simply refusing to compile would pass a
+/// state comparison and fail this.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DebugMix {
+    /// Nothing armed. The historical differential.
+    #[default]
+    Off,
+    /// One instruction breakpoint per trial, at a boundary drawn uniformly from
+    /// the trial's own executed trace — including the address one past its last
+    /// instruction, where arming must change nothing.
+    Break,
+    /// One data watchpoint per trial, over a random sub-range of the data
+    /// region, in a random direction.
+    Watch,
+}
+
+impl DebugMix {
+    pub fn parse(s: &str) -> Option<DebugMix> {
+        match s {
+            "off" | "none" => Some(DebugMix::Off),
+            "break" | "bp" => Some(DebugMix::Break),
+            "watch" | "wp" => Some(DebugMix::Watch),
+            _ => None,
+        }
+    }
 }
 
 /// Guest instructions per block when [`JitFuzzConfig::laps`] is set. Small on
@@ -346,6 +388,39 @@ pub struct JitSummary {
     /// Trials, and divergences, per [`Layout`].
     pub by_layout: [u64; 3],
     pub div_by_layout: [u64; 3],
+    /// Guest-memory TLB entries filled across the whole run, and fills the
+    /// backend refused (roadmap W8.6).
+    ///
+    /// Reported because "zero divergences" says nothing at all unless the fast
+    /// path was engaged: a harness whose regions are too tight to cache fills
+    /// **nothing**, and then every trial exercises the helper the JIT already
+    /// had. That is not a hypothetical — it is what the first version of the
+    /// W8.6 differential did for two million trials.
+    pub tlb_fills: u64,
+    pub tlb_denied: u64,
+    /// Trials where a compiled block handed control back at an armed breakpoint
+    /// rather than running past it, and trials where one refused a watched
+    /// access. Zero unless [`JitFuzzConfig::debug`] asked for them, and the
+    /// count that says the debugger dimension did anything at all.
+    pub breakpoint_stops: u64,
+    pub watch_stops: u64,
+    /// Guest-memory TLB entries filled **during the armed run only**, as
+    /// opposed to [`tlb_fills`](JitSummary::tlb_fills), which also counts the
+    /// unarmed control run each debugged trial makes first.
+    ///
+    /// The two together are the assertion that matters for S6: the same trials
+    /// fill entries with nothing armed and fill **none** with a watchpoint
+    /// armed. Either number alone would be satisfied by a harness that never
+    /// engaged the fast path at all. With a *breakpoint* armed the count must
+    /// stay non-zero — arming an address is not a reason to slow guest memory
+    /// down.
+    pub armed_tlb_fills: u64,
+    /// Trials in which the armed thing was actually reached, i.e. where the
+    /// expected retired count was **below** the count the same trial retired
+    /// with nothing armed. The rest armed something the trial never got to,
+    /// which is a real case (arming must change nothing) but not the
+    /// interesting one.
+    pub debug_split: u64,
 }
 
 impl JitSummary {
@@ -938,7 +1013,11 @@ pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
         let plan = trial_at(cfg, index);
         s.generated += plan.generated;
         s.by_layout[plan.layout.index()] += 1;
-        let (run, reason) = run_one(&mut jit, cfg.bits, &plan, cfg.laps);
+        let (run, reason) = if cfg.debug == DebugMix::Off {
+            run_one(&mut jit, cfg.bits, &plan, cfg.laps)
+        } else {
+            run_one_debugged(&mut jit, cfg, &plan, index, &mut s)
+        };
         s.trials += 1;
         match run {
             Run::NotCompiled => {
@@ -973,7 +1052,209 @@ pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
     }
     s.declined_ops = jit.stats().top_declined(20);
     s.links_taken = jit.stats().links_taken;
+    s.tlb_fills = jit.stats().tlb_fills;
+    s.tlb_denied = jit.stats().tlb_denied;
+    s.breakpoint_stops = jit.stats().breakpoint_stops;
+    s.watch_stops = jit.stats().watch_stops;
     Ok(s)
+}
+
+/// One trial with something armed (roadmap W9.3, steps S3 and S6).
+///
+/// Three runs of the same trial, and the third is the one under test:
+///
+/// 1. **Natural.** Nothing armed, so we know how far this trial's block gets on
+///    its own. Everything below is a *difference* against this, which is what
+///    stops the mode from passing on trials the JIT declines outright.
+/// 2. **Reference.** The interpreter walks the same trace, and — depending on
+///    the mode — either records the addresses it stops at or, with the same
+///    watchpoint installed on *its* memory, the first instruction at which a hit
+///    is recorded. Either way the expected answer comes from the interpreter,
+///    never from the JIT.
+/// 3. **Armed.** The JIT, with the handle installed exactly as `crates/app`
+///    installs it (on the engine *and* on the backend). Its retired count must
+///    equal the expected one, and the architectural state and every byte of
+///    guest memory must equal an interpreter stepped exactly that far.
+fn run_one_debugged(
+    jit: &mut Jit,
+    cfg: &JitFuzzConfig,
+    plan: &TrialPlan,
+    index: u64,
+    s: &mut JitSummary,
+) -> (Run, Option<String>) {
+    let bits = cfg.bits;
+    let mode = mode_of(bits);
+    let mut hooks = NoHooks;
+    // A budget big enough for the whole trial, rather than the single block
+    // `run_one` holds itself to. That is deliberate and it is the point of this
+    // mode: the case S3 exists for is a **chain** that reaches an armed address
+    // — one block at a time, the caller's loop head sees every block entry
+    // anyway and there is nothing to get wrong. Both runs below use it, so
+    // `natural` and the armed count are measured against the same rule.
+    let budget = plan.generated + 1;
+
+    // --- 1. the natural run -------------------------------------------------
+    jit.set_debug(DebugControl::detached());
+    jit.invalidate();
+    let Some((mut mem_n, mut cpu_n)) = setup(bits, plan) else {
+        return (Run::NotCompiled, Some("could not build the address space".into()));
+    };
+    let natural = jit.run(cpu_n.state_mut(), &mut mem_n, mode, budget).insns();
+
+    // --- 2. the reference, and the expected answer --------------------------
+    let Some((mut mem_r, mut cpu_r)) = setup(bits, plan) else {
+        return (Run::NotCompiled, Some("could not build the address space".into()));
+    };
+    // A generator stream is not a straight line — it contains branches — so an
+    // address can recur, and a breakpoint stops at the *first* time it is
+    // reached rather than at the draw's index.
+    let dbg = DebugControl::attached();
+    let mut rng = Rng::for_trial(cfg.seed ^ 0x9E37_79B9, index);
+    let expected;
+    match cfg.debug {
+        DebugMix::Off => unreachable!("run_one handles the undebugged case"),
+        DebugMix::Break => {
+            let mut trace = Vec::with_capacity(natural as usize + 1);
+            for _ in 0..natural {
+                trace.push(cpu_r.state().rip);
+                if !matches!(cpu_r.step(&mut mem_r, &mut hooks), Ok(Exit::Continue)) {
+                    break;
+                }
+            }
+            // …and the address one past the last instruction, where arming must
+            // change nothing at all.
+            trace.push(cpu_r.state().rip);
+            let target = trace[rng.below(trace.len() as u32) as usize];
+            dbg.arm_break(target);
+            let first = trace.iter().position(|&a| a == target).unwrap_or(trace.len() - 1);
+            expected = (first as u32).min(natural);
+        }
+        DebugMix::Watch => {
+            // --- where to put it ------------------------------------------
+            //
+            // Uniformly over the 4 KiB data region is the obvious answer and it
+            // is a **useless** one: a trial is eight instructions long, so a
+            // random 1–8 byte range is essentially never touched and the whole
+            // mode degenerates into "arming something changes nothing". (This
+            // was measured, not guessed: one trial in four thousand reached
+            // what it armed.)
+            //
+            // So the range is drawn against the trial's own behaviour. A probe
+            // run watches the *entire* data region and reports the first
+            // address this trial actually touches; three draws in four then
+            // cover that address, and the fourth deliberately does not — which
+            // keeps the "must not stop" case in the mix rather than trading one
+            // blind spot for another.
+            let touched = {
+                let probe = DebugControl::attached();
+                probe.arm_watch(gen::DATA_BASE, gen::DATA_LEN as u64, WatchKind::ReadWrite);
+                let mut first = None;
+                if let Some((mut mem_p, mut cpu_p)) = setup(bits, plan) {
+                    mem_p.set_debug(probe.clone());
+                    for _ in 0..natural {
+                        let stepped = cpu_p.step(&mut mem_p, &mut hooks);
+                        if let Some((addr, _)) = probe.take_watch_hit() {
+                            first = Some(addr);
+                            break;
+                        }
+                        if !matches!(stepped, Ok(Exit::Continue)) {
+                            break;
+                        }
+                    }
+                }
+                first
+            };
+            let len = 1 + u64::from(rng.below(8));
+            let base = match touched {
+                Some(a) if rng.below(4) != 0 => {
+                    a.saturating_sub(u64::from(rng.below(len as u32))).max(gen::DATA_BASE)
+                }
+                _ => gen::DATA_BASE + u64::from(rng.below(gen::DATA_LEN as u32)),
+            };
+            // `ReadWrite` twice, so the kind covers the access more often than
+            // not while both single directions still get drawn.
+            let kind = *rng.pick(&[
+                WatchKind::Read,
+                WatchKind::Write,
+                WatchKind::ReadWrite,
+                WatchKind::ReadWrite,
+            ]);
+            dbg.arm_watch(base, len, kind);
+            mem_r.set_debug(dbg.clone());
+            let mut first = natural;
+            for i in 0..natural {
+                let stepped = cpu_r.step(&mut mem_r, &mut hooks);
+                // Checked *before* the `Continue` test: an instruction that
+                // makes a watched access and then faults still made it.
+                if dbg.take_watch_hit().is_some() {
+                    first = i;
+                    break;
+                }
+                if !matches!(stepped, Ok(Exit::Continue)) {
+                    break;
+                }
+            }
+            expected = first;
+        }
+    }
+    if expected < natural {
+        s.debug_split += 1;
+    }
+
+    // --- 3. the armed run ---------------------------------------------------
+    jit.set_debug(dbg.clone());
+    jit.invalidate();
+    let Some((mut mem_j, mut cpu_j)) = setup(bits, plan) else {
+        return (Run::NotCompiled, Some("could not build the address space".into()));
+    };
+    // Installed on the backend too, exactly as the run loop does it: that is
+    // what makes `Memory::host_span` refuse while a watchpoint is armed.
+    mem_j.set_debug(dbg.clone());
+    let before = cpu_j.state().clone();
+    let fills_before = jit.stats().tlb_fills;
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, budget);
+    s.armed_tlb_fills += jit.stats().tlb_fills - fills_before;
+    let retired = run.insns();
+    if retired != expected {
+        return (
+            run,
+            Some(format!(
+                "armed run retired {retired} instructions, expected {expected}                  (the same trial retires {natural} with nothing armed)"
+            )),
+        );
+    }
+    if retired == 0 {
+        // Nothing ran, so nothing may have changed — the same promise a
+        // declined block makes.
+        if let Some(r) = diff_state(cpu_j.state(), &before) {
+            return (run, Some(format!("armed block retired nothing but changed state: {r}")));
+        }
+        return (run, None);
+    }
+
+    let Some((mut mem_i, mut cpu_i)) = setup(bits, plan) else {
+        return (run, Some("could not build the address space".into()));
+    };
+    for step in 0..retired {
+        match cpu_i.step(&mut mem_i, &mut hooks) {
+            Ok(Exit::Continue) => {}
+            other => {
+                return (
+                    run,
+                    Some(format!(
+                        "interpreter stopped after {step} of {retired} instructions: {other:?}"
+                    )),
+                )
+            }
+        }
+    }
+    if let Some(r) = diff_state(cpu_j.state(), cpu_i.state()) {
+        return (run, Some(r));
+    }
+    if let Some(r) = diff_mem(&mem_j, &mem_i, &plan.space) {
+        return (run, Some(r));
+    }
+    (run, None)
 }
 
 pub fn render(d: &JitDivergence) -> String {

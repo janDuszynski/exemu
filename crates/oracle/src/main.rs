@@ -13,10 +13,10 @@ fn main() {
 }
 
 /// `exemu-oracle jit [--bits 32|64|both] [--count N] [--seed S] [--chain K]
-///  [--layout low|edge|mixed] [--laps K]`
+///  [--layout low|edge|mixed] [--laps K] [--debug off|break|watch]`
 fn jit_main(argv: &[String]) {
     use exemu_cpu::Bits;
-    use exemu_oracle::jitdiff::{fuzz, render, JitFuzzConfig, Layout, LayoutMix};
+    use exemu_oracle::jitdiff::{fuzz, render, DebugMix, JitFuzzConfig, Layout, LayoutMix};
 
     let mut bits_list = vec![Bits::B32, Bits::B64];
     let mut count: u64 = 200_000;
@@ -25,6 +25,7 @@ fn jit_main(argv: &[String]) {
     let mut chain: u32 = 8;
     let mut laps: u32 = 1;
     let mut layouts = LayoutMix::Mixed;
+    let mut debug = DebugMix::Off;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -69,6 +70,22 @@ fn jit_main(argv: &[String]) {
                     }
                 };
             }
+            // Arm one thing per trial and require the run to land on an
+            // instruction count computed from the *interpreter's* trace
+            // (roadmap W9.3). `break` splits the block at an address drawn from
+            // the trial's own trace; `watch` puts a data watchpoint somewhere in
+            // the data region and requires the block to rewind onto exactly the
+            // instruction that first touches it.
+            "--debug" => {
+                i += 1;
+                debug = match argv.get(i).map(|s| s.as_str()).and_then(DebugMix::parse) {
+                    Some(d) => d,
+                    None => {
+                        eprintln!("--debug expects off|break|watch, got {:?}", argv.get(i));
+                        std::process::exit(2);
+                    }
+                };
+            }
             "--report" => {
                 i += 1;
                 report = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(report);
@@ -88,7 +105,11 @@ fn jit_main(argv: &[String]) {
             Bits::B64 => "64-bit",
         };
         let laps_note = if laps > 1 { format!(" × {laps} laps") } else { String::new() };
-        println!("== JIT-vs-interpreter differential ({name}): {count} trials × {chain} instructions{laps_note}, seed {seed}, layout {layouts:?} ==");
+        let dbg_note = match debug {
+            DebugMix::Off => String::new(),
+            d => format!(", debug {d:?}"),
+        };
+        println!("== JIT-vs-interpreter differential ({name}): {count} trials × {chain} instructions{laps_note}, seed {seed}, layout {layouts:?}{dbg_note} ==");
         let s = match fuzz(&JitFuzzConfig {
             bits,
             count,
@@ -97,6 +118,7 @@ fn jit_main(argv: &[String]) {
             chain,
             layouts,
             laps,
+            debug,
         }) {
             Ok(s) => s,
             Err(e) => {
@@ -126,6 +148,22 @@ fn jit_main(argv: &[String]) {
             })
             .collect();
         println!("     layouts: {}", per_layout.join("  "));
+        // The number that says whether the guest-memory TLB was engaged at all.
+        // Zero fills means every access in the whole run went through the
+        // helper, i.e. the fast path was never measured — which a "0
+        // divergences" line would otherwise hide completely.
+        println!(
+            "     guest-memory TLB: {} entries filled, {} fills refused",
+            s.tlb_fills, s.tlb_denied
+        );
+        if debug != DebugMix::Off {
+            println!(
+                "     debug: {} trials where the armed thing was reached, \
+                 {} chains stopped at a breakpoint, {} accesses refused, \
+                 {} TLB fills during the armed run",
+                s.debug_split, s.breakpoint_stops, s.watch_stops, s.armed_tlb_fills
+            );
+        }
         let declined: Vec<String> = s
             .declined_ops
             .iter()
