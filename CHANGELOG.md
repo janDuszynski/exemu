@@ -59,6 +59,27 @@ end-to-end on the default path.
   old loop pumped `NSEvent`s only when the command channel ran dry, so a stream
   of `Present`s meant no events at all; the pump now runs on a fixed 8 ms
   interval regardless.
+- **The window now comes to the front and takes the keyboard**, and the reason it
+  did not is an ordering AppKit does not document: `NSApplication::activate` must
+  be called **before** `makeKeyAndOrderFront`, not after. Called after, the window
+  is ordered in while the app is still inactive, so the window server puts it on
+  the Space the app is assigned to rather than the one in front of the user, and
+  it never becomes key — measured as `isOnActiveSpace=false` with a full-screen
+  app frontmost, and visible as grey traffic lights in a window capture. Swapping
+  the two lines gives `isOnActiveSpace=true`, coloured traffic lights, and
+  `exemu` in the menu bar.
+- **The live input chain was driven end to end and watched.**
+  `EXEMU_COCOA_SYNTH_CLICK=x,y` posts one synthetic left click into the
+  application's own `NSEvent` queue at that client point, so the click travels the
+  real path — `nextEventMatchingMask` dequeues it, the window-number filter
+  accepts it, `event_client_pos` converts it through the real `NSWindow`'s content
+  view, the channel carries it, win32k routes it, Wine's `DispatchMessageW`
+  lowers it through `NtUserMessageCall`, and the guest's `WndProc` handles it.
+  On `gui-sample` the guest draws its click rectangle with the corner exactly at
+  `x,y` (checked at two different points), and the run grows from 1,596,465 to
+  1,597,073 instructions — the guest really executed its handler. This is the
+  first time anything but an injected `InputEvent` has been shown to reach the
+  guest; only the physical mouse itself is still unexercised.
 - **Two AppKit correctness fixes.** `setReleasedWhenClosed(false)` — the host
   holds a `Retained<NSWindow>`, so letting AppKit release it on close left a
   dangling pointer for the next visibility check. And `finishLaunching`, which is

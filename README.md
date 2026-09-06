@@ -807,9 +807,22 @@ to the wrong one — with more than one top-level window on screen that is still
 the first shown one, because the input channel carries no window identity yet.
 The event pump also runs on a fixed interval while the guest is presenting, so
 an app that redraws continuously cannot starve its own window of mouse and
-keyboard events. Verified on screen: `exemu run --gui --wine-boot <dir>
-<gui-sample.exe>` puts a titled 480×260 `NSWindow` up with the guest's CoreText
-text and GDI rectangles in it.
+keyboard events.
+
+**And the window comes to the front and takes the keyboard.** `exemu run --gui
+--wine-boot <dir> <gui-sample.exe>` puts a titled 480×260 `NSWindow` up with the
+guest's CoreText text and GDI rectangles in it, frontmost, as the active
+application. That last part is an ordering the AppKit documentation does not
+spell out: `NSApplication::activate` has to be called **before**
+`makeKeyAndOrderFront`, not after — the other way round the window is ordered in
+while the app is still inactive, so it lands on whichever Space the app is
+assigned to rather than the one in front of the user, and never becomes key.
+`EXEMU_COCOA_SYNTH_CLICK=x,y` posts one synthetic left click into the app's own
+`NSEvent` queue at that client point a moment after the window opens, which is
+how the whole live input chain — `nextEventMatchingMask` → the tap → the input
+channel → win32k → Wine's `DispatchMessageW` → the guest's `WndProc` → GDI →
+present — is exercised without a hand on the mouse. On `gui-sample` it draws the
+guest's click rectangle with its corner exactly at `x,y`.
 
 **`WINEDEBUG` works on the Wine path.** Wine's own `TRACE`/`WARN`/`ERR`/`FIXME`
 channels are resolved by `ntdll` against a per-process option array the unix
