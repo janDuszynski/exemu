@@ -26,6 +26,38 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 931, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### PE sections are mapped from their real characteristics, not RWX (W9.5)
+- **The loader used to map every section — and the PE header page —
+  read/write/execute**, on the recorded theory that "running arbitrary binaries
+  matters more than reproducing page-permission enforcement". It maps each one
+  from its own `IMAGE_SECTION_HEADER.Characteristics` now: code is not writable,
+  data is not executable, resources and `.pdata` are read-only, and the header
+  page is writable (packers rebuild import tables there) but never executable.
+- **The theory it replaces was wrong about its own counter-example.** The
+  corpus's self-modifying guest is the UPX-packed Firefox stub, which
+  decompresses over its own image and jumps into it — and UPX *marks* `UPX0` and
+  `UPX1` `MEM_READ|MEM_WRITE|MEM_EXECUTE`. An honest mapping hands a packer
+  exactly the pages it asked for; it is only the ordinary MSVC image that stops
+  being a `W^X` hole. Pinned both ways in `crates/app/tests/section_perms.rs`.
+- **One documented departure, because a real gap sits under it.** The section
+  carrying the **import address table** is mapped writable even when the linker
+  marked it read-only. exemu's own binder does not need that (it patches IAT
+  slots with the privileged `Memory::poke`), but on the `--wine-boot` path the
+  loader binding those slots is *guest* code — Wine's i386 `loader_init` —
+  which brackets the write with `NtProtectVirtualMemory(PAGE_READWRITE)`.
+  exemu's implementation of that syscall is **nominal**: it records the
+  requested `PAGE_*` for `VirtualQuery` to report and never changes a real
+  permission (nothing in the tree calls `Memory::protect`). Without the
+  carve-out, Wine's loader dies on its first IAT store — measured on
+  `SteamSetup.exe`, one 4-byte write to `0x408070` in its read-only `.rdata`,
+  after which the 32-bit loader never gets past kernel32/kernelbase.
+- **This supersedes the "exemu maps PE sections RWX" justification** recorded
+  under the block-JIT work below. The per-*page* code-generation counter is
+  still the right precision, but for the narrower reason that a genuinely
+  writable-and-executable section (a UPX stub) exists at all.
+- Corpus **11/11** with every count unchanged to the instruction, 7-Zip's three
+  rows included; **976 tests**, clippy clean at `-D warnings`.
+
 ### Wine's debug channels resolve through Wine's own mechanism (W6.4)
 - **What a `TRACE()` costs in a Wine builtin is decided by a per-process array
   exemu never wrote.** Every channel is a 16-byte `{ unsigned char flags;

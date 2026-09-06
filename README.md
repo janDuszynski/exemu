@@ -181,9 +181,15 @@ exemu cocoa-demo [--size WxH] [--hold SECS]
 
 1. **Load** — `exemu-loader` validates the DOS/PE/COFF/optional headers,
    reads the section table and walks the import directory.
-2. **Map** — `exemu-app` maps headers and sections at the image base with
-   per-section permissions, and sets up a stack, a heap arena, and a
-   TEB/PEB pair reachable through the `gs:` segment.
+2. **Map** — `exemu-app` maps headers and sections at the image base with the
+   permissions each section's own `Characteristics` asks for — code is not
+   writable, data is not executable, and a packer that marks its sections
+   `MEM_WRITE|MEM_EXECUTE` (UPX does) still gets exactly that — and sets up a
+   stack, a heap arena, and a TEB/PEB pair reachable through the `gs:` segment.
+   One documented departure: the section carrying the import address table is
+   mapped writable even when the linker marked it read-only, because on the
+   `--wine-boot` path the loader that binds those slots is guest code and
+   exemu's `NtProtectVirtualMemory` is still nominal.
 3. **Bind imports** — each imported symbol is assigned a synthetic *thunk*
    address by `exemu-os`, which the loader writes into the Import Address
    Table. There are no real DLLs in the address space.
@@ -484,8 +490,9 @@ first, because by the time its store can fault the pending registers hold its
 own operands. Self-modifying code is
 handled from the other side: a store into the running block's own bytes stops
 the block, and between blocks the cache is validated against the per-page
-code-generation counters, so an ordinary store into a PE section's data (which
-exemu maps RWX) does not throw the cache away.
+code-generation counters, so an ordinary store into a genuinely
+writable-and-executable section — a UPX stub decompressing over itself — does
+not throw the whole cache away.
 
 **Blocks are linked to each other natively.** A block's exit does not return to
 Rust to be told where to go next: when the target is a compile-time constant it
