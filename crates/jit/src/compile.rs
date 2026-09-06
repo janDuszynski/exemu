@@ -151,6 +151,16 @@ pub enum StopReason {
     /// self-modification check and the engine's two-page generation check are
     /// built on — so the block stops here rather than becoming two ranges.
     Wrapped,
+    /// The next instruction is at an address with an **armed breakpoint**
+    /// (roadmap W9.3). The block ends *before* it, so the debugger's one
+    /// decision point — the caller's run-loop head — sees `rip` sitting on the
+    /// armed address instead of the block running straight through it.
+    ///
+    /// A breakpoint at what would have been a block *entry* stops the loop on
+    /// its first turn and yields `insns == 0`, which is already defined as
+    /// "nothing here could be compiled and the caller must interpret". So
+    /// arming **splits** a block; it never de-optimises one.
+    Breakpoint { rip: u64 },
 }
 
 /// A compiled block, before it is written into the code buffer.
@@ -457,12 +467,23 @@ impl Compiler {
     /// Compile a straight-line block starting at `start`. A plan with
     /// `insns == 0` means nothing here could be compiled and the caller must
     /// interpret.
+    ///
+    /// `stop_before` is the lowest guest address the block may **not** compile
+    /// (roadmap W9.3): the engine computes it once per block from
+    /// [`DebugControl::next_break_at_or_after`], and `u64::MAX` — the value a
+    /// detached handle yields — is "no such address", which no instruction can
+    /// start at. It costs the loop below one integer compare per instruction
+    /// and the emitted code nothing at all.
+    ///
+    /// [`DebugControl::next_break_at_or_after`]:
+    ///     exemu_core::debug::DebugControl::next_break_at_or_after
     pub fn compile<M: Memory + ?Sized>(
         mem: &M,
         mode: Mode,
         start: u64,
         max_insns: u32,
         slot_base: Option<u32>,
+        stop_before: u64,
     ) -> BlockPlan {
         let mut c = Compiler {
             asm: Asm::new(),
@@ -499,6 +520,17 @@ impl Compiler {
         let mut stop = StopReason::Full;
         let mut rip = start;
         while c.insns < max_insns {
+            // The debugger's one negative guarantee (roadmap W9.3): a compiled
+            // block never contains an armed breakpoint's instruction, so a
+            // chain cannot run past one. The *decision* to stop is not made
+            // here and is not made by this crate at all — the block simply ends
+            // with `rip` on the armed address, and the caller's run-loop head,
+            // which is where the interpreter path and the chain path converge,
+            // is the single place that sees it.
+            if rip == stop_before {
+                stop = StopReason::Breakpoint { rip };
+                break;
+            }
             c.rip = rip;
             let mut window = [0u8; 16];
             // How many bytes of `window` are really guest memory. The rest are
@@ -573,10 +605,12 @@ impl Compiler {
         if stop != StopReason::Terminator {
             // Only a block that stopped because it was *full* (or wrapped past
             // the top of the address space) has a compiled successor to link to.
-            // The other two reasons — an opcode this compiler declines, and a
-            // fetch that failed — are precisely the addresses where nothing can
-            // be compiled, so the chain has to hand that instruction to the
-            // interpreter.
+            // The other three reasons — an opcode this compiler declines, a
+            // fetch that failed, and an armed breakpoint — are precisely the
+            // addresses where nothing can be compiled, so the chain has to hand
+            // that instruction back rather than jump into it. For a breakpoint
+            // that is the whole point: a native link is exactly the path that
+            // would carry a chain past the caller's run-loop head.
             let linkable = matches!(stop, StopReason::Full | StopReason::Wrapped);
             c.exit_to(c.flags, end_rip, insns, ExitKind::of(linkable));
         }
