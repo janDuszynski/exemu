@@ -166,6 +166,8 @@ const ICONINFO_X_HOTSPOT: u64 = 0x04;
 const ICONINFO_Y_HOTSPOT: u64 = 0x08;
 const ICONINFO_HBM_MASK: u64 = 0x10;
 const ICONINFO_HBM_COLOR: u64 = 0x18;
+const USTR_LENGTH: u64 = 0x00;
+const USTR_BUFFER: u64 = 0x08;
 
 mod dev_caps {
     pub const TECHNOLOGY: u64 = 2;
@@ -3093,9 +3095,20 @@ fn copy_bitmap(os: &mut WinOs, mem: &mut dyn Memory, src: u32) -> Result<u32> {
     Ok(dst)
 }
 
+fn clear_unicode_string(mem: &mut dyn Memory, addr: u64) -> Result<()> {
+    if addr == 0 {
+        return Ok(());
+    }
+    mem.write_u16(addr + USTR_LENGTH, 0)?;
+    mem.write_u64(addr + USTR_BUFFER, 0)?;
+    Ok(())
+}
+
 fn nt_user_get_icon_info(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hicon = os.syscall_arg(cpu, mem, 0)? as u32;
     let info = os.syscall_arg(cpu, mem, 1)?;
+    let module = os.syscall_arg(cpu, mem, 2)?;
+    let res_name = os.syscall_arg(cpu, mem, 3)?;
     let bpp_out = os.syscall_arg(cpu, mem, 4)?;
     let Some(icon) = os.win32k_state.icons.iter().find(|(h, _)| *h == hicon).map(|(_, i)| *i)
     else {
@@ -3104,6 +3117,8 @@ fn nt_user_get_icon_info(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
     if info == 0 {
         return Ok(0);
     }
+    clear_unicode_string(mem, module)?;
+    clear_unicode_string(mem, res_name)?;
     let mask = copy_bitmap(os, mem, icon.mask)?;
     let color = copy_bitmap(os, mem, icon.color)?;
     mem.write_u32(info + ICONINFO_F_ICON, u32::from(icon.is_icon))?;
@@ -3597,6 +3612,42 @@ mod tests {
 
         cpu.set_reg(Reg::R10, 0xDEAD);
         assert_eq!(nt_user_get_icon_size(&mut os, &mut cpu, &mut mem).unwrap(), 0);
+    }
+
+    #[test]
+    fn get_icon_info_empties_the_module_and_resource_strings_it_is_handed() {
+        let (mut os, mut mem) = os_with_gdi();
+        let mut cpu = CpuState::default();
+
+        cpu.set_reg(Reg::R10, 1);
+        cpu.set_reg(Reg::Rdx, call_one_param::CREATE_CURSOR_ICON);
+        let hicon = nt_user_call_one_param(&mut os, &mut cpu, &mut mem).unwrap();
+
+        let (module, res_name, info) = (0x10_4000u64, 0x10_4100u64, 0x10_4200u64);
+        for base in [module, res_name] {
+            mem.write_u16(base + USTR_LENGTH, 0x1C55).unwrap();
+            mem.write_u16(base + 2, 0x206).unwrap();
+            mem.write_u64(base + USTR_BUFFER, 0xDEAD_BEEF).unwrap();
+        }
+        cpu.set_reg(Reg::R10, hicon as u64);
+        cpu.set_reg(Reg::Rdx, info);
+        cpu.set_reg(Reg::R8, module);
+        cpu.set_reg(Reg::R9, res_name);
+        mem.write_u64(0x10_8000 + 0x28, 0).unwrap();
+        assert_eq!(nt_user_get_icon_info(&mut os, &mut cpu, &mut mem).unwrap(), 1);
+
+        for base in [module, res_name] {
+            assert_eq!(
+                mem.read_u16(base + USTR_LENGTH).unwrap(),
+                0,
+                "GetIconInfoExW writes its terminator at szModName[Length]"
+            );
+            assert_eq!(
+                mem.read_u64(base + USTR_BUFFER).unwrap(),
+                0,
+                "…and reads the buffer field back as the integer resource id"
+            );
+        }
     }
 
     #[test]
