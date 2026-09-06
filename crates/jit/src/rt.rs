@@ -290,8 +290,17 @@ pub unsafe extern "C" fn jit_write<M: Memory + ?Sized>(
     // deciding whether to unlink for real. One shift, one multiply and one load,
     // on a path a store takes ~10% of guest instructions.
     let own = addr < ctx.code_hi && addr.saturating_add(size as u64) > ctx.code_lo;
+    // The second probe is only worth making when the access really does span two
+    // pages. `code_page_bit` depends on nothing but `addr / CODE_PAGE_SIZE`
+    // (pinned by `the_page_hash_puts_one_page_in_exactly_one_bit`), so within a
+    // page the two probes are the same probe — and every store was paying for it.
+    // The offset test also covers the address-space wrap that made the old form
+    // use `wrapping_add`: an `addr` high enough to wrap has a page offset high
+    // enough to take the branch.
+    let spans_two_pages =
+        (addr & (exemu_core::CODE_PAGE_SIZE - 1)) + size as u64 > exemu_core::CODE_PAGE_SIZE;
     let page = ctx.code_page_hit(addr)
-        || (size > 1 && ctx.code_page_hit(addr.wrapping_add(size as u64 - 1)));
+        || (spans_two_pages && ctx.code_page_hit(addr.wrapping_add(size as u64 - 1)));
     match ctx.mem.write_uint(addr, size as u8, value) {
         Err(_) => status::FAULT,
         Ok(()) => {
@@ -314,6 +323,80 @@ pub unsafe extern "C" fn jit_write<M: Memory + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `BlockCtx` over `mem` with `pages` marked as holding compiled code.
+    fn ctx_over<'a>(
+        mem: &'a mut exemu_memory::VirtualMemory,
+        table: &'a mut [u64],
+        pages: &[u64],
+    ) -> BlockCtx<'a, exemu_memory::VirtualMemory> {
+        for &p in pages {
+            let bit = code_page_bit(p);
+            table[(bit >> 6) as usize] |= 1 << (bit & 63);
+        }
+        BlockCtx {
+            parity: PARITY.as_ptr(),
+            code_lo: 0,
+            code_hi: 0,
+            read: jit_read,
+            write: jit_write,
+            retired: 0,
+            budget: 0,
+            links: std::ptr::null(),
+            link_epoch: 7,
+            pending: NO_SLOT,
+            trail: std::ptr::null_mut(),
+            trail_at: 0,
+            smc: NO_SMC,
+            smc_hits: 0,
+            code_pages: table.as_ptr(),
+            mem,
+        }
+    }
+
+    /// The store helper probes the page-hash table for the access's **last**
+    /// byte only when the access really spans two pages (roadmap W8.6). Within a
+    /// page the two probes are the same probe, so skipping the second is free;
+    /// across one it is not, and this is the case that would go silently
+    /// unnoticed if the test were dropped. Reported the same either way.
+    #[test]
+    fn a_store_straddling_into_a_code_page_is_still_reported() {
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
+        // Only the *second* page is one a compiled block was built from.
+        let mut ctx = ctx_over(&mut mem, &mut table, &[0x9000]);
+        // A 4-byte store whose first byte is on 0x8000 and whose last is on
+        // 0x9000. The first probe misses; only the second can catch it.
+        // SAFETY: `ctx` is a live, exclusively borrowed context, which is
+        // exactly what the helper's contract asks for.
+        let st = unsafe { jit_write(&mut ctx as *mut _, 0x8ffe, 4, 0x1122_3344) };
+        assert_eq!(st, status::OK, "not the running block's own code");
+        assert_eq!(ctx.smc_hits, 1, "the straddling store must be reported");
+        assert_eq!(ctx.smc, 0x8ffe);
+        assert_eq!(ctx.link_epoch, LINK_EPOCH_DEAD, "the chain's links must die");
+        // ...and the store itself happened, unchanged.
+        assert_eq!(mem.read_u32(0x8ffe).unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn a_store_inside_a_page_no_block_was_built_from_is_not_reported() {
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
+        let mut ctx = ctx_over(&mut mem, &mut table, &[0x9000]);
+        // Wholly inside 0x8000, including the 8-byte store that ends on the
+        // page's last byte — the boundary the offset test is written against.
+        for (addr, size) in [(0x8000u64, 8u32), (0x8ff8, 8), (0x8fff, 1)] {
+            // SAFETY: as above.
+            let st = unsafe { jit_write(&mut ctx as *mut _, addr, size, 0) };
+            assert_eq!(st, status::OK, "{addr:#x}");
+        }
+        assert_eq!(ctx.smc_hits, 0);
+        assert_eq!(ctx.link_epoch, 7, "the links must stay live");
+    }
 
     #[test]
     fn parity_table_matches_the_interpreters_definition() {
