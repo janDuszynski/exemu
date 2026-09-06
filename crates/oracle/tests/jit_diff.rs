@@ -76,6 +76,11 @@ fn run_debug(
         // off the fast path.
         DebugMix::Break => {
             assert!(s.armed_tlb_fills > 0, "arming a breakpoint disabled the guest-memory TLB");
+            // The path S3 exists for: a chain that reached the armed address
+            // and handed control back rather than interpreting through it. It
+            // only happens with a budget wider than one block, which is why the
+            // debugged runs get one.
+            assert!(s.breakpoint_stops > 0, "no chain ever stopped at an armed address");
         }
         DebugMix::Off => {}
     }

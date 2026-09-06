@@ -159,8 +159,9 @@ fn jit_main(argv: &[String]) {
         if debug != DebugMix::Off {
             println!(
                 "     debug: {} trials where the armed thing was reached, \
-                 {} chains stopped at a breakpoint, {} accesses refused",
-                s.debug_split, s.breakpoint_stops, s.watch_stops
+                 {} chains stopped at a breakpoint, {} accesses refused, \
+                 {} TLB fills during the armed run",
+                s.debug_split, s.breakpoint_stops, s.watch_stops, s.armed_tlb_fills
             );
         }
         let declined: Vec<String> = s

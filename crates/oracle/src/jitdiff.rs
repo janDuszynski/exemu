@@ -1085,6 +1085,13 @@ fn run_one_debugged(
     let bits = cfg.bits;
     let mode = mode_of(bits);
     let mut hooks = NoHooks;
+    // A budget big enough for the whole trial, rather than the single block
+    // `run_one` holds itself to. That is deliberate and it is the point of this
+    // mode: the case S3 exists for is a **chain** that reaches an armed address
+    // — one block at a time, the caller's loop head sees every block entry
+    // anyway and there is nothing to get wrong. Both runs below use it, so
+    // `natural` and the armed count are measured against the same rule.
+    let budget = plan.generated + 1;
 
     // --- 1. the natural run -------------------------------------------------
     jit.set_debug(DebugControl::detached());
@@ -1092,7 +1099,7 @@ fn run_one_debugged(
     let Some((mut mem_n, mut cpu_n)) = setup(bits, plan) else {
         return (Run::NotCompiled, Some("could not build the address space".into()));
     };
-    let natural = jit.run(cpu_n.state_mut(), &mut mem_n, mode, 1).insns();
+    let natural = jit.run(cpu_n.state_mut(), &mut mem_n, mode, budget).insns();
 
     // --- 2. the reference, and the expected answer --------------------------
     let Some((mut mem_r, mut cpu_r)) = setup(bits, plan) else {
@@ -1205,7 +1212,7 @@ fn run_one_debugged(
     mem_j.set_debug(dbg.clone());
     let before = cpu_j.state().clone();
     let fills_before = jit.stats().tlb_fills;
-    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, budget);
     s.armed_tlb_fills += jit.stats().tlb_fills - fills_before;
     let retired = run.insns();
     if retired != expected {
