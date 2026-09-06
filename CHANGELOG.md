@@ -26,6 +26,28 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 931, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### Where the comctl6 side-by-side assembly actually is (W6.1, diagnosis)
+- With Wine's own debug channels on, a WoW64 guest that asks for themed controls
+  reports `fixme:actctx:parse_depend_manifests Could not find dependent assembly
+  "Microsoft.Windows.Common-Controls" (6.0.0.0)`, and the process ends up with no
+  activation context at all. **The fallback is material:** Wine 11.0 ships two
+  comctl32 builds, and the pinned prefix has both — only `comctl32_v6.dll`
+  compiles the themed replacements for the user32 built-ins (Button, ComboBox,
+  Edit, ListBox, Static) plus SysLink and TaskDialog, and only it delay-imports
+  `uxtheme`. Without the assembly a guest gets the v5 build.
+- **The prefix does ship the assembly**; it is simply never materialised. Wine
+  embeds it in the v6 DLL as an `RT_MANIFEST` resource *named* `WINE_MANIFEST`,
+  and writes the WinSxS store from it at prefix-creation time. exemu has never
+  run that step. `crates/app/tests/sxs_assembly.rs` pins the recovery half — the
+  resource is there, exemu's loader already reads and parses it, the v5 build
+  publishes none, and the exact WinSxS key Wine would look for.
+- Staging that store by hand surfaced a **real bug one layer down**:
+  `FILE_BOTH_DIR_INFORMATION.FileName` sits at +0x5E (after `ShortName[12]`),
+  not at the +0x60 struct size, so every filename Wine reads back from
+  `NtQueryDirectoryFile` is empty. Not fixed here — it is in `crates/os` — but
+  recorded with its reproduction. No lookup was faked and no half-working store
+  was landed.
+
 ### PE sections are mapped from their real characteristics, not RWX (W9.5)
 - **The loader used to map every section — and the PE header page —
   read/write/execute**, on the recorded theory that "running arbitrary binaries
