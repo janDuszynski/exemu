@@ -2375,18 +2375,45 @@ fn sys_color(index: u32) -> u32 {
 /// A documented `SM_*` system metric. Only the ones a control consults while
 /// painting are answered; the rest report 0, which is the honest "no such
 /// metric" and never a fabricated size.
+///
+/// **Zero is not always harmless** (roadmap W6.2). `shell32!SIC_Initialize`
+/// sizes the system image list straight from these:
+/// `ImageList_Create(GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), …)`.
+/// With the icon pair answering 0 it built a **0×0** image list, comctl32
+/// destroyed it on the spot, `SHGetImageList` handed comdlg32's file dialog a
+/// NULL `HIMAGELIST`, and `comctl32!HIMAGELIST_QueryInterface` (@ RVA 0x19050)
+/// dereferenced it — the `mov rax,[rdi]` at +0x19069 that ended every file-dialog
+/// run. Measured with Wine's own diagnostics, which logged
+/// `SIC_Initialize large 0x0 small 0x0` / `ImageList_Create (0 0 …)` before this.
+///
+/// `user32!create_icon_frame` consults the same pair to decide the frame size an
+/// icon resource is stretched to, so the two callers agree by construction.
+///
+/// The values are the documented 96-DPI defaults, which is the DPI exemu reports
+/// through `NtUserGetSystemDpiForProcess` and `GetDeviceCaps(LOGPIXELSX)`.
 fn system_metric(index: u32) -> u32 {
     const SM_CXSCREEN: u32 = 0;
     const SM_CYSCREEN: u32 = 1;
     const SM_CXBORDER: u32 = 5;
     const SM_CYBORDER: u32 = 6;
+    /// `SM_CXICON`/`SM_CYICON` — the size a full-size icon is loaded at.
+    const SM_CXICON: u32 = 11;
+    const SM_CYICON: u32 = 12;
+    /// `SM_CXCURSOR`/`SM_CYCURSOR` — the same for a cursor.
+    const SM_CXCURSOR: u32 = 13;
+    const SM_CYCURSOR: u32 = 14;
     const SM_CXEDGE: u32 = 45;
     const SM_CYEDGE: u32 = 46;
+    /// `SM_CXSMICON`/`SM_CYSMICON` — the small-icon size (list views, menus).
+    const SM_CXSMICON: u32 = 49;
+    const SM_CYSMICON: u32 = 50;
     match index {
         SM_CXSCREEN => 1920,
         SM_CYSCREEN => 1080,
         SM_CXBORDER | SM_CYBORDER => 1,
+        SM_CXICON | SM_CYICON | SM_CXCURSOR | SM_CYCURSOR => 32,
         SM_CXEDGE | SM_CYEDGE => 2,
+        SM_CXSMICON | SM_CYSMICON => 16,
         _ => 0,
     }
 }
@@ -4349,6 +4376,49 @@ mod tests {
     use super::*;
     use exemu_core::{DisplayMode, Perm, Reg, Region};
     use exemu_memory::VirtualMemory;
+
+    /// The icon metrics `shell32!SIC_Initialize` sizes the system image list
+    /// from (roadmap W6.2), pinned as a *pair* rather than as four numbers.
+    ///
+    /// This asserts the shape of the bug that was there, not just the values:
+    /// `SIC_Initialize` does `ImageList_Create(SM_CXICON, SM_CYICON, …)` and
+    /// `ImageList_Create(SM_CXSMICON, SM_CYSMICON, …)`, and comctl32 **destroys
+    /// an image list of zero extent on the spot** — which is how comdlg32's file
+    /// dialog came to dereference a NULL `HIMAGELIST`. So the load-bearing
+    /// property is that neither pair is degenerate, and the small pair really is
+    /// smaller than the large one (a list view that asks for "small" and gets
+    /// 32×32 mislays every row).
+    #[test]
+    fn the_icon_metrics_an_image_list_is_sized_from_are_not_degenerate() {
+        const SM_CXICON: u32 = 11;
+        const SM_CYICON: u32 = 12;
+        const SM_CXCURSOR: u32 = 13;
+        const SM_CYCURSOR: u32 = 14;
+        const SM_CXSMICON: u32 = 49;
+        const SM_CYSMICON: u32 = 50;
+
+        for index in [SM_CXICON, SM_CYICON, SM_CXCURSOR, SM_CYCURSOR, SM_CXSMICON, SM_CYSMICON] {
+            assert_ne!(
+                system_metric(index),
+                0,
+                "SM_{index} answering 0 builds a degenerate image list, which comctl32 destroys"
+            );
+        }
+        // Square, as every icon format is, and the documented 96-DPI defaults.
+        assert_eq!(system_metric(SM_CXICON), system_metric(SM_CYICON), "icons are square");
+        assert_eq!(system_metric(SM_CXSMICON), system_metric(SM_CYSMICON), "…and so are small ones");
+        assert_eq!(system_metric(SM_CXICON), 32);
+        assert_eq!(system_metric(SM_CXSMICON), 16);
+        assert!(
+            system_metric(SM_CXSMICON) < system_metric(SM_CXICON),
+            "the small icon must actually be smaller"
+        );
+        // A cursor is loaded at the full icon size on a 96-DPI display.
+        assert_eq!(system_metric(SM_CXCURSOR), system_metric(SM_CXICON));
+        // The control: an index exemu does not model still answers 0 rather
+        // than a fabricated size, so this is not a blanket "return something".
+        assert_eq!(system_metric(0x0fff), 0, "an unmodelled metric stays honestly 0");
+    }
 
     /// `NtUserEnumDisplaySettings` writes the DEVMODEW display fields at their
     /// ABI offsets, non-overlapping, from the driver's mode (roadmap W4.7).
