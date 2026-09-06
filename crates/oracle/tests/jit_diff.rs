@@ -20,11 +20,15 @@ fn jit_available() -> bool {
 }
 
 fn run_mix(bits: Bits, count: u64, seed: u64, chain: u32, layouts: LayoutMix) {
+    run_laps(bits, count, seed, chain, layouts, 1);
+}
+
+fn run_laps(bits: Bits, count: u64, seed: u64, chain: u32, layouts: LayoutMix, laps: u32) {
     if !jit_available() {
         eprintln!("skipping: no JIT backend on this platform");
         return;
     }
-    let s = fuzz(&JitFuzzConfig { bits, count, seed, max_report: 8, chain, layouts })
+    let s = fuzz(&JitFuzzConfig { bits, count, seed, max_report: 8, chain, layouts, laps })
         .expect("the JIT backend should be available here");
     for d in &s.first {
         eprintln!("{}", render(d));
@@ -39,6 +43,10 @@ fn run_mix(bits: Bits, count: u64, seed: u64, chain: u32, layouts: LayoutMix) {
     );
     // A run that compiles nothing would pass vacuously; require real work.
     assert!(s.insns > count / 2, "only {} instructions compiled in {} trials", s.insns, s.trials);
+    // Likewise for a lapped run that never actually linked anything.
+    if laps > 1 {
+        assert!(s.links_taken > count / 2, "only {} native links taken", s.links_taken);
+    }
 }
 
 fn run(bits: Bits, count: u64, seed: u64, chain: u32) {
@@ -81,6 +89,28 @@ fn jit_matches_the_interpreter_at_the_address_boundary() {
     run_mix(Bits::B32, 4_000, 3, 8, LayoutMix::Edge);
     run_mix(Bits::B64, 4_000, 11, 1, LayoutMix::Edge);
     run_mix(Bits::B32, 4_000, 11, 1, LayoutMix::Edge);
+}
+
+/// **Natively linked chains** (roadmap W8.5). Every trial above walks each of
+/// its blocks exactly once, which is precisely the case in which no link is ever
+/// *taken* — the slots get filled and the trial ends. These trials end in a
+/// `jmp` back to their own first instruction instead, with the block cap dropped
+/// so the body is several blocks, so the second and later passes enter blocks by
+/// a `br` from the previous block's exit with no Rust in between. What is
+/// compared against the interpreter is then what a linked chain computed: the
+/// registers, the flags, `rip`, and every byte of guest memory.
+#[test]
+fn jit_matches_the_interpreter_across_native_links() {
+    run_laps(Bits::B64, 4_000, 21, 8, LayoutMix::Mixed, 4);
+    run_laps(Bits::B32, 4_000, 21, 8, LayoutMix::Mixed, 4);
+}
+
+/// The same, at the address boundary — where a block ends on the top of the
+/// address space and its successor is at a *lower* address than it started.
+#[test]
+fn jit_matches_the_interpreter_across_native_links_at_the_boundary() {
+    run_laps(Bits::B64, 4_000, 22, 8, LayoutMix::Edge, 4);
+    run_laps(Bits::B32, 4_000, 22, 8, LayoutMix::Edge, 4);
 }
 
 /// The pre-W8.7 shape, kept so an old run can still be reproduced exactly.

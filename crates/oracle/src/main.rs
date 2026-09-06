@@ -13,7 +13,7 @@ fn main() {
 }
 
 /// `exemu-oracle jit [--bits 32|64|both] [--count N] [--seed S] [--chain K]
-///  [--layout low|edge|mixed]`
+///  [--layout low|edge|mixed] [--laps K]`
 fn jit_main(argv: &[String]) {
     use exemu_cpu::Bits;
     use exemu_oracle::jitdiff::{fuzz, render, JitFuzzConfig, Layout, LayoutMix};
@@ -23,6 +23,7 @@ fn jit_main(argv: &[String]) {
     let mut seed: u64 = 1;
     let mut report: usize = 25;
     let mut chain: u32 = 8;
+    let mut laps: u32 = 1;
     let mut layouts = LayoutMix::Mixed;
     let mut i = 1;
     while i < argv.len() {
@@ -47,6 +48,14 @@ fn jit_main(argv: &[String]) {
             "--chain" => {
                 i += 1;
                 chain = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(chain);
+            }
+            // Run each trial round a loop instead of once, which is what makes
+            // native block linking (roadmap W8.5) visible here: the first pass
+            // fills the link slots, and every pass after it enters blocks by a
+            // `br` from the previous block rather than through Rust.
+            "--laps" => {
+                i += 1;
+                laps = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(laps);
             }
             "--layout" => {
                 i += 1;
@@ -78,8 +87,17 @@ fn jit_main(argv: &[String]) {
             Bits::B32 => "32-bit",
             Bits::B64 => "64-bit",
         };
-        println!("== JIT-vs-interpreter differential ({name}): {count} trials × {chain} instructions, seed {seed}, layout {layouts:?} ==");
-        let s = match fuzz(&JitFuzzConfig { bits, count, seed, max_report: report, chain, layouts }) {
+        let laps_note = if laps > 1 { format!(" × {laps} laps") } else { String::new() };
+        println!("== JIT-vs-interpreter differential ({name}): {count} trials × {chain} instructions{laps_note}, seed {seed}, layout {layouts:?} ==");
+        let s = match fuzz(&JitFuzzConfig {
+            bits,
+            count,
+            seed,
+            max_report: report,
+            chain,
+            layouts,
+            laps,
+        }) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("  {e}");
@@ -123,6 +141,9 @@ fn jit_main(argv: &[String]) {
         if !declined.is_empty() {
             println!("     declined (opcode×blocks): {}", declined.join(" "));
         }
+        if s.links_taken != 0 {
+            println!("     {} block entries reached by a native link", s.links_taken);
+        }
         total_div += s.divergences;
     }
     if total_div == 0 {
@@ -139,7 +160,7 @@ fn unicorn_main(_argv: &[String]) {
     eprintln!("Build the differential oracle with:");
     eprintln!("  cargo run -p exemu-oracle --features unicorn --release -- fuzz [--bits 32|64] [--count N] [--seed S]");
     eprintln!("The JIT-vs-interpreter differential needs no reference emulator:");
-    eprintln!("  cargo run -p exemu-oracle --release -- jit [--bits 32|64|both] [--count N] [--chain K]");
+    eprintln!("  cargo run -p exemu-oracle --release -- jit [--bits 32|64|both] [--count N] [--chain K] [--laps K]");
     std::process::exit(2);
 }
 
