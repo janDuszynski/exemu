@@ -26,6 +26,42 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 804, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### comdlg32's file dialog, measured and root-caused (W6.2)
+- **A guest actually calls `GetOpenFileNameW`** now — `crates/app/src/
+  comdlg_sample.rs` generates a console PE that statically imports
+  `comdlg32!GetOpenFileNameW`/`GetSaveFileNameW`/`CommDlgExtendedError`, fills a
+  real x64 `OPENFILENAMEW`, and then **opens the path it is handed** with
+  `CreateFileW`/`ReadFile`, so a bridge returning a string the guest's own
+  filesystem view cannot resolve would fail visibly rather than silently pass.
+- **The call reaches Wine's own comdlg32**, proven positively rather than
+  assumed: a third leg repeats the call with a deliberately invalid
+  `lStructSize` and gets back `CDERR_STRUCTSIZE`. exemu implements no
+  `OPENFILENAMEW` validator anywhere, and the emulated path — where the import
+  is a recognised-but-unimplemented thunk — answers 0 for the same call.
+- **The dialog does not open, and `crates/app/tests/comdlg_gate.rs` pins exactly
+  where it stops.** The healthy call passes validation *and* finds, loads and
+  locks comdlg32's own dialog template (`CommDlgExtendedError() == 0`, i.e.
+  neither `CDERR_FINDRESFAILURE` nor `CDERR_LOADRESFAILURE`), then
+  `DialogBoxIndirectParamW` fails **with not one window reaching the driver**.
+- **Root cause**, from a `EXEMU_W32K_TRACE` transcript of the failing call:
+  user32's dialog manager names the dialog class the way Windows does — by its
+  well-known integer atom `MAKEINTATOM(32770)` = 0x8002 — resolves it with
+  `NtUserGetAtomName` and hands the resulting string to `NtUserGetClassInfoEx`.
+  exemu's win32k SSDT has no `NtUserGetAtomName` handler, so the name comes back
+  empty, the class lookup fails client-side, and creation aborts before
+  `NtUserCreateWindowEx`. The gate recovers the three syscall indices involved
+  from `win32u.dll`'s own export stubs, so a prefix refresh that renumbers the
+  SSDT fails the test instead of quietly invalidating the analysis.
+- **Fidelity decision for W6.2: let Wine render its own dialog**, not a native
+  `NSOpenPanel`. Verified experimentally that the gap is one SSDT handler wide —
+  with an `NtUserGetAtomName` that answers the documented integer-atom rule,
+  Wine builds its real `#32770` "Open" window with its own `Static` "Look &in:"
+  and `ComboBox` children (and then meets a separate guest-stack-depth problem
+  in the nested creation callbacks). A native panel would need a new intercept
+  seam and would discard every `OPENFILENAMEW` semantic — filters, `OFN_*`
+  flags, hook procs, custom templates, `nFileOffset`/`nFileExtension` — that
+  Wine's dialog implements for free.
+
 ### Per-exe profiles (W9.4)
 - **`exemu run --profile <path>`** loads a TOML `[profile]` table of run
   settings — `max_steps`, `sandbox_root`, `wine_boot` (Wine prefix), `dpi`,
