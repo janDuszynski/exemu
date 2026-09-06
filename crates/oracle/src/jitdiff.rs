@@ -270,7 +270,25 @@ pub struct JitFuzzConfig {
     pub chain: u32,
     /// Which address-space layouts trials are drawn from.
     pub layouts: LayoutMix,
+    /// How many times a trial's instructions are run **round a loop**, which is
+    /// what makes this differential able to see native block linking at all
+    /// (roadmap W8.5).
+    ///
+    /// At the default of 1 a trial is one straight run of one block, and the
+    /// engine is held to a budget of one block — the shape this harness has
+    /// always measured. Above 1 the trial ends in a `jmp` back to its own first
+    /// instruction instead of a `ret`, the block cap drops to
+    /// [`LAP_MAX_INSNS`] so the body becomes several blocks, and the budget
+    /// allows that many passes. The first pass creates the links; every pass
+    /// after it takes them, so the bytes compared against the interpreter are
+    /// the ones a *linked chain* produced.
+    pub laps: u32,
 }
+
+/// Guest instructions per block when [`JitFuzzConfig::laps`] is set. Small on
+/// purpose: it splits a trial into several blocks, so the fallthrough edge
+/// between them is linked as well as the `jmp` that closes the loop.
+pub const LAP_MAX_INSNS: u32 = 3;
 
 #[derive(Default)]
 pub struct JitSummary {
@@ -289,6 +307,11 @@ pub struct JitSummary {
     pub interpreted: u64,
     /// Instructions the generator emitted (the denominator for coverage).
     pub generated: u64,
+    /// Block entries the JIT reached by a **native link** rather than by
+    /// returning here (roadmap W8.5). Zero unless [`JitFuzzConfig::laps`] is
+    /// set — a straight-line trial walks each block exactly once, so there is
+    /// no second pass for a link to be taken on.
+    pub links_taken: u64,
     /// First opcode byte of every block the compiler declined outright, most
     /// frequent first (`opcode | 0x100` for the `0F` map).
     pub declined_ops: Vec<(u16, u64)>,
@@ -410,8 +433,39 @@ fn boundary_shape(rng: &mut Rng, bits: Bits, sp: &Space) -> (Vec<u8>, String, u6
                 (format!("j{cc:x} rel32"), 1)
             }
         }
+        // `call rel32 +0` — the get-EIP idiom, and the one call shape whose
+        // target is the next instruction, so the trial carries on afterwards
+        // instead of jumping into the middle of itself. It pushes the address
+        // *after* the call, which in a flush layout is on the boundary.
+        6 => {
+            mov_reg_imm(&mut b, bits, RSP, sp.push_sp);
+            b.push(0xE8);
+            b.extend_from_slice(&0u32.to_le_bytes());
+            (format!("mov esp,{:#x} ; call rel32 +0", sp.push_sp), 2)
+        }
+        // A computed jump to the instruction after itself: take the address the
+        // call just pushed, add the length of what follows, and `jmp` to it.
+        // This is the shape the indirect-branch inline cache exists for — the
+        // same branch going to the same place every time — and it lands on real
+        // code rather than on whatever a random register holds.
+        7 => {
+            mov_reg_imm(&mut b, bits, RSP, sp.push_sp);
+            b.push(0xE8);
+            b.extend_from_slice(&0u32.to_le_bytes()); // call +0: pushes `next`
+            b.push(0x58); // pop rax/eax
+            let wide = bits == Bits::B64;
+            if wide {
+                b.push(0x48);
+            }
+            // `add rax, imm8` then `jmp rax`: the distance from the popped
+            // address to the byte after the whole sequence.
+            let after = if wide { 1 + 4 + 2 } else { 1 + 3 + 2 };
+            b.extend_from_slice(&[0x83, 0xC0, after]);
+            b.extend_from_slice(&[0xFF, 0xE0]);
+            ("call +0 ; pop rax ; add rax,n ; jmp rax".into(), 4)
+        }
         // [rbp+disp8] load / store / lea, from a base on the boundary.
-        6..=8 => {
+        8 => {
             mov_reg_imm(&mut b, bits, RBP, sp.wrap_base);
             let disp = rng.next_u32() as u8;
             let reg = rng.below(8) as u8;
@@ -469,9 +523,10 @@ fn trial_at(cfg: &JitFuzzConfig, index: u64) -> TrialPlan {
     let mut bytes = Vec::new();
     let mut labels: Vec<String> = Vec::new();
     let mut generated = 0u64;
-    // Leave room for the terminating `ret` and, in the flush layouts, for the
+    // Leave room for the terminator — one byte for a `ret`, five for the `jmp`
+    // back that a lapped trial ends on — and, in the flush layouts, for the
     // whole block to sit inside the code region.
-    let room = sp.code_len as usize - 1;
+    let room = sp.code_len as usize - if cfg.laps > 1 { 5 } else { 1 };
     for _ in 0..cfg.chain.max(1) {
         // A boundary shape a quarter of the time. Under `Layout::Low` these are
         // still worth generating — push/pop/branch lowerings are not otherwise
@@ -507,6 +562,15 @@ fn trial_at(cfg: &JitFuzzConfig, index: u64) -> TrialPlan {
     if sp.flush && !bytes.is_empty() && rng.boolean() {
         let cut = (1 + rng.below(6) as usize).min(bytes.len() - 1);
         bytes.truncate(bytes.len() - cut);
+    } else if cfg.laps > 1 {
+        // `jmp` back to the trial's own first instruction, so the same code runs
+        // several times and the block boundaries inside it are walked more than
+        // once. The first pass fills the link slots; the passes after it take
+        // them, which is the only way this harness gets to compare a natively
+        // linked chain against the interpreter.
+        let back = -((bytes.len() + 5) as i64) as i32;
+        bytes.push(0xE9);
+        bytes.extend_from_slice(&back.to_le_bytes());
     } else {
         bytes.push(0xC3); // ret — not compiled, so it terminates the block
     }
@@ -610,8 +674,146 @@ fn diff_mem(a: &VirtualMemory, b: &VirtualMemory, sp: &Space) -> Option<String> 
     None
 }
 
+/// A lapped trial (roadmap W8.5): the trial's code ends in a `jmp` back to its
+/// own first instruction, so the same blocks are entered again and again, and
+/// after the first pass they are entered by a **native link** — a `br` from the
+/// previous block's exit, with no return to Rust in between.
+///
+/// The JIT side is driven exactly the way `crates/app`'s run loop drives it,
+/// because that is the only way a trial gets more than a handful of laps: a
+/// block that stops on an opcode the compiler declines hands that one
+/// instruction to an interpreter running against the *JIT's own* memory, and
+/// then the chain resumes. What comes out is a mixed native/interpreted run, and
+/// it is compared against a pure interpreter run of exactly the same length.
+#[allow(clippy::too_many_arguments)]
+fn run_lapped(
+    jit: &mut Jit,
+    plan: &TrialPlan,
+    laps: u32,
+    mut mem_j: VirtualMemory,
+    mut cpu_j: Interpreter,
+    mut mem_i: VirtualMemory,
+    mut cpu_i: Interpreter,
+) -> (Run, Option<String>) {
+    let budget = laps as u64 * (plan.generated + 1);
+    let mut hooks = NoHooks;
+    let mut total: u32 = 0;
+    let mut last = Run::NotCompiled;
+    // Did the JIT side's own interpreter stop on something other than a clean
+    // `Continue`? Then it may already have changed state before it stopped — a
+    // `rep stos` that faults partway has advanced `rdi` over the bytes it did
+    // write — so the reference has to be given that same instruction rather than
+    // left one behind it.
+    let mut stopped_mid_instruction = false;
+    // The two sides are compared **after every step**, not once at the end. A
+    // lapped trial runs the same block many times, so a state difference
+    // introduced on lap 1 would otherwise surface only as a fault several
+    // instructions later, at an address that says nothing about what went wrong.
+    let mut done: u32 = 0;
+    fn catch_up(
+        cpu_i: &mut Interpreter,
+        mem_i: &mut VirtualMemory,
+        done: &mut u32,
+        total: u32,
+    ) -> Option<String> {
+        let mut hooks = NoHooks;
+        while *done < total {
+            match cpu_i.step(mem_i, &mut hooks) {
+                Ok(Exit::Continue) => *done += 1,
+                other => {
+                    let rip = cpu_i.state().rip;
+                    let mut w = [0u8; 16];
+                    let _ = mem_i.fetch(rip, &mut w);
+                    return Some(format!(
+                        "interpreter stopped after {done} of {total} instructions at rip={rip:#x} [{}]: {other:?}",
+                        w.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+                    ));
+                }
+            }
+        }
+        None
+    }
+    while (total as u64) < budget {
+        let left = budget - total as u64;
+        // **The mode is re-read every time**, not fixed at the start of the
+        // trial. A guest can change it while it runs — a far jump through a CS
+        // selector is how a WoW64 process switches (roadmap W5.2), and `iret`
+        // reloads CS too — and the same bytes are two different programs in the
+        // two modes. The real run loop in `crates/app` re-reads it per iteration
+        // for exactly this reason; a lapped trial is the first thing here that
+        // calls `Jit::run` more than once, and pinning the mode made a 64-bit
+        // block run for an interpreter that had switched to 32-bit.
+        let mode = mode_of(cpu_j.bits());
+        let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, left);
+        total += run.insns();
+        last = run;
+        if let Some(r) = catch_up(&mut cpu_i, &mut mem_i, &mut done, total) {
+            return (last, Some(r));
+        }
+        if let Some(r) = diff_state(cpu_j.state(), cpu_i.state()) {
+            return (last, Some(r));
+        }
+        match run {
+            // Stopped on the budget: the `while` above decides whether that is
+            // the end of the trial.
+            Run::Executed { .. } => {}
+            // Rewound onto a faulting access. The interpreter is required to
+            // fail on that same instruction below, so stop here and let the
+            // comparison speak.
+            Run::Faulted { .. } => break,
+            // Nothing compiled at this address — the run loop's job is to
+            // interpret exactly one instruction and come back.
+            Run::SideExit { .. } | Run::NotCompiled => {
+                match cpu_j.step(&mut mem_j, &mut hooks) {
+                    Ok(Exit::Continue) => total += 1,
+                    _ => {
+                        stopped_mid_instruction = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(r) = catch_up(&mut cpu_i, &mut mem_i, &mut done, total) {
+        return (last, Some(r));
+    }
+    if stopped_mid_instruction {
+        // Whatever it did to the JIT side's state before it stopped, it does
+        // here too — including a partial one.
+        let _ = cpu_i.step(&mut mem_i, &mut hooks);
+    }
+    if let Some(r) = diff_state(cpu_j.state(), cpu_i.state()) {
+        return (last, Some(r));
+    }
+    if let Some(r) = diff_mem(&mem_j, &mem_i, &plan.space) {
+        return (last, Some(r));
+    }
+    if matches!(last, Run::Faulted { .. }) {
+        if let Ok(Exit::Continue) = cpu_i.step(&mut mem_i, &mut hooks) {
+            return (
+                last,
+                Some(format!(
+                    "JIT faulted at rip={:#x} but the interpreter executed that instruction",
+                    cpu_j.state().rip
+                )),
+            );
+        }
+    }
+    // Report the trial as having compiled `total` instructions, so the summary's
+    // coverage figure still means what it says.
+    (
+        match last {
+            Run::Faulted { .. } => Run::Faulted { insns: total },
+            Run::NotCompiled if total == 0 => Run::NotCompiled,
+            _ => Run::Executed { insns: total },
+        },
+        None,
+    )
+}
+
 /// Run one trial. Returns `(run, reason)`.
-fn run_one(jit: &mut Jit, bits: Bits, plan: &TrialPlan) -> (Run, Option<String>) {
+fn run_one(jit: &mut Jit, bits: Bits, plan: &TrialPlan, laps: u32) -> (Run, Option<String>) {
     let mode = mode_of(bits);
     let Some((mut mem_j, mut cpu_j)) = setup(bits, plan) else {
         return (Run::NotCompiled, Some("could not build the address space".into()));
@@ -625,9 +827,18 @@ fn run_one(jit: &mut Jit, bits: Bits, plan: &TrialPlan) -> (Run, Option<String>)
     // Budget 1 = exactly one block (roadmap W8.5). The generator emits straight
     // -line integer code, so a trial *is* one block; holding the chain loop to
     // one keeps this differential measuring the same thing it measured before
-    // chaining existed — the block, not the loop around it. Chaining is gated
-    // instead by the parity tests in `crates/jit/tests` and by the corpus twins,
-    // which are the only harnesses with real control flow in them.
+    // chaining existed — the block, not the loop around it.
+    //
+    // With `--laps` the trial is a loop instead, and the budget lets it round
+    // that loop several times: the first pass fills the link slots and every
+    // pass after it enters blocks by `br` rather than by returning here, so what
+    // is compared against the interpreter is what a natively linked chain
+    // computed. The budget is deliberately not a round multiple of the body —
+    // it lands wherever it lands, which is also a test that the chain stops on
+    // an instruction boundary the interpreter agrees with.
+    if laps > 1 {
+        return run_lapped(jit, plan, laps, mem_j, cpu_j, mem_i, cpu_i);
+    }
     let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
 
     let retired = match run {
@@ -688,12 +899,15 @@ fn run_one(jit: &mut Jit, bits: Bits, plan: &TrialPlan) -> (Run, Option<String>)
 
 pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
     let mut jit = Jit::new(4 << 20).map_err(|e| format!("no JIT on this platform: {e}"))?;
+    if cfg.laps > 1 {
+        jit.set_max_insns(LAP_MAX_INSNS);
+    }
     let mut s = JitSummary::default();
     for index in 0..cfg.count {
         let plan = trial_at(cfg, index);
         s.generated += plan.generated;
         s.by_layout[plan.layout.index()] += 1;
-        let (run, reason) = run_one(&mut jit, cfg.bits, &plan);
+        let (run, reason) = run_one(&mut jit, cfg.bits, &plan, cfg.laps);
         s.trials += 1;
         match run {
             Run::NotCompiled => {
@@ -727,6 +941,7 @@ pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
         }
     }
     s.declined_ops = jit.stats().top_declined(20);
+    s.links_taken = jit.stats().links_taken;
     Ok(s)
 }
 

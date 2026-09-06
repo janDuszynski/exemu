@@ -413,7 +413,7 @@ budget: `exemu run --max-steps 800000000 installer.exe`. Files land under
 The 7-Zip install above is ~4.97×10⁸ emulated instructions. Interpreted, that
 takes **16–27 seconds** on an M-series Mac depending on the machine's load;
 with `--jit` the *same run* — same instruction count, same output — takes about
-**3 seconds**.
+**a second** (0.76 s of CPU on an idle M-series machine).
 
 Interpreter speed was the next real wall, and the Wine path made it urgent
 rather than academic: running Wine's own DLLs as guest code means every Win32
@@ -432,13 +432,13 @@ the instruction set:
 * integer ALU (`add`/`or`/`and`/`sub`/`xor`/`cmp`) in every operand form,
   group 1, `test`, `mov`, `lea`, `movzx`/`movsx`/`movsxd`, `imul`,
   constant-count `shl`/`shr`/`sar`, `inc`/`dec`, `neg`, `not`, `cmov<cc>`,
-  `push`/`pop`, `push imm`, `leave`, the `moffs` `mov`s, and `j<cc>`/`jmp` as
-  compiled block terminators;
+  `push`/`pop`, `push imm`, `leave`, the `moffs` `mov`s, and `j<cc>`/`jmp`,
+  `call rel32` and indirect `call`/`jmp r/m` as compiled block terminators;
 * **everything else side-exits to the interpreter** — every SSE/x87/AVX
-  instruction, `syscall`, `call`/`ret`, indirect jumps, the string ops,
-  `adc`/`sbb`, the rotates, CL-count shifts, `mul`/`div`, the `LOCK`/`REP`
-  prefixes, the address-size override, and `fs:` in 64-bit mode. Deferring is
-  always safe; compiling something whose flag semantics are not proven is not.
+  instruction, `syscall`, `ret`, the string ops, `adc`/`sbb`, the rotates,
+  CL-count shifts, `mul`/`div`, the `LOCK`/`REP` prefixes, the address-size
+  override, and `fs:` in 64-bit mode. Deferring is always safe; compiling
+  something whose flag semantics are not proven is not.
 
 That slice was chosen by measuring, not guessing: an instrumented build
 (`--opcode-profile`) counts every instruction shape a real run executes. On
@@ -451,7 +451,7 @@ that is enforced two ways. A differential oracle
 ([below](#differential-cpu-oracle)) runs generated blocks through both engines
 and compares the entire architectural state — every GPR, every `rflags` bit
 including the ones x86 leaves undefined, `rip`, the vector file and every byte
-of memory — at **0 divergences in 10.5M trials per bitness**, a twelfth of them
+of memory — at **0 divergences in 11.9M trials per bitness**, a tenth of them
 assembled at the top of the address space, where a 32-bit address wraps and a
 64-bit one must not. And every corpus binary is run both ways: same exit code,
 same fault site, same artifacts, and the same exact instruction count, with only
@@ -486,6 +486,36 @@ handled from the other side: a store into the running block's own bytes stops
 the block, and between blocks the cache is validated against the per-page
 code-generation counters, so an ordinary store into a PE section's data (which
 exemu maps RWX) does not throw the cache away.
+
+**Blocks are linked to each other natively.** A block's exit does not return to
+Rust to be told where to go next: when the target is a compile-time constant it
+reads a cached pointer to the successor's body and branches straight into it, so
+a run of blocks executes as one straight line of native code. A computed target —
+an indirect `call` or `jmp`, which is how every import-table call and every jump
+table goes — reads the same slot through an **inline cache**, taking the link
+only if the slot cached a block for the address the guest just produced.
+
+Two things make that safe rather than merely fast. The **budget** moved into the
+emitted exit: it adds the block's instructions to a running total and stops at
+the first block boundary at which the total has reached what the caller allowed,
+which is the same boundary the block-at-a-time loop stopped at — so timeslice
+preemption, the `KUSER_SHARED_DATA` clock refresh and the step cap still fire at
+the identical guest instruction, and every corpus pin holds to the instruction.
+And **unlinking is one increment**: each slot carries an epoch, and moving the
+engine's epoch retires every link at once, with no walk over the array, no
+patching of emitted code and no instruction-cache maintenance. That is what a
+code-cache flush does, what a store into a page a compiled block was built from
+does — checked on every store against a page-hash table, because a linked chain
+has no Rust between blocks to notice — and what attaching a debugger will do.
+
+On the 7-Zip install, **95.8% of block entries (78.0 M of 81.4 M) are reached by
+a branch from the previous block**, out of only 1,501 distinct filled slots.
+Measured interleaved (both binaries built, alternated in one session, min
+user+sys over five runs each), the run goes from **0.95 s to 0.76 s**, 28.5 G to
+21.7 G retired host instructions. The remaining per-block cost is now about a
+fifteen-instruction exit sequence, and the emitted code is 60% larger than it
+was, so the trade is code size for speed — which is a loss on a run too short to
+amortise compiling it.
 
 `crates/jit` is the **only** crate in the workspace that is not
 `#![forbid(unsafe_code)]`, because a JIT cannot be. The relaxation is bounded:
@@ -642,8 +672,8 @@ current table:
   PASS   7z2602-x64.exe                      exit 0            496,505,572     108    8.2s
   PASS   SteamSetup.exe                      fault @ 0x20001c2c 92,865,377       3    1.6s
   PASS   Firefox Installer.exe               fault @ 0x0         4,665,426       1    0.1s
-  PASS   7z2602-x64.exe (jit)                exit 0            496,505,572     108    1.0s
-  PASS   SteamSetup.exe (jit)                fault @ 0x20001c2c 92,865,377       3    0.7s
+  PASS   7z2602-x64.exe (jit)                exit 0            496,505,572     108    0.8s
+  PASS   SteamSetup.exe (jit)                fault @ 0x20001c2c 92,865,377       3    0.5s
   PASS   Firefox Installer.exe (jit)         fault @ 0x0         4,665,426       1    0.1s
   PASS   SteamSetup.exe (wine wow64)         exit 2              7,692,851       4    0.2s
   PASS   Firefox Installer.exe (wine wow64)  exit 1             14,466,116       3    0.2s
@@ -803,6 +833,7 @@ but means an address is being computed wrongly).
 
 ```sh
 cargo run -p exemu-oracle --release -- jit --bits both --count 1M --chain 8
+cargo run -p exemu-oracle --release -- jit --bits both --count 300k --laps 4
 ```
 
 **Where a trial is assembled is part of the trial.** In 32-bit mode every
@@ -820,11 +851,21 @@ compiler that decoded the zero padding of its own short instruction-fetch window
 at the end of an executable region, and a block ending exactly on the 4 GiB
 boundary whose self-modification range collapsed to nothing.
 
-Current result: **0 divergences in 10.5M trials per bitness**, across fourteen
-configurations (1, 8, 24 and 32 instructions per block; twelve seeds), of which
-800k per bitness were re-run against the deferred-flag lowering (roadmap W8.4)
-and **1.25M per bitness against the final tree, ~875k of that in the boundary
-layouts** (roadmap W8.7).
+A trial normally runs once and stops, which is exactly the case in which a
+**native block link is never taken** — the slots get filled on the way out and
+the trial ends. `--laps K` ends a trial in a `jmp` back to its own first
+instruction instead, with the block cap dropped so the body is several blocks, so
+the second and later passes enter blocks by a branch from the previous block's
+exit with no Rust in between; the JIT side is driven the way the real run loop
+drives it, handing each declined opcode to an interpreter running against its own
+memory. What is compared is then what a *linked chain* computed.
+
+Current result: **0 divergences in 11.9M trials per bitness**, across sixteen
+configurations (1, 8, 24 and 32 instructions per block; fourteen seeds), of which
+800k per bitness were re-run against the deferred-flag lowering (roadmap W8.4),
+**1.25M per bitness against the boundary-aware tree** (roadmap W8.7), and
+**1.4M per bitness against native linking — 400k of it lapped**, with 1.42M block
+entries reached by a native link (roadmap W8.5).
 
 ## Contributing
 

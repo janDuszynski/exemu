@@ -162,6 +162,15 @@ pub struct BlockPlan {
     /// The ARM64 words.
     pub code: Vec<u32>,
     pub stop: StopReason,
+    /// Word offset of the **chain entry**: the first instruction past the
+    /// prologue. A block reached by a native link jumps here rather than to word
+    /// 0, because the chain has already built the frame and loaded the pinned
+    /// registers, and doing it again would grow the stack without bound
+    /// (roadmap W8.5).
+    pub chain_off: u32,
+    /// Guest address each link slot this block took points at, in slot order.
+    /// Empty when the engine gave the block no slots.
+    pub links: Vec<u64>,
 }
 
 /// Maximum guest instructions in one block.
@@ -362,6 +371,10 @@ struct StoreStub {
     retired: u32,
     rip: u64,
     next_rip: u64,
+    /// Register holding the guest address to stop at, when the instruction is an
+    /// indirect `call` and its stop point is therefore not a constant. `None`
+    /// uses `next_rip`.
+    next_reg: Option<u32>,
     commit: Commit,
     /// Flag state as of the start of this instruction (the rewind path) …
     before: Flags,
@@ -390,17 +403,63 @@ pub struct Compiler {
     store_stubs: Vec<StoreStub>,
     /// Branches to the shared epilogue.
     exits: Vec<Label>,
+    /// First link slot this block may use, if the engine gave it any
+    /// (roadmap W8.5). `None` compiles a block that always returns to Rust.
+    slot_base: Option<u32>,
+    /// Guest address each slot this block took points at, in slot order.
+    link_targets: Vec<u64>,
+}
+
+/// Outgoing native links one block may hold: a conditional branch has two edges,
+/// and no terminator this compiler accepts has more.
+pub const MAX_LINKS: u32 = 2;
+
+/// Bytes per [`crate::rt::LinkSlot`], which the emitter indexes by hand.
+pub const SLOT_BYTES: u32 = std::mem::size_of::<crate::rt::LinkSlot>() as u32;
+
+/// Recorded in [`BlockPlan::links`] for a slot whose target is not known until
+/// the block runs.
+pub const INDIRECT_TARGET: u64 = u64::MAX;
+
+/// How a block leaves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitKind {
+    /// Return to the engine, which decides what runs next.
+    Return,
+    /// Return having rewound onto a faulting access.
+    Fault,
+    /// `rip` is a compile-time constant with a block of its own, so the exit may
+    /// jump straight into that block's code instead of returning (roadmap W8.5).
+    Link,
+}
+
+impl ExitKind {
+    fn of(linkable: bool) -> ExitKind {
+        if linkable {
+            ExitKind::Link
+        } else {
+            ExitKind::Return
+        }
+    }
 }
 
 /// Bit set in the block's return value when it exited by rewinding to a
-/// faulting instruction.
+/// faulting instruction. The instruction *count* is no longer in the return
+/// value: a natively linked chain accumulates it in `BlockCtx::retired`, so the
+/// engine reads it from there and a block returns only a status word.
 pub const RET_FAULT: u64 = 1 << 32;
 
 impl Compiler {
     /// Compile a straight-line block starting at `start`. A plan with
     /// `insns == 0` means nothing here could be compiled and the caller must
     /// interpret.
-    pub fn compile(mem: &dyn Memory, mode: Mode, start: u64, max_insns: u32) -> BlockPlan {
+    pub fn compile(
+        mem: &dyn Memory,
+        mode: Mode,
+        start: u64,
+        max_insns: u32,
+        slot_base: Option<u32>,
+    ) -> BlockPlan {
         let mut c = Compiler {
             asm: Asm::new(),
             mode,
@@ -412,8 +471,27 @@ impl Compiler {
             fault_stubs: Vec::new(),
             store_stubs: Vec::new(),
             exits: Vec::new(),
+            slot_base,
+            link_targets: Vec::new(),
         };
         c.prologue();
+        // --- the chain entry ---------------------------------------------
+        //
+        // Where a natively linked predecessor jumps in: past the frame the chain
+        // already built, but *before* the body — because the one thing a block
+        // must publish on every entry, however it was entered, is the guest byte
+        // range it was compiled from. The store helper tests every store against
+        // it, and with linking there is no Rust between blocks to set it.
+        //
+        // The block's length is not known until it has stopped growing, so the
+        // `add` that derives the end from the start is emitted as a placeholder
+        // and patched below. It is a plain `Vec<u32>` at this point; nothing here
+        // touches executable memory.
+        let chain_off = c.asm.len() as u32;
+        c.asm.mov_imm64(T0, start);
+        let bytes_at = c.asm.len();
+        c.asm.nop();
+        c.asm.stp(T0, T1, R_CTX, ctx_off::CODE_LO as i32);
         let mut stop = StopReason::Full;
         let mut rip = start;
         while c.insns < max_insns {
@@ -489,21 +567,41 @@ impl Compiler {
         let insns = c.insns;
         // Fallthrough exit: rip = end of the block, no fault.
         if stop != StopReason::Terminator {
-            c.exit_to(c.flags, end_rip, insns as u64);
+            // Only a block that stopped because it was *full* (or wrapped past
+            // the top of the address space) has a compiled successor to link to.
+            // The other two reasons — an opcode this compiler declines, and a
+            // fetch that failed — are precisely the addresses where nothing can
+            // be compiled, so the chain has to hand that instruction to the
+            // interpreter.
+            let linkable = matches!(stop, StopReason::Full | StopReason::Wrapped);
+            c.exit_to(c.flags, end_rip, insns, ExitKind::of(linkable));
         }
         c.emit_stubs();
         c.epilogue();
+        // Masked, because `end_rip` is: a 32-bit block that ends on the 4 GiB
+        // boundary has `end_rip == 0`, and a plain 64-bit subtraction would call
+        // that a 2^64-sized block instead of the handful of bytes it is.
+        let bytes = end_rip.wrapping_sub(start) & mode.addr_mask();
+        // Patch the chain entry's `add T1, T0, #bytes`. A block holds at most
+        // `MAX_INSNS` instructions of at most 15 bytes, so the length always
+        // fits the 12-bit immediate — asserted rather than assumed, because a
+        // silently truncated length would under-report the block's own range and
+        // let a store into it go unnoticed.
+        assert!(bytes < 4096, "block byte length {bytes} does not fit an add immediate");
+        {
+            let mut patch = Asm::new();
+            patch.add_imm(true, T1, T0, bytes as u32, false);
+            c.asm.words_mut()[bytes_at] = patch.words()[0];
+        }
         BlockPlan {
             start,
             insns,
             end_rip,
-            // Masked, because `end_rip` is: a 32-bit block that ends on the
-            // 4 GiB boundary has `end_rip == 0`, and a plain 64-bit subtraction
-            // would call that a 2^64-sized block instead of the handful of
-            // bytes it is.
-            bytes: end_rip.wrapping_sub(start) & mode.addr_mask(),
+            bytes,
             code: c.asm.into_words(),
             stop,
+            chain_off,
+            links: c.link_targets,
         }
     }
 
@@ -541,15 +639,127 @@ impl Compiler {
         a.ret();
     }
 
-    /// Leave the block: settle `flags`, store `rip`, set the return value, jump
-    /// to the epilogue. The flag state is passed in rather than taken from
+    /// Take the next link slot this block is allowed, for a jump to `target`.
+    /// `None` when the engine gave the block no slots, or when it has used them
+    /// all — either way the exit falls back to returning to Rust, which is
+    /// always correct and only slower.
+    fn take_slot(&mut self, target: u64) -> Option<u32> {
+        let base = self.slot_base?;
+        let n = self.link_targets.len() as u32;
+        if n >= MAX_LINKS {
+            return None;
+        }
+        self.link_targets.push(target);
+        Some(base + n)
+    }
+
+    /// Leave the block for guest address `rip`, having retired `retired`
+    /// instructions here. The flag state is passed in rather than taken from
     /// `self` because a stub exits with the state of the point it rewinds to,
     /// not the state of the emission cursor.
-    fn exit_to(&mut self, flags: Flags, rip: u64, ret: u64) {
+    ///
+    /// # What a linkable exit emits, and why in this order
+    ///
+    /// Every exit settles the flags, publishes `rip` and adds this block's
+    /// instructions to the chain's running total. An [`ExitKind::Link`] exit then
+    /// tries to continue **without returning to Rust** (roadmap W8.5):
+    ///
+    /// 1. **Budget first.** The chain stops at the first block boundary at which
+    ///    the running total has reached the budget — the same boundary the
+    ///    caller's block-at-a-time loop stopped at, which is what keeps
+    ///    preemption, the `KUSER_SHARED_DATA` refresh and the step cap firing at
+    ///    the *identical* guest instruction. This test is what makes native
+    ///    linking safe to do at all.
+    /// 2. **Then the slot.** A cached successor is taken only while the slot's
+    ///    epoch still matches the engine's, so invalidating every link in the
+    ///    process is one increment (see [`crate::rt::LinkSlot`]).
+    /// 3. **Then the trail.** The caller's loop cannot see a linked block, so
+    ///    compiled code records the entry address itself, and the fault reporter
+    ///    keeps printing a real history instead of one address per chain.
+    ///
+    /// If either test fails the exit records *which* slot it wanted in
+    /// `BlockCtx::pending` and returns; the engine fills that slot once it has
+    /// compiled and validated the block the chain landed on.
+    fn exit_to(&mut self, flags: Flags, rip: u64, retired: u32, kind: ExitKind) {
         self.emit_flags(flags);
-        self.asm.mov_imm64(T0, rip);
-        self.asm.str(8, T0, R_STATE, st::RIP);
-        self.asm.mov_imm64(0, ret);
+        self.asm.mov_imm64(T2, rip);
+        let slot = if kind == ExitKind::Link { self.take_slot(rip) } else { None };
+        self.emit_exit_tail(retired, kind == ExitKind::Fault, slot, false);
+    }
+
+    /// Leave the block for the guest address in `target`, computed at run time.
+    ///
+    /// The only difference from [`Compiler::exit_to`] is that the slot has to
+    /// prove it cached a block for *that* address before the link can be taken —
+    /// the inline cache an indirect branch needs (roadmap W8.5). A branch that
+    /// keeps going to the same place (which is what a jump table, a virtual call
+    /// or a tail call through a thunk does most of the time) then costs one
+    /// extra load and compare; one that does not simply returns to the engine.
+    fn exit_indirect(&mut self, flags: Flags, target: u32, retired: u32) {
+        self.emit_flags(flags);
+        self.asm.mov_reg(true, T2, target);
+        let slot = self.take_slot(INDIRECT_TARGET);
+        self.emit_exit_tail(retired, false, slot, true);
+    }
+
+    /// The part every exit shares: publish `rip` (already in `T2`), add this
+    /// block's instructions to the chain's running total, then either link on or
+    /// branch to the epilogue.
+    fn emit_exit_tail(&mut self, retired: u32, fault: bool, slot: Option<u32>, indirect: bool) {
+        self.asm.str(8, T2, R_STATE, st::RIP);
+        self.asm.ldr(8, T0, R_CTX, ctx_off::RETIRED);
+        if retired != 0 {
+            self.asm.add_imm(true, T0, T0, retired, false);
+            self.asm.str(8, T0, R_CTX, ctx_off::RETIRED);
+        }
+        if let Some(slot) = slot {
+            // Budget first: the chain stops at the first block boundary at which
+            // the running total has reached it, which is the boundary the
+            // block-at-a-time loop stopped at.
+            self.asm.ldr(8, T1, R_CTX, ctx_off::BUDGET);
+            self.asm.cmp_reg(true, T0, T1);
+            let spent = self.asm.b_cond_forward(Cond::Cs);
+            // The slot, addressed off the array base in the context. An `ldr`'s
+            // scaled immediate reaches 32 760 bytes; past that, one page-granular
+            // `add` gets the base within range, which covers every slot the
+            // engine can hand out.
+            let off = slot * SLOT_BYTES;
+            self.asm.ldr(8, T1, R_CTX, ctx_off::LINKS);
+            let bias = if off + 16 <= 32_760 { 0 } else { off & !0xFFF };
+            if bias != 0 {
+                self.asm.add_imm(true, T1, T1, bias >> 12, true);
+            }
+            let at = off - bias;
+            self.asm.ldr(8, T3, T1, at);
+            self.asm.ldr(8, T0, R_CTX, ctx_off::LINK_EPOCH);
+            self.asm.cmp_reg(true, T3, T0);
+            let stale = self.asm.b_cond_forward(Cond::Ne);
+            // The inline cache's compare: did this slot cache a block for the
+            // address the guest actually computed?
+            let missed = indirect.then(|| {
+                self.asm.ldr(8, T3, T1, at + 8);
+                self.asm.cmp_reg(true, T3, T2);
+                self.asm.b_cond_forward(Cond::Ne)
+            });
+            self.asm.ldr(8, T1, T1, at + 16);
+            // The block trail, for the fault reporter.
+            self.asm.ldr(8, T3, R_CTX, ctx_off::TRAIL_AT);
+            self.asm.add_imm(true, T0, T3, 1, false);
+            self.asm.str(8, T0, R_CTX, ctx_off::TRAIL_AT);
+            let ok = self.asm.and_imm(true, T3, T3, crate::rt::TRAIL as u64 - 1);
+            debug_assert!(ok, "the trail ring size must be a logical immediate");
+            self.asm.ldr(8, T0, R_CTX, ctx_off::TRAIL);
+            self.asm.str_reg_lsl3(T2, T0, T3);
+            self.asm.br(T1);
+            self.asm.bind(stale);
+            if let Some(m) = missed {
+                self.asm.bind(m);
+            }
+            self.asm.bind(spent);
+            self.asm.mov_imm64(T0, slot as u64);
+            self.asm.str(8, T0, R_CTX, ctx_off::PENDING);
+        }
+        self.asm.mov_imm64(0, if fault { RET_FAULT } else { 0 });
         let l = self.asm.b_forward();
         self.exits.push(l);
     }
@@ -562,14 +772,27 @@ impl Compiler {
             self.asm.subs_imm(true, ZR, 0, status::FAULT as u32, false);
             let is_fault = self.asm.b_cond_forward(Cond::Eq);
             self.emit_commit(s.commit);
-            self.exit_to(s.after, s.next_rip, (s.retired + 1) as u64);
+            // Never linked: the store landed on a page some compiled block was
+            // built from, so the engine has to look at it before anything else
+            // runs — including any block this one is linked to.
+            match s.next_reg {
+                None => self.exit_to(s.after, s.next_rip, s.retired + 1, ExitKind::Return),
+                Some(r) => {
+                    // An indirect `call` whose pushed return address landed in
+                    // code: the instruction has fully retired, and where it goes
+                    // is in a register rather than in the encoding.
+                    self.emit_flags(s.after);
+                    self.asm.mov_reg(true, T2, r);
+                    self.emit_exit_tail(s.retired + 1, false, None, false);
+                }
+            }
             self.asm.bind(is_fault);
-            self.exit_to(s.before, s.rip, s.retired as u64 | RET_FAULT);
+            self.exit_to(s.before, s.rip, s.retired, ExitKind::Fault);
         }
         let faults = std::mem::take(&mut self.fault_stubs);
         for f in faults {
             self.asm.bind(f.label);
-            self.exit_to(f.flags, f.rip, f.retired as u64 | RET_FAULT);
+            self.exit_to(f.flags, f.rip, f.retired, ExitKind::Fault);
         }
     }
 
@@ -693,6 +916,7 @@ impl Compiler {
             retired: self.insns,
             rip: self.rip,
             next_rip,
+            next_reg: None,
             commit,
             before: self.insn_flags,
             after: self.flags,
@@ -1156,7 +1380,7 @@ fn decode(window: &[u8], mode: Mode, rip: u64) -> Option<Insn> {
             // above, so the mode alone decides its width).
             0xA0..=0xA3 => imm = if mode.is64() { c.u64()? } else { c.u32()? as u64 },
             0x70..=0x7F | 0xEB => imm = c.u8()? as i8 as i64 as u64,
-            0xE9 => imm = c.u32()? as i32 as i64 as u64,
+            0xE8 | 0xE9 => imm = c.u32()? as i32 as i64 as u64,
             0x80 => imm = c.u8()? as u64,
             0x81 => {
                 let size = opsize(&pfx);
@@ -1249,6 +1473,13 @@ fn flag_effect(insn: &Insn) -> FlagEffect {
         0x40..=0x4F => FlagEffect::Reads,
         0x50..=0x5F | 0x63 | 0x88..=0x8B | 0x8D | 0x90 | 0xB0..=0xBF => FlagEffect::Neutral,
         0x68 | 0x6A | 0xA0..=0xA3 | 0xC6 | 0xC7 | 0xC9 => FlagEffect::Neutral,
+        // A branch touches no flag, but it is deliberately *not* `Neutral`:
+        // this classification is also what `defer_pays` scans with, and that
+        // scan walks addresses in order. Past a branch the next address is not
+        // the next instruction, so letting the scan continue through one would
+        // decide whether deferring pays by reading bytes the guest will not
+        // execute. `Reads` stops the scan, which is the conservative answer and
+        // the one that was measured. (Making them `Neutral` cost ~1% on 7-Zip.)
         0x80 | 0x81 | 0x83 => match Alu::from_op(insn.reg & 7) {
             Some(_) => FlagEffect::Overwrites,
             None => FlagEffect::Reads,
@@ -1403,7 +1634,7 @@ impl Compiler {
                     let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
                     debug_assert!(ok);
                 }
-                self.emit_store_push(w, next);
+                self.emit_store_push(w, next, None);
                 Lowered::Ok
             }
             0x58..=0x5F => {
@@ -1442,7 +1673,7 @@ impl Compiler {
                     let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
                     debug_assert!(ok);
                 }
-                self.emit_store_push(w, next);
+                self.emit_store_push(w, next, None);
                 Lowered::Ok
             }
 
@@ -1668,11 +1899,35 @@ impl Compiler {
                 Lowered::Ok
             }
 
+            // ---- CALL rel32 ----------------------------------------------
+            //
+            // A direct branch that happens to push: the target is in the
+            // encoding, so it takes an ordinary link slot rather than an inline
+            // cache, and the chain runs straight on into the callee.
+            0xE8 if !p.p66 => {
+                let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
+                let w = self.mode.stack_width();
+                self.asm.mov_imm64(R_VAL, next);
+                self.asm.ldr(8, T0, R_STATE, gpr_off(4));
+                self.asm.sub_imm(true, R_ADDR, T0, w as u32, false);
+                if !self.mode.is64() {
+                    let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
+                    debug_assert!(ok);
+                }
+                // If the pushed return address lands in guest code the call has
+                // still fully retired, so the stub's stop point is the call's
+                // *target*, not the byte after it.
+                self.emit_store_push(w, target, None);
+                let f = self.flags;
+                self.exit_to(f, target, self.insns + 1, ExitKind::Link);
+                Lowered::Terminated
+            }
+
             // ---- JMP rel -------------------------------------------------
             0xE9 | 0xEB => {
                 let target = next.wrapping_add(insn.imm) & self.mode.addr_mask();
                 let f = self.flags;
-                self.exit_to(f, target, (self.insns + 1) as u64);
+                self.exit_to(f, target, self.insns + 1, ExitKind::Link);
                 Lowered::Terminated
             }
 
@@ -1714,11 +1969,52 @@ impl Compiler {
                 }
             }
 
+            // ---- group 5: CALL / JMP r/m --------------------------------
+            //
+            // The indirect branches: a call through the import table, a virtual
+            // call, a tail jump through a thunk, a switch table. The target is
+            // not known until the block runs, so the exit goes through an inline
+            // cache (roadmap W8.5) — one load and one compare against the
+            // address the slot cached, which is enough for a branch that keeps
+            // going to the same place, and no worse than before when it does not.
+            //
+            // 16-bit operand forms are refused: they truncate `rip` to 16 bits,
+            // which nothing in a Windows guest does and which nothing here is
+            // written to reproduce.
+            0xFF if matches!(insn.reg & 7, 2 | 4) && !p.p66 => {
+                // The branch target lives in `R_FA` across the push's helper
+                // call, so any pending flag state — whose operands live in the
+                // same register — has to be settled before it is overwritten.
+                self.materialize();
+                let size = if self.mode.is64() { 8 } else { 4 };
+                // x86 reads the operand *before* the push, which is visible when
+                // the operand is stack-relative.
+                if let Rm::Mem(m) = insn.rm {
+                    self.emit_addr(&m);
+                    self.emit_load(R_FA, size);
+                } else if let Rm::Reg(i) = insn.rm {
+                    self.load_gpr(R_FA, i, size, has_rex);
+                }
+                if insn.reg & 7 == 2 {
+                    let w = self.mode.stack_width();
+                    self.asm.mov_imm64(R_VAL, next);
+                    self.asm.ldr(8, T0, R_STATE, gpr_off(4));
+                    self.asm.sub_imm(true, R_ADDR, T0, w as u32, false);
+                    if !self.mode.is64() {
+                        let ok = self.asm.and_imm(true, R_ADDR, R_ADDR, 0xffff_ffff);
+                        debug_assert!(ok);
+                    }
+                    self.emit_store_push(w, next, Some(R_FA));
+                }
+                self.exit_indirect(Flags::Live, R_FA, self.insns + 1);
+                Lowered::Terminated
+            }
+
             // ---- group 4/5: INC/DEC r/m ---------------------------------
             0xFE | 0xFF => {
                 let sub = insn.reg & 7;
                 if sub > 1 {
-                    return Lowered::Unsupported; // call/jmp/push r/m
+                    return Lowered::Unsupported; // push r/m, far call/jmp
                 }
                 let size = if insn.opcode == 0xFE { 1 } else { self.opsize(&p) };
                 self.materialize();
@@ -1990,7 +2286,7 @@ impl Compiler {
     /// The store half of `push`: the address in [`R_ADDR`] *is* the new rsp and
     /// the value is in [`R_VAL`]; rsp is committed only after the store
     /// succeeds.
-    fn emit_store_push(&mut self, w: u8, next: u64) {
+    fn emit_store_push(&mut self, w: u8, next: u64, next_reg: Option<u32>) {
         self.asm.mov_reg(true, 0, R_CTX);
         self.asm.mov_reg(true, 1, R_ADDR);
         self.asm.mov_imm64(2, w as u64);
@@ -2007,6 +2303,7 @@ impl Compiler {
             retired: self.insns,
             rip: self.rip,
             next_rip: next,
+            next_reg,
             commit: Commit::Gpr { idx: 4, size: 8, has_rex: true },
             before: self.insn_flags,
             after: self.flags,
@@ -2017,12 +2314,15 @@ impl Compiler {
     /// A conditional branch: both edges are compiled, so the block leaves with
     /// `rip` already correct and never returns to the interpreter for the jump.
     fn emit_jcc(&mut self, cc: u8, target: u64, fallthrough: u64) -> Lowered {
-        // The condition reads `R_FLAGS`, and both edges leave the block.
+        // The condition reads `R_FLAGS`, and both edges leave the block — and
+        // both are compile-time constants, so both get a link slot. A loop whose
+        // body and exit are each one block therefore runs entirely as native
+        // code once both slots are filled.
         self.materialize();
         let taken = self.branch_if_cond(cc);
-        self.exit_to(Flags::Live, fallthrough, (self.insns + 1) as u64);
+        self.exit_to(Flags::Live, fallthrough, self.insns + 1, ExitKind::Link);
         self.asm.bind(taken);
-        self.exit_to(Flags::Live, target, (self.insns + 1) as u64);
+        self.exit_to(Flags::Live, target, self.insns + 1, ExitKind::Link);
         Lowered::Terminated
     }
 }
