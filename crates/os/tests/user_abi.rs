@@ -99,6 +99,49 @@ fn the_prop_apis_tail_jump_straight_into_their_syscalls() {
 }
 
 #[test]
+fn win32u_publishes_the_font_indices_uniscribe_needs() {
+    if !present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (the Wine DLL set is git-ignored)");
+        return;
+    }
+    let w = dll("win32u.dll");
+    for (name, index) in [
+        ("NtGdiHfontCreate", 0x1233u32),
+        ("NtGdiGetDCObject", 0x11f0),
+        ("NtGdiSelectFont", 0x126e),
+        ("NtGdiExtGetObjectW", 0x11c7),
+        ("NtGdiGetTextMetricsW", 0x1229),
+        ("NtGdiGetTextFaceW", 0x1228),
+        ("NtGdiGetFontData", 0x11fe),
+        ("NtUserGetProcessDpiAwarenessContext", 0x1435),
+    ] {
+        assert_eq!(syscall_index(&w, name), Some(index), "{name}'s own stub");
+    }
+}
+
+#[test]
+fn create_font_indirect_hands_the_syscall_an_enumlogfontexdvw() {
+    if !present() {
+        eprintln!("SKIP: {WINE_DLLS} not present (the Wine DLL set is git-ignored)");
+        return;
+    }
+    let g = dll("gdi32.dll");
+    let code = export_bytes(&g, "CreateFontIndirectExW", 0x20)
+        .expect("gdi32 exports CreateFontIndirectExW as code");
+
+    assert_eq!(
+        &code[..4],
+        &[0x48, 0x83, 0xEC, 0x38],
+        "the wrapper only reserves shadow space; rcx is the caller's pointer, untouched"
+    );
+    assert!(
+        code.windows(5).any(|w| w == [0xBA, 0xA4, 0x01, 0x00, 0x00]),
+        "arg1 is sizeof(ENUMLOGFONTEXDVW) = 0x1a4 = LOGFONTW 0x5c + names 0x100 + DESIGNVECTOR 0x48, \
+         which is what makes arg0's first 0x5c bytes the LOGFONTW"
+    );
+}
+
+#[test]
 fn win32u_publishes_the_bitmap_and_icon_indices() {
     if !present() {
         eprintln!("SKIP: {WINE_DLLS} not present (the Wine DLL set is git-ignored)");

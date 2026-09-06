@@ -112,6 +112,14 @@ end-to-end on the default path.
   ComboBoxEx answers its edit's `EN_CHANGE` by asking the inner combo for
   `CB_GETCURSEL` and dereferencing `COMBOEX_FindItem`'s answer with no NULL
   check. `GetOpenFileNameW` still returns no path.
+- **`NtUserGetProcessDpiAwarenessContext` (0x1435) answers.**
+  `user32!GetThreadDpiAwarenessContext` reads the thread's context from
+  `TEB+0x830` and, when that is 0, asks this syscall with `process == -1` and
+  truncates the answer to 32 bits. The unserviced stub answered 0, which
+  `GetAwarenessFromDpiAwarenessContext` rejects as `DPI_AWARENESS_INVALID`;
+  exemu answers `NTUSER_DPI_UNAWARE` (0x6010), the context it already stamps
+  into every `win_proc_params` and the one that goes with the 96 DPI
+  `NtUserGetSystemDpiForProcess` reports.
 ### One host window per top-level, and input that goes only where it is routed (W4.6)
 - **A real `NSWindow` was confirmed on screen, by looking at it.** `exemu run
   --gui --wine-boot <dir> <gui-sample.exe>` puts up a titled 480×260 window

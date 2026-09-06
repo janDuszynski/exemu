@@ -11,6 +11,7 @@ const WIN32K_LAST: u32 = 0x1601;
 const NT_USER_INITIALIZE_CLIENT_PFN_ARRAYS: u32 = 0x147a;
 const NT_USER_GET_SYSTEM_DPI_FOR_PROCESS: u32 = 0x144b;
 const NT_USER_SET_PROCESS_DPI_AWARENESS_CONTEXT: u32 = 0x1577;
+const NT_USER_GET_PROCESS_DPI_AWARENESS_CONTEXT: u32 = 0x1435;
 const NT_USER_GET_ATOM_NAME: u32 = 0x13d1;
 const NT_USER_GET_CLASS_INFO_EX: u32 = 0x13d8;
 const NT_USER_REGISTER_CLASS_EX_WOW: u32 = 0x14eb;
@@ -942,6 +943,10 @@ pub(crate) fn register(os: &mut WinOs) {
         NT_USER_SET_PROCESS_DPI_AWARENESS_CONTEXT,
         nt_user_set_process_dpi_awareness_context,
     );
+    os.set_win32k_handler(
+        NT_USER_GET_PROCESS_DPI_AWARENESS_CONTEXT,
+        nt_user_get_process_dpi_awareness_context,
+    );
     os.set_win32k_handler(NT_USER_GET_ATOM_NAME, nt_user_get_atom_name);
     os.set_win32k_handler(NT_USER_GET_CLASS_INFO_EX, nt_user_get_class_info_ex);
     os.set_win32k_handler(NT_USER_REGISTER_CLASS_EX_WOW, nt_user_register_class_ex_wow);
@@ -1215,6 +1220,14 @@ fn nt_user_set_process_dpi_awareness_context(
     _mem: &mut dyn Memory,
 ) -> Result<u32> {
     Ok(1)
+}
+
+fn nt_user_get_process_dpi_awareness_context(
+    _os: &mut WinOs,
+    _cpu: &mut CpuState,
+    _mem: &mut dyn Memory,
+) -> Result<u32> {
+    Ok(crate::wow64::NTUSER_DPI_UNAWARE)
 }
 
 fn nt_user_get_atom_name(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
