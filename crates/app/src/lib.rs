@@ -18,6 +18,7 @@ pub mod audio_sample;
 pub mod cab;
 pub mod cab_sample;
 pub mod comctl_sample;
+pub mod comdlg_sample;
 pub mod gui_sample;
 pub mod sample;
 pub mod shell_link_sample;
