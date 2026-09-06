@@ -565,20 +565,45 @@ impl Process {
 
         let hdr_len = align_up(image.size_of_headers as u64, PAGE).max(PAGE);
         // Writable: packers (UPX etc.) reconstruct headers/import tables in
-        // place at the image base as they unpack.
-        mem.map_with_data("headers", base, hdr_len, &image.headers, Perm::RWX)?;
+        // place at the image base as they unpack. **Not executable**: no
+        // section covers `SizeOfHeaders`, so nothing a linker emitted can be
+        // fetched from here, and Windows maps the header page read-only.
+        mem.map_with_data("headers", base, hdr_len, &image.headers, Perm::RW)?;
 
         for s in &image.sections {
             let addr = base + s.rva as u64;
             let size = align_up((s.virtual_size as u64).max(s.data.len() as u64), PAGE).max(PAGE);
-            // Map every section read/write/execute. Real-world installers and
-            // packers routinely execute code they generate or unpack into
-            // "data" sections (and write to "code" sections), which a strict
-            // DEP model would fault. Running arbitrary binaries matters more
-            // here than reproducing page-permission enforcement.
-            let mut perm = Perm::RWX;
-            let _ = (s.writable, s.executable); // characteristics kept for `info`
-            perm = perm.union(if s.readable { Perm::READ } else { Perm::NONE });
+            let mut perm = section_perm(s);
+            // The one documented departure from the characteristics: the
+            // section that carries the **import address table** is mapped
+            // writable even when the linker marked it read-only (MSVC puts the
+            // IAT in `.rdata`). Binding imports means storing into those slots,
+            // and on the Wine path the code doing it is *guest* code — Wine's
+            // own i386 loader — which brackets the write with
+            // `NtProtectVirtualMemory(PAGE_READWRITE)`. exemu's implementation
+            // of that syscall is **nominal**: it records the requested
+            // `PAGE_*` value for `VirtualQuery` to report and never touches the
+            // real region permission (`crates/os/src/vm.rs::vm_protect_region`
+            // — no caller of `Memory::protect` exists anywhere in the tree).
+            // Without this carve-out, Wine's loader dies on its very first IAT
+            // store: measured on `SteamSetup.exe`, one 4-byte write to
+            // `0x408070` inside its read-only `.rdata`, after which the 32-bit
+            // loader never gets past kernel32/kernelbase and the process spins
+            // in `KiUserExceptionDispatcher`.
+            //
+            // exemu's *own* binder does not need this — it patches IAT slots
+            // with `Memory::poke`, which is the privileged loader write and
+            // bypasses permissions by design — so this exists purely for guest
+            // loaders. It goes away the day `NtProtectVirtualMemory` applies a
+            // real permission; see the W9.5 progress note for what that needs.
+            let end = s.rva as u64 + size;
+            let carries_iat = image
+                .imports
+                .iter()
+                .any(|i| (i.iat_rva as u64) >= s.rva as u64 && (i.iat_rva as u64) < end);
+            if carries_iat {
+                perm = perm.union(Perm::WRITE);
+            }
             mem.map_with_data(section_name(&s.name), addr, size, &s.data, perm)?;
         }
 
@@ -2346,6 +2371,36 @@ fn section_name(raw: &str) -> String {
     } else {
         raw.to_string()
     }
+}
+
+/// The permissions a PE section is mapped with, taken from its real
+/// `IMAGE_SECTION_HEADER.Characteristics` (roadmap W9.5).
+///
+/// exemu used to map **every** section `RWX` on the theory that running
+/// arbitrary binaries mattered more than reproducing DEP. It does not: the
+/// characteristics are what a packer relies on too. `UPX0`/`UPX1` are marked
+/// `MEM_READ|MEM_WRITE|MEM_EXECUTE` by UPX itself precisely because the stub
+/// decompresses over them and then jumps in, so an honest mapping still gives
+/// a self-modifying guest exactly the pages it asked for — while an ordinary
+/// MSVC image stops being a `W^X` hole, and its `.data` stops being executable.
+///
+/// Two deliberate departures from a literal reading of the bits, both of which
+/// match what Windows itself does with them:
+///
+/// * **Anything mapped is readable.** x86 has no write-only or execute-only
+///   page and the `PAGE_*` constants cannot express one — `PAGE_EXECUTE` reads
+///   fine on every x86 Windows has ever run on. A section marked executable or
+///   writable but not readable (some linkers, and every hand-rolled PE that
+///   leaves the field half-filled) is therefore mapped readable.
+/// * **A section with no access bits at all is mapped read-only**, not
+///   unreachable. `IMAGE_SCN_MEM_*` all clear usually means a linker left the
+///   field zero rather than that the program wants a guard page, and mapping it
+///   `NONE` would fault a guest that merely reads its own padding.
+fn section_perm(s: &exemu_core::pe::Section) -> Perm {
+    let bits = Perm::NONE
+        .union(if s.writable { Perm::WRITE } else { Perm::NONE })
+        .union(if s.executable { Perm::EXEC } else { Perm::NONE });
+    bits.union(Perm::READ)
 }
 
 /// Initial value for a known imported *data* symbol (a variable exported by

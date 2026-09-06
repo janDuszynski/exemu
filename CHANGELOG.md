@@ -26,6 +26,60 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 931, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### Where the comctl6 side-by-side assembly actually is (W6.1, diagnosis)
+- With Wine's own debug channels on, a WoW64 guest that asks for themed controls
+  reports `fixme:actctx:parse_depend_manifests Could not find dependent assembly
+  "Microsoft.Windows.Common-Controls" (6.0.0.0)`, and the process ends up with no
+  activation context at all. **The fallback is material:** Wine 11.0 ships two
+  comctl32 builds, and the pinned prefix has both — only `comctl32_v6.dll`
+  compiles the themed replacements for the user32 built-ins (Button, ComboBox,
+  Edit, ListBox, Static) plus SysLink and TaskDialog, and only it delay-imports
+  `uxtheme`. Without the assembly a guest gets the v5 build.
+- **The prefix does ship the assembly**; it is simply never materialised. Wine
+  embeds it in the v6 DLL as an `RT_MANIFEST` resource *named* `WINE_MANIFEST`,
+  and writes the WinSxS store from it at prefix-creation time. exemu has never
+  run that step. `crates/app/tests/sxs_assembly.rs` pins the recovery half — the
+  resource is there, exemu's loader already reads and parses it, the v5 build
+  publishes none, and the exact WinSxS key Wine would look for.
+- Staging that store by hand surfaced a **real bug one layer down**:
+  `FILE_BOTH_DIR_INFORMATION.FileName` sits at +0x5E (after `ShortName[12]`),
+  not at the +0x60 struct size, so every filename Wine reads back from
+  `NtQueryDirectoryFile` is empty. Not fixed here — it is in `crates/os` — but
+  recorded with its reproduction. No lookup was faked and no half-working store
+  was landed.
+
+### PE sections are mapped from their real characteristics, not RWX (W9.5)
+- **The loader used to map every section — and the PE header page —
+  read/write/execute**, on the recorded theory that "running arbitrary binaries
+  matters more than reproducing page-permission enforcement". It maps each one
+  from its own `IMAGE_SECTION_HEADER.Characteristics` now: code is not writable,
+  data is not executable, resources and `.pdata` are read-only, and the header
+  page is writable (packers rebuild import tables there) but never executable.
+- **The theory it replaces was wrong about its own counter-example.** The
+  corpus's self-modifying guest is the UPX-packed Firefox stub, which
+  decompresses over its own image and jumps into it — and UPX *marks* `UPX0` and
+  `UPX1` `MEM_READ|MEM_WRITE|MEM_EXECUTE`. An honest mapping hands a packer
+  exactly the pages it asked for; it is only the ordinary MSVC image that stops
+  being a `W^X` hole. Pinned both ways in `crates/app/tests/section_perms.rs`.
+- **One documented departure, because a real gap sits under it.** The section
+  carrying the **import address table** is mapped writable even when the linker
+  marked it read-only. exemu's own binder does not need that (it patches IAT
+  slots with the privileged `Memory::poke`), but on the `--wine-boot` path the
+  loader binding those slots is *guest* code — Wine's i386 `loader_init` —
+  which brackets the write with `NtProtectVirtualMemory(PAGE_READWRITE)`.
+  exemu's implementation of that syscall is **nominal**: it records the
+  requested `PAGE_*` for `VirtualQuery` to report and never changes a real
+  permission (nothing in the tree calls `Memory::protect`). Without the
+  carve-out, Wine's loader dies on its first IAT store — measured on
+  `SteamSetup.exe`, one 4-byte write to `0x408070` in its read-only `.rdata`,
+  after which the 32-bit loader never gets past kernel32/kernelbase.
+- **This supersedes the "exemu maps PE sections RWX" justification** recorded
+  under the block-JIT work below. The per-*page* code-generation counter is
+  still the right precision, but for the narrower reason that a genuinely
+  writable-and-executable section (a UPX stub) exists at all.
+- Corpus **11/11** with every count unchanged to the instruction, 7-Zip's three
+  rows included; **981 tests** (976 + 5), clippy clean at `-D warnings`.
+
 ### Breakpoints and watchpoints are honoured in compiled code (W9.3)
 - **The JIT's whole contribution to the debugger is a negative guarantee** —
   never run past an armed address — not a second breakpoint implementation. It
