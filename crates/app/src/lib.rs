@@ -936,7 +936,7 @@ impl Process {
         // backend (or a hardened-runtime build missing the JIT entitlement)
         // degrades in speed and nothing else.
         let want_jit = cfg.jit || std::env::var("EXEMU_JIT").is_ok_and(|v| v != "0");
-        let jit = if want_jit {
+        let mut jit = if want_jit {
             match exemu_jit::Jit::new(JIT_CODE_BYTES) {
                 Ok(j) => Some(j),
                 Err(e) => {
@@ -1202,6 +1202,13 @@ impl Process {
             None => (DebugControl::detached(), None, None),
         };
         mem.set_debug(dbg.clone());
+        // The JIT needs the same handle for the same reason the memory backend
+        // does: S3 splits a block before an armed address and S6 stops on a
+        // watched access, and both are decided inside `Jit::run`. A detached
+        // handle leaves emitted code byte-identical.
+        if let Some(j) = jit.as_mut() {
+            j.set_debug(dbg.clone());
+        }
 
         Ok(Process {
             mem,
@@ -1635,18 +1642,14 @@ impl Process {
         // Single-step: one instruction is one instruction, and a compiled block
         // is many. Permanent.
         stepping
-            // Until the JIT declines to chain past an armed address (S3 of the
-            // W9.3 design note) a compiled block would run straight through a
-            // breakpoint. Missing a breakpoint is the one failure a debugger may
-            // not have, so an armed address takes the run off the JIT for as
-            // long as it is armed: slower, never wrong, and self-lifting.
-            || self.dbg.any_breakpoints()
-            // Likewise for watchpoints. A compiled block already *records* the
-            // hit — `jit_read`/`jit_write` go through the same `read_uint` /
-            // `write_uint` the interpreter does — but it does not stop, so the
-            // hit would surface a whole chain late and be reported against the
-            // wrong instruction count. S6 is the stop half.
-            || self.dbg.any_watchpoints()
+            // Breakpoints and watchpoints no longer force the interpreter:
+            // S3 ends a compiled block *before* an armed address (so arming
+            // splits a block rather than de-optimising it) and S6 stops on a
+            // watched access before it happens, with the software TLB refusing
+            // to fill while a watchpoint is armed so the fast path cannot hide
+            // one. Both are proven against the JIT's own counters in
+            // `crates/jit/tests/debug.rs`, which asserts native code ran before
+            // each stop.
             // The chain loop stops at or *past* its budget, so it can overshoot
             // an instruction-count breakpoint by up to one block. Interpreting
             // the last stretch is what makes "stop at instruction N" exact.
