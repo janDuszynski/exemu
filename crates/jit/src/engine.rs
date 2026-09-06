@@ -45,8 +45,11 @@ use crate::rt::{
 
 pub use crate::compile::Mode;
 
-/// The ABI every compiled block is emitted with.
-type BlockFn = unsafe extern "C" fn(*mut CpuState, *mut BlockCtx<'_>) -> u64;
+/// The ABI every compiled block is emitted with. The context is passed as an
+/// untyped pointer because [`BlockCtx`] carries the backend's type as a
+/// parameter (roadmap W8.6) and emitted code reads only the fixed-offset prefix
+/// that every instantiation shares — see [`crate::rt::ctx_off`].
+type BlockFn = unsafe extern "C" fn(*mut CpuState, *mut u8) -> u64;
 
 /// What one [`Jit::run`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -336,7 +339,7 @@ impl Jit {
     }
 
     /// Compile (or find) the block at `rip` in `mode` and return its index.
-    fn block_at(&mut self, rip: u64, mode: Mode, mem: &dyn Memory) -> u32 {
+    fn block_at<M: Memory + ?Sized>(&mut self, rip: u64, mode: Mode, mem: &M) -> u32 {
         let long = mode == Mode::Long;
         let line = Self::line_of(rip, long);
         let l = self.lines[line];
@@ -460,7 +463,7 @@ impl Jit {
     /// almost every store, which measured **40× slower than the interpreter** on
     /// SteamSetup (an NSIS installer that decompresses into its own image)
     /// before this check was made page-precise.
-    fn validate(&mut self, idx: usize, mem: &dyn Memory) -> bool {
+    fn validate<M: Memory + ?Sized>(&mut self, idx: usize, mem: &M) -> bool {
         let cur = mem.code_generation();
         let b = &self.blocks[idx];
         if b.global_gen == cur {
@@ -515,7 +518,13 @@ impl Jit {
     /// blocks to do them: the entry trail (written on every link taken) and the
     /// self-modification check, which is now a page test on every store rather
     /// than a range test against the block currently running.
-    pub fn run(&mut self, state: &mut CpuState, mem: &mut dyn Memory, mode: Mode, budget: u64) -> Run {
+    pub fn run<M: Memory + ?Sized>(
+        &mut self,
+        state: &mut CpuState,
+        mem: &mut M,
+        mode: Mode,
+        budget: u64,
+    ) -> Run {
         self.stats.chains += 1;
         let long = mode == Mode::Long;
         // The running total is reported in a `u32` and a block adds at most
@@ -613,7 +622,7 @@ impl Jit {
                 // while a block is running.
                 let ret = unsafe {
                     let f: BlockFn = code.as_fn();
-                    f(state as *mut CpuState, &mut ctx as *mut BlockCtx)
+                    f(state as *mut CpuState, (&mut ctx as *mut BlockCtx<'_, M>).cast::<u8>())
                 };
                 (ret, ctx.retired, ctx.pending, (ctx.smc, ctx.smc_hits), ctx.trail_at)
             };

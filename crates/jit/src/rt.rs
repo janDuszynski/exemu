@@ -108,15 +108,28 @@ pub struct LinkSlot {
     pub code: u64,
 }
 
+/// The load helper's type, as compiled code calls it.
+pub type ReadFn<M> = unsafe extern "C" fn(*mut BlockCtx<'_, M>, u64, u32) -> ReadResult;
+
+/// The store helper's type.
+pub type WriteFn<M> = unsafe extern "C" fn(*mut BlockCtx<'_, M>, u64, u32, u64) -> u64;
+
 /// Everything a compiled block needs that is not the register file.
 ///
 /// The emitted code loads and stores this struct at fixed offsets ([`ctx_off`])
 /// and passes its address to the helpers; it never interprets the `mem` field,
-/// which is why that field can stay an ordinary Rust trait object.
+/// which is why that field can stay an ordinary Rust reference.
+///
+/// `M` is the guest-memory backend, **by value rather than as `dyn Memory`**
+/// (roadmap W8.6). It buys nothing structurally — the helpers still go through
+/// the same [`Memory`] impl, in the same order, with the same checks — but it
+/// takes the vtable dispatch out of the single hottest path in the JIT: with
+/// the backend's type known, `read_uint`/`write_uint` are direct calls that
+/// ThinLTO can inline into [`jit_read`]/[`jit_write`], which also collapses the
+/// 40-byte `Result<u64, EmuError>` those methods return through memory. Guest
+/// loads and stores were **40% of the whole 7-Zip run** when this was measured.
 #[repr(C)]
-pub struct BlockCtx<'a> {
-    /// Guest memory. Only the helpers below dereference it.
-    pub mem: &'a mut dyn Memory,
+pub struct BlockCtx<'a, M: Memory + ?Sized> {
     /// 256-byte table: `parity[b]` is the x86 PF for a result whose low byte is
     /// `b` (1 when the byte has an even number of set bits). Compiled code
     /// computes PF with an `and`+`ldrb` instead of a five-instruction fold.
@@ -129,9 +142,9 @@ pub struct BlockCtx<'a> {
     pub code_lo: u64,
     pub code_hi: u64,
     /// Address of [`jit_read`], loaded and `blr`-ed by compiled code.
-    pub read: unsafe extern "C" fn(*mut BlockCtx<'_>, u64, u32) -> ReadResult,
+    pub read: ReadFn<M>,
     /// Address of [`jit_write`].
-    pub write: unsafe extern "C" fn(*mut BlockCtx<'_>, u64, u32, u64) -> u64,
+    pub write: WriteFn<M>,
     /// Guest instructions retired since [`crate::Jit::run`] was entered — kept
     /// here rather than in a register because a chain of natively linked blocks
     /// carries it across block boundaries without returning to Rust.
@@ -169,9 +182,17 @@ pub struct BlockCtx<'a> {
     /// from. Read by [`jit_write`] on every store, so it is a table lookup and
     /// not a set-membership test.
     pub code_pages: *const u64,
+    /// Guest memory. Only the helpers below dereference it.
+    ///
+    /// **Last on purpose.** `M` is a type parameter (roadmap W8.6), so this is
+    /// a thin pointer for a concrete backend and a fat one for `dyn Memory`;
+    /// putting it last means every offset above it is the same either way, and
+    /// the emitter's [`ctx_off`] constants hold for every instantiation.
+    /// `ctx_offsets_do_not_depend_on_the_memory_type` pins that.
+    pub mem: &'a mut M,
 }
 
-impl BlockCtx<'_> {
+impl<M: Memory + ?Sized> BlockCtx<'_, M> {
     /// Might a compiled block live on `addr`'s page? A clear bit is a definitive
     /// no; a set bit is confirmed against the engine's exact page set on the
     /// rare path (see [`crate::Jit`]).
@@ -188,19 +209,25 @@ impl BlockCtx<'_> {
 }
 
 /// Byte offsets of the [`BlockCtx`] fields the emitter loads and stores.
+///
+/// Taken against `dyn Memory`, and identical for every other backend: `mem` is
+/// the struct's last field, so the type parameter cannot move anything the
+/// emitter addresses (see [`BlockCtx::mem`]).
 pub mod ctx_off {
     use super::BlockCtx;
-    pub const PARITY: u32 = std::mem::offset_of!(BlockCtx<'static>, parity) as u32;
-    pub const CODE_LO: u32 = std::mem::offset_of!(BlockCtx<'static>, code_lo) as u32;
-    pub const READ: u32 = std::mem::offset_of!(BlockCtx<'static>, read) as u32;
-    pub const WRITE: u32 = std::mem::offset_of!(BlockCtx<'static>, write) as u32;
-    pub const RETIRED: u32 = std::mem::offset_of!(BlockCtx<'static>, retired) as u32;
-    pub const BUDGET: u32 = std::mem::offset_of!(BlockCtx<'static>, budget) as u32;
-    pub const LINKS: u32 = std::mem::offset_of!(BlockCtx<'static>, links) as u32;
-    pub const LINK_EPOCH: u32 = std::mem::offset_of!(BlockCtx<'static>, link_epoch) as u32;
-    pub const PENDING: u32 = std::mem::offset_of!(BlockCtx<'static>, pending) as u32;
-    pub const TRAIL: u32 = std::mem::offset_of!(BlockCtx<'static>, trail) as u32;
-    pub const TRAIL_AT: u32 = std::mem::offset_of!(BlockCtx<'static>, trail_at) as u32;
+    use exemu_core::Memory;
+    type Ctx = BlockCtx<'static, dyn Memory>;
+    pub const PARITY: u32 = std::mem::offset_of!(Ctx, parity) as u32;
+    pub const CODE_LO: u32 = std::mem::offset_of!(Ctx, code_lo) as u32;
+    pub const READ: u32 = std::mem::offset_of!(Ctx, read) as u32;
+    pub const WRITE: u32 = std::mem::offset_of!(Ctx, write) as u32;
+    pub const RETIRED: u32 = std::mem::offset_of!(Ctx, retired) as u32;
+    pub const BUDGET: u32 = std::mem::offset_of!(Ctx, budget) as u32;
+    pub const LINKS: u32 = std::mem::offset_of!(Ctx, links) as u32;
+    pub const LINK_EPOCH: u32 = std::mem::offset_of!(Ctx, link_epoch) as u32;
+    pub const PENDING: u32 = std::mem::offset_of!(Ctx, pending) as u32;
+    pub const TRAIL: u32 = std::mem::offset_of!(Ctx, trail) as u32;
+    pub const TRAIL_AT: u32 = std::mem::offset_of!(Ctx, trail_at) as u32;
 }
 
 /// The parity table (`PF` = 1 when the low byte has an even population count).
@@ -219,7 +246,11 @@ pub static PARITY: [u8; 256] = {
 /// # Safety
 /// `ctx` must be the pointer the engine passed into the block: a live,
 /// exclusively-borrowed `BlockCtx` for the duration of the call.
-pub unsafe extern "C" fn jit_read(ctx: *mut BlockCtx<'_>, addr: u64, size: u32) -> ReadResult {
+pub unsafe extern "C" fn jit_read<M: Memory + ?Sized>(
+    ctx: *mut BlockCtx<'_, M>,
+    addr: u64,
+    size: u32,
+) -> ReadResult {
     // SAFETY: the engine builds the `BlockCtx` on its own stack, hands the block
     // a raw pointer to it, and holds no reference to it while the block runs —
     // so this is the only live borrow for the duration of the call.
@@ -234,7 +265,12 @@ pub unsafe extern "C" fn jit_read(ctx: *mut BlockCtx<'_>, addr: u64, size: u32) 
 ///
 /// # Safety
 /// As [`jit_read`].
-pub unsafe extern "C" fn jit_write(ctx: *mut BlockCtx<'_>, addr: u64, size: u32, value: u64) -> u64 {
+pub unsafe extern "C" fn jit_write<M: Memory + ?Sized>(
+    ctx: *mut BlockCtx<'_, M>,
+    addr: u64,
+    size: u32,
+    value: u64,
+) -> u64 {
     // SAFETY: see `jit_read`.
     let ctx = unsafe { &mut *ctx };
     // Two questions, because they have two different answers.
@@ -304,8 +340,51 @@ mod tests {
         ] {
             assert_eq!(off % 8, 0, "offset {off} is not 8-aligned");
             assert!(off < 4096 * 8, "offset {off} is past the scaled immediate");
-            assert!((off as usize) < std::mem::size_of::<BlockCtx<'static>>());
+            assert!((off as usize) < std::mem::size_of::<BlockCtx<'static, dyn Memory>>());
         }
+    }
+
+    /// The emitter's offsets are compile-time constants taken against one
+    /// instantiation, but a block runs with whatever backend the caller passed
+    /// (roadmap W8.6). `mem` is last precisely so that cannot matter: a thin
+    /// `&mut VirtualMemory` and a fat `&mut dyn Memory` must put every field the
+    /// emitter addresses in the same place.
+    #[test]
+    fn ctx_offsets_do_not_depend_on_the_memory_type() {
+        macro_rules! offs {
+            ($t:ty) => {
+                [
+                    std::mem::offset_of!(BlockCtx<'static, $t>, parity),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, code_lo),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, code_hi),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, read),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, write),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, retired),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, budget),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, links),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, link_epoch),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, pending),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, trail),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, trail_at),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, smc),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, smc_hits),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, code_pages),
+                ]
+            };
+        }
+        // A stand-in for any concrete backend: what matters is that it is
+        // `Sized`, so `&mut M` is a thin pointer where `&mut dyn Memory` is fat.
+        struct Thin;
+        impl Memory for Thin {
+            fn read(&self, _: u64, _: &mut [u8]) -> exemu_core::Result<()> {
+                unreachable!()
+            }
+            fn write(&mut self, _: u64, _: &[u8]) -> exemu_core::Result<()> {
+                unreachable!()
+            }
+        }
+        assert_eq!(offs!(Thin), offs!(dyn Memory));
+        assert_eq!(offs!(Thin)[0], 0, "the emitter's first field must be at 0");
     }
 
     #[test]

@@ -453,8 +453,8 @@ impl Compiler {
     /// Compile a straight-line block starting at `start`. A plan with
     /// `insns == 0` means nothing here could be compiled and the caller must
     /// interpret.
-    pub fn compile(
-        mem: &dyn Memory,
+    pub fn compile<M: Memory + ?Sized>(
+        mem: &M,
         mode: Mode,
         start: u64,
         max_insns: u32,
@@ -1524,7 +1524,7 @@ const DEFER_SCAN: u32 = 12;
 /// outright. Otherwise settling later costs one instruction *more* than
 /// computing now (the operation has to be repeated to recover NZCV), so the
 /// answer is no.
-fn defer_pays(mem: &dyn Memory, mode: Mode, mut rip: u64, budget: u32) -> bool {
+fn defer_pays<M: Memory + ?Sized>(mem: &M, mode: Mode, mut rip: u64, budget: u32) -> bool {
     for _ in 0..budget {
         let mut window = [0u8; 16];
         if mem.fetch(rip, &mut window).is_err() {
