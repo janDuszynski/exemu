@@ -15,7 +15,7 @@
 //! link-slot array, the block trail and the self-modification report all live
 //! here so that compiled code can maintain them itself.
 
-use exemu_core::Memory;
+use exemu_core::{Memory, Perm};
 
 /// Entries in the block-entry ring [`BlockCtx::trail`] points at. A power of two
 /// so compiled code can wrap the index with a single `and`.
@@ -108,6 +108,98 @@ pub struct LinkSlot {
     pub code: u64,
 }
 
+// ---------------------------------------------------------------------------
+// The guest-memory TLB (roadmap W8.6)
+// ---------------------------------------------------------------------------
+//
+// A direct-mapped cache of *host* addresses, so the common guest load or store
+// is a handful of emitted instructions instead of a call into [`jit_read`] /
+// [`jit_write`] and a region lookup. Compiled code only ever **reads** it; every
+// entry is written here, on the slow path, from a span the backend handed out —
+// and the backend refuses to hand one out in exactly the cases where a direct
+// access would not be equivalent (see `Memory::host_span`).
+
+/// Slots, a power of two so the index is a mask. 512 × 32 B = 16 KiB, which
+/// covers 2 MiB of contiguous guest space and sits well inside L1D.
+pub const TLB_SLOTS: usize = 512;
+
+/// `log2(TLB_SLOTS)`, as the emitter's `ubfx` width.
+pub const TLB_SLOT_BITS: u32 = 9;
+
+/// Guest page shift. The same 4 KiB page the SMC seam uses.
+pub const TLB_PAGE_BITS: u32 = 12;
+
+/// Bytes an entry must cover for the page it caches: **the whole page plus the
+/// widest access minus one**.
+///
+/// This is what makes the emitted fast path a single tag compare with no
+/// end-of-access check. An 8-byte load at the page's last byte reaches 7 bytes
+/// into the next page — and because the span was resolved as one contiguous run
+/// inside *one* region, those bytes are at the same host offset and under the
+/// same permission, so the cached base is right for them too. A page whose
+/// region ends less than 7 bytes past it simply never gets an entry and stays
+/// on the helper.
+pub const TLB_SPAN: usize = (1 << TLB_PAGE_BITS) + 7;
+
+/// The tag of a slot that caches nothing. A real tag is a guest address shifted
+/// right by [`TLB_PAGE_BITS`], so it can never reach `u64::MAX` — which matters,
+/// because a *zeroed* table would otherwise claim to cache guest page 0, and the
+/// differential's edge layout maps page 0 on purpose.
+pub const TLB_EMPTY: u64 = u64::MAX;
+
+/// One direct-mapped entry: a page's host base for reading and for writing,
+/// kept apart so a store can never take an entry a load filled.
+///
+/// `base` is `host_address_of_page - guest_page_base`, so compiled code forms
+/// the host address as `base + guest_addr` with one add folded into the load's
+/// addressing mode.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlbEntry {
+    pub read_tag: u64,
+    pub read_base: u64,
+    pub write_tag: u64,
+    pub write_base: u64,
+}
+
+impl TlbEntry {
+    /// An entry that caches nothing.
+    pub const EMPTY: TlbEntry =
+        TlbEntry { read_tag: TLB_EMPTY, read_base: 0, write_tag: TLB_EMPTY, write_base: 0 };
+}
+
+impl Default for TlbEntry {
+    fn default() -> Self {
+        TlbEntry::EMPTY
+    }
+}
+
+/// Byte offsets inside a [`TlbEntry`], for the emitter's `ldp`.
+pub mod tlb_off {
+    use super::TlbEntry;
+    pub const READ: u32 = std::mem::offset_of!(TlbEntry, read_tag) as u32;
+    pub const WRITE: u32 = std::mem::offset_of!(TlbEntry, write_tag) as u32;
+    pub const SIZE: u32 = std::mem::size_of::<TlbEntry>() as u32;
+}
+
+/// The tag compiled code compares against: `addr`'s guest page number.
+#[inline]
+pub fn tlb_tag(addr: u64) -> u64 {
+    addr >> TLB_PAGE_BITS
+}
+
+/// The slot compiled code indexes: the low bits of that page number.
+#[inline]
+pub fn tlb_slot(addr: u64) -> usize {
+    (tlb_tag(addr) as usize) & (TLB_SLOTS - 1)
+}
+
+/// Base of the page `addr` is on.
+#[inline]
+fn tlb_page_base(addr: u64) -> u64 {
+    addr & !((1u64 << TLB_PAGE_BITS) - 1)
+}
+
 /// The load helper's type, as compiled code calls it.
 pub type ReadFn<M> = unsafe extern "C" fn(*mut BlockCtx<'_, M>, u64, u32) -> ReadResult;
 
@@ -182,6 +274,20 @@ pub struct BlockCtx<'a, M: Memory + ?Sized> {
     /// from. Read by [`jit_write`] on every store, so it is a table lookup and
     /// not a set-membership test.
     pub code_pages: *const u64,
+    /// Base of the engine's [`TlbEntry`] array — [`TLB_SLOTS`] entries, read by
+    /// compiled code on every guest access and written only here.
+    pub tlb: *mut TlbEntry,
+    /// Non-zero while the helpers may fill that array. Zero is not a
+    /// correctness requirement — `Memory::host_span` refuses on its own in every
+    /// case that matters — it is how the engine stops paying for fills it knows
+    /// will be refused, and how a test can force every access onto the helper.
+    pub tlb_on: u64,
+    /// Entries filled, and fills the backend refused, since [`crate::Jit::run`]
+    /// was entered. Reported, not acted on: a refusal is a store into
+    /// executable memory or a page at the tail of its region, and how often
+    /// those happen is the thing worth knowing rather than guessing at.
+    pub tlb_fills: u64,
+    pub tlb_denied: u64,
     /// Guest memory. Only the helpers below dereference it.
     ///
     /// **Last on purpose.** `M` is a type parameter (roadmap W8.6), so this is
@@ -193,6 +299,60 @@ pub struct BlockCtx<'a, M: Memory + ?Sized> {
 }
 
 impl<M: Memory + ?Sized> BlockCtx<'_, M> {
+    /// Cache the host base of `addr`'s page for **reading**, if the backend
+    /// will hand one out.
+    ///
+    /// Called from the slow path after an access has already succeeded, so the
+    /// page is known to be mapped; what is being asked here is the stronger
+    /// question the fast path needs — is the *whole* page, plus the seven bytes
+    /// an 8-byte access at its last byte reaches, inside one region with this
+    /// permission, and is there nothing armed that must observe the access.
+    /// Every one of those is the backend's judgement, not this crate's.
+    #[cold]
+    #[inline(never)]
+    fn tlb_fill_read(&mut self, addr: u64) {
+        let page = tlb_page_base(addr);
+        let Some(span) = self.mem.host_span(page, TLB_SPAN, Perm::READ) else {
+            self.tlb_denied += 1;
+            return;
+        };
+        let base = (span.as_ptr() as u64).wrapping_sub(page);
+        self.tlb_fills += 1;
+        // SAFETY: `tlb` is the engine's array, `TLB_SLOTS` entries long and
+        // alive for the whole call; `tlb_slot` masks to exactly that many. The
+        // base is written before the tag so a slot is never momentarily
+        // readable with a stale base.
+        unsafe {
+            let e = self.tlb.add(tlb_slot(addr));
+            (*e).read_base = base;
+            (*e).read_tag = tlb_tag(addr);
+        }
+    }
+
+    /// As [`tlb_fill_read`](Self::tlb_fill_read), for **writing**.
+    ///
+    /// The backend additionally refuses executable memory here, which is what
+    /// keeps every store that could rewrite compiled code on [`jit_write`] —
+    /// and therefore keeps the self-modification range test, the code-page hash
+    /// and `Memory::code_generation` in the path of every such store.
+    #[cold]
+    #[inline(never)]
+    fn tlb_fill_write(&mut self, addr: u64) {
+        let page = tlb_page_base(addr);
+        let Some(span) = self.mem.host_span_mut(page, TLB_SPAN, Perm::WRITE) else {
+            self.tlb_denied += 1;
+            return;
+        };
+        let base = (span.as_mut_ptr() as u64).wrapping_sub(page);
+        self.tlb_fills += 1;
+        // SAFETY: as `tlb_fill_read`.
+        unsafe {
+            let e = self.tlb.add(tlb_slot(addr));
+            (*e).write_base = base;
+            (*e).write_tag = tlb_tag(addr);
+        }
+    }
+
     /// Might a compiled block live on `addr`'s page? A clear bit is a definitive
     /// no; a set bit is confirmed against the engine's exact page set on the
     /// rare path (see [`crate::Jit`]).
@@ -228,6 +388,7 @@ pub mod ctx_off {
     pub const PENDING: u32 = std::mem::offset_of!(Ctx, pending) as u32;
     pub const TRAIL: u32 = std::mem::offset_of!(Ctx, trail) as u32;
     pub const TRAIL_AT: u32 = std::mem::offset_of!(Ctx, trail_at) as u32;
+    pub const TLB: u32 = std::mem::offset_of!(Ctx, tlb) as u32;
 }
 
 /// The parity table (`PF` = 1 when the low byte has an even population count).
@@ -256,7 +417,15 @@ pub unsafe extern "C" fn jit_read<M: Memory + ?Sized>(
     // so this is the only live borrow for the duration of the call.
     let ctx = unsafe { &mut *ctx };
     match ctx.mem.read_uint(addr, size as u8) {
-        Ok(value) => ReadResult { value, status: status::OK },
+        Ok(value) => {
+            // The access succeeded, so this is a page worth caching — and this
+            // is the only moment the helper runs for it, because once the entry
+            // is in, compiled code stops calling here for that page.
+            if ctx.tlb_on != 0 {
+                ctx.tlb_fill_read(addr);
+            }
+            ReadResult { value, status: status::OK }
+        }
         Err(_) => ReadResult { value: 0, status: status::FAULT },
     }
 }
@@ -311,6 +480,9 @@ pub unsafe extern "C" fn jit_write<M: Memory + ?Sized>(
                 ctx.smc_hits += 1;
                 ctx.link_epoch = LINK_EPOCH_DEAD;
             }
+            if ctx.tlb_on != 0 {
+                ctx.tlb_fill_write(addr);
+            }
             if own {
                 status::WROTE_CODE
             } else {
@@ -324,11 +496,14 @@ pub unsafe extern "C" fn jit_write<M: Memory + ?Sized>(
 mod tests {
     use super::*;
 
-    /// A `BlockCtx` over `mem` with `pages` marked as holding compiled code.
-    fn ctx_over<'a>(
+    /// A `BlockCtx` over `mem` with `pages` marked as holding compiled code and
+    /// `tlb` as its guest-memory TLB.
+    fn ctx_with_tlb<'a>(
         mem: &'a mut exemu_memory::VirtualMemory,
         table: &'a mut [u64],
         pages: &[u64],
+        tlb: &'a mut [TlbEntry],
+        tlb_on: u64,
     ) -> BlockCtx<'a, exemu_memory::VirtualMemory> {
         for &p in pages {
             let bit = code_page_bit(p);
@@ -350,8 +525,42 @@ mod tests {
             smc: NO_SMC,
             smc_hits: 0,
             code_pages: table.as_ptr(),
+            tlb: tlb.as_mut_ptr(),
+            tlb_on,
+            tlb_fills: 0,
+            tlb_denied: 0,
             mem,
         }
+    }
+
+    /// A fresh TLB, as the engine hands one over.
+    fn empty_tlb() -> Vec<TlbEntry> {
+        vec![TlbEntry::EMPTY; TLB_SLOTS]
+    }
+
+    /// The entry `addr` maps to, read back the way compiled code would — through
+    /// the context's own pointer, so the backing array stays borrowed by it.
+    fn slot_of<M: Memory + ?Sized>(ctx: &BlockCtx<'_, M>, addr: u64) -> TlbEntry {
+        // SAFETY: `ctx.tlb` is the array the caller handed over, `TLB_SLOTS`
+        // entries long and alive for the whole test; `tlb_slot` masks into it.
+        unsafe { *ctx.tlb.add(tlb_slot(addr)) }
+    }
+
+    /// Is every slot still empty?
+    fn all_empty<M: Memory + ?Sized>(ctx: &BlockCtx<'_, M>) -> bool {
+        // SAFETY: as `slot_of`.
+        (0..TLB_SLOTS).all(|i| unsafe { *ctx.tlb.add(i) } == TlbEntry::EMPTY)
+    }
+
+    /// The two page-hash tests below do not exercise the TLB, so they get one
+    /// that is switched off.
+    fn ctx_over<'a>(
+        mem: &'a mut exemu_memory::VirtualMemory,
+        table: &'a mut [u64],
+        pages: &[u64],
+        tlb: &'a mut [TlbEntry],
+    ) -> BlockCtx<'a, exemu_memory::VirtualMemory> {
+        ctx_with_tlb(mem, table, pages, tlb, 0)
     }
 
     /// The store helper probes the page-hash table for the access's **last**
@@ -366,7 +575,8 @@ mod tests {
         let mut mem = exemu_memory::VirtualMemory::new();
         mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
         // Only the *second* page is one a compiled block was built from.
-        let mut ctx = ctx_over(&mut mem, &mut table, &[0x9000]);
+        let mut tlb = empty_tlb();
+        let mut ctx = ctx_over(&mut mem, &mut table, &[0x9000], &mut tlb);
         // A 4-byte store whose first byte is on 0x8000 and whose last is on
         // 0x9000. The first probe misses; only the second can catch it.
         // SAFETY: `ctx` is a live, exclusively borrowed context, which is
@@ -386,7 +596,8 @@ mod tests {
         let mut table = vec![0u64; CODE_PAGE_WORDS];
         let mut mem = exemu_memory::VirtualMemory::new();
         mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
-        let mut ctx = ctx_over(&mut mem, &mut table, &[0x9000]);
+        let mut tlb = empty_tlb();
+        let mut ctx = ctx_over(&mut mem, &mut table, &[0x9000], &mut tlb);
         // Wholly inside 0x8000, including the 8-byte store that ends on the
         // page's last byte — the boundary the offset test is written against.
         for (addr, size) in [(0x8000u64, 8u32), (0x8ff8, 8), (0x8fff, 1)] {
@@ -396,6 +607,167 @@ mod tests {
         }
         assert_eq!(ctx.smc_hits, 0);
         assert_eq!(ctx.link_epoch, 7, "the links must stay live");
+    }
+
+    // ---- the guest-memory TLB's fill side (roadmap W8.6) ------------------
+    //
+    // Compiled code only ever *reads* the table, and reading it is a tag compare
+    // it cannot get wrong. Everything that could be wrong is here, in what the
+    // helpers put into it — so these are the tests that matter.
+
+    /// The entry a hit uses: the right slot, the right tag, and a base that
+    /// turns a guest address into the host address of that guest byte.
+    #[test]
+    fn a_successful_read_caches_its_page() {
+        use exemu_core::{Memory as _, Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut tlb = empty_tlb();
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
+        mem.write_u64(0x9100, 0x0123_4567_89ab_cdef).unwrap();
+        let host = mem.host_span(0x9100, 8, Perm::READ).unwrap().as_ptr() as u64;
+
+        let mut ctx = ctx_with_tlb(&mut mem, &mut table, &[], &mut tlb, 1);
+        // SAFETY: `ctx` is a live, exclusively borrowed context.
+        let r = unsafe { jit_read(&mut ctx as *mut _, 0x9100, 8) };
+        assert_eq!(r.status, status::OK);
+        assert_eq!(r.value, 0x0123_4567_89ab_cdef);
+        assert_eq!(ctx.tlb_fills, 1);
+        assert_eq!(ctx.tlb_denied, 0);
+
+        let e = slot_of(&ctx, 0x9100);
+        assert_eq!(e.read_tag, tlb_tag(0x9100), "tagged with its own page");
+        assert_eq!(e.read_base.wrapping_add(0x9100), host, "base + addr is the host byte");
+        assert_eq!(e.write_tag, TLB_EMPTY, "a read must not fill the write half");
+    }
+
+    /// `tlb_on = 0` is the engine saying "do not bother", and nothing may appear.
+    #[test]
+    fn nothing_is_cached_while_the_table_is_switched_off() {
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut tlb = empty_tlb();
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
+        let mut ctx = ctx_with_tlb(&mut mem, &mut table, &[], &mut tlb, 0);
+        // SAFETY: as above.
+        unsafe {
+            jit_read(&mut ctx as *mut _, 0x9100, 8);
+            jit_write(&mut ctx as *mut _, 0x9100, 8, 1);
+        }
+        assert_eq!(ctx.tlb_fills, 0);
+        assert!(all_empty(&ctx));
+    }
+
+    /// **The self-modifying-code guarantee.** PE sections are mapped RWX, so a
+    /// store into an image must stay on the helper, where the code-page hash and
+    /// the running block's own range are tested. Reads of the same page are
+    /// fine — a read changes nothing.
+    #[test]
+    fn a_store_into_executable_memory_is_never_cached() {
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut tlb = empty_tlb();
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("image", 0x40_0000, 0x3000, Perm::RWX)).unwrap();
+        let mut ctx = ctx_with_tlb(&mut mem, &mut table, &[], &mut tlb, 1);
+        // SAFETY: as above.
+        let st = unsafe { jit_write(&mut ctx as *mut _, 0x40_1000, 4, 0x9090_9090) };
+        assert_eq!(st, status::OK);
+        assert_eq!(ctx.tlb_denied, 1, "the backend refused, and it was asked once");
+        assert_eq!(slot_of(&ctx, 0x40_1000).write_tag, TLB_EMPTY);
+        // ...and the store did reach the SMC seam it would have bypassed.
+        assert_eq!(ctx.mem.code_generation(), 1);
+        // A read of the same page caches normally.
+        // SAFETY: as above.
+        unsafe { jit_read(&mut ctx as *mut _, 0x40_1000, 4) };
+        assert_eq!(slot_of(&ctx, 0x40_1000).read_tag, tlb_tag(0x40_1000));
+    }
+
+    /// **The watchpoint guarantee.** Nothing is cached while one is armed, so
+    /// every access keeps going through the backend that reports it.
+    #[test]
+    fn nothing_is_cached_while_a_watchpoint_is_armed() {
+        use exemu_core::debug::{DebugControl, WatchKind};
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut tlb = empty_tlb();
+        let mut mem = exemu_memory::VirtualMemory::new();
+        mem.map(Region::new("data", 0x8000, 0x3000, Perm::RW)).unwrap();
+        let d = DebugControl::attached();
+        mem.set_debug(d.clone());
+        // Armed on a completely different address: the refusal is global,
+        // because an entry makes *every* access to its page unobservable.
+        d.arm_watch(0x8f00, 4, WatchKind::Write);
+
+        let mut ctx = ctx_with_tlb(&mut mem, &mut table, &[], &mut tlb, 1);
+        // SAFETY: as above.
+        unsafe {
+            jit_read(&mut ctx as *mut _, 0x9100, 8);
+            jit_write(&mut ctx as *mut _, 0x9100, 8, 1);
+        }
+        assert_eq!(ctx.tlb_fills, 0);
+        assert!(all_empty(&ctx));
+        // The access that was armed for was seen.
+        // SAFETY: as above.
+        unsafe { jit_write(&mut ctx as *mut _, 0x8f00, 4, 7) };
+        assert!(d.take_watch_hit().is_some(), "the watchpoint must still fire");
+    }
+
+    /// A page whose region ends inside the span an entry has to cover is left
+    /// alone, which is what lets the emitted probe be a single tag compare with
+    /// no end-of-access check: an 8-byte load at the page's last byte reaches
+    /// seven bytes past it, and those bytes have to be in the same region.
+    #[test]
+    fn a_page_at_the_tail_of_its_region_is_not_cached() {
+        use exemu_core::{Perm, Region};
+        let mut table = vec![0u64; CODE_PAGE_WORDS];
+        let mut tlb = empty_tlb();
+        let mut mem = exemu_memory::VirtualMemory::new();
+        // Exactly one page: the last byte's 8-byte access would leave it.
+        mem.map(Region::new("tight", 0x8000, 0x1000, Perm::RW)).unwrap();
+        // One page plus the slack: cacheable.
+        mem.map(Region::new("loose", 0xa000, 0x1000 + 8, Perm::RW)).unwrap();
+        let mut ctx = ctx_with_tlb(&mut mem, &mut table, &[], &mut tlb, 1);
+        // SAFETY: as above.
+        unsafe { jit_read(&mut ctx as *mut _, 0x8010, 4) };
+        assert_eq!(slot_of(&ctx, 0x8010).read_tag, TLB_EMPTY, "tight region");
+        assert_eq!(ctx.tlb_denied, 1);
+        // SAFETY: as above.
+        unsafe { jit_read(&mut ctx as *mut _, 0xa010, 4) };
+        assert_eq!(slot_of(&ctx, 0xa010).read_tag, tlb_tag(0xa010), "loose region");
+
+        // The property that buys: every access of every width, anywhere on a
+        // cached page, lands inside the span the entry was filled from.
+        let e = slot_of(&ctx, 0xa010);
+        let span = ctx.mem.host_span(0xa000, TLB_SPAN, Perm::READ).unwrap();
+        let lo = span.as_ptr() as u64;
+        for off in [0u64, 1, 0xffe, 0xfff] {
+            for width in [1u64, 2, 4, 8] {
+                let host = e.read_base.wrapping_add(0xa000 + off);
+                assert!(host >= lo, "{off:#x}/{width} before the span");
+                assert!(host + width <= lo + TLB_SPAN as u64, "{off:#x}/{width} past the span");
+            }
+        }
+    }
+
+    /// A tag is a guest address shifted right by the page bits, so it can never
+    /// be the empty marker — which is what stops a *zeroed* table from claiming
+    /// to cache guest page 0. The differential's edge layout maps page 0.
+    #[test]
+    fn no_real_tag_can_collide_with_the_empty_marker() {
+        for addr in [0u64, 1, 0xfff, 0x1000, u64::MAX, u64::MAX - 1] {
+            assert_ne!(tlb_tag(addr), TLB_EMPTY, "{addr:#x}");
+            assert!(tlb_slot(addr) < TLB_SLOTS);
+        }
+        assert_eq!(TlbEntry::EMPTY.read_tag, TLB_EMPTY);
+        assert_eq!(TlbEntry::EMPTY.write_tag, TLB_EMPTY);
+        assert_ne!(TlbEntry::EMPTY, TlbEntry { read_tag: 0, ..TlbEntry::EMPTY });
+        // The emitter folds the entry size into a shift.
+        assert_eq!(tlb_off::SIZE, 32);
+        assert_eq!(tlb_off::READ, 0);
+        assert_eq!(tlb_off::WRITE, 16);
+        assert_eq!(1usize << TLB_SLOT_BITS, TLB_SLOTS);
     }
 
     #[test]
