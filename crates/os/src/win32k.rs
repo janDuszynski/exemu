@@ -140,6 +140,22 @@ mod message_call {
     /// The internal `dispatch_message` every `DispatchMessage{A,W}` that is not
     /// `WM_PAINT`/`WM_TIMER` lowers to.
     pub const DISPATCH_MESSAGE: u64 = 0x3001;
+    /// **`SpyGetMsgName`** — not a message send at all: a *query* for the
+    /// printable name of message `msg` (roadmap W5.10).
+    ///
+    /// `user32!SPY_GetMsgName` (i386 rva 0x47f50) issues
+    /// `NtUserMessageCall(hwnd, msg, 0x80, 0, buffer, 0x3002, FALSE)` — `wParam`
+    /// is the buffer's size in bytes and `resultInfo` is the buffer, an ANSI
+    /// `char[128]` on its own stack, which it then prints with `"%s"`.
+    ///
+    /// It has to be named here because `user32!DefWindowProcW` calls
+    /// `SPY_EnterMessage` on **every** message, and treating this query as a
+    /// send is a self-feeding loop: kernel sends `WM_NCCREATE` → the WndProc
+    /// tail-jumps to `DefWindowProcW` → `SPY_EnterMessage` → `SPY_GetMsgName`
+    /// → the kernel "sends" `WM_NCCREATE` again. Measured on `SteamSetup.exe`:
+    /// 461 nested callbacks in ~200k instructions, ending in a 2 MiB 64-bit
+    /// stack overflow inside `wow64!Wow64KiUserCallbackDispatcher`.
+    pub const SPY_GET_MSG_NAME: u64 = 0x3002;
 }
 
 /// `CallWindowProc`'s `resultInfo` block starts with the procedure to call —
@@ -676,23 +692,62 @@ mod ancestor {
 /// keep the message pump inside the kernel for ever.
 const HIT_TEST_ROUNDS_MAX: usize = 8;
 
-// --- CREATESTRUCTW (64-bit) field offsets ---------------------------------
+// --- CREATESTRUCTW field offsets ------------------------------------------
 // The struct `WM_NCCREATE`/`WM_CREATE` carry in lParam. The `cy, cx, y, x`
 // ordering is the documented (counter-intuitive) Win32 layout, not a typo.
-const CS_LP_CREATE_PARAMS: u64 = 0x00;
-const CS_HINSTANCE: u64 = 0x08;
-const CS_HMENU: u64 = 0x10;
-const CS_HWND_PARENT: u64 = 0x18;
-const CS_CY: u64 = 0x20;
-const CS_CX: u64 = 0x24;
-const CS_Y: u64 = 0x28;
-const CS_X: u64 = 0x2C;
-const CS_STYLE: u64 = 0x30;
-const CS_LPSZ_NAME: u64 = 0x38;
-const CS_LPSZ_CLASS: u64 = 0x40;
-const CS_DW_EX_STYLE: u64 = 0x48;
-/// `sizeof(CREATESTRUCTW)` on 64-bit.
-const CREATESTRUCT_SIZE: u64 = 0x50;
+// Two layouts, because the receiving *code*'s bitness decides: a WoW64 guest's
+// WndProc is 32-bit and reads four-byte handles and string pointers (roadmap
+// W5.10).
+struct CsLayout {
+    lp_create_params: u64,
+    hinstance: u64,
+    hmenu: u64,
+    hwnd_parent: u64,
+    cy: u64,
+    cx: u64,
+    y: u64,
+    x: u64,
+    style: u64,
+    lpsz_name: u64,
+    lpsz_class: u64,
+    dw_ex_style: u64,
+    /// `sizeof(CREATESTRUCTW)` in this layout.
+    size: u64,
+}
+
+/// `CREATESTRUCTW` as 64-bit guest code sees it.
+const CS64: CsLayout = CsLayout {
+    lp_create_params: 0x00,
+    hinstance: 0x08,
+    hmenu: 0x10,
+    hwnd_parent: 0x18,
+    cy: 0x20,
+    cx: 0x24,
+    y: 0x28,
+    x: 0x2C,
+    style: 0x30,
+    lpsz_name: 0x38,
+    lpsz_class: 0x40,
+    dw_ex_style: 0x48,
+    size: 0x50,
+};
+
+/// …and as 32-bit guest code does.
+const CS32: CsLayout = CsLayout {
+    lp_create_params: 0x00,
+    hinstance: 0x04,
+    hmenu: 0x08,
+    hwnd_parent: 0x0C,
+    cy: 0x10,
+    cx: 0x14,
+    y: 0x18,
+    x: 0x1C,
+    style: 0x20,
+    lpsz_name: 0x24,
+    lpsz_class: 0x28,
+    dw_ex_style: 0x2C,
+    size: 0x30,
+};
 
 /// Bytes reserved below the interrupted `NtUserCreateWindowEx` syscall's guest
 /// rsp to hold the `CREATESTRUCTW` plus NUL-terminated copies of the window and
@@ -1708,9 +1763,22 @@ fn dispatch_create_messages(
     if wndproc == 0 {
         return Ok(false);
     }
-    let scratch = os.syscall_guest_rsp.wrapping_sub(CREATE_SCRATCH);
-    let cs = scratch & !0xf;
-    let strings = cs + CREATESTRUCT_SIZE;
+    // Where the struct goes, and how wide its pointers are, is decided by the
+    // *guest code's* bitness, not the process's. In a WoW64 process the 64-bit
+    // stack is at 0x10_0000_0000, so a `CREATESTRUCTW` parked below the syscall
+    // frame would reach the 32-bit WndProc as a truncated, unmapped `lParam`;
+    // and its `lpszName`/`lpszClass`/`hInstance` are 4 bytes wide there, not 8.
+    let wow64 = os.is_wow64();
+    let (cs, reserve) = if wow64 {
+        let Some(low) = os.wow64_callback_scratch(mem, CREATE_SCRATCH) else {
+            return Ok(false);
+        };
+        (low, 0)
+    } else {
+        (os.syscall_guest_rsp.wrapping_sub(CREATE_SCRATCH) & !0xf, CREATE_SCRATCH)
+    };
+    let layout = if wow64 { &CS32 } else { &CS64 };
+    let strings = cs + layout.size;
     // A stack too shallow to hold the scratch is not worth faulting the guest
     // over: skip the creation pair rather than corrupt memory.
     let Ok((name_ptr, name_len)) = write_wstr_at(mem, strings, info.title) else {
@@ -1718,25 +1786,32 @@ fn dispatch_create_messages(
     };
     let (class_ptr, _) = write_wstr_at(mem, strings + name_len, info.class_name)?;
 
-    mem.write_u64(cs + CS_LP_CREATE_PARAMS, info.create_params)?;
-    mem.write_u64(cs + CS_HINSTANCE, info.instance)?;
-    mem.write_u64(cs + CS_HMENU, info.menu)?;
-    mem.write_u64(cs + CS_HWND_PARENT, info.parent as u64)?;
-    mem.write_u32(cs + CS_CY, info.rect[3] as u32)?;
-    mem.write_u32(cs + CS_CX, info.rect[2] as u32)?;
-    mem.write_u32(cs + CS_Y, info.rect[1] as u32)?;
-    mem.write_u32(cs + CS_X, info.rect[0] as u32)?;
-    mem.write_u32(cs + CS_STYLE, info.style)?;
-    mem.write_u64(cs + CS_LPSZ_NAME, name_ptr)?;
-    mem.write_u64(cs + CS_LPSZ_CLASS, class_ptr)?;
-    mem.write_u32(cs + CS_DW_EX_STYLE, info.ex_style)?;
+    let ptr = |mem: &mut dyn Memory, at: u64, v: u64| -> Result<()> {
+        if wow64 {
+            mem.write_u32(at, v as u32)
+        } else {
+            mem.write_u64(at, v)
+        }
+    };
+    ptr(mem, cs + layout.lp_create_params, info.create_params)?;
+    ptr(mem, cs + layout.hinstance, info.instance)?;
+    ptr(mem, cs + layout.hmenu, info.menu)?;
+    ptr(mem, cs + layout.hwnd_parent, info.parent as u64)?;
+    mem.write_u32(cs + layout.cy, info.rect[3] as u32)?;
+    mem.write_u32(cs + layout.cx, info.rect[2] as u32)?;
+    mem.write_u32(cs + layout.y, info.rect[1] as u32)?;
+    mem.write_u32(cs + layout.x, info.rect[0] as u32)?;
+    mem.write_u32(cs + layout.style, info.style)?;
+    ptr(mem, cs + layout.lpsz_name, name_ptr)?;
+    ptr(mem, cs + layout.lpsz_class, class_ptr)?;
+    mem.write_u32(cs + layout.dw_ex_style, info.ex_style)?;
 
     let hwnd = hwnd as u64;
     let calls = vec![
         (wndproc, vec![hwnd, WM_NCCREATE as u64, 0, cs]),
         (wndproc, vec![hwnd, crate::gdi::WM_CREATE, 0, cs]),
     ];
-    os.call_wndprocs_from_syscall(cpu, mem, calls, Some(hwnd), CREATE_SCRATCH)
+    os.call_wndprocs_from_syscall(cpu, mem, calls, Some(hwnd), reserve)
 }
 
 /// `NtUserShowWindow(hwnd, cmd)` / `NtUserShowWindowAsync` — mark the window
@@ -1874,6 +1949,19 @@ fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
             let r = def_window_proc(os, cpu, mem, hwnd, msg, wparam, lparam, ansi)?;
             os.return_u64_from_syscall(r);
             Ok(0) // ignored: the 64-bit LRESULT above is what reaches rax
+        }
+        // A *query*, not a send: name the message into the caller's buffer.
+        // exemu has no table of Win32 message names, so it answers with the
+        // number — honest, and the only consumer is a trace string.
+        message_call::SPY_GET_MSG_NAME => {
+            let size = wparam.min(32) as usize;
+            if result_info != 0 && size > 1 {
+                let name = format!("{msg:#06x}");
+                let bytes = &name.as_bytes()[..name.len().min(size - 1)];
+                mem.write(result_info, bytes)?;
+                mem.write_u8(result_info + bytes.len() as u64, 0)?;
+            }
+            Ok(0)
         }
         message_call::CALL_WINDOW_PROC => {
             // `resultInfo+0` is the `lpPrevWndFunc` the caller passed.
@@ -2809,10 +2897,10 @@ fn arm_hit_test(
     let hwnd = pending.hwnd;
     let wndproc = os.win32k_state.wndproc_for(hwnd);
     let (x, y) = input_point(pending.ev).unwrap_or((0, 0));
-    // `!can_call_client()` (a WoW64 process) is handled here rather than at the
-    // callback itself because `pending` is consumed by the install: a window
-    // that *cannot* be asked is indistinguishable from one that has no WndProc,
-    // and both take the kernel's own answer.
+    // `!can_call_client()` (a boot with no callback route at all) is handled
+    // here rather than at the callback itself because `pending` is consumed by
+    // the install: a window that *cannot* be asked is indistinguishable from one
+    // that has no WndProc, and both take the kernel's own answer.
     if wndproc == 0 || !os.can_call_client() || pending.skipped.len() >= HIT_TEST_ROUNDS_MAX {
         let code =
             if os.win32k_state.contains_point(hwnd, x, y) { hit::CLIENT } else { hit::NOWHERE };
@@ -3089,7 +3177,7 @@ fn dispatch_to_wndproc(
     }
     let m = crate::msg::PostedMsg { hwnd, message: msg, wparam, lparam };
     if !os.call_wndprocs_from_syscall(cpu, mem, vec![(wndproc, m.into_args())], result, 0)? {
-        // No frame was installed (a WoW64 process — see `can_call_client`), so
+        // No frame was installed (no callback route — see `can_call_client`), so
         // nothing will supply rax on resume: answer here instead of returning
         // a 0 the handler never meant.
         return Ok(result.unwrap_or(0) as u32);
@@ -4488,17 +4576,17 @@ mod tests {
         assert!(dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap());
 
         let cs = (guest_rsp - CREATE_SCRATCH) & !0xf;
-        assert_eq!(mem.read_u64(cs + CS_LP_CREATE_PARAMS).unwrap(), 0xDEAD_BEEF);
-        assert_eq!(mem.read_u64(cs + CS_HINSTANCE).unwrap(), 0x1_4000_0000);
-        assert_eq!(mem.read_u64(cs + CS_HMENU).unwrap(), 0x65);
-        assert_eq!(mem.read_u64(cs + CS_HWND_PARENT).unwrap(), 0x1234);
+        assert_eq!(mem.read_u64(cs + CS64.lp_create_params).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(mem.read_u64(cs + CS64.hinstance).unwrap(), 0x1_4000_0000);
+        assert_eq!(mem.read_u64(cs + CS64.hmenu).unwrap(), 0x65);
+        assert_eq!(mem.read_u64(cs + CS64.hwnd_parent).unwrap(), 0x1234);
         // The `cy, cx, y, x` ordering is the documented (inverted) Win32 layout.
-        assert_eq!(mem.read_u32(cs + CS_CY).unwrap(), 200);
-        assert_eq!(mem.read_u32(cs + CS_CX).unwrap(), 300);
-        assert_eq!(mem.read_u32(cs + CS_Y).unwrap(), 20);
-        assert_eq!(mem.read_u32(cs + CS_X).unwrap(), 10);
-        assert_eq!(mem.read_u32(cs + CS_STYLE).unwrap(), 0x5000_0000);
-        assert_eq!(mem.read_u32(cs + CS_DW_EX_STYLE).unwrap(), 0x8);
+        assert_eq!(mem.read_u32(cs + CS64.cy).unwrap(), 200);
+        assert_eq!(mem.read_u32(cs + CS64.cx).unwrap(), 300);
+        assert_eq!(mem.read_u32(cs + CS64.y).unwrap(), 20);
+        assert_eq!(mem.read_u32(cs + CS64.x).unwrap(), 10);
+        assert_eq!(mem.read_u32(cs + CS64.style).unwrap(), 0x5000_0000);
+        assert_eq!(mem.read_u32(cs + CS64.dw_ex_style).unwrap(), 0x8);
 
         let read = |p: u64| {
             let mut s = String::new();
@@ -4510,11 +4598,11 @@ mod tests {
             }
             s
         };
-        let name = mem.read_u64(cs + CS_LPSZ_NAME).unwrap();
-        let class = mem.read_u64(cs + CS_LPSZ_CLASS).unwrap();
+        let name = mem.read_u64(cs + CS64.lpsz_name).unwrap();
+        let class = mem.read_u64(cs + CS64.lpsz_class).unwrap();
         assert_eq!(read(name), "Title", "lpszName is a NUL-terminated copy");
         assert_eq!(read(class), "TestClass", "lpszClass is a NUL-terminated copy");
-        assert!(name >= cs + CREATESTRUCT_SIZE && class > name, "the names follow the struct");
+        assert!(name >= cs + CS64.size && class > name, "the names follow the struct");
         assert!(
             class < guest_rsp,
             "the whole scratch stays below the interrupted syscall's stack pointer"
@@ -4548,10 +4636,10 @@ mod tests {
         };
         dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap();
         let cs = (0x10_8000u64 - CREATE_SCRATCH) & !0xf;
-        assert_eq!(mem.read_u64(cs + CS_LPSZ_NAME).unwrap(), 0);
+        assert_eq!(mem.read_u64(cs + CS64.lpsz_name).unwrap(), 0);
         assert_eq!(
-            mem.read_u64(cs + CS_LPSZ_CLASS).unwrap(),
-            cs + CREATESTRUCT_SIZE,
+            mem.read_u64(cs + CS64.lpsz_class).unwrap(),
+            cs + CS64.size,
             "the class name takes the start of the string area when there is no window name"
         );
     }
@@ -4578,22 +4666,27 @@ mod tests {
         assert_eq!(cpu.rip, 0, "nothing was seated");
     }
 
-    /// **A WoW64 process gets no creation pair either — the pinned W5.10 gap.**
+    /// **A WoW64 process gets its creation pair through a client callback**
+    /// (roadmap W5.10) — the positive half of what used to be pinned as a gap.
     ///
     /// The WndProc is 32-bit guest code but the win32k syscall arrives in long
-    /// mode, so seating it directly would run 32-bit bytes as 64-bit ones (see
+    /// mode, so seating it directly ran 32-bit bytes as 64-bit ones (see
     /// `WinOs::can_call_client` for the measured `SteamSetup` failure). The
-    /// window is still created; it simply never hears `WM_NCCREATE`/`WM_CREATE`.
+    /// kernel's own route does not: it resumes user mode at
+    /// `ntdll!KiUserCallbackDispatcher` with an `NtUserCallWinProc` block, and
+    /// everything below that — the mode switch, the `stdcall` frame, the return
+    /// address — is Wine's.
     ///
-    /// This test fails the day exemu routes client callbacks through
-    /// `ntdll64!KiUserCallbackDispatcher` → `wow64!Wow64KiUserCallbackDispatcher`,
-    /// which is exactly when the claim above must be rewritten.
+    /// What is asserted here is exactly what exemu contributes: the entry, the
+    /// dispatcher frame, and a `win_proc_params` whose `func`/`procW` are the
+    /// registered 32-bit WndProc and whose `lParam` is a **32-bit-addressable**
+    /// `CREATESTRUCTW` (the 64-bit stack of a WoW64 process is at
+    /// `0x10_0000_0000`, so one parked there would arrive truncated).
     #[test]
-    fn a_wow64_process_gets_no_creation_pair() {
-        const WNDPROC: u64 = 0x1_4000_1000;
-        let (mut os, mut mem, hwnd) = window_for_create(WNDPROC);
-        os.set_syscall_guest_rsp_for_test(0x10_8000);
-        let mut cpu = CpuState::default();
+    fn a_wow64_process_gets_its_creation_pair_through_a_client_callback() {
+        use crate::wow64::{cb_frame, win_proc_params as p};
+        const WNDPROC: u64 = 0x0040_1000; // 32-bit guest code
+        const DISPATCHER: u64 = 0x6001_2345; // ntdll64!KiUserCallbackDispatcher
         let info = CreateInfo {
             create_params: 0,
             instance: 0,
@@ -4605,22 +4698,86 @@ mod tests {
             title: "",
             class_name: "TestClass",
         };
-        // The same window, same registered WndProc: only the process changes.
-        assert!(
-            dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap(),
-            "control: a 64-bit process does get the creation pair",
-        );
 
+        // Control: a 64-bit process still takes the direct call.
+        let (mut os, mut mem, hwnd) = window_for_create(WNDPROC);
+        os.set_syscall_guest_rsp_for_test(0x10_8000);
+        let mut cpu = CpuState::default();
+        assert!(dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap());
+        assert_eq!(cpu.rip, WNDPROC, "a 64-bit process calls the WndProc directly");
+
+        // The same window, same registered WndProc: only the process changes.
         let (mut os, mut mem, hwnd) = window_for_create(WNDPROC);
         os.set_syscall_guest_rsp_for_test(0x10_8000);
         os.set_wow64_peb32(0x7f00_8000); // this process is now WoW64
+        os.set_client_callback_dispatcher(DISPATCHER);
         let mut cpu = CpuState::default();
-        assert!(!os.can_call_client(), "a WoW64 process takes no direct client callback");
-        assert!(
-            !dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap(),
-            "no creation pair is seated in a WoW64 process",
+        assert!(os.can_call_client(), "a WoW64 process with a published dispatcher can call back");
+        assert!(dispatch_create_messages(&mut os, &mut cpu, &mut mem, hwnd, &info).unwrap());
+
+        // exemu never enters the 32-bit procedure itself: it returns to user
+        // mode at the dispatcher, with the callback frame the dispatcher reads.
+        assert_eq!(cpu.rip, DISPATCHER, "the guest resumes at KiUserCallbackDispatcher");
+        let frame = cpu.rsp();
+        assert_eq!(frame % 16, 0, "16-byte aligned, so its `call` leaves the callee aligned");
+        assert_eq!(
+            mem.read_u32(frame + cb_frame::ID).unwrap() as u64,
+            u64::from(crate::wow64::NT_USER_CALL_WIN_PROC),
+            "…asking for NtUserCallWinProc",
         );
-        assert_eq!(cpu.rip, 0, "nothing was seated, so no 32-bit code runs in long mode");
+        assert_eq!(mem.read_u32(frame + cb_frame::LEN).unwrap(), p::CALL_LEN);
+
+        // The parameter block: the registered 32-bit WndProc, no ANSI mapping,
+        // nothing packed after it, and a DPI context user32 accepts.
+        let params = mem.read_u64(frame + cb_frame::ARGS).unwrap();
+        assert!(params > frame, "the block sits above the frame the callee grows down from");
+        assert_eq!(mem.read_u64(params + p::FUNC).unwrap(), WNDPROC);
+        assert_eq!(mem.read_u64(params + p::PROC_W).unwrap(), WNDPROC, "the pointer user32 calls");
+        assert_eq!(mem.read_u64(params + p::HWND).unwrap(), hwnd as u64);
+        assert_eq!(mem.read_u32(params + p::MSG).unwrap(), WM_NCCREATE);
+        assert_eq!(mem.read_u64(params + p::WPARAM).unwrap(), 0);
+        assert_eq!(mem.read_u32(params + p::SIZE).unwrap(), 0, "no packed message data");
+        assert_eq!(mem.read_u32(params + p::ANSI).unwrap(), 0);
+        assert_eq!(mem.read_u32(params + p::DPI_CONTEXT).unwrap(), crate::wow64::NTUSER_DPI_UNAWARE);
+
+        // …and the CREATESTRUCTW it points at is 32-bit: below 4 GiB, with
+        // 4-byte handles and string pointers.
+        let cs = mem.read_u64(params + p::LPARAM).unwrap();
+        assert!(cs <= u32::MAX as u64, "a 32-bit WndProc must be able to hold the lParam");
+        assert_eq!(mem.read_u32(cs + CS32.style).unwrap(), 0);
+        let class = mem.read_u32(cs + CS32.lpsz_class).unwrap() as u64;
+        assert_eq!(class, cs + CS32.size, "lpszClass follows the 0x30-byte 32-bit struct");
+        let mut name = String::new();
+        for i in 0.. {
+            match mem.read_u16(class + i * 2).unwrap() {
+                0 => break,
+                c => name.push(char::from_u32(c as u32).unwrap()),
+            }
+        }
+        assert_eq!(name, "TestClass");
+
+        // The callback returns through NtCallbackReturn, not to a thunk: its
+        // LRESULT arrives in a buffer, and the queue then runs `WM_CREATE`.
+        let ret = 0x30_0000u64;
+        mem.map(Region::new("ret", ret, 0x1000, Perm::RW)).unwrap();
+        mem.write_u64(ret, 0x1234_5678).unwrap();
+        assert_eq!(os.client_callback_return(&mut cpu, &mut mem, ret, 8, 0).unwrap(), 0);
+        assert_eq!(cpu.rip, DISPATCHER, "the second creation message is seated the same way");
+        let params2 = mem.read_u64(cpu.rsp() + cb_frame::ARGS).unwrap();
+        assert_eq!(mem.read_u32(params2 + p::MSG).unwrap(), crate::gdi::WM_CREATE as u32);
+
+        // Draining the queue resumes the interrupted syscall with the handler's
+        // own answer — the HWND, not the WndProc's LRESULT.
+        assert_eq!(os.client_callback_return(&mut cpu, &mut mem, ret, 8, 0).unwrap(), 0);
+        assert_eq!(cpu.reg(Reg::Rax), hwnd as u64, "NtUserCreateWindowEx still returns the HWND");
+
+        // A return with no callback active is refused the way wow64.dll's own
+        // slot-5 thunk refuses it.
+        assert_eq!(
+            os.client_callback_return(&mut cpu, &mut mem, ret, 8, 0).unwrap(),
+            0xC000_0258,
+            "STATUS_NO_CALLBACK_ACTIVE",
+        );
     }
 
     /// A second copy of ntdll is recognised structurally (export-directory name

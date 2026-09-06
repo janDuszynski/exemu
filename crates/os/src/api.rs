@@ -82,6 +82,73 @@ pub(crate) struct Win32kCbFrame {
     ///
     /// [`result`]: Self::result
     pub then: Option<crate::win32k::PendingHitTest>,
+    /// Present when this frame's callbacks run as **client callbacks** through
+    /// `ntdll!KiUserCallbackDispatcher` (a WoW64 process — roadmap W5.10). A
+    /// client callback never returns to a thunk: it leaves through
+    /// `NtCallbackReturn`, so nothing on the way preserves the interrupted
+    /// syscall's non-volatile registers and the kernel has to.
+    pub client: Option<Box<ClientCbState>>,
+}
+
+/// The register state a **client callback** displaces, kept kernel-side for the
+/// duration (roadmap W5.10).
+///
+/// Real Windows keeps exactly this in the callback's kernel trap frame. The
+/// chain a WoW64 window-procedure callback runs through —
+/// `KiUserCallbackDispatcher` → `wow64win!wow64_NtUserCallWinProc` →
+/// `wow64!Wow64KiUserCallbackDispatcher` → 32-bit code → `NtCallbackReturn` —
+/// unwinds by `longjmp`, not by returning, so `RBX/RBP/RSI/RDI/R12..R15` and
+/// `XMM6..XMM15` at the `NtCallbackReturn` syscall belong to `wow64win`, not to
+/// the `win32u` frame the original syscall must resume into.
+pub(crate) struct ClientCbState {
+    /// RBX, RBP, RSI, RDI, R12, R13, R14, R15.
+    gpr: [u64; 8],
+    /// XMM6..=XMM15.
+    xmm: [u128; 10],
+}
+
+/// The non-volatile GPRs, in the order [`ClientCbState::gpr`] stores them.
+const CLIENT_CB_GPRS: [Reg; 8] =
+    [Reg::Rbx, Reg::Rbp, Reg::Rsi, Reg::Rdi, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+/// First XMM register [`ClientCbState::xmm`] covers (through XMM15).
+const CLIENT_CB_XMM_FIRST: u8 = 6;
+
+/// Bytes of sub-4 GiB scratch per win32k callback nesting level.
+const WOW64_CB_SCRATCH_BLOCK: u64 = 0x400;
+/// Nesting levels the scratch covers.
+const WOW64_CB_SCRATCH_DEPTH: u64 = 16;
+
+/// `NtCallbackReturn(void *ret_ptr, ULONG ret_len, NTSTATUS status)` — SSDT
+/// index 5 (roadmap W5.10). See
+/// [`WinOs::client_callback_return`](WinOs::client_callback_return).
+pub(crate) fn ssdt_nt_callback_return(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let ret_ptr = os.syscall_arg(cpu, mem, 0)?;
+    let ret_len = os.syscall_arg(cpu, mem, 1)? as u32;
+    let status = os.syscall_arg(cpu, mem, 2)? as u32;
+    os.client_callback_return(cpu, mem, ret_ptr, ret_len, status)
+}
+
+impl ClientCbState {
+    fn capture(cpu: &CpuState) -> Self {
+        let mut gpr = [0u64; 8];
+        for (slot, r) in gpr.iter_mut().zip(CLIENT_CB_GPRS) {
+            *slot = cpu.reg(r);
+        }
+        let mut xmm = [0u128; 10];
+        for (slot, n) in xmm.iter_mut().zip(CLIENT_CB_XMM_FIRST..) {
+            *slot = cpu.xmm(n);
+        }
+        Self { gpr, xmm }
+    }
+
+    fn restore(&self, cpu: &mut CpuState) {
+        for (v, r) in self.gpr.iter().zip(CLIENT_CB_GPRS) {
+            cpu.set_reg(r, *v);
+        }
+        for (v, n) in self.xmm.iter().zip(CLIENT_CB_XMM_FIRST..) {
+            cpu.set_xmm_keep_upper(n, *v);
+        }
+    }
 }
 
 /// Every Windows symbol the emulator implements natively. Anything else
@@ -3123,18 +3190,24 @@ impl WinOs {
         }
     }
 
-    /// Whether exemu may seat a **client (user-mode) callback** on the guest
-    /// the direct way this module does it — `false` in a **WoW64** process
-    /// (roadmap W5.10).
+    /// Whether exemu may seat a **client (user-mode) callback** on the guest.
     ///
-    /// The direct path is sound only when the callee runs in the same mode, on
-    /// the same stack and under the same ABI as the syscall that interrupted
-    /// it. In a WoW64 process none of the three holds, and each failure is
-    /// independently fatal:
+    /// Always true now that a WoW64 process has a route (roadmap W5.10): a
+    /// 64-bit process takes the direct call this module has always made, and a
+    /// WoW64 one goes out through `ntdll!KiUserCallbackDispatcher` — see
+    /// [`seat_client_win_proc`](Self::seat_client_win_proc). It stays as a named
+    /// predicate because the two call sites that consume it
+    /// (`win32k::arm_hit_test`, `win32k::dispatch_to_wndproc`) have to answer
+    /// *something* when no callback can be seated, and that is a real state for
+    /// a window whose class was never registered.
+    ///
+    /// **What it used to guard, kept because it is what the route exists to
+    /// avoid.** Calling a 32-bit WndProc directly failed three independent ways,
+    /// each fatal on its own, measured on `SteamSetup.exe`:
     ///
     /// * **Mode.** The win32k syscall arrives from `win32u.dll` in *long* mode,
-    ///   but the WndProc is 32-bit guest code. Measured on `SteamSetup.exe`:
-    ///   `NtUserCreateWindowEx` (`win32u+0x12680`, reached through
+    ///   but the WndProc is 32-bit guest code. `NtUserCreateWindowEx`
+    ///   (`win32u+0x12680`, reached through
     ///   `wow64win!wow64_NtUserCreateWindowEx+0x131`) seated combase's
     ///   `OleMainThreadWndClass` procedure at `combase+0x1a630`, whose
     ///   `ff 25 fc d4 e4 02` is `jmp dword ptr [0x2e4d4fc]` — an ordinary
@@ -3144,9 +3217,9 @@ impl WinOs {
     ///   `KiUserExceptionDispatcher` breakpoints.
     /// * **ABI.** [`setup_call_args`](Self::setup_call_args) keys off
     ///   `cfg.is_64bit`, which is `true` here because the *process* is 64-bit
-    ///   (that is the whole point of new-WoW64) — so it would pass the four
+    ///   (that is the whole point of new-WoW64) — so it passed the four
     ///   arguments in `RCX/RDX/R8/R9` over a Win64 shadow area to a `stdcall`
-    ///   procedure that expects them pushed, and write an 8-byte return address
+    ///   procedure that expects them pushed, and wrote an 8-byte return address
     ///   a 32-bit `ret` cannot pop. The return thunk itself is unreachable:
     ///   the thunk arena is at `0x7EFF_0000_0000`, not representable in 32 bits.
     /// * **State.** Even a mode- and ABI-correct direct call would be unsound,
@@ -3155,18 +3228,12 @@ impl WinOs {
     ///   `BTCpuSimulate` establishes. Entering 32-bit code from the middle of a
     ///   64-bit syscall leaves `r13`/`r14` holding 64-bit callee-saved values.
     ///
-    /// The faithful path is the kernel's: return to user mode at
-    /// `ntdll64!KiUserCallbackDispatcher`, which in a WoW64 process reaches
-    /// `wow64!Wow64KiUserCallbackDispatcher` (a real export of the pinned
-    /// `wow64.dll`), which marshals the call down to the 32-bit
-    /// `ntdll32!KiUserCallbackDispatcher` through `BTCpuSimulate` and comes back
-    /// through `NtCallbackReturn`. exemu's win32k does not speak that protocol
-    /// yet, so until it does the honest answer is to **not make the call** —
-    /// a window is still created, it simply never receives its `WM_NCCREATE`/
-    /// `WM_CREATE` (the same shape of gap `NtUserCreateWindowEx` had before
-    /// roadmap W6.2b, and pinned as a test the same way).
+    /// The client-callback route fixes all three by not doing any of it in
+    /// exemu: the mode switch is `BTCpuSimulate`'s, the `stdcall` frame is
+    /// `wow64!Wow64KiUserCallbackDispatcher`'s, and the return address is one
+    /// Wine put on the 32-bit stack itself.
     pub(crate) fn can_call_client(&self) -> bool {
-        !self.is_wow64()
+        !self.is_wow64() || self.client_cb_dispatcher != 0
     }
 
     /// Is this process a **WoW64** process — a 32-bit guest running on the
@@ -3218,6 +3285,10 @@ impl WinOs {
         // was captured before the unix-stack switch. These are the resume state.
         let resume_rsp = self.syscall_guest_rsp;
         let call_base = resume_rsp.wrapping_sub(stack_reserve);
+        // A WoW64 process takes the client-callback route, and the register
+        // state the syscall must resume into has to be captured *now* — the
+        // callback leaves through `NtCallbackReturn`, not by returning.
+        let client = self.is_wow64().then(|| Box::new(ClientCbState::capture(cpu)));
         self.win32k_cb.push(Win32kCbFrame {
             resume_rip: cpu.reg(Reg::Rcx),
             resume_rsp,
@@ -3226,12 +3297,163 @@ impl WinOs {
             call_base,
             result,
             then: None,
+            client,
         });
-        let driver = self.win32k_cb_driver;
-        self.setup_call_args(cpu, mem, func, &args, driver, call_base)?;
+        if let Err(e) = self.seat_win32k_callback(cpu, mem, func, &args, call_base) {
+            self.win32k_cb.pop();
+            return Err(e);
+        }
         // dispatch_syscall must not restore/return: we've installed the WndProc.
         self.syscall_resume_as_is = true;
         Ok(true)
+    }
+
+    /// A **sub-4 GiB** block of `size` bytes for by-pointer data this callback
+    /// nesting level hands a 32-bit client callback, or `None` if the low arena
+    /// is exhausted (roadmap W5.10).
+    ///
+    /// One page per nesting level, indexed by the depth of the win32k callback
+    /// stack, so a WndProc that creates another window during its own
+    /// `WM_CREATE` does not overwrite the `CREATESTRUCTW` it is still holding.
+    /// Beyond [`WOW64_CB_SCRATCH_DEPTH`] levels there is no block and the caller
+    /// skips the callback rather than aliasing one.
+    pub(crate) fn wow64_callback_scratch(&mut self, mem: &mut dyn Memory, size: u64) -> Option<u64> {
+        if self.wow64_cb_scratch == 0 {
+            let bytes = WOW64_CB_SCRATCH_DEPTH * WOW64_CB_SCRATCH_BLOCK;
+            self.wow64_cb_scratch =
+                self.map_anywhere_low(mem, bytes, exemu_core::Perm::RW, "wow64-callback-scratch")?;
+        }
+        let depth = self.win32k_cb.len() as u64;
+        (depth < WOW64_CB_SCRATCH_DEPTH && size <= WOW64_CB_SCRATCH_BLOCK)
+            .then(|| self.wow64_cb_scratch + depth * WOW64_CB_SCRATCH_BLOCK)
+    }
+
+    /// Seat one queued win32k callback — the direct way in a 64-bit process,
+    /// through `ntdll!KiUserCallbackDispatcher` in a WoW64 one.
+    fn seat_win32k_callback(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+        func: u64,
+        args: &[u64],
+        call_base: u64,
+    ) -> Result<()> {
+        if self.win32k_cb.last().is_some_and(|f| f.client.is_some()) {
+            return self.seat_client_win_proc(cpu, mem, func, args, call_base);
+        }
+        let driver = self.win32k_cb_driver;
+        self.setup_call_args(cpu, mem, func, args, driver, call_base)
+    }
+
+    /// Enter user mode at `ntdll!KiUserCallbackDispatcher` with an
+    /// `NtUserCallWinProc` callback for `func(hwnd, msg, wparam, lparam)`
+    /// (roadmap W5.10) — the one way a kernel calls a **32-bit** guest's window
+    /// procedure without pretending the CPU is in long mode.
+    ///
+    /// Everything below this point is Wine's own code, and it fixes all three
+    /// defects the direct call had at a stroke: the mode switch is
+    /// `BTCpuSimulate`'s, the `stdcall` frame is
+    /// `wow64!Wow64KiUserCallbackDispatcher`'s, and the return address a 32-bit
+    /// `ret` pops is one Wine put on the 32-bit stack.
+    ///
+    /// The kernel's whole contribution is this frame:
+    ///
+    /// ```text
+    ///   [rsp .. rsp+0x20)   the callee's shadow area
+    ///   [rsp+0x20]          args = &win_proc_params
+    ///   [rsp+0x28]          len  = 0x48
+    ///   [rsp+0x2c]          id   = NtUserCallWinProc
+    ///   rip                 ntdll!KiUserCallbackDispatcher
+    /// ```
+    ///
+    /// `rsp` is 16-byte aligned so that the dispatcher's own
+    /// `call [KernelCallbackTable + id*8]` leaves the callee at the alignment
+    /// the Win64 ABI promises it.
+    fn seat_client_win_proc(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+        func: u64,
+        args: &[u64],
+        call_base: u64,
+    ) -> Result<()> {
+        use crate::wow64::{cb_frame, win_proc_params as p};
+        let dispatcher = self.client_cb_dispatcher;
+        if dispatcher == 0 {
+            return Err(exemu_core::EmuError::Os(
+                "a client callback needs ntdll!KiUserCallbackDispatcher, which this boot did not publish"
+                    .into(),
+            ));
+        }
+        let (hwnd, msg) = (args.first().copied().unwrap_or(0), args.get(1).copied().unwrap_or(0));
+        let (wparam, lparam) = (args.get(2).copied().unwrap_or(0), args.get(3).copied().unwrap_or(0));
+
+        // The parameter block sits above the frame, on the interrupted syscall's
+        // own 64-bit stack: `wow64win` rewrites it in place before copying the
+        // narrowed form down to the 32-bit stack, so it must be writable, and
+        // nothing below `frame` may be ours (the callee grows down from there).
+        let params = (call_base - 0x100) & !0xf;
+        mem.write_u64(params + p::FUNC, func)?;
+        mem.write_u64(params + p::HWND, hwnd)?;
+        mem.write_u32(params + p::MSG, msg as u32)?;
+        mem.write_u64(params + p::WPARAM, wparam)?;
+        mem.write_u64(params + p::LPARAM, lparam)?;
+        mem.write_u32(params + p::SIZE, 0)?; // nothing packed after the struct
+        mem.write_u32(params + p::ANSI, 0)?; // …so no A/W conversion either
+        mem.write_u32(params + p::MAPPING, 0)?;
+        mem.write_u32(params + p::DPI_CONTEXT, crate::wow64::NTUSER_DPI_UNAWARE)?;
+        mem.write_u64(params + p::PROC_A, 0)?;
+        mem.write_u64(params + p::PROC_W, func)?; // the pointer user32 calls
+        mem.write_u64(params + p::RESULT, 0)?;
+
+        let frame = (params - cb_frame::SIZE) & !0xf;
+        mem.write_u64(frame + cb_frame::ARGS, params)?;
+        mem.write_u32(frame + cb_frame::LEN, p::CALL_LEN)?;
+        mem.write_u32(frame + cb_frame::ID, crate::wow64::NT_USER_CALL_WIN_PROC)?;
+        cpu.set_rsp(frame);
+        cpu.rip = dispatcher;
+        Ok(())
+    }
+
+    /// `NtCallbackReturn(ret_ptr, ret_len, status)` — the way out of a client
+    /// callback (roadmap W5.10).
+    ///
+    /// The syscall arrives on the *callback's* stack with the callback chain's
+    /// registers, so the kernel restores what it saved when it seated the
+    /// callback, publishes the callback's `LRESULT` in rax and then behaves
+    /// exactly as if the WndProc had returned to the driver thunk: run the next
+    /// queued callback, or resume the interrupted syscall's caller.
+    pub(crate) fn client_callback_return(
+        &mut self,
+        cpu: &mut CpuState,
+        mem: &mut dyn Memory,
+        ret_ptr: u64,
+        ret_len: u32,
+        _status: u32,
+    ) -> Result<u32> {
+        /// `STATUS_NO_CALLBACK_ACTIVE` — the same answer `wow64.dll`'s own
+        /// slot-5 thunk gives when there is no frame at `TEB64+0x14a8`.
+        const STATUS_NO_CALLBACK_ACTIVE: u32 = 0xC000_0258;
+        if !self.win32k_cb.last().is_some_and(|f| f.client.is_some()) {
+            return Ok(STATUS_NO_CALLBACK_ACTIVE);
+        }
+        // The result buffer is whatever user32 handed back: 8 bytes on the
+        // 64-bit side, 4 sign-extended once `wow64win` has widened a 32-bit
+        // LRESULT (it does the `movsxd` itself, so both widths arrive here).
+        let lresult = match ret_len {
+            0 => 0,
+            n if n >= 8 => mem.read_u64(ret_ptr)?,
+            _ => mem.read_u32(ret_ptr)? as i32 as i64 as u64,
+        };
+        if let Some(state) = self.win32k_cb.last().and_then(|f| f.client.as_deref()) {
+            state.restore(cpu);
+        }
+        cpu.set_reg(Reg::Rax, lresult);
+        self.win32k_cb_advance(cpu, mem)?;
+        // The resume state is installed: dispatch_syscall must not restore the
+        // NtCallbackReturn frame over it.
+        self.syscall_resume_as_is = true;
+        Ok(0)
     }
 
     /// A WndProc invoked from a win32k syscall returned to the driver thunk: run
@@ -3254,8 +3476,7 @@ impl WinOs {
         let next = self.win32k_cb.last_mut().and_then(|f| f.remaining.pop_front());
         if let Some((func, args)) = next {
             let base = self.win32k_cb.last().expect("frame just read").call_base;
-            let driver = self.win32k_cb_driver;
-            self.setup_call_args(cpu, mem, func, &args, driver, base)?;
+            self.seat_win32k_callback(cpu, mem, func, &args, base)?;
             return Ok(Outcome::Resume);
         }
         let f = self.win32k_cb.pop().expect("win32k cb driver without frame");

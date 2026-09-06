@@ -298,6 +298,14 @@ pub fn build(
     })?;
     wow64::publish_wow64_exception_hook(mem, ntdll64.base, prepare)?;
 
+    // …and the third thing a loader would have done: `PEB64.KernelCallbackTable`
+    // (roadmap W5.10). `wow64win!DllMain` publishes its own `user_callbacks`
+    // array there on `DLL_PROCESS_ATTACH`; exemu maps `wow64win` directly and
+    // runs no `DllMain`, so without this the first client callback would
+    // `call [0 + id*8]`. The array's address is decoded from that `DllMain`'s
+    // own bytes, not hardcoded.
+    wow64::publish_kernel_callback_table(mem, wow64win.base, wow64win.entry, WOW64_PEB64)?;
+
     Ok(Wow64Boot {
         ntdll32,
         wow64cpu,

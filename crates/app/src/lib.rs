@@ -1005,6 +1005,14 @@ impl Process {
             os.register_wow64_module("wow64cpu.dll", boot.wow64cpu.base);
             os.register_wow64_module("wow64win.dll", boot.wow64win.base);
 
+            // The entry a kernel resumes user mode on to run a **client
+            // callback** — how exemu's win32k reaches a 32-bit guest's window
+            // procedure without ever leaving long mode itself (roadmap W5.10).
+            let dispatcher = ntdll64.export("KiUserCallbackDispatcher").ok_or_else(|| {
+                EmuError::Os("WoW64 boot: the 64-bit ntdll exports no KiUserCallbackDispatcher".into())
+            })?;
+            os.set_client_callback_dispatcher(dispatcher);
+
             // The 32-bit ntdll's own unixlib handle (roadmap W5.3). A 32-bit
             // `__wine_unix_call` reaches the *same* 64-bit dispatcher as a
             // 64-bit one — `wow64cpu`'s BOP handler (rva 0x1255) just
