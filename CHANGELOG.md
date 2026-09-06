@@ -23,8 +23,48 @@ Wine's DLLs are loaded as separate guest image files, never linked or transcribe
 into any exemu crate (LGPL-2.1-or-later invariant); every native backend is
 written from public NT/PE specs and Wine's published architecture docs.
 
-Tests grew 199 → 1052, clippy clean at `-D warnings`; 7-Zip still installs
+Tests grew 199 → 1059, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
+
+### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
+- **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
+  `0x20..=0x37` are the stock objects, so a guest had **72 GDI handles for its
+  whole life** — and nothing ever came back: `NtGdiDeleteObjectApp` cleared the
+  entry's in-use byte without returning the slot, while `NtUserReleaseDC` and
+  `NtUserEndPaint` leaked it outright. By the time `shell32!SIC_Initialize`
+  loaded its five shell icons the table was dry, which is why the 48x48, the
+  *second* 16x16 and the 256x256 failed where the first two succeeded, and why
+  two identical 16x16 loads disagreed. It was never the size and never the
+  PNG-compressed resources. Slots are now recycled through a free list and the
+  table holds 4096.
+- **`NtUserGetIconInfo` now empties the two `UNICODE_STRING`s it is handed.**
+  `GetIconInfoExW` writes its NUL terminators at `szModName[Length]` and
+  `szResName[Length]`, indexing by `Length` as a character count; exemu left both
+  fields untouched, so the terminator landed thousands of bytes past the struct.
+  With an empty module name `CopyImage` takes its documented copy-and-scale path
+  instead of reloading from a resource.
+- **`GetDlgItem` returned 0 for every dialog in every guest.** `user32!GetDlgItem`
+  starts with `GetWindow(hwndDlg, GW_CHILD)`, which is `NtUserCallHwndParam`
+  selector `0x10` — unserviced, so it answered 0 and the search never began.
+  `NtUserBuildHwndList` behind it had never been reached once. Both are serviced
+  now, including the caller-writes-the-terminator convention its callers rely on.
+- **`NtUserAllocWinProc` answers a real window-procedure handle.** It had
+  answered 0, and `SetWindowLongPtrW` stores that answer, so `DWLP_DLGPROC` was 0
+  for every dialog in the process and `DefDlgProcW` called nothing. exemu now
+  keeps a `{procA, procW}` table and hands back an opaque handle that
+  `GetDialogProc` resolves per flavour.
+- **The result:** Wine's file dialog builds its controls, initialises its shell
+  image lists, enumerates the folder through `IShellFolder`, fills its Look-in
+  combo and delivers `CDN_INITDONE`/`CDN_FOLDERCHANGE`/`CDN_SELCHANGE` — 65.7M
+  instructions where it used to spend 3M. `GetOpenFileNameW` still returns FALSE
+  with `CommDlgExtendedError() == 0`, an honest cancel, and no access violation.
+- **The next wall is fonts, and it is pinned rather than described.** A headless
+  run can now be told what a user would have typed
+  (`RunConfig::file_dialog_pick`, `EXEMU_FILE_DIALOG_PICK`); it posts `WM_SETTEXT`
+  into the file-name combo's edit and `WM_COMMAND(IDOK)` to the dialog. That
+  reaches gdi32's bundled Uniscribe and faults at `gdi32+0x38819`, because
+  `NtGdiHfontCreate` is unserviced and no DC ever carries a font. Off by default,
+  so no existing run changes.
 
 ### The file dialog tells the truth: an honest cancel instead of a hollow TRUE (W6.2)
 - **`GetOpenFileNameW` had started returning TRUE with an untouched `lpstrFile`**,
