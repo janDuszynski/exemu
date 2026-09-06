@@ -404,7 +404,30 @@ impl WinOs {
             }
             base
         } else {
-            match self.map_anywhere(mem, view_size, Perm::RWX, "section-view") {
+            // In a **WoW64** process a flat view goes below 4 GiB, for the same
+            // reason an image view does (roadmap W5.7) and the NLS blob does:
+            // `wow64.dll`'s `NtMapViewOfSection` thunk narrows the base it gets
+            // back into the guest's 32-bit `*BaseAddress` cell without checking,
+            // so a high placement is silently truncated into an unmapped pointer
+            // rather than failing. A 64-bit consumer can address a low view just
+            // as well, so one rule serves both halves of the process.
+            //
+            // Measured on SteamSetup's WoW64 boot, on the one flat view it makes
+            // — the Common-Controls manifest `ntdll!lookup_winsxs` maps once the
+            // WinSxS store exists. Placed unconstrained the view landed at
+            // **0x40_0003_0000**; the thunk handed the 32-bit guest `0x30000`;
+            // and `RtlIsTextUnicode(buf = 0x30000, len = 0x5eb)` faulted on
+            // `cmp byte [esi+ecx-1], 1` reading 0x305ea — the last byte of a view
+            // that was never there (ntdll32 rva 0x2a59b). Nothing was wrong with
+            // the size the guest was told; only the address it was given.
+            // Constrained low, the same view lands at 0x30000 and the process
+            // runs on.
+            let placed = if self.wow64_peb32 != 0 {
+                self.map_anywhere_low(mem, view_size, Perm::RWX, "section-view")
+            } else {
+                self.map_anywhere(mem, view_size, Perm::RWX, "section-view")
+            };
+            match placed {
                 Some(b) => b,
                 None => return Ok(STATUS_NO_MEMORY),
             }

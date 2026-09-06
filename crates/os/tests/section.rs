@@ -217,6 +217,77 @@ fn pagefile_backed_section_is_zeroed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **In a WoW64 process a flat view must be 32-bit addressable (roadmap W5.7).**
+///
+/// `wow64.dll`'s `NtMapViewOfSection` thunk narrows the base the kernel returns
+/// into the 32-bit guest's `PVOID *BaseAddress` cell **without checking**, so a
+/// view placed above 4 GiB is not refused — it is silently truncated into a
+/// pointer to nothing, and the guest faults somewhere else entirely on its first
+/// read.
+///
+/// This is not hypothetical. Measured on SteamSetup's WoW64 boot with the WinSxS
+/// store staged, on the one flat view it makes — the Common-Controls manifest
+/// `ntdll!lookup_winsxs` maps: unconstrained, the view landed at
+/// **0x40_0003_0000**, the guest was handed **0x30000**, and the 32-bit
+/// `RtlIsTextUnicode(buf = 0x30000, len = 0x5eb)` faulted at ntdll32 rva 0x2a59b
+/// on `cmp byte [esi+ecx-1], 1` reading 0x305ea — the last byte of a view that
+/// was never there. The size the guest was told was right; only the address was
+/// wrong. Constrained, the same view lands at 0x30000 and the process runs on.
+///
+/// The test drives the real dispatcher and asserts both halves of that: the base
+/// fits 32 bits, and it survives the narrowing the thunk performs — the guest
+/// can read the view's **last** byte through the truncated pointer.
+#[test]
+fn wow64_flat_view_is_32_bit_addressable() {
+    let dir = std::env::temp_dir().join(format!("exemu-w5_7flat-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let (mut os, mut mem) = setup(&dir);
+    // This process is WoW64 (the same marker `nls.rs` and `thread.rs` key off).
+    os.set_wow64_peb32(0x7f00_8000);
+
+    let max_ptr = SCRATCH + 0x40;
+    mem.write_u64(max_ptr, 0x1000).unwrap();
+    let sh_ptr = SCRATCH;
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_CREATE_SECTION,
+        &[sh_ptr, 0, 0, max_ptr, 0x04 /* PAGE_READWRITE */, 0 /* SEC_COMMIT */, 0],
+    );
+    assert_eq!(st, STATUS_SUCCESS);
+    let section = mem.read_u64(sh_ptr).unwrap();
+
+    let base_ptr = SCRATCH + 0x10;
+    let size_ptr = SCRATCH + 0x18;
+    mem.write_u64(base_ptr, 0).unwrap();
+    mem.write_u64(size_ptr, 0).unwrap();
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_MAP_VIEW,
+        &[section, 0xFFFF_FFFF_FFFF_FFFF, base_ptr, 0, 0, 0, size_ptr, 1, 0, 0x04],
+    );
+    assert_eq!(st, STATUS_SUCCESS);
+    let base = mem.read_u64(base_ptr).unwrap();
+    let size = mem.read_u64(size_ptr).unwrap();
+    assert!(
+        base + size <= u32::MAX as u64,
+        "a flat view in a WoW64 process must fit below 4 GiB — wow64.dll narrows the base it \
+         gets back into the guest's 32-bit cell without checking, so {base:#x} would reach the \
+         guest as {:#x}",
+        base as u32,
+    );
+    // The narrowing is a no-op on a low base, and the LAST byte is really there —
+    // the byte `RtlIsTextUnicode` reads first and the one a short view loses.
+    let narrowed = base as u32 as u64;
+    assert_eq!(narrowed, base, "the thunk's narrowing loses nothing");
+    let mut last = [0u8; 1];
+    mem.read(narrowed + size - 1, &mut last)
+        .expect("the view's last byte is mapped at the address the guest is handed");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A bad section handle → STATUS_INVALID_HANDLE, not a fault.
 #[test]
 fn map_bad_section_handle_rejected() {
