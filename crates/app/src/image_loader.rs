@@ -42,3 +42,40 @@ impl exemu_loader::ModuleSet for Modules<'_> {
         Some(exemu_loader::LoadedModule { base, exports })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exemu_core::Export;
+
+    struct FakeModules(Vec<(&'static str, u64, Vec<Export>)>);
+
+    impl ModuleExports for FakeModules {
+        fn module_exports(&self, dll: &str) -> Option<(u64, &[Export])> {
+            let (_, base, exports) = self.0.iter().find(|(name, _, _)| *name == dll)?;
+            Some((*base, exports.as_slice()))
+        }
+    }
+
+    fn export(name: &str, rva: u32, forwarder: Option<&str>) -> Export {
+        Export { name: Some(name.into()), ordinal: 1, rva, forwarder: forwarder.map(Into::into) }
+    }
+
+    #[test]
+    fn a_forwarded_export_resolves_to_the_target_modules_code() {
+        let modules = FakeModules(vec![
+            ("kernel32.dll", 0x1000_0000, vec![export("HeapAlloc", 0x10, Some("ntdll.RtlAllocateHeap"))]),
+            ("ntdll.dll", 0x2000_0000, vec![export("RtlAllocateHeap", 0x1234, None)]),
+        ]);
+        let forwarded = ImportSymbol::Named("HeapAlloc".into());
+        assert_eq!(PeImageLoader.resolve_export(&modules, "kernel32.dll", &forwarded), Some(0x2000_1234));
+        let missing = ImportSymbol::Named("HeapFree".into());
+        assert_eq!(PeImageLoader.resolve_export(&modules, "kernel32.dll", &missing), None);
+    }
+
+    #[test]
+    fn an_api_set_contract_names_its_host_dll() {
+        assert_eq!(PeImageLoader.api_set_host("api-ms-win-crt-runtime-l1-1-0.dll"), Some("ucrtbase"));
+        assert_eq!(PeImageLoader.api_set_host("kernel32.dll"), None);
+    }
+}
