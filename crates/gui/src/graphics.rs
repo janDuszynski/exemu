@@ -529,7 +529,7 @@ mod imp {
     const VK_STRUCTURE_TYPE_APPLICATION_INFO: u32 = 0;
     const VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO: u32 = 1;
     const VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR: u32 = 0x0000_0001;
-    const VK_PORTABILITY_ENUMERATION_EXTENSION: &str = "VK_KHR_portability_enumeration";
+    const VK_PORTABILITY_ENUMERATION_EXTENSION: &CStr = c"VK_KHR_portability_enumeration";
     const VK_EXTENSION_PROPERTIES_SIZE: usize = 260;
     const VK_PHYSICAL_DEVICE_PROPERTIES_NAME_OFFSET: usize = 20;
     const VK_PHYSICAL_DEVICE_PROPERTIES_SIZE: usize = 2048;
@@ -667,16 +667,15 @@ mod imp {
             }
             let portability = self
                 .instance_extensions()
-                .map(|e| e.iter().any(|x| x == VK_PORTABILITY_ENUMERATION_EXTENSION))
+                .map(|e| e.iter().any(|x| x.as_bytes() == VK_PORTABILITY_ENUMERATION_EXTENSION.to_bytes()))
                 .unwrap_or(false);
 
             let f = self.proc(std::ptr::null_mut(), "vkCreateInstance")?;
             let create: PfnCreateInstance =
                 unsafe { std::mem::transmute::<PfnVoid, PfnCreateInstance>(f) };
 
-            let app_name = CString::new("exemu").expect("literal has no NUL");
-            let ext_name =
-                CString::new(VK_PORTABILITY_ENUMERATION_EXTENSION).expect("literal has no NUL");
+            let app_name = c"exemu";
+            let ext_name = VK_PORTABILITY_ENUMERATION_EXTENSION;
             let ext_ptrs = [ext_name.as_ptr()];
 
             let mut app = [0u8; 56];
