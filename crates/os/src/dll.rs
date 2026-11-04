@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use exemu_core::{CpuState, Export, ImportSymbol, Memory, Result};
+use exemu_core::{CpuState, Export, ImageLoader, ImportSymbol, Memory, ModuleExports, Result};
 
 use crate::WinOs;
 
@@ -78,8 +78,8 @@ fn base_name(path: &str) -> String {
     n
 }
 
-fn canonical_name(raw: &str) -> String {
-    match exemu_loader::resolve_api_set(raw) {
+fn canonical_name(images: &dyn ImageLoader, raw: &str) -> String {
+    match images.api_set_host(raw) {
         Some(host) => {
             let mut s = host.to_string();
             if !s.ends_with(".dll") {
@@ -96,11 +96,15 @@ fn align_up(v: u64, a: u64) -> u64 {
 }
 
 impl WinOs {
+    pub fn set_image_loader(&mut self, images: Box<dyn ImageLoader>) {
+        self.images = images;
+    }
+
     pub(crate) fn load_library(&mut self, mem: &mut dyn Memory, path: &str) -> Result<u64> {
         if path.is_empty() {
             return Ok(self.cfg.image_base);
         }
-        let name = canonical_name(&base_name(path));
+        let name = canonical_name(&*self.images, &base_name(path));
 
         if let Some(&h) = self.dll.by_name.get(&name) {
             if let Some(m) = self.dll.modules.iter_mut().find(|m| m.name == name) {
@@ -121,7 +125,7 @@ impl WinOs {
     }
 
     pub(crate) fn module_handle(&mut self, path: &str) -> u64 {
-        let name = canonical_name(&base_name(path));
+        let name = canonical_name(&*self.images, &base_name(path));
         if let Some(&h) = self.dll.by_name.get(&name) {
             return h;
         }
@@ -210,7 +214,7 @@ impl WinOs {
         let Ok(bytes) = std::fs::read(&host) else {
             return Ok(None);
         };
-        let Ok(mut image) = exemu_loader::parse(&bytes) else {
+        let Ok(mut image) = self.images.parse(&bytes) else {
             return Ok(None);
         };
 
@@ -227,7 +231,7 @@ impl WinOs {
 
         let preferred = image.image_base;
         if let Err(e) =
-            exemu_loader::apply_relocations(&mut image.sections, &image.relocations, preferred, base)
+            self.images.apply_relocations(&mut image.sections, &image.relocations, preferred, base)
         {
             if self.cfg.trace {
                 eprintln!("[exemu] plugin {name}: bad relocations ({e}); not loading");
@@ -249,7 +253,7 @@ impl WinOs {
 
         let mut dep_names: Vec<String> = Vec::new();
         for imp in &image.imports {
-            let dep = canonical_name(&imp.dll);
+            let dep = canonical_name(&*self.images, &imp.dll);
             if EMULATED.contains(&dep.as_str())
                 || self.dll.by_name.contains_key(&dep)
                 || dep_names.contains(&dep)
@@ -341,7 +345,7 @@ impl WinOs {
         let Ok(bytes) = std::fs::read(host) else {
             return Ok(None);
         };
-        let Ok(mut image) = exemu_loader::parse(&bytes) else {
+        let Ok(mut image) = self.images.parse(&bytes) else {
             return Ok(None);
         };
 
@@ -358,7 +362,7 @@ impl WinOs {
 
         let preferred = image.image_base;
         if let Err(e) =
-            exemu_loader::apply_relocations(&mut image.sections, &image.relocations, preferred, base)
+            self.images.apply_relocations(&mut image.sections, &image.relocations, preferred, base)
         {
             if self.cfg.trace {
                 eprintln!("[exemu] wine-core {name}: bad relocations ({e}); not loading");
@@ -491,14 +495,14 @@ impl WinOs {
     }
 
     pub fn resolve_import_addr(&mut self, dll: &str, symbol: &ImportSymbol) -> u64 {
-        let host: &str = match exemu_loader::resolve_api_set(dll) {
+        let host: &str = match self.images.api_set_host(dll) {
             Some(h) => h,
             None => dll,
         };
         let view = GuestModules { dll: &self.dll };
-        match exemu_loader::resolve_import(&view, host, symbol) {
-            exemu_loader::Resolved::GuestCode(addr) => addr,
-            exemu_loader::Resolved::Fallback => self.resolve_import(host, symbol),
+        match self.images.resolve_export(&view, host, symbol) {
+            Some(addr) => addr,
+            None => self.resolve_import(host, symbol),
         }
     }
 
@@ -932,11 +936,11 @@ struct GuestModules<'a> {
     dll: &'a Loader,
 }
 
-impl exemu_loader::ModuleSet for GuestModules<'_> {
-    fn module(&self, dll: &str) -> Option<exemu_loader::LoadedModule<'_>> {
+impl ModuleExports for GuestModules<'_> {
+    fn module_exports(&self, dll: &str) -> Option<(u64, &[Export])> {
         let &base = self.dll.by_name.get(dll)?;
         let exports = self.dll.exports.get(&base)?;
-        Some(exemu_loader::LoadedModule { base, exports })
+        Some((base, exports.as_slice()))
     }
 }
 

@@ -425,6 +425,7 @@ impl Process {
             file_dialog_pick: cfg.file_dialog_pick.clone(),
         });
 
+        os.set_image_loader(Box::new(image_loader::PeImageLoader));
         os.set_unwind_table(image.function_table.clone());
 
         os.set_environment(cfg.environment.clone());

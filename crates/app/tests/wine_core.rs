@@ -91,6 +91,7 @@ fn setup(sandbox: &Path) -> (WinOs, VirtualMemory) {
         wine_dll_dir: Some(WINE_DLLS.to_string()),
         ..WinConfig::default()
     });
+    os.set_image_loader(Box::new(exemu_app::image_loader::PeImageLoader));
     os.seed_main_teb(&mut mem, STACK_BASE, STACK_BASE + STACK_SIZE).unwrap();
     os.init_ldr(&mut mem).unwrap();
     (os, mem)
