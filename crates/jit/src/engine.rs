@@ -47,6 +47,7 @@ pub struct JitStats {
     pub flushes: u64,
     pub breakpoint_stops: u64,
     pub watch_stops: u64,
+    pub budget_stops: u64,
     pub tlb_fills: u64,
     pub tlb_denied: u64,
     pub tlb_resets: u64,
@@ -66,6 +67,7 @@ impl JitStats {
 struct Block {
     code: Option<BlockCode>,
     chain: u64,
+    insns: u32,
     page0: u64,
     page1: u64,
     gen0: u64,
@@ -96,6 +98,7 @@ pub struct Jit {
     code_gen: u64,
     stats: JitStats,
     max_insns: u32,
+    longest: u32,
     trail: Box<[u64]>,
     trail_at: u64,
     links: Box<[LinkSlot]>,
@@ -128,6 +131,7 @@ impl Jit {
             code_gen: 0,
             stats: JitStats::default(),
             max_insns: MAX_INSNS,
+            longest: 0,
             trail: vec![0; TRAIL].into_boxed_slice(),
             trail_at: 0,
             links: vec![LinkSlot::default(); (link_blocks * MAX_LINKS) as usize]
@@ -219,6 +223,7 @@ impl Jit {
         self.buffer.reset();
         self.blocks.clear();
         self.map.clear();
+        self.longest = 0;
         self.unlink_all();
         self.code_page_set.clear();
         self.code_pages.fill(0);
@@ -278,12 +283,13 @@ impl Jit {
                 *self.stats.declined.entry(key).or_insert(0) += 1;
             }
         }
-        let mk = |code: Option<BlockCode>, chain_off: u32| Block {
+        let mk = |code: Option<BlockCode>, chain_off: u32, insns: u32| Block {
             chain: match code {
                 Some(c) => c.addr() as u64 + 4 * chain_off as u64,
                 None => 0,
             },
             code,
+            insns,
             page0: meta.2,
             page1: meta.3,
             gen0: meta.4,
@@ -291,13 +297,13 @@ impl Jit {
             global_gen: meta.6,
         };
         let block = if plan.insns == 0 {
-            mk(None, 0)
+            mk(None, 0, 0)
         } else {
             match self.buffer.push(&plan.code) {
                 Ok(code) => {
                     self.stats.blocks_compiled += 1;
                     self.stats.peak_code_bytes = self.stats.peak_code_bytes.max(self.buffer.used());
-                    mk(Some(code), plan.chain_off)
+                    mk(Some(code), plan.chain_off, plan.insns)
                 }
                 Err(_) => {
                     self.flush();
@@ -312,15 +318,16 @@ impl Jit {
                     match self.buffer.push(&plan.code) {
                         Ok(code) => {
                             self.stats.blocks_compiled += 1;
-                            mk(Some(code), plan.chain_off)
+                            mk(Some(code), plan.chain_off, plan.insns)
                         }
-                        Err(_) => mk(None, 0),
+                        Err(_) => mk(None, 0, 0),
                     }
                 }
             }
         };
         let idx = self.blocks.len() as u32;
         if block.code.is_some() {
+            self.longest = self.longest.max(block.insns);
             self.note_code_page(meta.2);
             self.note_code_page(meta.3);
         }
@@ -392,8 +399,8 @@ impl Jit {
                 self.flush();
                 idx = self.block_at(rip, mode, &*mem) as usize;
             }
-            let (code, chain) = match &self.blocks[idx] {
-                Block { code: Some(c), chain, .. } => (*c, *chain),
+            let (code, chain, insns) = match &self.blocks[idx] {
+                Block { code: Some(c), chain, insns, .. } => (*c, *chain, *insns),
                 _ => {
                     self.pending = NO_SLOT;
                     self.stats.not_compiled += 1;
@@ -417,6 +424,10 @@ impl Jit {
                 self.links[slot] = fill;
             }
             self.pending = NO_SLOT;
+            if retired + u64::from(insns) > budget {
+                self.stats.budget_stops += 1;
+                return Run::SideExit { insns: retired as u32 };
+            }
 
             let trail_before = self.trail_at;
             let (ret, ran, pending, smc, trail_at) = {
@@ -429,7 +440,7 @@ impl Jit {
                     write,
                     debug: debug.as_ref(),
                     retired,
-                    budget,
+                    link_limit: (budget + 1).saturating_sub(u64::from(self.longest)),
                     links: self.links.as_ptr(),
                     link_epoch: self.link_epoch,
                     pending: NO_SLOT,
@@ -538,7 +549,7 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         let mut jit = Jit::new(64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem, Mode::Long, 1);
+        let r = jit.run(&mut st, &mut mem, Mode::Long, 2);
         assert_eq!(r, Run::Executed { insns: 2 });
         assert_eq!(st.gpr[0], 12);
         assert_eq!(st.rip, CODE + 8);
@@ -566,7 +577,7 @@ mod tests {
         st.rip = CODE;
         st.gpr[2] = 0xDEAD_0000;
         let mut jit = Jit::new(64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem, Mode::Long, 1);
+        let r = jit.run(&mut st, &mut mem, Mode::Long, 1000);
         assert_eq!(r, Run::Faulted { insns: 1 });
         assert_eq!(st.gpr[0], 1, "the first instruction did run");
         assert_eq!(st.rip, CODE + 5, "rip rewound to the faulting instruction");
@@ -582,7 +593,7 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         let mut jit = Jit::new(64 * 1024).unwrap();
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 2 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 2), Run::Executed { insns: 2 });
         assert_eq!(st.rip, CODE + 6, "branch taken");
     }
 
@@ -591,7 +602,7 @@ mod tests {
         let mut mem = VirtualMemory::new();
         mem.map(Region::new("code", CODE, 0x1000, Perm::RWX)).unwrap();
         let code = [
-            0xC6, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00, 0x90,
+            0xC6, 0x04, 0x25, 0x09, 0x10, 0x00, 0x00, 0x09,
             0xB8, 0x07, 0x00, 0x00, 0x00,
             DECLINED,
         ];
@@ -599,10 +610,11 @@ mod tests {
         let mut st = CpuState::new();
         st.rip = CODE;
         let mut jit = Jit::new(64 * 1024).unwrap();
-        let r = jit.run(&mut st, &mut mem, Mode::Long, 1);
-        assert_eq!(r, Run::Executed { insns: 1 }, "stopped after the self-modifying store");
-        assert_eq!(st.rip, CODE + 8);
-        assert_eq!(st.gpr[0], 0, "the instruction after the store did NOT run");
+        let r = jit.run(&mut st, &mut mem, Mode::Long, 1000);
+        assert_eq!(r, Run::SideExit { insns: 2 });
+        assert_eq!(st.rip, CODE + 13);
+        assert_eq!(st.gpr[0], 9, "the instruction after the store ran from its rewritten bytes");
+        assert_eq!(jit.recent_blocks()[..2], [CODE, CODE + 8], "the block stopped at the store");
     }
 
     #[test]
@@ -645,7 +657,7 @@ mod tests {
 
         st.rip = CODE;
         st.gpr[0] = 5;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Protected, 1), Run::Executed { insns: 2 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Protected, 2), Run::Executed { insns: 2 });
         assert_eq!(st.gpr[0], 5, "protected mode: `dec eax` then `inc eax`");
         assert_eq!(st.rip, CODE + 3);
 
@@ -917,7 +929,7 @@ mod tests {
         let mut st = CpuState::new();
 
         st.rip = CODE;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 1), Run::Executed { insns: 2 });
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 2), Run::Executed { insns: 2 });
         assert_eq!(st.rip, CODE + 7);
         assert_eq!(jit.stats().blocks_executed, 1);
 
@@ -931,14 +943,26 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_stops_the_chain_at_the_first_boundary_that_reaches_it() {
+    fn the_block_that_would_cross_the_budget_is_left_to_the_interpreter() {
         let mut mem = mem_with(&CHAIN);
         let mut jit = Jit::new(64 * 1024).unwrap();
         let mut st = CpuState::new();
         st.rip = CODE;
-        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 3), Run::Executed { insns: 4 });
-        assert_eq!(st.rip, CODE + 12, "stopped on a block boundary, not mid-block");
-        assert_eq!(jit.stats().blocks_executed, 2);
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 3), Run::SideExit { insns: 2 });
+        assert_eq!(st.rip, CODE + 7, "stopped before the block that does not fit");
+        assert_eq!(jit.stats().blocks_executed, 1);
+        assert_eq!(jit.stats().budget_stops, 1);
+    }
+
+    #[test]
+    fn a_zero_budget_runs_nothing() {
+        let mut mem = mem_with(&CHAIN);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut st = CpuState::new();
+        st.rip = CODE;
+        assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 0), Run::SideExit { insns: 0 });
+        assert_eq!(st.rip, CODE);
+        assert_eq!(st.gpr[0], 0);
     }
 
     #[test]
@@ -952,7 +976,7 @@ mod tests {
 
         let mut stepped = 0u32;
         loop {
-            match one.run(&mut a, &mut mem, Mode::Long, 1) {
+            match one.run(&mut a, &mut mem, Mode::Long, 2) {
                 Run::Executed { insns } => stepped += insns,
                 other => {
                     stepped += other.insns();
@@ -988,7 +1012,7 @@ mod tests {
         let mut st = CpuState::new();
         for _ in 0..40 {
             st.rip = CODE;
-            jit.run(&mut st, &mut mem, Mode::Long, 1);
+            jit.run(&mut st, &mut mem, Mode::Long, 2);
         }
         let t = jit.recent_blocks();
         assert_eq!(t.len(), TRAIL, "the ring is full");
@@ -1032,34 +1056,34 @@ mod tests {
     }
 
     #[test]
-    fn a_linked_chain_still_stops_the_instant_the_budget_is_reached() {
-        for budget in 1..=20u64 {
+    fn a_linked_chain_never_retires_past_its_budget() {
+        let mut short = 0;
+        for budget in 0..=20u64 {
             let mut mem = mem_with(&LOOP);
             let mut linked = Jit::new(64 * 1024).unwrap();
-            let mut lone = Jit::new(64 * 1024).unwrap();
+            let mut cold = Jit::new(64 * 1024).unwrap();
             let (mut a, mut b) = (CpuState::new(), CpuState::new());
             let mut warm = CpuState::new();
             warm.rip = CODE;
             linked.run(&mut warm, &mut mem, Mode::Long, 1000);
+            assert!(linked.stats().links_made > 0, "the warm-up linked nothing");
 
             a.rip = CODE;
             b.rip = CODE;
+            let taken = linked.stats().links_taken;
             let chained = linked.run(&mut a, &mut mem, Mode::Long, budget).insns();
-            let mut stepped = 0u32;
-            while (stepped as u64) < budget {
-                match lone.run(&mut b, &mut mem, Mode::Long, 1) {
-                    Run::Executed { insns } => stepped += insns,
-                    other => {
-                        stepped += other.insns();
-                        break;
-                    }
-                }
+            let stepped = cold.run(&mut b, &mut mem, Mode::Long, budget).insns();
+            assert!(u64::from(chained) <= budget, "budget {budget}: retired {chained}");
+            if budget >= 10 {
+                assert!(linked.stats().links_taken > taken, "budget {budget}: no link was taken");
             }
+            short += u64::from(u64::from(chained) < budget && chained < 18);
             assert_eq!(chained, stepped, "budget {budget}: retired a different amount");
             assert_eq!(a.rip, b.rip, "budget {budget}: stopped at a different instruction");
             assert_eq!(a.gpr, b.gpr, "budget {budget}");
             assert_eq!(a.rflags, b.rflags, "budget {budget}");
         }
+        assert!(short > 0, "no budget ever ended inside a block");
     }
 
     #[test]

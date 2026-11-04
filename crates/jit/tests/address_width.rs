@@ -1,6 +1,7 @@
 use exemu_core::hooks::NoHooks;
 use exemu_core::{Cpu, CpuState, Exit, Memory, Perm, Region};
 use exemu_cpu::{Bits, Interpreter};
+use exemu_jit::compile::{Compiler, MAX_INSNS};
 use exemu_jit::{Jit, Mode, Run};
 use exemu_memory::VirtualMemory;
 
@@ -60,6 +61,10 @@ fn diff(a: &CpuState, b: &CpuState, what: &str) {
     assert_eq!(a.rip, b.rip, "{what}: rip jit={:#x} interp={:#x}", a.rip, b.rip);
 }
 
+fn block_len(mem: &VirtualMemory, bits: Bits, at: u64) -> u64 {
+    u64::from(Compiler::compile(mem, mode_of(bits), at, MAX_INSNS, None, u64::MAX).insns)
+}
+
 fn parity(bits: Bits, at: u64, code: &[u8], what: &str, s: &CpuState) -> u32 {
     if !jit_available() {
         return 0;
@@ -67,7 +72,8 @@ fn parity(bits: Bits, at: u64, code: &[u8], what: &str, s: &CpuState) -> u32 {
     let (mut mem_j, mut cpu_j) = build(bits, at, code, s);
     let (mut mem_i, mut cpu_i) = build(bits, at, code, s);
     let mut jit = Jit::new(256 * 1024).expect("JIT should be available");
-    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode_of(bits), 1);
+    let budget = block_len(&mem_j, bits, at);
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode_of(bits), budget);
     let n = run.insns();
     assert!(n > 0, "{what}: the JIT executed nothing ({run:?})");
     let mut hooks = NoHooks;
@@ -98,7 +104,8 @@ fn parity(bits: Bits, at: u64, code: &[u8], what: &str, s: &CpuState) -> u32 {
 fn jit_only(bits: Bits, at: u64, code: &[u8], s: &CpuState) -> CpuState {
     let (mut mem, mut cpu) = build(bits, at, code, s);
     let mut jit = Jit::new(64 * 1024).unwrap();
-    jit.run(cpu.state_mut(), &mut mem, mode_of(bits), 1);
+    let budget = block_len(&mem, bits, at);
+    jit.run(cpu.state_mut(), &mut mem, mode_of(bits), budget);
     cpu.state().clone()
 }
 
@@ -351,6 +358,13 @@ fn a_block_that_ends_on_2_32_still_sees_a_store_into_its_own_code() {
     assert_eq!(plan.stop, exemu_jit::StopReason::Wrapped);
     assert_eq!(plan.bytes, 0x10, "the block covers exactly the bytes it compiled");
 
-    let n = parity(Bits::B32, at, &code, "store into a block that ends on 2^32", &s);
-    assert_eq!(n, 2, "the block must commit the store and stop, not run the stale nops");
+    parity(Bits::B32, at, &code, "store into a block that ends on 2^32", &s);
+    let (mut mem, mut cpu) = build(Bits::B32, at, &code, &s);
+    let mut jit = Jit::new(64 * 1024).unwrap();
+    jit.run(cpu.state_mut(), &mut mem, Mode::Protected, u64::from(plan.insns));
+    assert_eq!(
+        jit.recent_blocks()[..2],
+        [at, at + 8],
+        "the block must commit the store and stop, not run the stale nops"
+    );
 }
