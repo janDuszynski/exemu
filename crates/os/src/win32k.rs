@@ -2175,7 +2175,8 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
                 call_hwnd_param::GET_WINDOW_LONG_A | call_hwnd_param::GET_WINDOW_LONG_W => LONG_SIZE,
                 _ => LONG_PTR_SIZE,
             };
-            let value = get_window_long(os, hwnd, param as i64, size);
+            let offset = param as u32 as i32 as i64;
+            let value = get_window_long(os, hwnd, offset, size);
             os.return_u64_from_syscall(value);
             Ok(0)
         }
@@ -5283,6 +5284,25 @@ mod tests {
         assert_eq!(get_window_long(&os, hwnd, 12, P), 0, "a pointer must fit inside the extra bytes");
         assert_eq!(get_window_long(&os, hwnd, -999, P), 0);
         assert_eq!(get_window_long(&os, 0xDEAD, 0, P), 0, "an unknown hwnd reads nothing");
+    }
+
+    #[test]
+    fn get_window_long_reads_its_offset_as_an_int_whichever_way_it_was_widened() {
+        const GWLP_USERDATA_ZERO_EXTENDED: u64 = GWLP_USERDATA as i32 as u32 as u64;
+        let (mut os, mut mem, hwnd) = message_call_fixture();
+        os.win32k_state.window_mut(hwnd).unwrap().user_data = 0x0001_BC48;
+        for (param, how) in [
+            (GWLP_USERDATA as u64, "sign-extended by 64-bit user32"),
+            (GWLP_USERDATA_ZERO_EXTENDED, "zero-extended by wow64win's get_ulong"),
+        ] {
+            let mut cpu = CpuState::default();
+            cpu.set_reg(Reg::R10, hwnd as u64);
+            cpu.set_reg(Reg::Rdx, param);
+            cpu.set_reg(Reg::R8, call_hwnd_param::GET_WINDOW_LONG_W);
+            os.syscall_result64 = None;
+            nt_user_call_hwnd_param(&mut os, &mut cpu, &mut mem).unwrap();
+            assert_eq!(os.syscall_result64, Some(0x0001_BC48), "GWLP_USERDATA {how}");
+        }
     }
 
     #[test]
