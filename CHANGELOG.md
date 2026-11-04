@@ -54,6 +54,8 @@ end-to-end on the default path.
   count in both bitnesses against the interpreter; and
   `crates/os/tests/thread.rs` runs two spinning threads for 230,017 steps in
   both modes and compares the counters each thread reached.
+- The Firefox and SteamSetup Wine-path entries now have `--jit` twins in
+  `corpus.toml`, pinned to the interpreter numbers.
 
 ### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
 - **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
