@@ -4,7 +4,9 @@ use std::path::Path;
 use exemu_core::{Cpu, EmuError, Memory, Perm, Result};
 use exemu_memory::VirtualMemory;
 use exemu_os::winedebug;
-use exemu_os::wow64::{self, Wow64Image};
+use exemu_os::wow64;
+
+use crate::wow64_image::{self, Wow64Image};
 
 pub const WOW64_LOW_ARENA: u64 = 0x6000_0000;
 pub const WOW64_LOW_ARENA_SIZE: u64 = 0x0800_0000;
@@ -70,7 +72,7 @@ pub fn build(
     let mut place = |mem: &mut VirtualMemory, host: std::path::PathBuf, name: &'static str| -> Result<Wow64Image> {
         let bytes = std::fs::read(&host)
             .map_err(|e| EmuError::Os(format!("WoW64 boot: cannot read {}: {e}", host.display())))?;
-        let img = wow64::map_image(mem, &bytes, low, name)?;
+        let img = wow64_image::map_image(mem, &bytes, low, name)?;
         low += img.size;
         low = (low + 0xffff) & !0xffff;
         if low > WOW64_LOW_ARENA + WOW64_LOW_ARENA_SIZE {
@@ -85,23 +87,23 @@ pub fn build(
     const HIGH: u64 = 0x0000_0007_0000_0000;
     let wow64_bytes = std::fs::read(dirs.dir64.join("wow64.dll"))
         .map_err(|e| EmuError::Os(format!("WoW64 boot: cannot read wow64.dll: {e}")))?;
-    let wow64_img = wow64::map_image(mem, &wow64_bytes, HIGH, "wow64")?;
+    let wow64_img = wow64_image::map_image(mem, &wow64_bytes, HIGH, "wow64")?;
     let win_bytes = std::fs::read(dirs.dir64.join("wow64win.dll"))
         .map_err(|e| EmuError::Os(format!("WoW64 boot: cannot read wow64win.dll: {e}")))?;
-    let wow64win = wow64::map_image(mem, &win_bytes, HIGH + 0x0400_0000, "wow64win")?;
+    let wow64win = wow64_image::map_image(mem, &win_bytes, HIGH + 0x0400_0000, "wow64win")?;
     let win32u_bytes = std::fs::read(dirs.dir64.join("win32u.dll"))
         .map_err(|e| EmuError::Os(format!("WoW64 boot: cannot read win32u.dll: {e}")))?;
-    let win32u = wow64::map_image(mem, &win32u_bytes, HIGH + 0x0800_0000, "win32u64")?;
+    let win32u = wow64_image::map_image(mem, &win32u_bytes, HIGH + 0x0800_0000, "win32u64")?;
 
-    let bound = wow64::bind_imports(mem, &wow64_img, &[ntdll64], 8)?;
+    let bound = wow64_image::bind_imports(mem, &wow64_img, &[ntdll64], 8)?;
     if bound < 200 {
         return Err(EmuError::Os(format!(
             "WoW64 boot: wow64.dll bound only {bound} ntdll imports (expected 200+) — wrong pinned set?"
         )));
     }
-    wow64::bind_imports(mem, &wow64cpu, &[&wow64_img, ntdll64], 8)?;
-    wow64::bind_imports(mem, &win32u, &[ntdll64], 8)?;
-    let win_bound = wow64::bind_imports(mem, &wow64win, &[ntdll64, &wow64_img, &win32u], 8)?;
+    wow64_image::bind_imports(mem, &wow64cpu, &[&wow64_img, ntdll64], 8)?;
+    wow64_image::bind_imports(mem, &win32u, &[ntdll64], 8)?;
+    let win_bound = wow64_image::bind_imports(mem, &wow64win, &[ntdll64, &wow64_img, &win32u], 8)?;
     if win_bound < 450 {
         return Err(EmuError::Os(format!(
             "WoW64 boot: wow64win.dll bound only {win_bound} imports (expected 480+) — wrong pinned set?"

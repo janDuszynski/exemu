@@ -13,6 +13,7 @@ pub mod socket_sample;
 pub mod winsxs;
 pub mod wow64_boot;
 pub mod wow64_gui_sample;
+pub mod wow64_image;
 pub mod wow64_sample;
 pub mod spawn;
 pub mod spawn_sample;
@@ -556,7 +557,7 @@ impl Process {
             };
             let ntdll64_bytes = std::fs::read(dirs.dir64.join("ntdll.dll"))
                 .map_err(|e| EmuError::Os(format!("WoW64 boot: cannot re-read ntdll.dll: {e}")))?;
-            let ntdll64 = exemu_os::wow64::image_view(&ntdll64_bytes, ntdll_base)?;
+            let ntdll64 = wow64_image::image_view(&ntdll64_bytes, ntdll_base)?;
 
             let boot = wow64_boot::build(&mut mem, &dirs, &ntdll64, base)?;
             if cfg.wow64_bringup == wow64_boot::Bringup::Direct {
