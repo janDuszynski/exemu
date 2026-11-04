@@ -1,3 +1,5 @@
+pub mod wow64;
+
 const IMAGE_BASE: u64 = 0x1_4000_0000;
 const SECTION_ALIGN: u32 = 0x1000;
 const FILE_ALIGN: u32 = 0x200;
