@@ -51,6 +51,8 @@ const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
+const SECTION_HEADER_SIZE: usize = 40;
+
 pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     let r = Reader::new(bytes);
 
@@ -109,42 +111,27 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     let (delay_dir_rva, delay_dir_size) = dir(DIR_DELAY_IMPORT)?;
 
     let sec_table = opt + size_opt_header;
+    let headers = (0..num_sections)
+        .map(|i| SectionHeader::read(&r, sec_table + i * SECTION_HEADER_SIZE))
+        .collect::<Result<Vec<_>>>()?;
+    let raw_limits = raw_copy_limits(&headers)?;
     let mut sections = Vec::with_capacity(num_sections);
-    let mut raw_total = 0usize;
-    for i in 0..num_sections {
-        let s = sec_table + i * 40;
-        let name = {
-            let raw = r.bytes(s, 8)?;
-            let end = raw.iter().position(|&b| b == 0).unwrap_or(8);
-            String::from_utf8_lossy(&raw[..end]).into_owned()
-        };
-        let virtual_size = r.u32(s + 8)?;
-        let rva = r.u32(s + 12)?;
-        let size_raw = r.u32(s + 16)? as usize;
-        let ptr_raw = r.u32(s + 20)? as usize;
-        let chars = r.u32(s + 36)?;
-
-        let data = if size_raw == 0 || chars & SCN_CNT_UNINIT_DATA != 0 {
+    for (h, limit) in headers.into_iter().zip(raw_limits) {
+        let data = if h.size_raw == 0 || h.chars & SCN_CNT_UNINIT_DATA != 0 {
             Vec::new()
         } else {
-            let avail = r.len().saturating_sub(ptr_raw).min(size_raw);
-            raw_total = raw_total.saturating_add(avail);
-            if raw_total > r.len() {
-                return Err(EmuError::InvalidPe(
-                    "section raw data exceeds the file size".into(),
-                ));
-            }
-            r.bytes(ptr_raw, avail)?
+            let avail = r.len().saturating_sub(h.ptr_raw).min(h.size_raw).min(limit);
+            r.bytes(h.ptr_raw, avail)?
         };
 
         sections.push(Section {
-            name,
-            rva,
-            virtual_size,
+            name: h.name,
+            rva: h.rva,
+            virtual_size: h.virtual_size,
             data,
-            readable: chars & SCN_MEM_READ != 0,
-            writable: chars & SCN_MEM_WRITE != 0,
-            executable: chars & SCN_MEM_EXECUTE != 0,
+            readable: h.chars & SCN_MEM_READ != 0,
+            writable: h.chars & SCN_MEM_WRITE != 0,
+            executable: h.chars & SCN_MEM_EXECUTE != 0,
         });
     }
 
@@ -206,6 +193,59 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
         function_table,
         activation_context,
     })
+}
+
+struct SectionHeader {
+    name: String,
+    virtual_size: u32,
+    rva: u32,
+    size_raw: usize,
+    ptr_raw: usize,
+    chars: u32,
+}
+
+impl SectionHeader {
+    fn read(r: &Reader, at: usize) -> Result<SectionHeader> {
+        let raw_name = r.bytes(at, 8)?;
+        let name_len = raw_name.iter().position(|&b| b == 0).unwrap_or(8);
+        Ok(SectionHeader {
+            name: String::from_utf8_lossy(&raw_name[..name_len]).into_owned(),
+            virtual_size: r.u32(at + 8)?,
+            rva: r.u32(at + 12)?,
+            size_raw: r.u32(at + 16)? as usize,
+            ptr_raw: r.u32(at + 20)? as usize,
+            chars: r.u32(at + 36)?,
+        })
+    }
+
+    fn virtual_span(&self) -> u64 {
+        if self.virtual_size != 0 {
+            u64::from(self.virtual_size)
+        } else {
+            self.size_raw as u64
+        }
+    }
+
+    fn virtual_end(&self) -> u64 {
+        u64::from(self.rva) + self.virtual_span()
+    }
+}
+
+fn raw_copy_limits(headers: &[SectionHeader]) -> Result<Vec<usize>> {
+    let mut by_rva: Vec<usize> = (0..headers.len()).collect();
+    by_rva.sort_by_key(|&i| (headers[i].rva, headers[i].virtual_span()));
+    let mut limits = vec![usize::MAX; headers.len()];
+    for pair in by_rva.windows(2) {
+        let (cur, next) = (&headers[pair[0]], &headers[pair[1]]);
+        if cur.virtual_end() > u64::from(next.rva) {
+            return Err(EmuError::InvalidPe(format!(
+                "section {:?} at rva {:#x} overlaps section {:?} at rva {:#x}",
+                cur.name, cur.rva, next.name, next.rva
+            )));
+        }
+        limits[pair[0]] = (next.rva - cur.rva) as usize;
+    }
+    Ok(limits)
 }
 
 fn parse_exports(
@@ -807,19 +847,58 @@ mod tests {
         assert!(parse_relocs(&sections, u32::MAX - 0x10, u32::MAX).is_ok());
     }
 
-    #[test]
-    fn sections_sharing_raw_data_beyond_the_file_size_are_rejected() {
+    const TEST_SEC_TABLE: usize = 0x80 + 4 + 20 + 0xF0;
+
+    fn pe_with_sections(
+        count: u16,
+        file_len: usize,
+        header: impl Fn(usize) -> (u32, u32, u32, u32),
+    ) -> Vec<u8> {
         let mut f = minimal_pe_no_tls();
-        let coff = 0x80 + 4;
-        f[coff + 2..coff + 4].copy_from_slice(&40u16.to_le_bytes());
-        f.resize(0x80 + 4 + 20 + 0xF0 + 40 * 40, 0);
-        for i in 1..40 {
-            let sec = 0x80 + 4 + 20 + 0xF0;
-            let (src, dst) = (sec, sec + i * 40);
-            let hdr: Vec<u8> = f[src..src + 40].to_vec();
-            f[dst..dst + 40].copy_from_slice(&hdr);
+        f.resize(file_len.max(TEST_SEC_TABLE + usize::from(count) * SECTION_HEADER_SIZE), 0);
+        f[0x80 + 4 + 2..0x80 + 4 + 4].copy_from_slice(&count.to_le_bytes());
+        let template = f[TEST_SEC_TABLE..TEST_SEC_TABLE + SECTION_HEADER_SIZE].to_vec();
+        for i in 0..usize::from(count) {
+            let s = TEST_SEC_TABLE + i * SECTION_HEADER_SIZE;
+            f[s..s + SECTION_HEADER_SIZE].copy_from_slice(&template);
+            let (rva, virtual_size, size_raw, ptr_raw) = header(i);
+            put_le32(&mut f, s + 8, virtual_size);
+            put_le32(&mut f, s + 12, rva);
+            put_le32(&mut f, s + 16, size_raw);
+            put_le32(&mut f, s + 20, ptr_raw);
         }
-        assert!(matches!(parse(&f), Err(EmuError::InvalidPe(_))));
+        f
+    }
+
+    #[test]
+    fn sections_sharing_raw_data_load() {
+        let len = 0x600u32;
+        let f = pe_with_sections(2, len as usize, |i| (0x1000 * (i as u32 + 1), 0x1000, len, 0));
+        let pe = parse(&f).expect("two sections over the same file bytes are a valid image");
+        assert_eq!(pe.sections.len(), 2);
+        assert_eq!(pe.sections[0].data, f);
+        assert_eq!(pe.sections[1].data, f);
+    }
+
+    #[test]
+    fn a_mutated_section_count_over_one_virtual_range_is_refused() {
+        let f = pe_with_sections(1000, 0x10000, |_| (0x1000, 0x1000, 0x10000, 0));
+        match parse(&f) {
+            Err(EmuError::InvalidPe(why)) => assert!(why.contains("overlaps"), "{why}"),
+            other => panic!("expected an overlap refusal, got {:?}", other.map(|p| p.sections.len())),
+        }
+    }
+
+    #[test]
+    fn section_raw_data_stops_at_the_next_section() {
+        let len = 0x4000u32;
+        let f = pe_with_sections(64, len as usize, |i| (0x1000 * (i as u32 + 1), 0x10, len, 0));
+        let pe = parse(&f).expect("ascending sections with small virtual sizes are a valid layout");
+        let (last, rest) = pe.sections.split_last().unwrap();
+        assert!(rest.iter().all(|s| s.data.len() == 0x1000));
+        assert_eq!(last.data.len(), len as usize);
+        let copied: usize = pe.sections.iter().map(|s| s.data.len()).sum();
+        assert_eq!(copied, 63 * 0x1000 + len as usize);
     }
 
     fn put_le32(d: &mut [u8], off: usize, v: u32) {
