@@ -14,9 +14,15 @@ pub(crate) fn parse_function_table(
     dir_size: u32,
 ) -> Vec<UnwindEntry> {
     let mut table = Vec::new();
-    let count = dir_size / 12;
+    let readable_end = sections
+        .iter()
+        .map(|s| u64::from(s.rva) + s.data.len() as u64)
+        .max()
+        .unwrap_or(0);
+    let readable = readable_end.saturating_sub(u64::from(dir_rva)) / 12;
+    let count = (dir_size / 12).min(u32::try_from(readable).unwrap_or(u32::MAX));
     for i in 0..count {
-        let rec = dir_rva + i * 12;
+        let rec = dir_rva.wrapping_add(i * 12);
         let Ok(entry) = parse_runtime_function(sections, rec, 0) else { continue };
         let Some(entry) = entry else { continue };
         table.push(entry);
@@ -31,8 +37,8 @@ fn parse_runtime_function(
     depth: u8,
 ) -> Result<Option<UnwindEntry>> {
     let begin_rva = slice_u32(sections, rec_rva)?;
-    let end_rva = slice_u32(sections, rec_rva + 4)?;
-    let unwind_rva = slice_u32(sections, rec_rva + 8)?;
+    let end_rva = slice_u32(sections, rec_rva.wrapping_add(4))?;
+    let unwind_rva = slice_u32(sections, rec_rva.wrapping_add(8))?;
     if begin_rva == 0 && end_rva == 0 {
         return Ok(None);
     }
@@ -52,23 +58,23 @@ fn parse_unwind_info(sections: &[Section], rva: u32, depth: u8) -> Result<Unwind
     if version != 1 && version != 2 {
         return Err(EmuError::InvalidPe(format!("UNWIND_INFO version {version}")));
     }
-    let prolog_size = slice_u8(sections, rva + 1)?;
-    let count = slice_u8(sections, rva + 2)?;
-    let b3 = slice_u8(sections, rva + 3)?;
+    let prolog_size = slice_u8(sections, rva.wrapping_add(1))?;
+    let count = slice_u8(sections, rva.wrapping_add(2))?;
+    let b3 = slice_u8(sections, rva.wrapping_add(3))?;
     let frame_register = match b3 & 0xF {
         0 => None,
         r => Some(r),
     };
     let frame_offset = ((b3 >> 4) as u16) * 16;
 
-    let slots_base = rva + 4;
+    let slots_base = rva.wrapping_add(4);
     let slot = |i: u32| -> Result<(u8, u8, u8)> {
-        let lo = slice_u8(sections, slots_base + i * 2)?;
-        let hi = slice_u8(sections, slots_base + i * 2 + 1)?;
+        let lo = slice_u8(sections, slots_base.wrapping_add(i * 2))?;
+        let hi = slice_u8(sections, slots_base.wrapping_add(i * 2 + 1))?;
         Ok((lo, hi & 0xF, hi >> 4))
     };
-    let next_u16 = |i: u32| slice_u16(sections, slots_base + i * 2);
-    let next_u32 = |i: u32| slice_u32(sections, slots_base + i * 2);
+    let next_u16 = |i: u32| slice_u16(sections, slots_base.wrapping_add(i * 2));
+    let next_u32 = |i: u32| slice_u32(sections, slots_base.wrapping_add(i * 2));
 
     let mut codes = Vec::new();
     let mut i = 0u32;
@@ -111,7 +117,7 @@ fn parse_unwind_info(sections: &[Section], rva: u32, depth: u8) -> Result<Unwind
         return Err(EmuError::InvalidPe("unwind codes overrun their count".into()));
     }
 
-    let after_codes = slots_base + 2 * ((count as u32 + 1) & !1);
+    let after_codes = slots_base.wrapping_add(2 * ((count as u32 + 1) & !1));
 
     let mut handler_rva = None;
     let mut handler_data_rva = None;
@@ -126,7 +132,7 @@ fn parse_unwind_info(sections: &[Section], rva: u32, depth: u8) -> Result<Unwind
         }
     } else if flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER) != 0 {
         handler_rva = Some(slice_u32(sections, after_codes)?);
-        handler_data_rva = Some(after_codes + 4);
+        handler_data_rva = Some(after_codes.wrapping_add(4));
     }
 
     Ok(UnwindInfo {

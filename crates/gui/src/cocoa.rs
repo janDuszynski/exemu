@@ -158,7 +158,7 @@ impl CocoaWindow {
             src.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
                 full_region(w, h),
                 0,
-                NonNull::new(bgra.as_ptr() as *mut c_void).unwrap(),
+                NonNull::from(bgra).cast::<c_void>(),
                 (w * 4) as usize,
             );
         }
@@ -501,7 +501,7 @@ pub fn metal_bgra_roundtrip(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
         tex.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
             region,
             0,
-            NonNull::new(bgra.as_ptr() as *mut c_void).unwrap(),
+            NonNull::from(bgra).cast::<c_void>(),
             stride,
         );
     }
@@ -509,7 +509,7 @@ pub fn metal_bgra_roundtrip(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
     let mut out = vec![0u8; n];
     unsafe {
         tex.getBytes_bytesPerRow_fromRegion_mipmapLevel(
-            NonNull::new(out.as_mut_ptr() as *mut c_void).unwrap(),
+            NonNull::from(out.as_mut_slice()).cast::<c_void>(),
             stride,
             region,
             0,
