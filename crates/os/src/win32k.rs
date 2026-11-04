@@ -393,6 +393,7 @@ mod window_relative {
 const HWND_LIST_MAX: usize = 4096;
 const DIALOG_CLASS: &str = "#32770";
 const IDC_FILENAME_COMBO: u64 = 0x47c;
+const FILE_DIALOG_PICK_SEPARATOR: char = '|';
 const IDOK: u64 = 1;
 const WM_COMMAND: u32 = 0x0111;
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
@@ -756,7 +757,6 @@ pub(crate) struct Win32kState {
     icons: Vec<(u32, IconObject)>,
     win_procs: Vec<WinProc>,
     driven_dialogs: Vec<u32>,
-    pick_text: u64,
     sys_brushes: Vec<(u32, u32)>,
     gdi_table_base: u64,
     gdi_next_slot: u64,
@@ -1843,8 +1843,14 @@ fn edit_within(st: &Win32kState, root: u32) -> Option<u32> {
     None
 }
 
+fn next_file_dialog_pick(os: &WinOs) -> Option<String> {
+    let picks = os.cfg.file_dialog_pick.as_deref()?;
+    let nth = os.win32k_state.driven_dialogs.len();
+    picks.split(FILE_DIALOG_PICK_SEPARATOR).nth(nth).map(str::to_string)
+}
+
 fn drive_file_dialog(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
-    let Some(pick) = os.cfg.file_dialog_pick.clone() else { return false };
+    let Some(pick) = next_file_dialog_pick(os) else { return false };
     let st = &os.win32k_state;
     let Some((hwnd, target)) = st
         .windows
@@ -1862,20 +1868,16 @@ fn drive_file_dialog(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
         return false;
     };
 
-    if os.win32k_state.pick_text == 0 {
-        let bytes: Vec<u8> =
-            pick.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
-        let Some(base) = os.map_anywhere(mem, bytes.len() as u64, Perm::RW, "dialog-pick") else {
-            return false;
-        };
-        if mem.write(base, &bytes).is_err() {
-            return false;
-        }
-        os.win32k_state.pick_text = base;
+    let bytes: Vec<u8> =
+        pick.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+    let Some(text) = os.map_anywhere(mem, bytes.len() as u64, Perm::RW, "dialog-pick") else {
+        return false;
+    };
+    if mem.write(text, &bytes).is_err() {
+        return false;
     }
 
     os.win32k_state.driven_dialogs.push(hwnd);
-    let text = os.win32k_state.pick_text;
     os.post_internal(target as u64, WM_SETTEXT, 0, text);
     os.post_internal(hwnd as u64, WM_COMMAND, IDOK, 0);
     true
@@ -4725,6 +4727,41 @@ mod tests {
         assert!(os.threads[os.current].msgs.is_empty(), "and nothing more was invented");
 
         cancel_unattended_dialog(&mut os);
+        assert!(os.threads[os.current].msgs.is_empty());
+    }
+
+    fn file_dialog(os: &mut WinOs) -> (u32, u32) {
+        let dialog = child(os, 0, [0, 0, 100, 100]);
+        os.win32k_state.window_mut(dialog).unwrap().class_name = DIALOG_CLASS.into();
+        let combo = child(os, dialog, [0, 0, 100, 20]);
+        os.win32k_state.window_mut(combo).unwrap().id = IDC_FILENAME_COMBO;
+        let edit = child(os, combo, [0, 0, 100, 20]);
+        os.win32k_state.window_mut(edit).unwrap().class_name = "Edit".into();
+        (dialog, edit)
+    }
+
+    #[test]
+    fn each_file_dialog_takes_the_next_pick_and_the_rest_are_left_alone() {
+        let mut mem = VirtualMemory::new();
+        let mut os = WinOs::new(crate::WinConfig {
+            is_64bit: true,
+            file_dialog_pick: Some("open.txt|save.txt".into()),
+            ..Default::default()
+        });
+
+        for want in ["open.txt", "save.txt"] {
+            let (dialog, edit) = file_dialog(&mut os);
+            assert!(drive_file_dialog(&mut os, &mut mem), "a fresh dialog is driven");
+            let typed = os.msg_next().expect("the pick is typed first");
+            assert_eq!((typed.hwnd, typed.message), (edit as u64, WM_SETTEXT), "into the edit");
+            assert_eq!(read_wstr(&mem, typed.lparam).unwrap(), want);
+            let ok = os.msg_next().expect("then OK is pressed");
+            assert_eq!((ok.hwnd, ok.message, ok.wparam), (dialog as u64, WM_COMMAND, IDOK));
+            assert!(!drive_file_dialog(&mut os, &mut mem), "a dialog is driven once");
+        }
+
+        file_dialog(&mut os);
+        assert!(!drive_file_dialog(&mut os, &mut mem), "no pick is left for a third dialog");
         assert!(os.threads[os.current].msgs.is_empty());
     }
 

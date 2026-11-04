@@ -228,7 +228,7 @@ fn wine_file_dialog_is_built_but_never_completes() {
 }
 
 #[test]
-fn driving_the_dialog_returns_the_typed_path_and_the_file_behind_it() {
+fn driving_both_dialogs_opens_the_first_pick_and_saves_to_the_second() {
     if !wine_dlls_present() {
         eprintln!("SKIP: {WINE_DLLS} not present (the Wine DLL set is git-ignored)");
         return;
@@ -242,7 +242,8 @@ fn driving_the_dialog_returns_the_typed_path_and_the_file_behind_it() {
         undriven.steps
     );
 
-    let (driven, _) = run_on_wine_picking("pick", Some(comdlg_sample::PICK_FILE_NAME));
+    let picks = format!("{}|{}", comdlg_sample::PICK_FILE_NAME, comdlg_sample::SAVE_FILE_NAME);
+    let (driven, _) = run_on_wine_picking("pick", Some(&picks));
     let res = driven.unwrap_or_else(|e| {
         panic!(
             "the driven dialog must run to completion. 0xc0000005 at 0x10 in \
@@ -267,6 +268,28 @@ fn driving_the_dialog_returns_the_typed_path_and_the_file_behind_it() {
         PICK_CONTENT,
         "the path it returned opens the seeded file"
     );
+
+    assert_eq!(num(&r, comdlg_sample::TAG_SAVE_RET), 1, "GetSaveFileNameW answered TRUE");
+    assert_eq!(
+        tag(&r, comdlg_sample::TAG_SAVE),
+        format!(r"{}\{}", comdlg_sample::INITIAL_DIR, comdlg_sample::SAVE_FILE_NAME),
+        "the second dialog took the second pick, so no overwrite prompt stood in the way"
+    );
+    assert_eq!(num(&r, comdlg_sample::TAG_SAVE_ERR), 0);
+    assert_eq!(num(&r, comdlg_sample::TAG_WROTE), comdlg_sample::SAVE_PAYLOAD.len() as u32);
+    let saved = Path::new(&res.sandbox)
+        .join("C")
+        .join("Users")
+        .join("exemu")
+        .join("Documents")
+        .join(comdlg_sample::SAVE_FILE_NAME);
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap_or_default(),
+        comdlg_sample::SAVE_PAYLOAD,
+        "the guest wrote its payload through the path the save dialog returned ({})",
+        saved.display()
+    );
+    assert_eq!(res.exit_code, 0, "both dialogs completed and nothing failed. Got {r:?}");
 }
 
 #[test]
