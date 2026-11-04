@@ -879,6 +879,10 @@ pub(crate) fn ws2_32_unixlib() -> Unixlib {
     Unixlib { name: "ws2_32", table: WS2_32_UNIXLIB, wow64: false }
 }
 
+pub(crate) fn ws2_32_wow64_unixlib() -> Unixlib {
+    Unixlib { name: "ws2_32 (wow64)", table: WS2_32_UNIXLIB, wow64: true }
+}
+
 pub(crate) fn ssdt_nt_device_io_control_file(
     os: &mut WinOs,
     cpu: &mut CpuState,

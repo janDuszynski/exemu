@@ -3,6 +3,12 @@ use exemu_core::{CpuState, Memory, Reg, Result};
 use crate::WinOs;
 
 pub(crate) const MEMORY_WINE_UNIX_FUNCS: u32 = 1000;
+pub(crate) const MEMORY_WINE_UNIX_WOW64_FUNCS: u32 = 1001;
+
+const PE32_MAGIC: u16 = 0x10B;
+const PE32_PLUS_MAGIC: u16 = 0x20B;
+const PE32_EXPORT_DIR: u64 = 96;
+const PE32_PLUS_EXPORT_DIR: u64 = 112;
 
 pub(crate) const SSDT_NT_QUERY_VIRTUAL_MEMORY: u32 = 0x23;
 
@@ -116,14 +122,16 @@ impl WinOs {
         self.unixlib_of_module.get(&module_base).copied()
     }
 
-    fn register_builtin_unixlib(&mut self, mem: &dyn Memory, base: u64) -> Option<u64> {
+    fn register_builtin_unixlib(&mut self, mem: &dyn Memory, base: u64, wow64: bool) -> Option<u64> {
         let name = module_name_at(mem, base)?;
         if self.cfg.trace {
-            eprintln!("[unixlib] {name} at {base:#x} asks for its unix side");
+            let side = if wow64 { "wow64 " } else { "" };
+            eprintln!("[unixlib] {name} at {base:#x} asks for its {side}unix side");
         }
-        let lib = match name.to_ascii_lowercase().as_str() {
-            "ws2_32.dll" => crate::net::ws2_32_unixlib(),
-            crate::audio::DRIVER_MODULE => crate::audio::coreaudio_unixlib(),
+        let lib = match (name.to_ascii_lowercase().as_str(), wow64) {
+            ("ws2_32.dll", false) => crate::net::ws2_32_unixlib(),
+            ("ws2_32.dll", true) => crate::net::ws2_32_wow64_unixlib(),
+            (crate::audio::DRIVER_MODULE, false) => crate::audio::coreaudio_unixlib(),
             _ => return None,
         };
         Some(self.register_unixlib(base, lib))
@@ -173,11 +181,12 @@ impl WinOs {
     ) -> Result<u32> {
         let info_class = self.syscall_arg(cpu, mem, 2)? as u32;
 
-        match info_class {
-            MEMORY_WINE_UNIX_FUNCS => {}
+        let wow64 = match info_class {
+            MEMORY_WINE_UNIX_FUNCS => false,
+            MEMORY_WINE_UNIX_WOW64_FUNCS => true,
             crate::vm::MEMORY_BASIC_INFORMATION => return self.nt_query_virtual_memory_basic(cpu, mem),
             _ => return Ok(STATUS_INVALID_PARAMETER),
-        }
+        };
 
         let base_address = self.syscall_arg(cpu, mem, 1)?;
         let buffer = self.syscall_arg(cpu, mem, 3)?;
@@ -188,8 +197,9 @@ impl WinOs {
             return Ok(STATUS_INVALID_PARAMETER);
         }
         let handle = match self.unixlib_handle_of(base_address) {
-            Some(h) => h,
-            None => match self.register_builtin_unixlib(mem, base_address) {
+            Some(h) if self.unixlibs.get(h as usize).is_some_and(|l| l.wow64 == wow64) => h,
+            Some(_) => return Ok(STATUS_INVALID_ADDRESS),
+            None => match self.register_builtin_unixlib(mem, base_address, wow64) {
                 Some(h) => h,
                 None => return Ok(STATUS_INVALID_ADDRESS),
             },
@@ -211,10 +221,12 @@ fn module_name_at(mem: &dyn Memory, base: u64) -> Option<String> {
         return None;
     }
     let opt = base + e_lfanew + 24;
-    if mem.read_u16(opt).ok()? != 0x20B {
-        return None;
-    }
-    let export_rva = mem.read_u32(opt + 112).ok()? as u64;
+    let export_dir = match mem.read_u16(opt).ok()? {
+        PE32_PLUS_MAGIC => PE32_PLUS_EXPORT_DIR,
+        PE32_MAGIC => PE32_EXPORT_DIR,
+        _ => return None,
+    };
+    let export_rva = mem.read_u32(opt + export_dir).ok()? as u64;
     if export_rva == 0 {
         return None;
     }
@@ -360,6 +372,80 @@ mod tests {
         cpu.set_reg(Reg::R8, 0);
         cpu.set_reg(Reg::R9, 0x2_0100);
         assert_eq!(os.nt_query_virtual_memory(&mut cpu, &mut mem).unwrap(), STATUS_INVALID_PARAMETER);
+    }
+
+    fn map_named_image(mem: &mut VirtualMemory, base: u64, magic: u16, name: &str) {
+        mem.map_fixed(base, 0x1000, exemu_core::Perm::RW, "image").unwrap();
+        let e_lfanew = 0x80u64;
+        let opt = base + e_lfanew + 24;
+        let export_dir = if magic == PE32_MAGIC { PE32_EXPORT_DIR } else { PE32_PLUS_EXPORT_DIR };
+        let (export_rva, name_rva) = (0x400u64, 0x500u64);
+        mem.write_u16(base, 0x5A4D).unwrap();
+        mem.write_u32(base + 0x3C, e_lfanew as u32).unwrap();
+        mem.write_u32(base + e_lfanew, 0x0000_4550).unwrap();
+        mem.write_u16(opt, magic).unwrap();
+        mem.write_u32(opt + export_dir, export_rva as u32).unwrap();
+        mem.write_u32(base + export_rva + 12, name_rva as u32).unwrap();
+        mem.write(base + name_rva, name.as_bytes()).unwrap();
+    }
+
+    fn query_class(os: &mut WinOs, mem: &mut VirtualMemory, base: u64, class: u32) -> (u32, u64) {
+        let gsp = 0x2_0800;
+        mem.write_u64(gsp + 0x28, 8).unwrap();
+        mem.write_u64(gsp + 0x30, 0).unwrap();
+        mem.write_u64(0x2_0100, 0xA5A5_A5A5_A5A5_A5A5).unwrap();
+        os.set_syscall_guest_rsp_for_test(gsp);
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, 0xFFFF_FFFF_FFFF_FFFF);
+        cpu.set_reg(Reg::Rdx, base);
+        cpu.set_reg(Reg::R8, class as u64);
+        cpu.set_reg(Reg::R9, 0x2_0100);
+        let status = os.nt_query_virtual_memory(&mut cpu, mem).unwrap();
+        (status, mem.read_u64(0x2_0100).unwrap())
+    }
+
+    #[test]
+    fn a_32bit_ws2_32_gets_its_unix_side_through_the_wow64_funcs_class() {
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, exemu_core::Perm::RW, "scratch").unwrap();
+        let mut os = os64();
+        let base = 0x0050_0000;
+        map_named_image(&mut mem, base, PE32_MAGIC, "ws2_32.dll");
+
+        let (status, handle) = query_class(&mut os, &mut mem, base, MEMORY_WINE_UNIX_WOW64_FUNCS);
+        assert_eq!(
+            status, STATUS_SUCCESS,
+            "wow64.dll turns a 32-bit DLL's MemoryWineUnixFuncs into MemoryWineUnixWow64Funcs; \
+             refusing it makes ws2_32's DllMain return FALSE"
+        );
+        assert_ne!(handle, 0xA5A5_A5A5_A5A5_A5A5, "the handle is written to the caller's buffer");
+
+        let mut cpu = CpuState::default();
+        let status = os.dispatch_unix_call(handle, 0, 0x2_0200, &mut cpu, &mut mem).unwrap();
+        assert!(os.unix_call_wow64, "a call through the wow64 handle is marked as carrying 32-bit args");
+        assert_eq!(status, 11001, "and answers what the 64-bit side answers: no resolver");
+
+        let (again, same) = query_class(&mut os, &mut mem, base, MEMORY_WINE_UNIX_WOW64_FUNCS);
+        assert_eq!((again, same), (STATUS_SUCCESS, handle), "one module, one handle");
+        let (native, _) = query_class(&mut os, &mut mem, base, MEMORY_WINE_UNIX_FUNCS);
+        assert_eq!(native, STATUS_INVALID_ADDRESS, "the wow64 side is not handed out as the native one");
+    }
+
+    #[test]
+    fn the_wow64_funcs_class_is_refused_for_a_library_without_a_wow64_side() {
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x2_0000, 0x1000, exemu_core::Perm::RW, "scratch").unwrap();
+        let mut os = os64();
+        let base = 0x0060_0000;
+        map_named_image(&mut mem, base, PE32_MAGIC, crate::audio::DRIVER_MODULE);
+        let (status, untouched) = query_class(&mut os, &mut mem, base, MEMORY_WINE_UNIX_WOW64_FUNCS);
+        assert_eq!(status, STATUS_INVALID_ADDRESS, "its unix side reads 64-bit argument structs only");
+        assert_eq!(untouched, 0xA5A5_A5A5_A5A5_A5A5);
+
+        let base64 = 0x0070_0000;
+        map_named_image(&mut mem, base64, PE32_PLUS_MAGIC, crate::audio::DRIVER_MODULE);
+        let (status, _) = query_class(&mut os, &mut mem, base64, MEMORY_WINE_UNIX_FUNCS);
+        assert_eq!(status, STATUS_SUCCESS, "the native class still answers the 64-bit driver");
     }
 
     #[test]
