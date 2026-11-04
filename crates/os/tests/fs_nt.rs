@@ -114,6 +114,7 @@ fn nt_create_write_readback_and_queries() {
     let dir = std::env::temp_dir().join(format!("exemu-w2_8-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(dir.join("C").join("out")).unwrap();
     let (mut os, mut mem) = setup(&dir);
 
     let handle_ptr = SCRATCH;

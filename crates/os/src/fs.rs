@@ -482,6 +482,9 @@ const FILE_OPEN_IF: u32 = 3;
 const FILE_OVERWRITE: u32 = 4;
 const FILE_OVERWRITE_IF: u32 = 5;
 
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+
 const FILE_WRITE_DATA: u64 = 0x0000_0002;
 const FILE_APPEND_DATA: u64 = 0x0000_0004;
 const NT_GENERIC_WRITE: u64 = 0x4000_0000;
@@ -512,6 +515,10 @@ pub(crate) const SSDT_NT_FS_CONTROL_FILE: u32 = 0x39;
 pub(crate) const SSDT_NT_CLOSE: u32 = 0x0f;
 
 const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+const STATUS_OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+const STATUS_NOT_A_DIRECTORY: u32 = 0xC000_0103;
+const STATUS_FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 
 const NT_FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
@@ -557,34 +564,70 @@ impl WinOs {
             return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
         };
 
-        let existed = path.exists();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let options = self.syscall_arg(cpu, mem, 8)? as u32;
+        let want_dir = options & FILE_DIRECTORY_FILE != 0;
+        let want_file = options & FILE_NON_DIRECTORY_FILE != 0;
+        if want_dir && want_file {
+            return Ok(STATUS_INVALID_PARAMETER);
         }
-        let wants_write = access & (NT_GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0
-            || disposition != FILE_OPEN;
+        if disposition > FILE_OVERWRITE_IF {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+        if want_dir && matches!(disposition, FILE_SUPERSEDE | FILE_OVERWRITE | FILE_OVERWRITE_IF) {
+            return Ok(STATUS_INVALID_PARAMETER);
+        }
+
+        let existed = path.exists();
+        let existing_is_dir = path.is_dir();
+        if let Some(parent) = path.parent() {
+            if !parent.is_dir() {
+                return Ok(STATUS_OBJECT_PATH_NOT_FOUND);
+            }
+        }
+        if existed {
+            if disposition == FILE_CREATE {
+                return Ok(STATUS_OBJECT_NAME_COLLISION);
+            }
+            if want_dir && !existing_is_dir {
+                return Ok(STATUS_NOT_A_DIRECTORY);
+            }
+            if want_file && existing_is_dir {
+                return Ok(STATUS_FILE_IS_A_DIRECTORY);
+            }
+            if existing_is_dir && matches!(disposition, FILE_SUPERSEDE | FILE_OVERWRITE | FILE_OVERWRITE_IF) {
+                return Ok(STATUS_FILE_IS_A_DIRECTORY);
+            }
+        } else if matches!(disposition, FILE_OPEN | FILE_OVERWRITE) {
+            return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+
+        let creating_dir = want_dir && !existed;
+        if creating_dir && std::fs::create_dir(&path).is_err() {
+            return Ok(STATUS_ACCESS_DENIED);
+        }
+        let opens_dir = want_dir || existing_is_dir;
+        let wants_write = !opens_dir
+            && (access & (NT_GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA) != 0
+                || disposition != FILE_OPEN);
 
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true);
         if wants_write {
             opts.write(true);
-        }
-        match disposition {
-            FILE_CREATE => {
-                opts.create_new(true);
-            }
-            FILE_SUPERSEDE | FILE_OVERWRITE_IF => {
-                opts.create(true).truncate(true);
-            }
-            FILE_OPEN => {}
-            FILE_OPEN_IF => {
-                opts.create(true);
-            }
-            FILE_OVERWRITE => {
-                opts.truncate(true);
-            }
-            _ => {
-                opts.create(true);
+            match disposition {
+                FILE_CREATE => {
+                    opts.create_new(true);
+                }
+                FILE_SUPERSEDE | FILE_OVERWRITE_IF => {
+                    opts.create(true).truncate(true);
+                }
+                FILE_OPEN_IF => {
+                    opts.create(true);
+                }
+                FILE_OVERWRITE => {
+                    opts.truncate(true);
+                }
+                _ => {}
             }
         }
 
@@ -593,7 +636,10 @@ impl WinOs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(STATUS_OBJECT_NAME_NOT_FOUND);
             }
-            Err(_) => return Ok(STATUS_OBJECT_NAME_NOT_FOUND),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(STATUS_OBJECT_NAME_COLLISION);
+            }
+            Err(_) => return Ok(STATUS_ACCESS_DENIED),
         };
 
         let is_dir = file.metadata().map(|m| m.is_dir()).unwrap_or(false);
@@ -604,7 +650,9 @@ impl WinOs {
 
         let information = match disposition {
             FILE_CREATE => FILE_CREATED,
-            FILE_SUPERSEDE => FILE_SUPERSEDED,
+            FILE_SUPERSEDE => {
+                if existed { FILE_SUPERSEDED } else { FILE_CREATED }
+            }
             FILE_OVERWRITE | FILE_OVERWRITE_IF => {
                 if existed { FILE_OVERWRITTEN } else { FILE_CREATED }
             }
