@@ -2954,7 +2954,7 @@ impl WinOs {
         let retaddr = mem.read_u32(s)? as u64;
         let scopetable = cpu.gpr_read(Reg::Rax as u8, 4) as u32;
         let caller_ebp = cpu.gpr_read(Reg::Rbp as u8, 4) as u32;
-        let fs0 = exemu_cpu::FS_BASE_32;
+        let fs0 = exemu_core::cpu::DEFAULT_FS_BASE;
         let old_head = mem.read_u32(fs0)?;
 
         let m4 = s.wrapping_sub(4) & 0xFFFF_FFFF;
