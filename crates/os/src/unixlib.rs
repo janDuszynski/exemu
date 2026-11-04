@@ -123,6 +123,7 @@ impl WinOs {
         }
         let lib = match name.to_ascii_lowercase().as_str() {
             "ws2_32.dll" => crate::net::ws2_32_unixlib(),
+            crate::crypt32::CRYPT32_MODULE => crate::crypt32::crypt32_unixlib(),
             crate::audio::DRIVER_MODULE => crate::audio::coreaudio_unixlib(),
             _ => return None,
         };

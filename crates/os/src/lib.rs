@@ -4,6 +4,7 @@ mod api;
 mod apiset;
 pub mod audio;
 mod boot;
+mod crypt32;
 mod dll;
 mod exc;
 pub mod folders;
