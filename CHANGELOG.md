@@ -26,6 +26,34 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 1059, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### The file dialog returns the path (W6.2)
+- **`CallWindowProcW` keeps its procedure's result.** `user32!CallWindowProcW`
+  passes a `win_proc_params` block to `NtUserMessageCall` with type
+  `NtUserCallWindowProc` (0x2ab) and, only if that answers TRUE, calls
+  `dispatch_win_proc_params` on the block itself and returns what the procedure
+  returned. exemu called the procedure from the kernel side instead and answered
+  0, so every `CallWindowProcW` in a Wine guest returned 0, and with it every
+  comctl32 subclass that chains through `DefSubclassProc`. That is the whole
+  ComboBoxEx crash: the empty listbox answered `LB_GETCURSEL` with `LB_ERR`,
+  the chain turned it into 0, and `COMBOEX_ComboWndProc` asked
+  `COMBOEX_FindItem` for item 0 of an empty list and dereferenced the NULL it got.
+  exemu now fills the block the way win32u does (`hwnd`, `msg`, `wparam`,
+  `lparam`, `ansi`/`ansi_dst`, `WMCHAR_MAP_CALLWINDOWPROC`, the DPI context, and
+  `procA`/`procW` resolved from a window-procedure handle, or the plain address
+  for both) and answers TRUE; a NULL or unissued handle answers FALSE. The layout
+  is `user32`'s DWARF `struct win_proc_params` (0x48 bytes), and wow64win's
+  `win_proc_params_64to32` narrows the same block for a 32-bit caller.
+- **`EXEMU_FILE_DIALOG_PICK` takes one name per dialog**, separated by `|` (a
+  character no Windows file name can hold), handed out in the order the dialogs
+  open; a dialog with no pick left is not driven. One name for every dialog
+  typed the open leg's file into the save dialog too, which `OFN_OVERWRITEPROMPT`
+  turns into an overwrite question nobody can answer.
+- **The result:** with `exemu-pick.txt|exemu-saved.txt`, the comdlg sample's
+  `GetOpenFileNameW` answers TRUE with `C:\Users\exemu\Documents\exemu-pick.txt`
+  and the guest reads the seeded file through it, and `GetSaveFileNameW` answers
+  TRUE with `C:\Users\exemu\Documents\exemu-saved.txt` and the guest writes its
+  payload there: exit 0, every leg passing, 53.5M instructions.
+
 ### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
 - **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
   `0x20..=0x37` are the stock objects, so a guest had **72 GDI handles for its
