@@ -211,7 +211,7 @@ impl DebugMix {
 
 pub const LAP_MAX_INSNS: u32 = 3;
 
-const CUT_SALT: u64 = 0xC07_B0D6_E7;
+const CUT_SALT: u64 = 0x000C_07B0_D6E7;
 
 #[derive(Default)]
 pub struct JitSummary {
