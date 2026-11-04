@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:de7e0ea7-79ee-57f0-853e-a350b5c839b2",
+  "serialNumber": "urn:uuid:5ffb26d8-ea4a-50ae-a09a-d23411509dbe",
   "version": 1,
   "metadata": {
     "component": {
@@ -212,6 +212,25 @@
         }
       ],
       "description": "Application layer: loads a PE, builds the process image, and runs the emulation loop.",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/janDuszynski/exe-emulator"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/exemu-audio@0.0.4",
+      "name": "exemu-audio",
+      "version": "0.0.4",
+      "purl": "pkg:cargo/exemu-audio@0.0.4",
+      "licenses": [
+        {
+          "expression": "PolyForm-Noncommercial-1.0.0"
+        }
+      ],
+      "description": "Host audio backend for exemu \u2014 CoreAudio behind the exemu-core AudioSink seam",
       "externalReferences": [
         {
           "type": "vcs",
@@ -525,6 +544,25 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/objc2-audio-toolbox@0.3.2",
+      "name": "objc2-audio-toolbox",
+      "version": "0.3.2",
+      "purl": "pkg:cargo/objc2-audio-toolbox@0.3.2",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "description": "Bindings to the AudioToolbox framework",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/madsmtm/objc2"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/objc2-cloud-kit@0.3.2",
       "name": "objc2-cloud-kit",
       "version": "0.3.2",
@@ -535,6 +573,25 @@
         }
       ],
       "description": "Bindings to the CloudKit framework",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/madsmtm/objc2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/objc2-core-audio-types@0.3.2",
+      "name": "objc2-core-audio-types",
+      "version": "0.3.2",
+      "purl": "pkg:cargo/objc2-core-audio-types@0.3.2",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "description": "Bindings to the CoreAudioTypes framework",
       "externalReferences": [
         {
           "type": "vcs",
@@ -884,9 +941,19 @@
       ]
     },
     {
+      "ref": "pkg:cargo/exemu-audio@0.0.4",
+      "dependsOn": [
+        "pkg:cargo/exemu-core@0.0.4",
+        "pkg:cargo/objc2-audio-toolbox@0.3.2",
+        "pkg:cargo/objc2-core-audio-types@0.3.2",
+        "pkg:cargo/objc2-core-foundation@0.3.2"
+      ]
+    },
+    {
       "ref": "pkg:cargo/exemu-cli@0.0.4",
       "dependsOn": [
         "pkg:cargo/exemu-app@0.0.4",
+        "pkg:cargo/exemu-audio@0.0.4",
         "pkg:cargo/exemu-core@0.0.4",
         "pkg:cargo/exemu-cpu@0.0.4",
         "pkg:cargo/exemu-gui@0.0.4",
@@ -942,8 +1009,6 @@
       "ref": "pkg:cargo/exemu-os@0.0.4",
       "dependsOn": [
         "pkg:cargo/exemu-core@0.0.4",
-        "pkg:cargo/exemu-cpu@0.0.4",
-        "pkg:cargo/exemu-loader@0.0.4",
         "pkg:cargo/font8x8@0.3.1"
       ]
     },
@@ -1011,10 +1076,27 @@
       ]
     },
     {
+      "ref": "pkg:cargo/objc2-audio-toolbox@0.3.2",
+      "dependsOn": [
+        "pkg:cargo/bitflags@2.13.0",
+        "pkg:cargo/objc2-core-audio-types@0.3.2",
+        "pkg:cargo/objc2-core-foundation@0.3.2",
+        "pkg:cargo/objc2-foundation@0.3.2",
+        "pkg:cargo/objc2@0.6.4"
+      ]
+    },
+    {
       "ref": "pkg:cargo/objc2-cloud-kit@0.3.2",
       "dependsOn": [
         "pkg:cargo/bitflags@2.13.0",
         "pkg:cargo/objc2-foundation@0.3.2",
+        "pkg:cargo/objc2@0.6.4"
+      ]
+    },
+    {
+      "ref": "pkg:cargo/objc2-core-audio-types@0.3.2",
+      "dependsOn": [
+        "pkg:cargo/bitflags@2.13.0",
         "pkg:cargo/objc2@0.6.4"
       ]
     },

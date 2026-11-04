@@ -17,7 +17,7 @@ The `Verdict` column is a reading aid, not the gate. The gate is `cargo deny che
 
 **Wine is not in this table and cannot be.** Wine's PE builtin DLLs are LGPL-2.1-or-later and are loaded at runtime as separate guest image files, not as cargo dependencies. Their obligations are tracked in [`docs/COMPLIANCE.md`](../COMPLIANCE.md).
 
-## Shipping closure (38 dependencies)
+## Shipping closure (41 dependencies)
 
 | Crate | Version | Licence (SPDX) | Scope | Verdict |
 | ----- | ------- | -------------- | ----- | ------- |
@@ -29,6 +29,7 @@ The `Verdict` column is a reading aid, not the gate. The gate is `cargo deny che
 | `crc32fast` | 1.5.0 | MIT OR Apache-2.0 | ship | permissive |
 | `dispatch2` | 0.3.1 | Zlib OR Apache-2.0 OR MIT | ship | permissive |
 | `exemu-app` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
+| `exemu-audio` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
 | `exemu-cli` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
 | `exemu-core` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
 | `exemu-cpu` | 0.0.4 | PolyForm-Noncommercial-1.0.0 | ship | exemu's own code |
@@ -45,7 +46,9 @@ The `Verdict` column is a reading aid, not the gate. The gate is `cargo deny che
 | `miniz_oxide` | 0.8.9 | MIT OR Zlib OR Apache-2.0 | ship | permissive |
 | `objc2` | 0.6.4 | MIT | ship | permissive |
 | `objc2-app-kit` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | ship | permissive |
+| `objc2-audio-toolbox` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | ship | permissive |
 | `objc2-cloud-kit` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | ship | permissive |
+| `objc2-core-audio-types` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | ship | permissive |
 | `objc2-core-data` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | ship | permissive |
 | `objc2-core-foundation` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | ship | permissive |
 | `objc2-core-graphics` | 0.3.2 | Zlib OR Apache-2.0 OR MIT | ship | permissive |
