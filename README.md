@@ -62,7 +62,7 @@ orchestrates them.
 
 | Crate            | Layer          | Responsibility                                             |
 | ---------------- | -------------- | ---------------------------------------------------------- |
-| `exemu-core`     | Domain         | CPU state, PE model, errors; `Memory`/`Cpu`/`Hooks` traits |
+| `exemu-core`     | Domain         | CPU state, PE model, errors; `Memory`/`Cpu`/`Hooks`/`ImageLoader` traits |
 | `exemu-loader`   | Infrastructure | Parse PE64 headers, sections and imports                   |
 | `exemu-memory`   | Infrastructure | Region-based virtual memory with permissions               |
 | `exemu-cpu`      | Infrastructure | x86-64 decoder + interpreter                               |
