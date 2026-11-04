@@ -2018,7 +2018,8 @@ fn drive_file_dialog(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
 
     let bytes: Vec<u8> =
         pick.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
-    let Some(text) = os.map_anywhere(mem, bytes.len() as u64, Perm::RW, "dialog-pick") else {
+    let below_4g = os.is_wow64();
+    let Some(text) = map_guest_reachable(os, mem, bytes.len() as u64, "dialog-pick", below_4g) else {
         return false;
     };
     if mem.write(text, &bytes).is_err() {
@@ -2349,11 +2350,11 @@ fn ensure_gdi_table(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
     }
     let peb32 = os.wow64_peb32();
     let table_size = GDI_TABLE_SLOTS * GDI_ENTRY_SIZE;
-    let Some(table) = map_gdi_arena(os, mem, table_size, "gdi-handle-table", peb32 != 0) else {
+    let Some(table) = map_guest_reachable(os, mem, table_size, "gdi-handle-table", peb32 != 0) else {
         return false;
     };
     let arena_size = GDI_TABLE_SLOTS * GDI_DC_OBJECT_SIZE;
-    let Some(arena) = map_gdi_arena(os, mem, arena_size, "gdi-dc-arena", peb32 != 0) else {
+    let Some(arena) = map_guest_reachable(os, mem, arena_size, "gdi-dc-arena", peb32 != 0) else {
         return false;
     };
     if mem.write_u64(peb + GDI_PEB_TABLE_PTR_OFF, table).is_err() {
@@ -2368,7 +2369,7 @@ fn ensure_gdi_table(os: &mut WinOs, mem: &mut dyn Memory) -> bool {
     publish_stock_objects(os, mem).is_ok()
 }
 
-fn map_gdi_arena(
+fn map_guest_reachable(
     os: &mut WinOs,
     mem: &mut dyn Memory,
     size: u64,
@@ -3613,7 +3614,8 @@ fn alloc_bitmap(
     let Some((handle, _)) = alloc_gdi_object(os, mem, gdi_type::BITMAP)? else {
         return Ok(0);
     };
-    let Some(bits) = os.map_anywhere(mem, stride * rows, Perm::RW, "gdi-bitmap") else {
+    let below_4g = os.is_wow64();
+    let Some(bits) = map_guest_reachable(os, mem, stride * rows, "gdi-bitmap", below_4g) else {
         return Ok(0);
     };
     let bmp = Bitmap { w, h: rows as i32, planes, bpp, bits, stride: stride as u32, top_down };
@@ -4286,6 +4288,36 @@ mod tests {
                 <= u32::MAX as u64,
             "…and so must every object the entries point at"
         );
+    }
+
+    #[test]
+    fn a_wow64_guest_gets_dib_bits_and_the_drives_text_below_4g() {
+        const PEB: u64 = 0x7F00_0000;
+        const PEB32: u64 = 0x0020_0000;
+        let mut os = WinOs::new(crate::WinConfig {
+            is_64bit: true,
+            peb_addr: PEB,
+            file_dialog_pick: Some("pick.txt".into()),
+            ..Default::default()
+        });
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("peb", PEB, 0x1000, Perm::RW)).unwrap();
+        mem.map(Region::new("peb32", PEB32, 0x1000, Perm::RW)).unwrap();
+        os.set_wow64_peb32(PEB32);
+
+        let h = alloc_bitmap(&mut os, &mut mem, 16, 16, 1, 32, true).unwrap();
+        let bits = os.win32k_state.bitmap(h).unwrap().bits;
+        assert!(
+            bits + 16 * 16 * 4 <= u32::MAX as u64,
+            "wow64win hands CreateDIBSection's bits pointer to 32-bit code truncated; got {bits:#x}"
+        );
+
+        let (_, edit) = file_dialog(&mut os);
+        assert!(drive_file_dialog(&mut os, &mut mem));
+        let typed = os.msg_next().unwrap();
+        assert_eq!(typed.hwnd, edit as u64);
+        assert!(typed.lparam <= u32::MAX as u64, "a 32-bit edit reads WM_SETTEXT's lParam as 32 bits");
+        assert_eq!(read_wstr(&mem, typed.lparam).unwrap(), "pick.txt");
     }
 
     #[test]
