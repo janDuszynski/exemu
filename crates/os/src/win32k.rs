@@ -365,6 +365,9 @@ mod client_menu_name {
 }
 const WND_EXTRA_MAX: u32 = 4096;
 
+const LONG_SIZE: usize = 4;
+const LONG_PTR_SIZE: usize = 8;
+
 const GWLP_WNDPROC: i64 = -4;
 const GWLP_HINSTANCE: i64 = -6;
 const GWLP_HWNDPARENT: i64 = -8;
@@ -386,7 +389,8 @@ mod call_hwnd {
 }
 
 mod call_hwnd_param {
-    pub const GET_WINDOW_LONG: u64 = 0x0a;
+    pub const GET_WINDOW_LONG_A: u64 = 0x09;
+    pub const GET_WINDOW_LONG_W: u64 = 0x0a;
     pub const GET_WINDOW_LONG_PTR_A: u64 = 0x0b;
     pub const GET_WINDOW_LONG_PTR_W: u64 = 0x0c;
     pub const GET_WINDOW_RECT: u64 = 0x0d;
@@ -2162,10 +2166,15 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
     let param = os.syscall_arg(cpu, mem, 1)?;
     let code = os.syscall_arg(cpu, mem, 2)?;
     match code {
-        call_hwnd_param::GET_WINDOW_LONG
+        call_hwnd_param::GET_WINDOW_LONG_A
+        | call_hwnd_param::GET_WINDOW_LONG_W
         | call_hwnd_param::GET_WINDOW_LONG_PTR_A
         | call_hwnd_param::GET_WINDOW_LONG_PTR_W => {
-            let value = get_window_long(os, hwnd, param as i64);
+            let size = match code {
+                call_hwnd_param::GET_WINDOW_LONG_A | call_hwnd_param::GET_WINDOW_LONG_W => LONG_SIZE,
+                _ => LONG_PTR_SIZE,
+            };
+            let value = get_window_long(os, hwnd, param as i64, size);
             os.return_u64_from_syscall(value);
             Ok(0)
         }
@@ -2234,7 +2243,7 @@ fn nt_user_call_one_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memo
     }
 }
 
-fn get_window_long(os: &WinOs, hwnd: u32, offset: i64) -> u64 {
+fn get_window_long(os: &WinOs, hwnd: u32, offset: i64, size: usize) -> u64 {
     let Some(w) = os.win32k_state.window(hwnd) else { return 0 };
     match offset {
         GWL_STYLE => w.style as u64,
@@ -2245,18 +2254,20 @@ fn get_window_long(os: &WinOs, hwnd: u32, offset: i64) -> u64 {
         GWLP_USERDATA => w.user_data,
         GWLP_ID => w.id,
         off if off >= 0 => {
-            let off = off as usize;
-            if off + 8 > w.extra.len() {
+            let Some(bytes) = (off as usize).checked_add(size).and_then(|end| w.extra.get(off as usize..end))
+            else {
                 return 0;
-            }
-            u64::from_le_bytes(w.extra[off..off + 8].try_into().unwrap_or([0; 8]))
+            };
+            let mut value = [0u8; 8];
+            value[..bytes.len()].copy_from_slice(bytes);
+            u64::from_le_bytes(value)
         }
         _ => 0,
     }
 }
 
-fn set_window_long(os: &mut WinOs, hwnd: u32, offset: i64, value: u64) -> u64 {
-    let previous = get_window_long(os, hwnd, offset);
+fn set_window_long(os: &mut WinOs, hwnd: u32, offset: i64, value: u64, size: usize) -> u64 {
+    let previous = get_window_long(os, hwnd, offset, size);
     let Some(w) = os.win32k_state.window_mut(hwnd) else { return 0 };
     match offset {
         GWL_STYLE => w.style = value as u32,
@@ -2266,9 +2277,9 @@ fn set_window_long(os: &mut WinOs, hwnd: u32, offset: i64, value: u64) -> u64 {
         GWLP_USERDATA => w.user_data = value,
         GWLP_ID => w.id = value,
         off if off >= 0 => {
-            let off = off as usize;
-            if off + 8 <= w.extra.len() {
-                w.extra[off..off + 8].copy_from_slice(&value.to_le_bytes());
+            let end = (off as usize).checked_add(size);
+            if let Some(bytes) = end.and_then(|end| w.extra.get_mut(off as usize..end)) {
+                bytes.copy_from_slice(&value.to_le_bytes()[..size]);
             }
         }
         _ => {}
@@ -2280,7 +2291,7 @@ fn nt_user_set_window_long(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
     let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
     let offset = os.syscall_arg(cpu, mem, 1)? as i32 as i64;
     let value = os.syscall_arg(cpu, mem, 2)? as u32 as u64;
-    let previous = set_window_long(os, hwnd, offset, value);
+    let previous = set_window_long(os, hwnd, offset, value, LONG_SIZE);
     Ok(previous as u32)
 }
 
@@ -2292,7 +2303,7 @@ fn nt_user_set_window_long_ptr(
     let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
     let offset = os.syscall_arg(cpu, mem, 1)? as i32 as i64;
     let value = os.syscall_arg(cpu, mem, 2)?;
-    let previous = set_window_long(os, hwnd, offset, value);
+    let previous = set_window_long(os, hwnd, offset, value, LONG_PTR_SIZE);
     os.return_u64_from_syscall(previous);
     Ok(0)
 }
@@ -5224,20 +5235,49 @@ mod tests {
         let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
         let hwnd = child(&mut os, 0, [1, 2, 30, 40]);
 
-        assert_eq!(get_window_long(&os, hwnd, GWL_STYLE), WS_VISIBLE as u64);
-        assert_eq!(set_window_long(&mut os, hwnd, GWL_EXSTYLE, 0x20000), 0, "ex-style started 0");
-        assert_eq!(get_window_long(&os, hwnd, GWL_EXSTYLE), 0x20000);
+        const P: usize = LONG_PTR_SIZE;
+        assert_eq!(get_window_long(&os, hwnd, GWL_STYLE, P), WS_VISIBLE as u64);
+        assert_eq!(set_window_long(&mut os, hwnd, GWL_EXSTYLE, 0x20000, P), 0, "ex-style started 0");
+        assert_eq!(get_window_long(&os, hwnd, GWL_EXSTYLE, P), 0x20000);
 
         const INFO: u64 = 0x4000_0001_7AA0;
-        assert_eq!(get_window_long(&os, hwnd, 0), 0, "extra bytes start zeroed");
-        assert_eq!(set_window_long(&mut os, hwnd, 0, INFO), 0);
-        assert_eq!(get_window_long(&os, hwnd, 0), INFO, "a pointer survives the round trip");
-        assert_eq!(set_window_long(&mut os, hwnd, 0, 1), INFO, "Set returns the previous value");
+        assert_eq!(get_window_long(&os, hwnd, 0, P), 0, "extra bytes start zeroed");
+        assert_eq!(set_window_long(&mut os, hwnd, 0, INFO, P), 0);
+        assert_eq!(get_window_long(&os, hwnd, 0, P), INFO, "a pointer survives the round trip");
+        assert_eq!(set_window_long(&mut os, hwnd, 0, 1, P), INFO, "Set returns the previous value");
 
-        assert_eq!(get_window_long(&os, hwnd, 4096), 0);
-        assert_eq!(set_window_long(&mut os, hwnd, 4096, 0xFF), 0);
-        assert_eq!(get_window_long(&os, hwnd, -999), 0);
-        assert_eq!(get_window_long(&os, 0xDEAD, 0), 0, "an unknown hwnd reads nothing");
+        assert_eq!(get_window_long(&os, hwnd, 4096, P), 0);
+        assert_eq!(set_window_long(&mut os, hwnd, 4096, 0xFF, P), 0);
+        assert_eq!(get_window_long(&os, hwnd, 12, P), 0, "a pointer must fit inside the extra bytes");
+        assert_eq!(get_window_long(&os, hwnd, -999, P), 0);
+        assert_eq!(get_window_long(&os, 0xDEAD, 0, P), 0, "an unknown hwnd reads nothing");
+    }
+
+    #[test]
+    fn a_long_touches_four_extra_bytes_so_32bit_dialog_slots_stay_apart() {
+        const DWLP_MSGRESULT: i64 = 0;
+        const DWLP_DLGPROC: i64 = 4;
+        const DWLP_USER: i64 = 8;
+        const DLGPROC: u64 = WINPROC_HANDLE_TAG | 3;
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let hwnd = child(&mut os, 0, [0, 0, 10, 10]);
+
+        set_window_long(&mut os, hwnd, DWLP_DLGPROC, DLGPROC, LONG_PTR_SIZE);
+        set_window_long(&mut os, hwnd, DWLP_MSGRESULT, 0, LONG_SIZE);
+        set_window_long(&mut os, hwnd, DWLP_USER, 0x1234_5678, LONG_SIZE);
+        assert_eq!(
+            get_window_long(&os, hwnd, DWLP_DLGPROC, LONG_SIZE),
+            DLGPROC,
+            "DefDlgProc's DWLP_MSGRESULT reset and DWLP_USER leave the dialog procedure alone"
+        );
+        assert_eq!(get_window_long(&os, hwnd, DWLP_USER, LONG_SIZE), 0x1234_5678);
+        assert_eq!(
+            set_window_long(&mut os, hwnd, DWLP_USER, 0xFFFF_FFFF_0000_0001, LONG_SIZE),
+            0x1234_5678,
+            "the previous LONG comes back whole"
+        );
+        assert_eq!(get_window_long(&os, hwnd, DWLP_USER, LONG_SIZE), 1, "only four bytes were written");
+        assert_eq!(get_window_long(&os, hwnd, 13, LONG_SIZE), 0, "a LONG must fit inside the extra bytes");
     }
 
     #[test]
