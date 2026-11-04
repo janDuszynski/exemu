@@ -8,6 +8,7 @@ pub mod driver;
 pub mod error;
 pub mod gui;
 pub mod hooks;
+pub mod image;
 pub mod memory;
 pub mod pe;
 pub mod spawn;
@@ -31,6 +32,7 @@ pub use driver::{
 pub use error::{EmuError, Result};
 pub use gui::{Control, ControlKind, DialogTemplate, DrawOp, Gui, GuiEvent, NoGui};
 pub use hooks::Hooks;
+pub use image::{ImageLoader, ModuleExports, NoImageLoader};
 pub use memory::{Memory, Perm, Region, CODE_PAGE_SIZE};
 pub use pe::{
     ActivationContext, AssemblyIdentity, Export, Import, ImportSymbol, ManifestInfo, PeImage,
