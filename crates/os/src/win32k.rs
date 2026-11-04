@@ -421,6 +421,7 @@ const WINDOW_ANCESTRY_MAX: usize = 64;
 const CLIENT_PFN_COUNT: usize = 17;
 const PFN_THUNK_JMP: [u8; 3] = [0x48, 0xFF, 0x25];
 const PFN_THUNK_LEN: u64 = 7;
+const PFN_THUNK_JMP32: [u8; 2] = [0xFF, 0x25];
 
 const PFN_SCROLL_BAR: usize = 0;
 const PFN_MESSAGE: usize = 1;
@@ -1077,9 +1078,16 @@ fn honest_stub(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> R
     Ok(0)
 }
 
-fn resolve_client_pfn(mem: &dyn Memory, entry: u64) -> Result<(u64, u64)> {
+fn resolve_client_pfn(mem: &dyn Memory, entry: u64, wow64: bool) -> Result<(u64, u64)> {
     if entry == 0 {
         return Ok((0, 0));
+    }
+    if wow64 {
+        if [mem.read_u8(entry)?, mem.read_u8(entry + 1)?] != PFN_THUNK_JMP32 {
+            return Ok((entry, 0));
+        }
+        let slot = mem.read_u32(entry + 2)? as u64;
+        return Ok((mem.read_u32(slot)? as u64, slot));
     }
     let mut op = [0u8; 3];
     for (i, b) in op.iter_mut().enumerate() {
@@ -1097,6 +1105,7 @@ fn resolve_client_pfn(mem: &dyn Memory, entry: u64) -> Result<(u64, u64)> {
 fn read_client_pfn_array(
     mem: &dyn Memory,
     base: u64,
+    wow64: bool,
 ) -> Result<([u64; CLIENT_PFN_COUNT], [u64; CLIENT_PFN_COUNT])> {
     let mut procs = [0u64; CLIENT_PFN_COUNT];
     let mut slots = [0u64; CLIENT_PFN_COUNT];
@@ -1104,7 +1113,7 @@ fn read_client_pfn_array(
         return Ok((procs, slots));
     }
     for i in 0..CLIENT_PFN_COUNT {
-        let (p, s) = resolve_client_pfn(mem, mem.read_u64(base + (i as u64) * 8)?)?;
+        let (p, s) = resolve_client_pfn(mem, mem.read_u64(base + (i as u64) * 8)?, wow64)?;
         procs[i] = p;
         slots[i] = s;
     }
@@ -1121,8 +1130,9 @@ fn nt_user_initialize_client_pfn_arrays(
     let user32 = os.syscall_arg(cpu, mem, 3)?;
     os.win32k_state.client_pfn_table = procs_a;
     os.win32k_state.user32_image = (user32, pe_image_size(mem, user32).unwrap_or(0));
-    let (pfn_a, slots_a) = read_client_pfn_array(mem, procs_a).unwrap_or_default();
-    let (pfn_w, slots_w) = read_client_pfn_array(mem, procs_w).unwrap_or_default();
+    let wow64 = os.is_wow64();
+    let (pfn_a, slots_a) = read_client_pfn_array(mem, procs_a, wow64).unwrap_or_default();
+    let (pfn_w, slots_w) = read_client_pfn_array(mem, procs_w, wow64).unwrap_or_default();
     os.win32k_state.client_pfn_a = pfn_a;
     os.win32k_state.client_pfn_w = pfn_w;
     if let Some(ntdll) = os.module_base("ntdll.dll") {
@@ -4405,7 +4415,7 @@ mod tests {
     #[test]
     fn client_pfn_entries_resolve_through_their_thunks() {
         let (mem, funcs, procs) = synth_client_pfn();
-        let (resolved, slots) = read_client_pfn_array(&mem, funcs).unwrap();
+        let (resolved, slots) = read_client_pfn_array(&mem, funcs, false).unwrap();
         assert!(slots[PFN_BUTTON] != 0, "a thunked entry reports the slot it jumps through");
         assert_eq!(resolved, procs, "every published index resolves to its own proc");
         assert_eq!(resolved[6], 0, "the unpublished index stays null");
@@ -4416,10 +4426,30 @@ mod tests {
     #[test]
     fn client_pfn_resolution_is_honest_about_non_thunks() {
         let (mem, _, _) = synth_client_pfn();
-        assert_eq!(read_client_pfn_array(&mem, 0).unwrap().0, [0u64; CLIENT_PFN_COUNT]);
-        assert_eq!(resolve_client_pfn(&mem, 0).unwrap(), (0, 0));
+        assert_eq!(read_client_pfn_array(&mem, 0, false).unwrap().0, [0u64; CLIENT_PFN_COUNT]);
+        assert_eq!(resolve_client_pfn(&mem, 0, false).unwrap(), (0, 0));
         let direct = 0x2000_1000;
-        assert_eq!(resolve_client_pfn(&mem, direct).unwrap(), (direct, 0));
+        assert_eq!(resolve_client_pfn(&mem, direct, false).unwrap(), (direct, 0));
+    }
+
+    #[test]
+    fn a_wow64_client_pfn_resolves_through_ntdll32s_absolute_jump() {
+        const STUB: u64 = 0x2000_0100;
+        const SLOT: u64 = 0x2000_0800;
+        const PROC: u32 = 0x0190_1234;
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("ntdll32", 0x2000_0000, 0x1000, Perm::RWX)).unwrap();
+        mem.write(STUB, &[PFN_THUNK_JMP32[0], PFN_THUNK_JMP32[1]]).unwrap();
+        mem.write_u32(STUB + 2, SLOT as u32).unwrap();
+        mem.write_u32(SLOT, PROC).unwrap();
+
+        assert_eq!(resolve_client_pfn(&mem, STUB, true).unwrap(), (PROC as u64, SLOT));
+        assert_eq!(
+            resolve_client_pfn(&mem, STUB, false).unwrap(),
+            (STUB, 0),
+            "FF 25 in 64-bit code is RIP-relative, so it is not this thunk"
+        );
+        assert_eq!(resolve_client_pfn(&mem, SLOT, true).unwrap(), (SLOT, 0), "a plain proc is itself");
     }
 
     #[test]
