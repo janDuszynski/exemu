@@ -9,10 +9,10 @@ pub(crate) fn locate<'a>(regions: impl IntoIterator<Item = &'a Region>, addr: u6
         if r.contains(addr) {
             return format!("in {} at offset {:#x}", describe(r), addr - r.base);
         }
-        if r.end() <= addr && below.is_none_or(|b| r.end() > b.end()) {
+        if r.end() <= addr && below.map_or(true, |b| r.end() > b.end()) {
             below = Some(r);
         }
-        if r.base > addr && above.is_none_or(|a| r.base < a.base) {
+        if r.base > addr && above.map_or(true, |a| r.base < a.base) {
             above = Some(r);
         }
     }
