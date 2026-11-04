@@ -2400,7 +2400,7 @@ fn nt_user_get_dc(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> R
     let hwnd_arg = os.syscall_arg(cpu, mem, 0)? as u32;
     let hwnd = resolve_dc_hwnd(os, hwnd_arg);
     if hwnd == 0 {
-        return Ok(0);
+        return if hwnd_arg == 0 { alloc_dc(os, mem, 0) } else { Ok(0) };
     }
     if ensure_surface(os, mem, hwnd).is_none() {
         return Ok(0);
@@ -4091,6 +4091,21 @@ mod tests {
             0,
             "init_script_cache rejects a LOGFONTW whose lfFaceName[0] is 0"
         );
+    }
+
+    #[test]
+    fn get_dc_null_is_a_screen_dc_even_before_any_window_exists() {
+        let (mut os, mut mem) = os_with_gdi();
+        assert!(os.win32k_state.windows.is_empty());
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, 0);
+        let hdc = nt_user_get_dc(&mut os, &mut cpu, &mut mem).unwrap();
+        assert_ne!(hdc, 0, "GetDC(NULL) is the screen DC; DIALOG_CreateIndirect measures its font on it");
+        assert_eq!(os.win32k_state.dc(hdc).map(|d| d.font), Some(STOCK_SYSTEM_FONT));
+        assert!(dc_surface(&os, hdc).is_none(), "with no window there is nothing to draw into");
+
+        cpu.set_reg(Reg::R10, 0xDEAD);
+        assert_eq!(nt_user_get_dc(&mut os, &mut cpu, &mut mem).unwrap(), 0, "a bad window is no DC");
     }
 
     #[test]
