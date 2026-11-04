@@ -21,6 +21,36 @@ pub const PROBE_LRESULT: u32 = 0x5EED_1234;
 pub const WINDOW_STYLE: u32 = 0x00CF_0000;
 pub const CREATESTRUCT32_STYLE: u32 = 0x20;
 
+pub const CLASS_STYLE: u32 = 0x0000_000B;
+pub const CLASS_CLS_EXTRA: u32 = 8;
+pub const CLASS_WND_EXTRA: u32 = 16;
+pub const CLASS_BACKGROUND: u32 = 6;
+pub const CLASS_MENU_NAME: u32 = 0x77;
+
+pub mod wndclassw {
+    pub const STYLE: u32 = 0x00;
+    pub const WNDPROC: u32 = 0x04;
+    pub const CLS_EXTRA: u32 = 0x08;
+    pub const WND_EXTRA: u32 = 0x0c;
+    pub const INSTANCE: u32 = 0x10;
+    pub const BACKGROUND: u32 = 0x1c;
+    pub const MENU_NAME: u32 = 0x20;
+    pub const CLASS_NAME: u32 = 0x24;
+}
+
+pub mod wndclassexw {
+    pub const CB_SIZE: u32 = 0x00;
+    pub const STYLE: u32 = 0x04;
+    pub const WNDPROC: u32 = 0x08;
+    pub const CLS_EXTRA: u32 = 0x0c;
+    pub const WND_EXTRA: u32 = 0x10;
+    pub const INSTANCE: u32 = 0x14;
+    pub const BACKGROUND: u32 = 0x20;
+    pub const MENU_NAME: u32 = 0x24;
+    pub const CLASS_NAME: u32 = 0x28;
+    pub const SIZE: u32 = 0x30;
+}
+
 pub mod seen {
     pub const NCCREATE: u32 = 1;
     pub const CREATE: u32 = 2;
@@ -38,22 +68,27 @@ pub mod data {
     pub const ATOM: u32 = 0x18;
     pub const ESP_BEFORE: u32 = 0x1c;
     pub const ESP_AFTER: u32 = 0x20;
+    pub const INFO_ATOM: u32 = 0x24;
     pub const WNDCLASS: u32 = 0x40;
-    pub const LEN: u32 = 0x80;
+    pub const WNDCLASSEX: u32 = 0x80;
+    pub const LEN: u32 = 0x100;
 }
 
 pub const fn data_va(off: u32) -> u64 {
     (IMAGE_BASE + DATA_RVA + off) as u64
 }
 
-const IMPORTS: [(&str, &[&str]); 2] =
-    [("user32.dll", &["RegisterClassW", "CreateWindowExW", "SendMessageW", "DefWindowProcW"]), ("ntdll.dll", &["NtTerminateProcess"])];
+const IMPORTS: [(&str, &[&str]); 2] = [
+    ("user32.dll", &["RegisterClassW", "CreateWindowExW", "SendMessageW", "DefWindowProcW", "GetClassInfoExW"]),
+    ("ntdll.dll", &["NtTerminateProcess"]),
+];
 
 const I_REGISTER_CLASS: u32 = 0;
 const I_CREATE_WINDOW: u32 = 1;
 const I_SEND_MESSAGE: u32 = 2;
 const I_DEF_WINDOW_PROC: u32 = 3;
-const I_TERMINATE: u32 = 4;
+const I_GET_CLASS_INFO_EX: u32 = 4;
+const I_TERMINATE: u32 = 5;
 
 pub fn build() -> Vec<u8> {
     let ndlls = IMPORTS.len() as u32;
@@ -211,6 +246,7 @@ fn wide(s: &str) -> Vec<u8> {
 fn build_text(iat: &dyn Fn(u32) -> u32, class_va: u32, title_va: u32) -> Vec<u8> {
     let cell = |off: u32| IMAGE_BASE + DATA_RVA + off;
     let wc = cell(data::WNDCLASS);
+    let wcx = cell(data::WNDCLASSEX);
     let mut c: Vec<u8> = Vec::new();
 
     c.extend_from_slice(&[0xE9, 0, 0, 0, 0]);
@@ -270,9 +306,18 @@ fn build_text(iat: &dyn Fn(u32) -> u32, class_va: u32, title_va: u32) -> Vec<u8>
 
     c.extend_from_slice(&[0x89, 0x25]);
     c.extend_from_slice(&cell(data::ESP_BEFORE).to_le_bytes());
-    emit_store_imm(&mut c, wc + 0x04, wndproc_va);
-    emit_store_imm(&mut c, wc + 0x10, IMAGE_BASE);
-    emit_store_imm(&mut c, wc + 0x24, class_va);
+    for (off, v) in [
+        (wndclassw::STYLE, CLASS_STYLE),
+        (wndclassw::WNDPROC, wndproc_va),
+        (wndclassw::CLS_EXTRA, CLASS_CLS_EXTRA),
+        (wndclassw::WND_EXTRA, CLASS_WND_EXTRA),
+        (wndclassw::INSTANCE, IMAGE_BASE),
+        (wndclassw::BACKGROUND, CLASS_BACKGROUND),
+        (wndclassw::MENU_NAME, CLASS_MENU_NAME),
+        (wndclassw::CLASS_NAME, class_va),
+    ] {
+        emit_store_imm(&mut c, wc + off, v);
+    }
 
     c.push(0x68);
     c.extend_from_slice(&wc.to_le_bytes());
@@ -285,6 +330,16 @@ fn build_text(iat: &dyn Fn(u32) -> u32, class_va: u32, title_va: u32) -> Vec<u8>
     c.extend_from_slice(&[0x75, 0x00]);
     emit_exit(&mut c, iat(I_TERMINATE), GUI_FAIL_NO_ATOM_EXIT as u32);
     patch_rel8(&mut c, jnz_atom);
+
+    emit_store_imm(&mut c, wcx + wndclassexw::CB_SIZE, wndclassexw::SIZE);
+    for imm in [wcx, class_va, IMAGE_BASE] {
+        c.push(0x68);
+        c.extend_from_slice(&imm.to_le_bytes());
+    }
+    c.extend_from_slice(&[0xFF, 0x15]);
+    c.extend_from_slice(&iat(I_GET_CLASS_INFO_EX).to_le_bytes());
+    c.push(0xA3);
+    c.extend_from_slice(&cell(data::INFO_ATOM).to_le_bytes());
 
     for imm in [0u32, IMAGE_BASE, 0, 0, 120, 200, 20, 10, WINDOW_STYLE, title_va, class_va, 0] {
         c.push(0x68);
@@ -424,6 +479,7 @@ mod tests {
                 "ntdll.dll!NtTerminateProcess",
                 "user32.dll!CreateWindowExW",
                 "user32.dll!DefWindowProcW",
+                "user32.dll!GetClassInfoExW",
                 "user32.dll!RegisterClassW",
                 "user32.dll!SendMessageW",
             ],
@@ -431,6 +487,6 @@ mod tests {
         let mut slots: Vec<u32> = img.imports.iter().map(|i| i.iat_rva).collect();
         slots.sort_unstable();
         slots.dedup();
-        assert_eq!(slots.len(), 5, "five distinct IAT slots");
+        assert_eq!(slots.len(), 6, "six distinct IAT slots");
     }
 }
