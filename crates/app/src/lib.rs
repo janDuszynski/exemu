@@ -6,6 +6,7 @@ pub mod cab_sample;
 pub mod comctl_sample;
 pub mod comdlg_sample;
 pub mod gui_sample;
+pub mod image_loader;
 pub mod sample;
 pub mod shell_link_sample;
 pub mod shell_sample;
