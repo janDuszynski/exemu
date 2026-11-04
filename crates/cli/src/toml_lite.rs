@@ -18,7 +18,12 @@ impl Value {
             while let Some(c) = chars.next() {
                 match c {
                     '"' => return Some(Value::Str(out)),
-                    '\\' => out.push(chars.next()?),
+                    '\\' => out.push(match chars.next()? {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        other => other,
+                    }),
                     _ => out.push(c),
                 }
             }
@@ -49,10 +54,16 @@ pub fn quote(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
     for c in s.chars() {
-        if c == '"' || c == '\\' {
-            o.push('\\');
+        match c {
+            '"' | '\\' => {
+                o.push('\\');
+                o.push(c);
+            }
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            _ => o.push(c),
         }
-        o.push(c);
     }
     o.push('"');
     o
@@ -86,6 +97,16 @@ mod tests {
     #[test]
     fn quote_escapes_quotes_and_backslashes() {
         assert_eq!(quote("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn control_characters_round_trip_through_their_escapes() {
+        let text = "curl 8.21.0\r\nRelease-Date:\t2026-06-24\r\n";
+        let quoted = quote(text);
+        assert!(!quoted.contains('\n') && !quoted.contains('\r'), "a quoted value stays on one line");
+        assert_eq!(quoted, "\"curl 8.21.0\\r\\nRelease-Date:\\t2026-06-24\\r\\n\"");
+        assert!(matches!(Value::parse(&quoted), Some(Value::Str(s)) if s == text));
+        assert!(matches!(Value::parse("\"C:\\\\new\""), Some(Value::Str(s)) if s == "C:\\new"));
     }
 
     #[test]
