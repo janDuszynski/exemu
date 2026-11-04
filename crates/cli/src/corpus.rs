@@ -54,6 +54,8 @@ pub struct Entry {
     pub jit: bool,
     pub debug_idle: bool,
     pub wine_boot: Option<String>,
+    pub args: Vec<String>,
+    pub stdout: Option<String>,
     pub note: Option<String>,
 }
 
@@ -72,6 +74,7 @@ pub struct Observed {
     pub rip: Option<u64>,
     pub artifacts: u64,
     pub detail: String,
+    pub stdout: String,
     pub elapsed: Duration,
 }
 
@@ -199,6 +202,9 @@ impl Manifest {
             if let Some(dir) = &e.wine_boot {
                 let _ = writeln!(o, "wine_boot = {}", quote(dir));
             }
+            if !e.args.is_empty() {
+                let _ = writeln!(o, "args      = {}", quote(&e.args.join(" ")));
+            }
             let _ = writeln!(o, "max_steps = {}", e.max_steps);
             let _ = writeln!(o, "outcome   = {}", quote(e.outcome.as_str()));
             if e.outcome == Outcome::Exit {
@@ -214,6 +220,9 @@ impl Manifest {
             }
             if let Some(stop) = &e.stop {
                 let _ = writeln!(o, "stop      = {}", quote(stop));
+            }
+            if let Some(stdout) = &e.stdout {
+                let _ = writeln!(o, "stdout    = {}", quote(stdout));
             }
         }
         o
@@ -308,6 +317,14 @@ impl Entry {
                 Some(Value::Str(s)) => Some(s.clone()),
                 _ => None,
             },
+            args: match get("args") {
+                Some(Value::Str(s)) => s.split_whitespace().map(str::to_string).collect(),
+                _ => Vec::new(),
+            },
+            stdout: match get("stdout") {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            },
             note: match get("note") {
                 Some(Value::Str(s)) => Some(s.clone()),
                 _ => None,
@@ -346,7 +363,6 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
     cmd.current_dir(&dir)
         .arg("run")
         .arg(leaf)
-        .arg("--no-echo")
         .arg("--max-steps")
         .arg(e.max_steps.to_string())
         .arg("--telemetry")
@@ -367,6 +383,12 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
     if let Some(dir) = m.wine_boot_path(e) {
         cmd.arg("--wine-boot").arg(absolute(dir));
     }
+    if e.stdout.is_none() {
+        cmd.arg("--no-echo");
+    }
+    if !e.args.is_empty() {
+        cmd.arg("--").args(&e.args);
+    }
     let out = cmd
         .output()
         .map_err(|err| format!("cannot spawn {}: {err}", opts.exemu_bin.display()))?;
@@ -377,6 +399,7 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
         .ok_or_else(|| format!("{}: could not parse the run report:\n{report}", e.name))?;
     obs.elapsed = elapsed;
     obs.artifacts = count_files(&work.join("exemu-sandbox"));
+    obs.stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     Ok(obs)
 }
 
@@ -388,6 +411,7 @@ fn parse_report(report: &str) -> Option<Observed> {
         rip: None,
         artifacts: 0,
         detail: String::new(),
+        stdout: String::new(),
         elapsed: Duration::ZERO,
     };
 
@@ -500,6 +524,12 @@ pub fn compare(e: &Entry, o: &Observed) -> Vec<String> {
         }
     }
 
+    if let Some(want) = &e.stdout {
+        if want != &o.stdout {
+            problems.push(format!("stdout: expected {want:?} but the guest wrote {:?}", o.stdout));
+        }
+    }
+
     problems
 }
 
@@ -565,6 +595,12 @@ pub fn apply_update(m: &mut Manifest, verdicts: &[Verdict]) -> Vec<String> {
         if e.artifacts != Some(o.artifacts) {
             changes.push(format!("{}: artifacts {:?} → {}", e.name, e.artifacts, o.artifacts));
             e.artifacts = Some(o.artifacts);
+        }
+        if let Some(stdout) = e.stdout.as_mut() {
+            if *stdout != o.stdout {
+                changes.push(format!("{}: stdout {:?} → {:?}", e.name, stdout, o.stdout));
+                stdout.clone_from(&o.stdout);
+            }
         }
     }
     changes
@@ -864,6 +900,7 @@ artifacts = 4
             rip: None,
             artifacts: 110,
             detail: "exit 0".into(),
+            stdout: String::new(),
             elapsed: Duration::ZERO,
         };
         assert!(compare(e, &o).is_empty(), "the pinned run passes");
@@ -890,6 +927,7 @@ artifacts = 4
             rip: e.rip,
             artifacts: 0,
             detail: e.stop.clone().unwrap(),
+            stdout: String::new(),
             elapsed: Duration::ZERO,
         };
         assert!(compare(e, &o).is_empty(), "drift inside the tolerance passes");
@@ -999,6 +1037,7 @@ tolerance = 0
             rip: None,
             artifacts: 111,
             detail: "exit 0".into(),
+            stdout: String::new(),
             elapsed: Duration::ZERO,
         };
         let v = Verdict { problems: compare(&entry, &observed), entry, observed };
@@ -1009,5 +1048,78 @@ tolerance = 0
         assert_eq!(m.entries[0].artifacts, Some(111));
         assert!(m.to_toml().contains("a \\\"quoted\\\" note"));
         assert!(compare(&m.entries[0], &v.observed).is_empty());
+    }
+
+    const CONSOLE: &str = r#"[[binary]]
+name      = "tool.exe --version (wine)"
+path      = "example_exe/tool.exe"
+quick     = true
+virtual_clock = true
+wine_boot = "example_exe/wine-dlls/x86_64-windows"
+args      = "-s  --version"
+max_steps = 300000000
+outcome   = "exit"
+exit_code = 0
+steps     = 3951927
+tolerance = 0
+artifacts = 4
+stdout    = "tool 1.0\r\nFeatures: a b\r\n"
+"#;
+
+    fn console_run(stdout: &str) -> Observed {
+        Observed {
+            outcome: Outcome::Exit,
+            exit_code: 0,
+            steps: 3_951_927,
+            rip: None,
+            artifacts: 4,
+            detail: "exit 0".into(),
+            stdout: stdout.into(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_console_entry_carries_its_guest_args_and_pins_its_stdout_exactly() {
+        let m = Manifest::parse(CONSOLE, PathBuf::from("/repo")).expect("parse");
+        let e = &m.entries[0];
+        assert_eq!(e.args, vec!["-s".to_string(), "--version".to_string()]);
+        assert_eq!(e.stdout.as_deref(), Some("tool 1.0\r\nFeatures: a b\r\n"));
+
+        assert!(compare(e, &console_run("tool 1.0\r\nFeatures: a b\r\n")).is_empty());
+        let wrong = compare(e, &console_run("tool 1.0\nFeatures: a b\n"));
+        assert_eq!(wrong.len(), 1, "a lost carriage return is drift: {wrong:?}");
+        assert!(wrong[0].starts_with("stdout:"));
+        assert_eq!(compare(e, &console_run("")).len(), 1, "silence is not the banner");
+
+        let back = Manifest::parse(&m.to_toml(), PathBuf::from("/repo")).expect("reparse");
+        assert_eq!(back.entries[0].args, e.args, "`--update` keeps the guest args");
+        assert_eq!(back.entries[0].stdout, e.stdout, "`--update` keeps the pinned stdout byte for byte");
+
+        let plain = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
+        assert!(plain.entries[0].args.is_empty());
+        assert_eq!(plain.entries[0].stdout, None);
+        let unpinned = Observed { artifacts: 110, steps: 496_505_788, ..console_run("anything") };
+        assert!(compare(&plain.entries[0], &unpinned).is_empty());
+        let text = plain.to_toml();
+        assert!(!text.contains("args") && !text.contains("stdout"));
+    }
+
+    #[test]
+    fn update_refreshes_a_pinned_stdout_and_never_adds_one() {
+        let mut m = Manifest::parse(CONSOLE, PathBuf::from("/repo")).expect("parse");
+        let entry = m.entries[0].clone();
+        let observed = console_run("tool 1.1\r\n");
+        let v = Verdict { problems: compare(&entry, &observed), entry, observed };
+        let changes = apply_update(&mut m, std::slice::from_ref(&v));
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(m.entries[0].stdout.as_deref(), Some("tool 1.1\r\n"));
+
+        let mut plain = Manifest::parse(SAMPLE, PathBuf::from("/repo")).expect("parse");
+        let entry = plain.entries[0].clone();
+        let observed = Observed { artifacts: 110, steps: 496_505_788, ..console_run("noise") };
+        let v = Verdict { problems: compare(&entry, &observed), entry, observed };
+        assert!(apply_update(&mut plain, std::slice::from_ref(&v)).is_empty());
+        assert_eq!(plain.entries[0].stdout, None);
     }
 }
