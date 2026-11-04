@@ -518,7 +518,8 @@ mod sse;
 mod vex;
 mod x87;
 
-pub use exec::{CpuidFeature, CpuidReg, SEL_CS32, SEL_CS64, SEL_DATA};
+pub use exec::{CpuidFeature, CpuidReg};
+pub use exemu_core::cpu::{SEL_CS32, SEL_CS64, SEL_DATA};
 
 pub fn is_sse_opcode(op2: u8) -> bool {
     sse::is_sse(op2)

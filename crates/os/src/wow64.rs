@@ -21,9 +21,9 @@ pub const CTX_EFLAGS: u64 = 0xc0;
 pub const CTX_ESP: u64 = 0xc4;
 pub const CTX_SEGSS: u64 = 0xc8;
 
-pub const SEL_CS32: u32 = 0x23;
-pub const SEL_SS32: u32 = 0x2b;
-pub const SEL_CS64: u32 = 0x33;
+pub const SEL_CS32: u32 = exemu_core::cpu::SEL_CS32 as u32;
+pub const SEL_SS32: u32 = exemu_core::cpu::SEL_DATA as u32;
+pub const SEL_CS64: u32 = exemu_core::cpu::SEL_CS64 as u32;
 
 pub const TEB64_WOW_TEB_OFFSET: u64 = 0x180c;
 

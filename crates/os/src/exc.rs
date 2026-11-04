@@ -1,3 +1,4 @@
+use exemu_core::cpu::{SEL_CS32, SEL_CS64, SEL_DATA};
 use exemu_core::{CpuState, Memory, Result};
 
 pub(crate) const CONTEXT_SIZE: u64 = 0x4d0;
@@ -19,12 +20,6 @@ pub enum TrapMode {
     #[default]
     Long,
     Compat32,
-}
-
-pub mod exemu_cpu_sel {
-    pub const CS64: u16 = 0x33;
-    pub const CS32: u16 = 0x23;
-    pub const DATA: u16 = 0x2b;
 }
 
 pub(crate) const EXCEPTION_RECORD_SIZE: u64 = 0x20 + 15 * 8;
@@ -504,12 +499,12 @@ impl WinOs {
         write_context(mem, new_rsp, cpu)?;
 
         let cs = match mode {
-            TrapMode::Long => exemu_cpu_sel::CS64,
-            TrapMode::Compat32 => exemu_cpu_sel::CS32,
+            TrapMode::Long => SEL_CS64,
+            TrapMode::Compat32 => SEL_CS32,
         };
         mem.write_u16(new_rsp + OFF_SEG_CS, cs)?;
         for off in [OFF_SEG_DS, OFF_SEG_ES, OFF_SEG_FS, OFF_SEG_GS, OFF_SEG_SS] {
-            mem.write_u16(new_rsp + off, exemu_cpu_sel::DATA)?;
+            mem.write_u16(new_rsp + off, SEL_DATA)?;
         }
         mem.write_u32(new_rsp + OFF_CONTEXT_FLAGS, CONTEXT_ALL | CONTEXT_SEGMENTS)?;
 
@@ -523,7 +518,7 @@ impl WinOs {
         mem.write_u64(new_rsp + 0x598, cs as u64)?;
         mem.write_u64(new_rsp + 0x5A0, rflags)?;
         mem.write_u64(new_rsp + 0x5A8, old_rsp)?;
-        mem.write_u64(new_rsp + 0x5B0, exemu_cpu_sel::DATA as u64)?;
+        mem.write_u64(new_rsp + 0x5B0, SEL_DATA as u64)?;
 
         cpu.set_rsp(new_rsp);
         cpu.rip = ntdll_base + RVA_KI_USER_EXCEPTION_DISPATCHER;

@@ -32,10 +32,6 @@ pub struct CpuidFeature {
     pub probe: &'static [u8],
 }
 
-pub const SEL_CS64: u16 = 0x33;
-pub const SEL_CS32: u16 = 0x23;
-pub const SEL_DATA: u16 = 0x2b;
-
 impl Interpreter {
     #[inline]
     pub(crate) fn segment_selector(&self, idx: u8) -> u16 {
