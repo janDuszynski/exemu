@@ -949,8 +949,8 @@ impl Win32kState {
             if w.parent == 0 || self.window(w.parent).is_none() {
                 break;
             }
-            ox += w.rect[0];
-            oy += w.rect[1];
+            ox = ox.wrapping_add(w.rect[0]);
+            oy = oy.wrapping_add(w.rect[1]);
             cur = w.parent;
         }
         (ox, oy)
@@ -960,7 +960,7 @@ impl Win32kState {
         let (ox, oy) = self.client_origin(hwnd);
         let Some(w) = self.window(hwnd) else { return [0; 4] };
         let (cx, cy) = client_size(w);
-        let mut r = [ox, oy, ox + cx as i32, oy + cy as i32];
+        let mut r = [ox, oy, ox.wrapping_add(cx as i32), oy.wrapping_add(cy as i32)];
         let mut cur = hwnd;
         for _ in 0..WINDOW_ANCESTRY_MAX {
             let Some(w) = self.window(cur) else { break };
@@ -973,8 +973,8 @@ impl Win32kState {
             let (pcx, pcy) = client_size(p);
             r[0] = r[0].max(px);
             r[1] = r[1].max(py);
-            r[2] = r[2].min(px + pcx as i32);
-            r[3] = r[3].min(py + pcy as i32);
+            r[2] = r[2].min(px.wrapping_add(pcx as i32));
+            r[3] = r[3].min(py.wrapping_add(pcy as i32));
             cur = parent;
         }
         r
@@ -1014,7 +1014,7 @@ impl Win32kState {
         let (ox, oy) = self.client_origin(hwnd);
         let Some(w) = self.window(hwnd) else { return false };
         let (cx, cy) = client_size(w);
-        x >= ox && y >= oy && x < ox + cx as i32 && y < oy + cy as i32
+        x >= ox && y >= oy && x < ox.wrapping_add(cx as i32) && y < oy.wrapping_add(cy as i32)
     }
 
     fn window_from_point(&self, x: i32, y: i32, skip: &[u32]) -> u32 {
@@ -2189,8 +2189,8 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
                 let owner = os.win32k_state.surface_owner(hwnd);
                 let (ox, oy) = os.win32k_state.client_origin(hwnd);
                 let screen = os.win32k_state.window(owner).map(|w| (w.rect[0], w.rect[1])).unwrap_or((0, 0));
-                let (x, y) = (screen.0 + ox, screen.1 + oy);
-                [x, y, x + cx as i32, y + cy as i32]
+                let (x, y) = (screen.0.wrapping_add(ox), screen.1.wrapping_add(oy));
+                [x, y, x.wrapping_add(cx as i32), y.wrapping_add(cy as i32)]
             };
             let out = mem.read_u64(param + CALL_RECT_PARAM_RECT)?;
             if out == 0 {
@@ -5250,6 +5250,26 @@ mod tests {
         destroy_window(&mut os, edit);
         assert_eq!(os.win32k_state.focus, 0, "destroying the focus window clears it");
         assert_eq!(keyboard_target(&os, 0), top);
+    }
+
+    #[test]
+    fn window_geometry_wraps_instead_of_panicking_on_guest_coordinates() {
+        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
+        let top = child(&mut os, 0, [i32::MAX - 5, i32::MAX - 5, 463, 415]);
+        let kid = child(&mut os, top, [i32::MAX, i32::MAX, 10, 10]);
+        let _ = os.win32k_state.client_origin(kid);
+        let _ = os.win32k_state.window_visible_rect(kid);
+        let _ = os.win32k_state.contains_point(kid, 0, 0);
+
+        let mut mem = VirtualMemory::new();
+        mem.map(Region::new("stack", MSG_CALL_STACK, 0x1000, Perm::RW)).unwrap();
+        mem.map(Region::new("scratch", MSG_CALL_SCRATCH, 0x1000, Perm::RW)).unwrap();
+        mem.write_u64(MSG_CALL_SCRATCH + CALL_RECT_PARAM_RECT, MSG_CALL_SCRATCH + 0x100).unwrap();
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, kid as u64);
+        cpu.set_reg(Reg::Rdx, MSG_CALL_SCRATCH);
+        cpu.set_reg(Reg::R8, call_hwnd_param::GET_WINDOW_RECT);
+        assert_eq!(nt_user_call_hwnd_param(&mut os, &mut cpu, &mut mem).unwrap(), 1);
     }
 
     #[test]
