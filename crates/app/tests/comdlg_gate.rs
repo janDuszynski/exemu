@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use exemu_app::{comdlg_sample, load_and_run, RunConfig};
+use exemu_app::{comdlg_sample, load_and_run, Process, RunConfig};
 use exemu_gui::{DriverCall, RecordingDriver};
 
 const WINE_DLLS: &str = "../../example_exe/wine-dlls/x86_64-windows";
+const WINE_DLLS32: &str = "../../example_exe/wine-dlls/i386-windows";
 
 fn wine_dlls_present() -> bool {
     Path::new(WINE_DLLS).join("comdlg32.dll").exists()
@@ -290,6 +291,98 @@ fn driving_both_dialogs_opens_the_first_pick_and_saves_to_the_second() {
         saved.display()
     );
     assert_eq!(res.exit_code, 0, "both dialogs completed and nothing failed. Got {r:?}");
+}
+
+fn peek_wstr(proc: &Process, at: u64, max: u64) -> String {
+    let units: Vec<u16> = (0..max)
+        .map(|i| {
+            let lo = proc.peek_u8(at + i * 2).unwrap_or(0) as u16;
+            let hi = proc.peek_u8(at + i * 2 + 1).unwrap_or(0) as u16;
+            lo | hi << 8
+        })
+        .take_while(|u| *u != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+fn peek_astr(proc: &Process, at: u64, len: u32) -> String {
+    let bytes: Vec<u8> = (0..len as u64).map(|i| proc.peek_u8(at + i).unwrap_or(0)).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[test]
+fn a_32bit_guest_drives_both_dialogs_through_wow64() {
+    if !wine_dlls_present() || !Path::new(WINE_DLLS32).join("comdlg32.dll").exists() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    use comdlg_sample::wow64::{self as s, data};
+
+    let sandbox = seeded_sandbox("wow64");
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<exemu_core::InputEvent>();
+    drop(tx);
+    let mut cfg = RunConfig {
+        echo: false,
+        max_steps: 400_000_000,
+        wine_boot_dir: Some(WINE_DLLS.to_string()),
+        sandbox_root: Some(sandbox.clone()),
+        input: Some(rx),
+        driver: Some(Box::new(RecordingDriver::new(Arc::clone(&log)))),
+        file_dialog_pick: Some(format!(
+            "{}|{}",
+            comdlg_sample::PICK_FILE_NAME,
+            comdlg_sample::SAVE_FILE_NAME
+        )),
+        ..RunConfig::default()
+    };
+    let mut proc = Process::load(&s::build(), &mut cfg).expect("the PE32 guest boots on WoW64");
+    assert!(proc.wow64().is_some(), "a PE32 on the Wine boot is a WoW64 process");
+    let run = proc.run_borrowed();
+    let u32_at = |off: u32| proc.peek_u32(s::data_va(off)).unwrap_or(u32::MAX);
+    let open = peek_wstr(&proc, s::data_va(data::OPEN_BUF), 260);
+    let save = peek_wstr(&proc, s::data_va(data::SAVE_BUF), 260);
+    let read_len = u32_at(data::READ_COUNT).min(data::READ_BUF_LEN);
+    let read = peek_astr(&proc, s::data_va(data::READ_BUF), read_len);
+    let state = format!(
+        "open_ret={} open_err={} open={open:?} read={read:?} save_ret={} save_err={} save={save:?} wrote={}",
+        u32_at(data::OPEN_RET),
+        u32_at(data::OPEN_ERR),
+        u32_at(data::SAVE_RET),
+        u32_at(data::SAVE_ERR),
+        u32_at(data::WROTE)
+    );
+    let res = run.unwrap_or_else(|e| panic!("the WoW64 drive must run to completion: {e}\n{state}"));
+    eprintln!("comdlg wow64 drive: exit={} steps={} {state}", res.exit_code, res.steps);
+
+    let dialogs = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| matches!(c, DriverCall::CreateWindow { params, .. } if params.class_name == "#32770"))
+        .count();
+    assert_eq!(dialogs, 2, "the 32-bit comdlg32 built both dialogs. {state}");
+    assert_eq!(u32_at(data::OPEN_RET), 1, "GetOpenFileNameW answered TRUE. {state}");
+    assert_eq!(
+        open,
+        format!(r"{}\{}", comdlg_sample::INITIAL_DIR, comdlg_sample::PICK_FILE_NAME),
+        "{state}"
+    );
+    assert_eq!(read, PICK_CONTENT, "the 32-bit guest opened the seeded file through it. {state}");
+    assert_eq!(u32_at(data::SAVE_RET), 1, "GetSaveFileNameW answered TRUE. {state}");
+    assert_eq!(
+        save,
+        format!(r"{}\{}", comdlg_sample::INITIAL_DIR, comdlg_sample::SAVE_FILE_NAME),
+        "{state}"
+    );
+    assert_eq!(u32_at(data::WROTE), comdlg_sample::SAVE_PAYLOAD.len() as u32, "{state}");
+    let saved = sandbox
+        .join("C")
+        .join("Users")
+        .join("exemu")
+        .join("Documents")
+        .join(comdlg_sample::SAVE_FILE_NAME);
+    assert_eq!(std::fs::read_to_string(&saved).unwrap_or_default(), comdlg_sample::SAVE_PAYLOAD);
 }
 
 #[test]
