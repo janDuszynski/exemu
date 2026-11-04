@@ -174,6 +174,8 @@ const DEFAULT_CONTRACTS: &[(&str, &str)] = &[
     ("api-ms-win-crt-time-l1-1-0", "ucrtbase.dll"),
     ("api-ms-win-crt-utility-l1-1-0", "ucrtbase.dll"),
     ("api-ms-win-crt-multibyte-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-conio-l1-1-0", "ucrtbase.dll"),
+    ("api-ms-win-crt-private-l1-1-0", "ucrtbase.dll"),
     ("api-ms-win-core-processthreads-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-synch-l1-1-0", "kernelbase.dll"),
     ("api-ms-win-core-synch-l1-2-0", "kernelbase.dll"),
@@ -314,6 +316,8 @@ mod tests {
         assert_eq!(resolve("api-ms-win-crt-stdio-l1-1-0").as_deref(), Some("ucrtbase.dll"));
         assert_eq!(resolve("api-ms-win-core-synch-l1-2-0").as_deref(), Some("kernelbase.dll"));
         assert_eq!(resolve("api-ms-win-core-rtlsupport-l1-1-0").as_deref(), Some("ntdll.dll"));
+        assert_eq!(resolve("api-ms-win-crt-conio-l1-1-0").as_deref(), Some("ucrtbase.dll"));
+        assert_eq!(resolve("api-ms-win-crt-private-l1-1-0").as_deref(), Some("ucrtbase.dll"));
         assert_eq!(resolve("api-ms-win-core-nonexistent-l9-9-9"), None);
     }
 

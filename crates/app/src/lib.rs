@@ -11,6 +11,7 @@ pub mod sample;
 pub mod shell_link_sample;
 pub mod shell_sample;
 pub mod socket_sample;
+pub mod prefix_dirs;
 pub mod winsxs;
 pub mod wow64_boot;
 pub mod wow64_gui_sample;
@@ -394,6 +395,7 @@ impl Process {
                 (false, Some(d32)) => d32.clone(),
                 _ => std::path::PathBuf::from(dir),
             };
+            prefix_dirs::stage_prefix_dirs(&sandbox);
             let _ = winsxs::stage_comctl6(&sandbox, &prefix, winsxs::arch_for(image.is_64bit));
         }
 

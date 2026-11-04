@@ -91,7 +91,7 @@ fn steamsetup_wow64_probe() {
          32-bit callback/thread refusals (W5.10/W5.11) stopped holding",
     );
     assert!(
-        (5_000_000..20_000_000).contains(&p.steps),
+        (5_000_000..60_000_000).contains(&p.steps),
         "SteamSetup should run millions of instructions on the WoW64 path; ran {} ({})",
         p.steps,
         p.outcome,
