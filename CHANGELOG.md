@@ -54,6 +54,41 @@ end-to-end on the default path.
   TRUE with `C:\Users\exemu\Documents\exemu-saved.txt` and the guest writes its
   payload there: exit 0, every leg passing, 53.5M instructions.
 
+### …and so does the 32-bit one, through WoW64 (W6.2)
+A 32-bit twin of the comdlg sample (`comdlg_sample::wow64`) runs the same two
+legs as a WoW64 process. It met six walls, each its own commit:
+- **No builtin classes.** The i386 user32 hands `NtUserInitializeClientPfnArrays`
+  ntdll32's `Ntdll*WndProc_*` stubs, each a `jmp dword [abs32]` (`FF 25`) into the
+  `user_procs` copy `RtlInitializeNtUserPfn` made — not the x64 `48 FF 25` thunk
+  exemu resolved — so every builtin class was refused and `#32770` was "not
+  found". (The arrays keep 64-bit slots on both sides: 0x88 bytes, high dwords 0.)
+- **`NtUserGetClassInfoEx` never wrote its `WNDCLASSEXW`.** `WIN_CreateWindowEx`
+  passes one on its stack and hands any non-NULL `lpszMenuName` to `LoadMenuW`;
+  on WoW64, wow64win copies the 64-bit block it passed back to 32 bits, so the
+  uninitialised field arrived as `0x0400c4df` and `kernelbase!get_res_nameW`
+  faulted on it. Classes now keep what they were registered with (extra bytes,
+  icons, cursor, the client menu name) and the answer follows win32u: the menu
+  name for the charset asked, the instance asked about (0 for user32's own).
+- **`GetDC(NULL)` failed before any window existed**, so `DIALOG_CreateIndirect`
+  measured its font on no DC and laid the dialog out with base units 0,0. It is
+  now a screen DC with nothing to draw into.
+- **A `LONG` wrote eight bytes.** 32-bit dialogs keep `DWLP_MSGRESULT`,
+  `DWLP_DLGPROC` and `DWLP_USER` four bytes apart, so `DefDlgProc`'s
+  `SetWindowLongW(DWLP_MSGRESULT, 0)` zeroed the dialog procedure and
+  `FileOpenDlgProc95` never saw `WM_INITDIALOG`. `NtUserSetWindowLong` and the
+  `GetWindowLong{A,W}` selectors now touch four bytes; `GetWindowLongA` (9) is
+  serviced at all.
+- **DIB bits above 4 GiB.** `CreateDIBSection`'s bits pointer reaches 32-bit code
+  through wow64win truncated; `create_alpha_bitmap` faulted at `0x018eb003`.
+  DIB bits (and the drive's typed text) are mapped below 4 GiB for a WoW64 guest.
+- **`GetWindowLong`'s offset is an `INT`.** wow64win zero-extends it, so
+  `GWLP_USERDATA` arrived as `0xffffffeb`, read as an extra-bytes offset, and
+  `ShellView_WndProc` got a NULL `this` on `WM_CREATE`.
+- **The result:** both legs answer TRUE with the typed paths, the 32-bit guest
+  reads the seeded file and writes its payload, exit 0. `comdlg_gate` pins it.
+  Window geometry sums on guest coordinates now wrap instead of panicking a debug
+  host.
+
 ### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
 - **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
   `0x20..=0x37` are the stock objects, so a guest had **72 GDI handles for its
