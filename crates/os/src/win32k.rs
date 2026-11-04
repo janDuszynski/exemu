@@ -344,10 +344,21 @@ const CLASS_ATOM_BASE: u16 = 0xC000;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_CHILD: u32 = 0x4000_0000;
 
-const WNDCLASSEXW_WNDPROC: u64 = 0x08;
-const WNDCLASSEXW_STYLE: u64 = 0x04;
-const WNDCLASSEXW_CB_WND_EXTRA: u64 = 0x14;
-const WNDCLASSEXW_BACKGROUND: u64 = 0x30;
+mod wndclassexw {
+    pub const STYLE: u64 = 0x04;
+    pub const WNDPROC: u64 = 0x08;
+    pub const CB_CLS_EXTRA: u64 = 0x10;
+    pub const CB_WND_EXTRA: u64 = 0x14;
+    pub const INSTANCE: u64 = 0x18;
+    pub const ICON: u64 = 0x20;
+    pub const CURSOR: u64 = 0x28;
+    pub const BACKGROUND: u64 = 0x30;
+    pub const MENU_NAME: u64 = 0x38;
+    pub const CLASS_NAME: u64 = 0x40;
+    pub const ICON_SM: u64 = 0x48;
+}
+
+const CLIENT_MENU_NAME_SIZE: usize = 0x18;
 const WND_EXTRA_MAX: u32 = 4096;
 
 const GWLP_WNDPROC: i64 = -4;
@@ -1285,9 +1296,39 @@ fn nt_user_get_atom_name(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
 }
 
 fn nt_user_get_class_info_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let instance = os.syscall_arg(cpu, mem, 0)?;
     let name_ptr = os.syscall_arg(cpu, mem, 1)?;
+    let wc = os.syscall_arg(cpu, mem, 2)?;
+    let menu_name = os.syscall_arg(cpu, mem, 3)?;
     let name = read_unicode_string(mem, name_ptr)?;
-    Ok(os.win32k_state.class_by_name(&name).map(u32::from).unwrap_or(0))
+    let st = &os.win32k_state;
+    let Some((atom, class)) = st.class_by_name(&name).and_then(|a| Some((a, st.class_by_atom(a)?))) else {
+        return Ok(0);
+    };
+    if wc != 0 {
+        let name_buffer = if name_ptr != 0 { mem.read_u64(name_ptr + USTR_BUFFER)? } else { 0 };
+        let instance = if instance == st.user32_image.0 { 0 } else { instance };
+        write_class_info(mem, wc, class, instance, name_buffer)?;
+    }
+    if menu_name != 0 {
+        mem.write(menu_name, &[0u8; CLIENT_MENU_NAME_SIZE])?;
+    }
+    Ok(atom as u32)
+}
+
+fn write_class_info(mem: &mut dyn Memory, wc: u64, class: &Class, instance: u64, name: u64) -> Result<()> {
+    use wndclassexw as w;
+    mem.write_u32(wc + w::STYLE, class.style)?;
+    mem.write_u64(wc + w::WNDPROC, class.wndproc)?;
+    mem.write_u32(wc + w::CB_CLS_EXTRA, 0)?;
+    mem.write_u32(wc + w::CB_WND_EXTRA, class.wnd_extra)?;
+    mem.write_u64(wc + w::INSTANCE, instance)?;
+    mem.write_u64(wc + w::ICON, 0)?;
+    mem.write_u64(wc + w::CURSOR, 0)?;
+    mem.write_u64(wc + w::BACKGROUND, class.background)?;
+    mem.write_u64(wc + w::MENU_NAME, 0)?;
+    mem.write_u64(wc + w::CLASS_NAME, name)?;
+    mem.write_u64(wc + w::ICON_SM, 0)
 }
 
 fn nt_user_register_class_ex_wow(
@@ -1301,10 +1342,10 @@ fn nt_user_register_class_ex_wow(
 
     let (style, wndproc, background, wnd_extra) = if wc != 0 {
         (
-            mem.read_u32(wc + WNDCLASSEXW_STYLE)?,
-            mem.read_u64(wc + WNDCLASSEXW_WNDPROC)?,
-            mem.read_u64(wc + WNDCLASSEXW_BACKGROUND)?,
-            mem.read_u32(wc + WNDCLASSEXW_CB_WND_EXTRA)?.min(WND_EXTRA_MAX),
+            mem.read_u32(wc + wndclassexw::STYLE)?,
+            mem.read_u64(wc + wndclassexw::WNDPROC)?,
+            mem.read_u64(wc + wndclassexw::BACKGROUND)?,
+            mem.read_u32(wc + wndclassexw::CB_WND_EXTRA)?.min(WND_EXTRA_MAX),
         )
     } else {
         (0, 0, 0, 0)
@@ -5557,5 +5598,67 @@ mod tests {
                 "{func:#x}: FALSE leaves the caller's block alone"
             );
         }
+    }
+
+    fn get_class_info(os: &mut WinOs, mem: &mut VirtualMemory, name: &str) -> (u32, u64, u64) {
+        const USTR: u64 = MSG_CALL_SCRATCH;
+        const BUF: u64 = MSG_CALL_SCRATCH + 0x40;
+        const WC: u64 = MSG_CALL_SCRATCH + 0x100;
+        const MENU: u64 = MSG_CALL_SCRATCH + 0x200;
+        let units: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        mem.write(BUF, &units).unwrap();
+        mem.write_u16(USTR + USTR_LENGTH, units.len() as u16).unwrap();
+        mem.write_u64(USTR + USTR_BUFFER, BUF).unwrap();
+        mem.write(WC, &[0xAA; 0x50]).unwrap();
+        mem.write(MENU, &[0xAA; CLIENT_MENU_NAME_SIZE]).unwrap();
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, 0x5000_0000);
+        cpu.set_reg(Reg::Rdx, USTR);
+        cpu.set_reg(Reg::R8, WC);
+        cpu.set_reg(Reg::R9, MENU);
+        mem.write_u64(MSG_CALL_STACK + 0x800 + 0x28, 0).unwrap();
+        (nt_user_get_class_info_ex(os, &mut cpu, mem).unwrap(), WC, MENU)
+    }
+
+    #[test]
+    fn get_class_info_fills_the_wndclassexw_and_clears_the_menu_name() {
+        use wndclassexw as w;
+        let (mut os, mut mem, _) = message_call_fixture();
+        os.win32k_state.classes.push((
+            0xC123,
+            Class {
+                name: "ExemuClass".into(),
+                wndproc: 0x4000_1230,
+                style: 0x8,
+                background: 6,
+                wnd_extra: 0x1e,
+            },
+        ));
+
+        let (atom, wc, menu) = get_class_info(&mut os, &mut mem, "exemuclass");
+        assert_eq!(atom, 0xC123, "class names compare case-insensitively");
+        let u64_at = |off| mem.read_u64(wc + off).unwrap();
+        assert_eq!(mem.read_u32(wc + w::STYLE).unwrap(), 0x8);
+        assert_eq!(u64_at(w::WNDPROC), 0x4000_1230);
+        assert_eq!(mem.read_u32(wc + w::CB_CLS_EXTRA).unwrap(), 0);
+        assert_eq!(mem.read_u32(wc + w::CB_WND_EXTRA).unwrap(), 0x1e);
+        assert_eq!(u64_at(w::INSTANCE), 0x5000_0000, "the instance asked about");
+        assert_eq!(u64_at(w::BACKGROUND), 6);
+        assert_eq!(
+            u64_at(w::MENU_NAME),
+            0,
+            "no menu: CreateWindowEx hands a non-NULL one straight to LoadMenuW"
+        );
+        assert_eq!(u64_at(w::CLASS_NAME), MSG_CALL_SCRATCH + 0x40, "the caller's own name buffer");
+        for off in [w::ICON, w::CURSOR, w::ICON_SM] {
+            assert_eq!(u64_at(off), 0, "WNDCLASSEXW+{off:#x}");
+        }
+        assert_eq!(mem.read_u64(menu).unwrap(), 0, "client_menu_name.nameA");
+        assert_eq!(mem.read_u64(menu + 8).unwrap(), 0, "client_menu_name.nameW");
+        assert_eq!(mem.read_u64(menu + 16).unwrap(), 0, "client_menu_name.nameUS");
+
+        let (atom, wc, _) = get_class_info(&mut os, &mut mem, "NoSuchClass");
+        assert_eq!(atom, 0);
+        assert_eq!(mem.read_u64(wc + w::MENU_NAME).unwrap(), 0xAAAA_AAAA_AAAA_AAAA, "not found writes nothing");
     }
 }
