@@ -104,7 +104,21 @@ mod message_call {
     ];
 }
 
-const WIN_PROC_PARAMS_FUNC: u64 = 0x00;
+mod win_proc_params {
+    pub const FUNC: u64 = 0x00;
+    pub const HWND: u64 = 0x08;
+    pub const MSG: u64 = 0x10;
+    pub const WPARAM: u64 = 0x18;
+    pub const LPARAM: u64 = 0x20;
+    pub const ANSI: u64 = 0x28;
+    pub const ANSI_DST: u64 = 0x2c;
+    pub const MAPPING: u64 = 0x30;
+    pub const DPI_CONTEXT: u64 = 0x34;
+    pub const PROC_A: u64 = 0x38;
+    pub const PROC_W: u64 = 0x40;
+}
+
+const WMCHAR_MAP_CALLWINDOWPROC: u32 = 5;
 
 const NT_GDI_EXT_TEXT_OUT_W: u32 = 0x11c9;
 const NT_GDI_RECTANGLE: u32 = 0x1259;
@@ -1582,20 +1596,49 @@ fn nt_user_message_call(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory
             Ok(0)
         }
         message_call::CALL_WINDOW_PROC => {
-            let proc = if result_info != 0 {
-                mem.read_u64(result_info + WIN_PROC_PARAMS_FUNC)?
-            } else {
-                0
-            };
-            if proc == 0 {
-                return Ok(0);
-            }
             let m = crate::msg::PostedMsg { hwnd: hwnd as u64, message: msg, wparam, lparam };
-            os.call_wndprocs_from_syscall(cpu, mem, vec![(proc, m.into_args())], Some(0), 0)?;
-            Ok(0)
+            init_win_proc_params(&os.win32k_state, mem, result_info, &m, ansi)
         }
         _ => Ok(0),
     }
+}
+
+fn win_proc_flavours(st: &Win32kState, func: u64) -> Option<WinProc> {
+    match winproc_slot(func) {
+        None => Some(WinProc { proc_a: func, proc_w: func }),
+        Some(slot) => st.win_procs.get(slot).copied(),
+    }
+}
+
+fn init_win_proc_params(
+    st: &Win32kState,
+    mem: &mut dyn Memory,
+    params: u64,
+    m: &crate::msg::PostedMsg,
+    ansi: bool,
+) -> Result<u32> {
+    use win_proc_params as p;
+    if params == 0 {
+        return Ok(0);
+    }
+    let func = mem.read_u64(params + p::FUNC)?;
+    if func == 0 {
+        return Ok(0);
+    }
+    let Some(procs) = win_proc_flavours(st, func) else { return Ok(0) };
+    let (own, other) = if ansi { (procs.proc_a, procs.proc_w) } else { (procs.proc_w, procs.proc_a) };
+    let ansi_dst = ansi != (own == 0 && other != 0);
+    mem.write_u64(params + p::HWND, m.hwnd)?;
+    mem.write_u32(params + p::MSG, m.message)?;
+    mem.write_u64(params + p::WPARAM, m.wparam)?;
+    mem.write_u64(params + p::LPARAM, m.lparam)?;
+    mem.write_u32(params + p::ANSI, ansi as u32)?;
+    mem.write_u32(params + p::ANSI_DST, ansi_dst as u32)?;
+    mem.write_u32(params + p::MAPPING, WMCHAR_MAP_CALLWINDOWPROC)?;
+    mem.write_u32(params + p::DPI_CONTEXT, crate::wow64::NTUSER_DPI_UNAWARE)?;
+    mem.write_u64(params + p::PROC_A, procs.proc_a)?;
+    mem.write_u64(params + p::PROC_W, procs.proc_w)?;
+    Ok(1)
 }
 
 fn read_text_param(mem: &dyn Memory, ptr: u64, ansi: bool) -> Result<String> {
@@ -5383,6 +5426,69 @@ mod tests {
             let (_, frames) = message_call(&mut os, &mut mem, hwnd, 0, ty);
             assert_eq!(frames, 0, "kernel procedure {ty:#x} called the application's WndProc");
             assert_eq!(os.syscall_result64, Some(1), "type {ty:#x} answers WM_NCCREATE");
+        }
+    }
+
+    fn call_window_proc(os: &mut WinOs, mem: &mut VirtualMemory, hwnd: u32, func: u64) -> (u32, usize) {
+        mem.write(MSG_CALL_SCRATCH, &[0xAA; 0x48]).unwrap();
+        mem.write_u64(MSG_CALL_SCRATCH + win_proc_params::FUNC, func).unwrap();
+        message_call(os, mem, hwnd, MSG_CALL_SCRATCH, message_call::CALL_WINDOW_PROC)
+    }
+
+    #[test]
+    fn call_window_proc_hands_user32_the_procedure_instead_of_calling_it() {
+        use win_proc_params as p;
+        const RAW: u64 = 0x4000_5000;
+        let (mut os, mut mem, hwnd) = message_call_fixture();
+
+        let (status, frames) = call_window_proc(&mut os, &mut mem, hwnd, RAW);
+        assert_eq!(status, 1, "TRUE tells CallWindowProcW to run dispatch_win_proc_params");
+        assert_eq!(frames, 0, "the kernel never calls the procedure, so its LRESULT is not lost");
+        assert_eq!(os.syscall_result64, None, "the TRUE is the status, not a stand-in LRESULT");
+
+        let at = |off| MSG_CALL_SCRATCH + off;
+        assert_eq!(mem.read_u64(at(p::FUNC)).unwrap(), RAW, "func is the caller's, untouched");
+        assert_eq!(mem.read_u64(at(p::HWND)).unwrap(), hwnd as u64);
+        assert_eq!(mem.read_u32(at(p::MSG)).unwrap(), WM_NCCREATE);
+        assert_eq!(mem.read_u64(at(p::WPARAM)).unwrap(), 0x80);
+        assert_eq!(mem.read_u64(at(p::LPARAM)).unwrap(), 0);
+        assert_eq!(mem.read_u32(at(p::ANSI)).unwrap(), 0);
+        assert_eq!(mem.read_u32(at(p::ANSI_DST)).unwrap(), 0, "a plain W procedure is called as W");
+        assert_eq!(mem.read_u32(at(p::MAPPING)).unwrap(), WMCHAR_MAP_CALLWINDOWPROC);
+        assert_eq!(mem.read_u32(at(p::DPI_CONTEXT)).unwrap(), crate::wow64::NTUSER_DPI_UNAWARE);
+        assert_eq!(mem.read_u64(at(p::PROC_W)).unwrap(), RAW, "procW is what dispatch calls");
+        assert_eq!(mem.read_u64(at(p::PROC_A)).unwrap(), RAW);
+    }
+
+    #[test]
+    fn call_window_proc_resolves_a_winproc_handle_to_the_flavour_it_holds() {
+        use win_proc_params as p;
+        const PROC_A: u64 = 0x4000_6000;
+        let (mut os, mut mem, hwnd) = message_call_fixture();
+        let handle = alloc_win_proc(&mut os.win32k_state, PROC_A, true);
+
+        let (status, _) = call_window_proc(&mut os, &mut mem, hwnd, handle);
+        assert_eq!(status, 1);
+        assert_eq!(mem.read_u64(MSG_CALL_SCRATCH + p::PROC_A).unwrap(), PROC_A);
+        assert_eq!(mem.read_u64(MSG_CALL_SCRATCH + p::PROC_W).unwrap(), 0);
+        assert_eq!(
+            mem.read_u32(MSG_CALL_SCRATCH + p::ANSI_DST).unwrap(),
+            1,
+            "a W call to an ANSI-only procedure is converted W to A"
+        );
+    }
+
+    #[test]
+    fn call_window_proc_refuses_a_null_or_unissued_procedure() {
+        for func in [0, WINPROC_HANDLE_TAG | 0x800] {
+            let (mut os, mut mem, hwnd) = message_call_fixture();
+            let (status, frames) = call_window_proc(&mut os, &mut mem, hwnd, func);
+            assert_eq!((status, frames), (0, 0), "{func:#x} has nothing to dispatch to");
+            assert_eq!(
+                mem.read_u64(MSG_CALL_SCRATCH + win_proc_params::PROC_W).unwrap(),
+                0xAAAA_AAAA_AAAA_AAAA,
+                "{func:#x}: FALSE leaves the caller's block alone"
+            );
         }
     }
 }

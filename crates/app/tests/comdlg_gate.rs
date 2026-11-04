@@ -228,7 +228,7 @@ fn wine_file_dialog_is_built_but_never_completes() {
 }
 
 #[test]
-fn driving_the_dialog_gets_through_text_layout_and_stops_in_the_comboboxex() {
+fn driving_the_dialog_returns_the_typed_path_and_the_file_behind_it() {
     if !wine_dlls_present() {
         eprintln!("SKIP: {WINE_DLLS} not present (the Wine DLL set is git-ignored)");
         return;
@@ -243,36 +243,29 @@ fn driving_the_dialog_gets_through_text_layout_and_stops_in_the_comboboxex() {
     );
 
     let (driven, _) = run_on_wine_picking("pick", Some(comdlg_sample::PICK_FILE_NAME));
-    let err = match driven {
-        Ok(res) => {
-            let r = report(&res.stdout);
-            panic!(
-                "the drive no longer faults — re-baseline this test to the positive \
-                 assertion: OPEN must be the path comdlg32 resolved and READ must be \
-                 {PICK_CONTENT:?}. Got exit={} {r:?}",
-                res.exit_code
-            )
-        }
-        Err(e) => e.to_string(),
-    };
-    eprintln!("comdlg wine drive: {err}");
-    assert!(err.contains("0xc0000005"), "the drive still ends in an access violation: {err}");
-    assert!(
-        !err.contains("0xc0000005 at 0x70"),
-        "0x70 is ScriptCache::tm.tmHeight read through a NULL ScriptCache — the font wall, \
-         which GDI font objects removed. If it is back, NtGdiHfontCreate / NtGdiGetDCObject / \
-         NtGdiExtGetObjectW stopped agreeing with gdi32!init_script_cache: {err}"
+    let res = driven.unwrap_or_else(|e| {
+        panic!(
+            "the driven dialog must run to completion. 0xc0000005 at 0x10 in \
+             comctl32!COMBOEX_ComboWndProc means CallWindowProcW lost its LRESULT again: \
+             NtUserCallWindowProc must fill win_proc_params and answer TRUE, not call the \
+             procedure itself. {e}"
+        )
+    });
+    let r = report(&res.stdout);
+    eprintln!("comdlg wine drive: exit={} steps={} {r:?}", res.exit_code, res.steps);
+
+    assert_no_hollow_success(&r);
+    assert_eq!(num(&r, comdlg_sample::TAG_OPEN_RET), 1, "GetOpenFileNameW answered TRUE");
+    assert_eq!(
+        tag(&r, comdlg_sample::TAG_OPEN),
+        format!(r"{}\{}", comdlg_sample::INITIAL_DIR, comdlg_sample::PICK_FILE_NAME),
+        "comdlg32 resolved the typed name against the initial directory"
     );
-    let faulted: u64 = err
-        .split("faulted after ")
-        .nth(1)
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    assert!(
-        faulted > 50_533_163,
-        "the drive must get PAST the font wall, which stopped it at 50,533,163 instructions; \
-         got {faulted} ({err})"
+    assert_eq!(num(&r, comdlg_sample::TAG_OPEN_ERR), 0);
+    assert_eq!(
+        tag(&r, comdlg_sample::TAG_READ),
+        PICK_CONTENT,
+        "the path it returned opens the seeded file"
     );
 }
 
