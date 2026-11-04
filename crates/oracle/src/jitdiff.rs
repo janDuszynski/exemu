@@ -4,6 +4,7 @@ use exemu_core::debug::{DebugControl, WatchKind};
 use exemu_core::hooks::NoHooks;
 use exemu_core::{Cpu, CpuState, Exit, Memory, Perm, Region};
 use exemu_cpu::{Bits, Interpreter};
+use exemu_jit::compile::{Compiler, MAX_INSNS};
 use exemu_jit::{Jit, Mode, Run};
 use exemu_memory::VirtualMemory;
 
@@ -186,6 +187,7 @@ pub struct JitFuzzConfig {
     pub layouts: LayoutMix,
     pub laps: u32,
     pub debug: DebugMix,
+    pub cut: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -209,6 +211,8 @@ impl DebugMix {
 
 pub const LAP_MAX_INSNS: u32 = 3;
 
+const CUT_SALT: u64 = 0xC07_B0D6_E7;
+
 #[derive(Default)]
 pub struct JitSummary {
     pub trials: u64,
@@ -230,6 +234,7 @@ pub struct JitSummary {
     pub watch_stops: u64,
     pub armed_tlb_fills: u64,
     pub debug_split: u64,
+    pub budget_stops: u64,
 }
 
 impl JitSummary {
@@ -549,16 +554,21 @@ fn diff_mem(a: &VirtualMemory, b: &VirtualMemory, sp: &Space) -> Option<String> 
     None
 }
 
-#[allow(clippy::too_many_arguments)]
+struct Twin {
+    mem_j: VirtualMemory,
+    cpu_j: Interpreter,
+    mem_i: VirtualMemory,
+    cpu_i: Interpreter,
+}
+
 fn run_lapped(
     jit: &mut Jit,
     plan: &TrialPlan,
     laps: u32,
-    mut mem_j: VirtualMemory,
-    mut cpu_j: Interpreter,
-    mut mem_i: VirtualMemory,
-    mut cpu_i: Interpreter,
+    mut cuts: Option<Rng>,
+    twin: Twin,
 ) -> (Run, Option<String>) {
+    let Twin { mut mem_j, mut cpu_j, mut mem_i, mut cpu_i } = twin;
     let budget = laps as u64 * (plan.generated + plan.tail);
     let mut hooks = NoHooks;
     let mut total: u32 = 0;
@@ -589,9 +599,28 @@ fn run_lapped(
         None
     }
     while (total as u64) < budget {
-        let left = budget - total as u64;
+        let rest = budget - total as u64;
+        let left = match cuts.as_mut() {
+            Some(rng) => {
+                let cut = match rng.below(4) {
+                    0 => 8 + rng.below(40),
+                    _ => rng.below(2 * LAP_MAX_INSNS + 2),
+                };
+                rest.min(u64::from(cut))
+            }
+            None => rest,
+        };
         let mode = mode_of(cpu_j.bits());
         let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, left);
+        if u64::from(run.insns()) > left {
+            return (
+                run,
+                Some(format!(
+                    "the JIT retired {} instructions against a budget of {left} at instruction {total}",
+                    run.insns()
+                )),
+            );
+        }
         total += run.insns();
         last = run;
         if let Some(r) = catch_up(&mut cpu_i, &mut mem_i, &mut done, total) {
@@ -648,7 +677,8 @@ fn run_lapped(
     )
 }
 
-fn run_one(jit: &mut Jit, bits: Bits, plan: &TrialPlan, laps: u32) -> (Run, Option<String>) {
+fn run_one(jit: &mut Jit, cfg: &JitFuzzConfig, plan: &TrialPlan, index: u64) -> (Run, Option<String>) {
+    let (bits, laps) = (cfg.bits, cfg.laps);
     let mode = mode_of(bits);
     let Some((mut mem_j, mut cpu_j)) = setup(bits, plan) else {
         return (Run::NotCompiled, Some("could not build the address space".into()));
@@ -660,9 +690,11 @@ fn run_one(jit: &mut Jit, bits: Bits, plan: &TrialPlan, laps: u32) -> (Run, Opti
 
     jit.invalidate();
     if laps > 1 {
-        return run_lapped(jit, plan, laps, mem_j, cpu_j, mem_i, cpu_i);
+        let cuts = cfg.cut.then(|| Rng::for_trial(cfg.seed ^ CUT_SALT, index));
+        return run_lapped(jit, plan, laps, cuts, Twin { mem_j, cpu_j, mem_i, cpu_i });
     }
-    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
+    let one_block = Compiler::compile(&mem_j, mode, plan.at, MAX_INSNS, None, u64::MAX).insns;
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, u64::from(one_block));
 
     let retired = match run {
         Run::NotCompiled => {
@@ -725,7 +757,7 @@ pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
         s.generated += plan.generated;
         s.by_layout[plan.layout.index()] += 1;
         let (run, reason) = if cfg.debug == DebugMix::Off {
-            run_one(&mut jit, cfg.bits, &plan, cfg.laps)
+            run_one(&mut jit, cfg, &plan, index)
         } else {
             run_one_debugged(&mut jit, cfg, &plan, index, &mut s)
         };
@@ -767,6 +799,7 @@ pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
     s.tlb_denied = jit.stats().tlb_denied;
     s.breakpoint_stops = jit.stats().breakpoint_stops;
     s.watch_stops = jit.stats().watch_stops;
+    s.budget_stops = jit.stats().budget_stops;
     Ok(s)
 }
 

@@ -19,6 +19,7 @@ fn jit_main(argv: &[String]) {
     let mut laps: u32 = 1;
     let mut layouts = LayoutMix::Mixed;
     let mut debug = DebugMix::Off;
+    let mut cut = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -69,6 +70,7 @@ fn jit_main(argv: &[String]) {
                     }
                 };
             }
+            "--cut" => cut = true,
             "--report" => {
                 i += 1;
                 report = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(report);
@@ -87,7 +89,11 @@ fn jit_main(argv: &[String]) {
             Bits::B32 => "32-bit",
             Bits::B64 => "64-bit",
         };
-        let laps_note = if laps > 1 { format!(" × {laps} laps") } else { String::new() };
+        let laps_note = match (laps > 1, cut) {
+            (true, true) => format!(" × {laps} laps, budgets cut mid-block"),
+            (true, false) => format!(" × {laps} laps"),
+            (false, _) => String::new(),
+        };
         let dbg_note = match debug {
             DebugMix::Off => String::new(),
             d => format!(", debug {d:?}"),
@@ -102,6 +108,7 @@ fn jit_main(argv: &[String]) {
             layouts,
             laps,
             debug,
+            cut,
         }) {
             Ok(s) => s,
             Err(e) => {
@@ -161,6 +168,9 @@ fn jit_main(argv: &[String]) {
         if s.links_taken != 0 {
             println!("     {} block entries reached by a native link", s.links_taken);
         }
+        if s.budget_stops != 0 {
+            println!("     {} chains stopped short of a block that would cross the budget", s.budget_stops);
+        }
         total_div += s.divergences;
     }
     if total_div == 0 {
@@ -177,7 +187,7 @@ fn unicorn_main(_argv: &[String]) {
     eprintln!("Build the differential oracle with:");
     eprintln!("  cargo run -p exemu-oracle --features unicorn --release -- fuzz [--bits 32|64] [--count N] [--seed S]");
     eprintln!("The JIT-vs-interpreter differential needs no reference emulator:");
-    eprintln!("  cargo run -p exemu-oracle --release -- jit [--bits 32|64|both] [--count N] [--chain K] [--laps K]");
+    eprintln!("  cargo run -p exemu-oracle --release -- jit [--bits 32|64|both] [--count N] [--chain K] [--laps K] [--cut]");
     std::process::exit(2);
 }
 
