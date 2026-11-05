@@ -27,6 +27,22 @@ Tests grew 199 → 1059, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
 ### 32-bit GUI programs get their windows on the WoW64 path (W5)
+- **Menus and accelerator tables are real.** `NtUserCreateMenu`,
+  `CreatePopupMenu`, `DestroyMenu`, `DeleteMenu`, `RemoveMenu`, `SetMenu`,
+  `CheckMenuItem`, `EnableMenuItem`, `DrawMenuBar`, `ThunkedMenuItemInfo`
+  (insert, modify, get, state, submenu, id, default item, radio check),
+  `ThunkedMenuInfo`, `GetMenuItemCount` and `GetMenuInfo` now keep a menu object
+  model (`win32k/menu.rs`); `CheckMenuItem` and `EnableMenuItem` answer the
+  previous state as Windows does, and `GetMenu` reads the attachment back through
+  `GWLP_ID`. `NtUserCreateAcceleratorTable`, `CopyAcceleratorTable`,
+  `DestroyAcceleratorTable` and `TranslateAccelerator` (`win32k/accel.rs`) match a
+  key message against the table and send `WM_COMMAND` with `HIWORD(wParam)=1` to
+  the window. `NtUserGetKeyState` reports the keys the host driver pressed.
+  Minesweeper's `LoadMenuW` now returns a menu and xmsol builds its whole menu bar.
+  Not yet: drawing the bar, `WM_INITMENU` before an accelerator, popup tracking.
+- **A WoW64 caller's `GetWindowLong` index was read as a large positive offset.**
+  `wow64win` zero-extends the 32-bit `INT` index, so `GWL_STYLE` and `GWLP_ID`
+  never matched; the index is now sign-extended from 32 bits.
 - **`NtUserGetClassInfoEx` never filled the `WNDCLASSEXW` it was handed.**
   user32's `WIN_CreateWindowEx` reads `lpszMenuName` from that struct and passes
   it to `LoadMenuW`, so every window was created from uninitialised stack. Under
