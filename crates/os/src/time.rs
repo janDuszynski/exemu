@@ -92,7 +92,7 @@ impl WinOs {
         if ptr != 0 {
             let f = systemtime_fields(self.filetime_now());
             for (i, field) in f.iter().enumerate() {
-                mem.write_u16(ptr + i as u64 * 2, *field)?;
+                mem.write_u16_at(ptr, i as u64 * 2, *field)?;
             }
         }
         Ok(Outcome::Return(0))
