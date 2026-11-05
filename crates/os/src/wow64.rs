@@ -62,11 +62,11 @@ pub fn publish_system_dll_init_block(mem: &mut dyn Memory, block: u64, v: &Syste
         }
     }
     mem.write_u32(block, SYSDLL_BLOCK_SIZE as u32)?;
-    mem.write_u64(block + SYSDLL_LDR_INITIALIZE_THUNK, v.ldr_initialize_thunk)?;
-    mem.write_u64(block + SYSDLL_KI_USER_EXCEPTION_DISPATCHER, v.exception_dispatcher)?;
-    mem.write_u64(block + SYSDLL_KI_USER_APC_DISPATCHER, v.apc_dispatcher)?;
-    mem.write_u64(block + SYSDLL_KI_USER_CALLBACK_DISPATCHER, v.callback_dispatcher)?;
-    mem.write_u64(block + SYSDLL_NTDLL32_BASE, v.ntdll32_base)?;
+    mem.write_u64_at(block, SYSDLL_LDR_INITIALIZE_THUNK, v.ldr_initialize_thunk)?;
+    mem.write_u64_at(block, SYSDLL_KI_USER_EXCEPTION_DISPATCHER, v.exception_dispatcher)?;
+    mem.write_u64_at(block, SYSDLL_KI_USER_APC_DISPATCHER, v.apc_dispatcher)?;
+    mem.write_u64_at(block, SYSDLL_KI_USER_CALLBACK_DISPATCHER, v.callback_dispatcher)?;
+    mem.write_u64_at(block, SYSDLL_NTDLL32_BASE, v.ntdll32_base)?;
     Ok(())
 }
 
@@ -114,15 +114,15 @@ pub const TEB32_ACTIVATION_CONTEXT_STACK_POINTER: u64 = 0x1a8;
 pub const TEB32_ACTIVATION_CONTEXT_STACK: u64 = 0x1800;
 
 pub fn seed_teb32(mem: &mut dyn Memory, teb32: u64, peb32: u64, stack_base: u64, stack_top: u64) -> Result<()> {
-    mem.write_u32(teb32 + TEB32_EXCEPTION_LIST, u32::MAX)?;
-    mem.write_u32(teb32 + TEB32_STACK_BASE, stack_top as u32)?;
-    mem.write_u32(teb32 + TEB32_STACK_LIMIT, stack_base as u32)?;
-    mem.write_u32(teb32 + TEB32_SELF, teb32 as u32)?;
-    mem.write_u32(teb32 + TEB32_PEB, peb32 as u32)?;
+    mem.write_u32_at(teb32, TEB32_EXCEPTION_LIST, u32::MAX)?;
+    mem.write_u32_at(teb32, TEB32_STACK_BASE, stack_top as u32)?;
+    mem.write_u32_at(teb32, TEB32_STACK_LIMIT, stack_base as u32)?;
+    mem.write_u32_at(teb32, TEB32_SELF, teb32 as u32)?;
+    mem.write_u32_at(teb32, TEB32_PEB, peb32 as u32)?;
     let actx = teb32 + TEB32_ACTIVATION_CONTEXT_STACK;
-    mem.write_u32(teb32 + TEB32_ACTIVATION_CONTEXT_STACK_POINTER, actx as u32)?;
-    mem.write_u32(actx + 0x04, actx as u32 + 0x04)?;
-    mem.write_u32(actx + 0x08, actx as u32 + 0x04)?;
+    mem.write_u32_at(teb32, TEB32_ACTIVATION_CONTEXT_STACK_POINTER, actx as u32)?;
+    mem.write_u32_at(actx, 0x04, actx as u32 + 0x04)?;
+    mem.write_u32_at(actx, 0x08, actx as u32 + 0x04)?;
     Ok(())
 }
 
@@ -156,16 +156,16 @@ pub struct Wow64Threading {
 }
 
 pub fn init_cpu_area(mem: &mut dyn Memory, teb_base: u64, area: u64, start: Start32) -> Result<()> {
-    mem.write_u64(teb_base + TEB_CPU_AREA_PTR_OFF, area)?;
+    mem.write_u64_at(teb_base, TEB_CPU_AREA_PTR_OFF, area)?;
     mem.write_u32(area, 0)?;
     let ctx = area + CPU_AREA_HEADER_LEN;
-    mem.write_u32(ctx + CTX_EIP, start.eip)?;
-    mem.write_u32(ctx + CTX_ESP, start.esp)?;
-    mem.write_u32(ctx + CTX_EAX, start.eax)?;
-    mem.write_u32(ctx + CTX_EBX, start.ebx)?;
-    mem.write_u32(ctx + CTX_EFLAGS, EFLAGS_INIT)?;
-    mem.write_u32(ctx + CTX_SEGCS, SEL_CS32)?;
-    mem.write_u32(ctx + CTX_SEGSS, SEL_SS32)?;
+    mem.write_u32_at(ctx, CTX_EIP, start.eip)?;
+    mem.write_u32_at(ctx, CTX_ESP, start.esp)?;
+    mem.write_u32_at(ctx, CTX_EAX, start.eax)?;
+    mem.write_u32_at(ctx, CTX_EBX, start.ebx)?;
+    mem.write_u32_at(ctx, CTX_EFLAGS, EFLAGS_INIT)?;
+    mem.write_u32_at(ctx, CTX_SEGCS, SEL_CS32)?;
+    mem.write_u32_at(ctx, CTX_SEGSS, SEL_SS32)?;
     Ok(())
 }
 
@@ -191,13 +191,13 @@ pub fn link_teb32(mem: &mut dyn Memory, teb64: u64, teb32: u64) -> Result<()> {
              TEB64.WowTebOffset is a signed 32-bit field"
         ))
     })?;
-    mem.write_u32(teb64 + TEB64_WOW_TEB_OFFSET, delta as u32)?;
-    mem.write_u32(teb32 + TEB32_SELF, teb32 as u32)?;
+    mem.write_u32_at(teb64, TEB64_WOW_TEB_OFFSET, delta as u32)?;
+    mem.write_u32_at(teb32, TEB32_SELF, teb32 as u32)?;
     Ok(())
 }
 
 pub fn teb32_of(mem: &dyn Memory, teb64: u64) -> Result<Option<u64>> {
-    let off = mem.read_u32(teb64 + TEB64_WOW_TEB_OFFSET)? as i32;
+    let off = mem.read_u32_at(teb64, TEB64_WOW_TEB_OFFSET)? as i32;
     if off == 0 {
         return Ok(None);
     }
@@ -280,7 +280,7 @@ pub fn publish_kernel_callback_table(mem: &mut dyn Memory, wow64win_base: u64, e
         if table < wow64win_base {
             break;
         }
-        mem.write_u64(peb64 + PEB64_KERNEL_CALLBACK_TABLE, table)?;
+        mem.write_u64_at(peb64, PEB64_KERNEL_CALLBACK_TABLE, table)?;
         return Ok(table);
     }
     Err(EmuError::Os(format!(
@@ -312,15 +312,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(mem.read_u64(teb + TEB_CPU_AREA_PTR_OFF).unwrap(), area, "area ptr at TEB+0x1488");
+        assert_eq!(mem.read_u64_at(teb, TEB_CPU_AREA_PTR_OFF).unwrap(), area, "area ptr at TEB+0x1488");
         assert_eq!(mem.read_u32(area).unwrap(), 0, "header cleared → forward path");
         let ctx = area + CPU_AREA_HEADER_LEN;
-        assert_eq!(mem.read_u32(ctx + CTX_EIP).unwrap(), 0x0040_1234, "Eip");
-        assert_eq!(mem.read_u32(ctx + CTX_ESP).unwrap(), 0x0041_0000, "Esp");
-        assert_eq!(mem.read_u32(ctx + CTX_EAX).unwrap(), 0x0040_5678, "Eax = the thread entry point");
-        assert_eq!(mem.read_u32(ctx + CTX_SEGCS).unwrap(), SEL_CS32, "SegCs = 0x23");
-        assert_eq!(mem.read_u32(ctx + CTX_SEGSS).unwrap(), SEL_SS32, "SegSs = 0x2b");
-        assert_eq!(mem.read_u32(ctx + CTX_EFLAGS).unwrap(), EFLAGS_INIT, "EFlags");
+        assert_eq!(mem.read_u32_at(ctx, CTX_EIP).unwrap(), 0x0040_1234, "Eip");
+        assert_eq!(mem.read_u32_at(ctx, CTX_ESP).unwrap(), 0x0041_0000, "Esp");
+        assert_eq!(mem.read_u32_at(ctx, CTX_EAX).unwrap(), 0x0040_5678, "Eax = the thread entry point");
+        assert_eq!(mem.read_u32_at(ctx, CTX_SEGCS).unwrap(), SEL_CS32, "SegCs = 0x23");
+        assert_eq!(mem.read_u32_at(ctx, CTX_SEGSS).unwrap(), SEL_SS32, "SegSs = 0x2b");
+        assert_eq!(mem.read_u32_at(ctx, CTX_EFLAGS).unwrap(), EFLAGS_INIT, "EFlags");
         assert_eq!(CTX_SEGCS - CTX_EIP, 4, "SegCs directly follows Eip");
     }
 
@@ -332,7 +332,7 @@ mod tests {
 
         publish_wow64_transition(&mut mem, slot, 0x6A40_7000).unwrap();
         assert_eq!(mem.read_u32(slot).unwrap(), 0x6A40_7000, "BOP VA published as a 32-bit cell");
-        assert_eq!(mem.read_u32(slot + 4).unwrap(), 0, "only the 32-bit slot is written");
+        assert_eq!(mem.read_u32_at(slot, 4).unwrap(), 0, "only the 32-bit slot is written");
 
         let err = publish_wow64_transition(&mut mem, slot, 0x1_0000_7000).unwrap_err();
         assert!(matches!(err, EmuError::Os(_)), "a BOP above 4 GiB is rejected, not truncated: {err}");
@@ -349,12 +349,12 @@ mod tests {
         assert_eq!(teb32_of(&mem, teb64).unwrap(), None, "a zero field means: not a WoW64 thread");
         link_teb32(&mut mem, teb64, teb32).unwrap();
         assert_eq!(teb32_of(&mem, teb64).unwrap(), Some(teb32), "TEB64 + (i32)WowTebOffset = TEB32");
-        assert_eq!(mem.read_u32(teb32 + TEB32_SELF).unwrap() as u64, teb32, "TEB32.NtTib.Self");
+        assert_eq!(mem.read_u32_at(teb32, TEB32_SELF).unwrap() as u64, teb32, "TEB32.NtTib.Self");
 
         let below = teb64 - 0x8000;
         mem.map(Region::new("below", below, 0x1000, Perm::RW)).unwrap();
         link_teb32(&mut mem, teb64, below).unwrap();
-        assert_eq!(mem.read_u32(teb64 + TEB64_WOW_TEB_OFFSET).unwrap() as i32, -0x8000);
+        assert_eq!(mem.read_u32_at(teb64, TEB64_WOW_TEB_OFFSET).unwrap() as i32, -0x8000);
         assert_eq!(teb32_of(&mem, teb64).unwrap(), Some(below), "a negative WowTebOffset resolves too");
 
         let err = link_teb32(&mut mem, teb64, 0x1_0000_0000).unwrap_err();
