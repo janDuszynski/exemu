@@ -100,6 +100,28 @@ end-to-end on the default path.
   section before unpacking into it (xmplay's petite stub) faulted on its first
   write. The old protection reported is the section's own.
 
+### curl runs completely on the Wine path: the first finished console program
+- **A 64-bit mingw console program does its whole job.** `curl.exe` 8.21.0
+  (LibreSSL, 20 Wine builtins) prints its 551-byte `--version` banner and exits
+  0 after 3,951,927 instructions, and a `file://` fetch copies the loader's own
+  3,848,296-byte `curl.exe` into `C:/Temp` and exits 0 after 4,499,611. Before,
+  `--version` stopped at 2,552,459 instructions with `loader_init c0000142,
+  CRYPT32.dll failed to initialize`.
+- **crypt32 gets a unix side.** crypt32's `DllMain` fails when its
+  `MemoryWineUnixFuncs` query finds nothing; `crates/os/src/crypt32.rs` now
+  answers its seven unix calls as the pinned `crypt32.so` does on a host with
+  no PKCS#12 library and an empty root store.
+- **Corpus rows carry guest `args` and a `stdout` pin.** A row with a `stdout`
+  pin runs with console echo on and fails unless the guest wrote exactly those
+  bytes; `toml_lite` decodes `\n`, `\r` and `\t`. Exit code and artifact count
+  alone could not tell a correct banner from silence, so console programs were
+  a gate that could not fail. Mutation-checked: dropping the crypt32 arm, a
+  wrong stdout byte, a muted console write, a mis-decoded `\r` and dropped
+  `args` each turn the gate red.
+- **Not yet:** `http://` fetches stop at the first socket option and `FIONBIO`
+  ioctl (`STATUS_NOT_IMPLEMENTED`); secur32's schannel and dnsapi's libresolv
+  unix sides are absent.
+
 ### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
 - **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
   `0x20..=0x37` are the stock objects, so a guest had **72 GDI handles for its

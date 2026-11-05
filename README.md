@@ -380,6 +380,7 @@ than approximate: the gate pins them with zero tolerance.
 | ---------- | ---- | ------ |
 | **7-Zip installer** | 64-bit MSVC GUI | **installs end to end** — drives its dialog, "clicks" Install, decompresses its LZMA archive, writes all 107 files + registry, exits 0 (**496,505,572** instructions, 108 sandbox files) |
 | **extracted `7z.exe`** | 64-bit console | **runs and prints its banner/usage** (`7-Zip 26.02 … Igor Pavlov`); `7z i` also runs |
+| `curl.exe` 8.21.0, **`--wine-boot`** | 64-bit mingw console | **does its whole job** — `--version` prints its 551-byte banner (pinned byte for byte) and exits 0 after **3,951,927** instructions; a `file://` copy writes a 3,848,296-byte file and exits 0 after **4,499,611**. `http://` is not reachable: socket options and `FIONBIO` are unimplemented |
 | generated `hello.exe` | 64-bit console | **runs fully**, prints output incl. an SSE2 computation, exits 0 |
 | Firefox Installer | 32-bit, UPX-packed | UPX self-decompresses, IAT reconstructed; the inner program runs CRT init + setup + SEH frame build + thread/sync init for **4,665,426** instructions, then calls through a NULL function pointer (`rip=0`) |
 | SteamSetup | 32-bit NSIS | creates its temp dir, reads its own file, and decompresses/executes its archive for **92,865,377** instructions, then writes through a NULL pointer at `0x20001c2c` |
@@ -637,7 +638,7 @@ and create+wait an event, all via genuine `SYSCALL`s. It skips cleanly when the
 `corpus.toml` at the repository root pins what each real installer in the test
 corpus does — outcome, instruction count, where it stopped, and how many files
 it wrote — and `exemu corpus` (or `crates/cli/tests/corpus_gate.rs`) runs them
-and fails on drift. This is the harness that catches cross-thread / IPC /
+and fails on drift. A row may also pass guest `args` and pin the guest's exact `stdout` (only such a row runs with console echo on), so a console program is checked on what it prints. This is the harness that catches cross-thread / IPC /
 integration regressions: the differential CPU oracle is single-stream and
 structurally cannot see them.
 
