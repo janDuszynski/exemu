@@ -54,10 +54,14 @@ pub(crate) fn crypt32_unixlib() -> Unixlib {
     Unixlib { name: "crypt32", table: &CRYPT32_UNIXLIB, wow64: false }
 }
 
+pub(crate) fn crypt32_wow64_unixlib() -> Unixlib {
+    Unixlib { name: "crypt32 (wow64)", table: &CRYPT32_UNIXLIB, wow64: true }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unixlib::MEMORY_WINE_UNIX_FUNCS;
+    use crate::unixlib::{MEMORY_WINE_UNIX_FUNCS, MEMORY_WINE_UNIX_WOW64_FUNCS};
     use crate::WinConfig;
     use exemu_core::{Perm, Reg};
     use exemu_memory::VirtualMemory;
@@ -171,6 +175,39 @@ mod tests {
         assert_eq!(call(&mut os, &mut mem, handle, CODE_IMPORT_STORE_KEY, PARAMS), STATUS_INVALID_PARAMETER);
         assert_eq!(call(&mut os, &mut mem, handle, CODE_IMPORT_STORE_CERT, PARAMS), STATUS_INVALID_PARAMETER);
         assert_eq!(call(&mut os, &mut mem, handle, CODE_CLOSE_CERT_STORE, PARAMS), STATUS_SUCCESS);
+    }
+
+    #[test]
+    fn a_32bit_crypt32_gets_its_unix_side_through_the_wow64_funcs_class() {
+        const PE32_MAGIC: u16 = 0x10B;
+        const PE32_EXPORT_DIR_ENTRY: u64 = OPTIONAL_HEADER + 96;
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(SCRATCH, 0x1000, Perm::RW, "scratch").unwrap();
+        map_crypt32_image(&mut mem);
+        mem.write_u16(IMAGE_BASE + OPTIONAL_HEADER, PE32_MAGIC).unwrap();
+        mem.write_u32(IMAGE_BASE + EXPORT_DIR_ENTRY, 0).unwrap();
+        mem.write_u32(IMAGE_BASE + PE32_EXPORT_DIR_ENTRY, EXPORT_DIR_RVA as u32).unwrap();
+        let mut os = WinOs::new(WinConfig { is_64bit: true, echo: false, ..WinConfig::default() });
+
+        mem.write_u64(HANDLE_OUT, POISON).unwrap();
+        mem.write_u64(GUEST_RSP + 0x28, 8).unwrap();
+        mem.write_u64(GUEST_RSP + 0x30, 0).unwrap();
+        os.set_syscall_guest_rsp_for_test(GUEST_RSP);
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, u64::MAX);
+        cpu.set_reg(Reg::Rdx, IMAGE_BASE);
+        cpu.set_reg(Reg::R8, u64::from(MEMORY_WINE_UNIX_WOW64_FUNCS));
+        cpu.set_reg(Reg::R9, HANDLE_OUT);
+        assert_eq!(
+            os.nt_query_virtual_memory(&mut cpu, &mut mem).unwrap(),
+            STATUS_SUCCESS,
+            "wow64.dll rewrites a 32-bit crypt32's MemoryWineUnixFuncs to the wow64 class; refusing it fails DllMain"
+        );
+        let handle = mem.read_u64(HANDLE_OUT).unwrap();
+        assert_ne!(handle, POISON);
+        assert_eq!(call(&mut os, &mut mem, handle, CODE_PROCESS_ATTACH, PARAMS), STATUS_DLL_NOT_FOUND);
+        assert!(os.unix_call_wow64);
+        assert_eq!(call(&mut os, &mut mem, handle, CODE_ENUM_ROOT_CERTS, PARAMS), STATUS_NO_MORE_ENTRIES);
     }
 
     #[test]
