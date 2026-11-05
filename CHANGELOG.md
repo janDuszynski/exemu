@@ -72,12 +72,25 @@ end-to-end on the default path.
   and then caught the interpreter up to that count, and the only budget it ever
   passed ended on a lap, which is a block boundary. Nothing could overshoot
   where it looked. `exemu-oracle jit --laps K --cut` now cuts every lapped
-  trial at random budgets of 0..7 instructions against 3-instruction blocks and
-  fails if a call retires one instruction past what it was given;
+  trial at random budgets, three in four of 0..7 instructions against
+  3-instruction blocks and one in four of 8..47, and fails if a call retires one
+  instruction past what it was given;
   `crates/jit/tests/budget.rs` stops a call/loop program at every instruction
   count in both bitnesses against the interpreter; and
   `crates/os/tests/thread.rs` runs two spinning threads for 230,017 steps in
   both modes and compares the counters each thread reached.
+- **The run loop's budget while an exception is being delivered.** With
+  `exc_depth != 0` the loop passes budget 0. Under the floor contract that still
+  ran one JIT block; under the ceiling contract it runs none and the loop
+  interprets one instruction. Corpus-neutral, and nothing observable moves,
+  because the depth is reset by whichever path takes the next step.
+  `crates/app/tests/jit_exception.rs` pins a delivered access violation to the
+  same instruction count with and without the JIT, but it cannot tell the two
+  budgets apart: its fault ends the run.
+- **The budget gates counted the wrong stops.** `budget_stops` also counts a
+  budget of 0, which stops at every block, so `thread.rs` and the differential
+  could not fail on a floor budget. `JitStats::budget_refusals` counts only the
+  stops that turned away a block with budget left, and those gates assert on it.
 - The Firefox and SteamSetup Wine-path entries now have `--jit` twins in
   `corpus.toml`, pinned to the interpreter numbers.
 
