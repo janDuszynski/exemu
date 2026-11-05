@@ -27,6 +27,10 @@
 #                 between a twin pair — one instruction, one artifact, a
 #                 different fault site — is a JIT bug, and catching that is the
 #                 reason the pair exists.
+#   args          guest command-line arguments after argv[0], split on whitespace
+#   stdout        the guest's exact stdout bytes (\r and \n escaped). Only a row
+#                 that pins it runs with console echo on; `--update` refreshes it
+#                 there and never adds it to a row that does not pin it
 #   max_steps     instruction budget for the run; exhausting it is a failure
 #   outcome       "exit" (clean ExitProcess) | "fault" | "budget"
 #   exit_code     expected process exit code, outcome = "exit" only
@@ -281,3 +285,35 @@ exit_code = 1
 steps     = 14797513
 tolerance = 0
 artifacts = 4
+
+[[binary]]
+name      = "curl.exe --version (wine)"
+path      = "example_exe/curl-8.21.0_2-win64-mingw/bin/curl.exe"
+note      = "64-bit mingw console program (curl 8.21.0, statically linked LibreSSL) on Wine's 64-bit PE set, and the first corpus row where a console program does its whole job and is checked on what it PRINTS. Wine's loader_init binds 20 builtins (kernelbase, ucrtbase, ws2_32, secur32, wldap32, dnsapi, iphlpapi, bcrypt, crypt32 and the rest), every DllMain runs, curl writes its version banner and exits 0. stdout is pinned byte for byte, 551 bytes with the CRLF the CRT's text mode writes, because exit code and artifact count alone cannot tell a correct banner from garbage or silence. It used to stop at 2,552,459 instructions with loader_init c0000142, CRYPT32.dll failed to initialize: crypt32's DllMain returns FALSE when __wine_init_unix_call (NtQueryVirtualMemory class MemoryWineUnixFuncs on its own base) fails, and exemu had no crypt32 unix side. exemu now answers crypt32's seven unix calls (crates/os/src/crypt32.rs) the way the pinned crypt32.so does on a host without a PKCS#12 library and with an empty root store. What moves this count: the pinned Wine prefix, the WINEDEBUG default (secur32's schannel and dnsapi's libresolv unix sides are still absent and each prints one err line, which is counted work), and the sandbox. Deterministic across three runs."
+quick     = true
+virtual_clock = true
+wine_boot = "example_exe/wine-dlls/x86_64-windows"
+args      = "--version"
+max_steps = 300000000
+outcome   = "exit"
+exit_code = 0
+steps     = 3951927
+tolerance = 0
+artifacts = 4
+stdout    = "curl 8.21.0 (x86_64-w64-mingw32) libcurl/8.21.0 LibreSSL/4.3.2 zlib/1.3.1.zlib-ng brotli/1.2.0 zstd/1.5.7 WinIDN libpsl/0.22.0 libssh2/1.11.1 nghttp2/1.69.0 ngtcp2/1.24.0 nghttp3/1.17.0 WinLDAP\r\nRelease-Date: 2026-06-24\r\nProtocols: dict file ftp ftps gopher gophers http https imap imaps ipfs ipns ldap ldaps mqtt mqtts pop3 pop3s rtsp scp sftp smtp smtps telnet tftp ws wss\r\nFeatures: alt-svc AsynchDNS brotli HSTS HTTP2 HTTP3 HTTPS-proxy HTTPSRR IDN IPv6 Kerberos Largefile libz NativeCA proxy-HTTP3 PSL SPNEGO SSL SSPI threadsafe UnixSockets zstd\r\n"
+
+[[binary]]
+name      = "curl.exe file:// copy (wine)"
+path      = "example_exe/curl-8.21.0_2-win64-mingw/bin/curl.exe"
+note      = "The same binary doing a real job that needs no network: curl -s -o C:/Temp/curl-copy.exe -w %{size_download} file:///C:/curl.exe reads the loader's own copy of the program through libcurl's file:// handler and writes a 3,848,296-byte copy into C:/Temp. stdout pins the byte count curl reports and the fifth artifact is the copy; the copy was compared byte for byte against the host file with cmp when this row was blessed, since the gate counts files and does not hash them. A file:// fetch of a pre-seeded C:/Temp/hello.txt round-trips byte for byte too, but the harness cannot pre-seed a sandbox, so this row copies the one file every sandbox has. Network is out of scope: an http:// fetch gets through WSAStartup and WSASocketW and then fails on the first socket option and FIONBIO ioctl, which exemu's wineserver answers STATUS_NOT_IMPLEMENTED, and curl reports (1) Unsupported protocol. Deterministic across three runs."
+quick     = true
+virtual_clock = true
+wine_boot = "example_exe/wine-dlls/x86_64-windows"
+args      = "-s -o C:/Temp/curl-copy.exe -w %{size_download} file:///C:/curl.exe"
+max_steps = 300000000
+outcome   = "exit"
+exit_code = 0
+steps     = 4499611
+tolerance = 0
+artifacts = 5
+stdout    = "3848296"
