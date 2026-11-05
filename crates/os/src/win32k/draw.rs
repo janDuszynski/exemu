@@ -620,9 +620,8 @@ pub(super) fn nt_gdi_move_to(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn M
 
 pub(super) fn nt_gdi_line_to(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hdc = os.syscall_arg_u32(cpu, mem, 0)?;
-    let limit = g::COORD_LIMIT;
-    let x = (os.syscall_arg_u32(cpu, mem, 1)? as i32).clamp(-limit, limit);
-    let y = (os.syscall_arg_u32(cpu, mem, 2)? as i32).clamp(-limit, limit);
+    let x = os.syscall_arg_u32(cpu, mem, 1)? as i32;
+    let y = os.syscall_arg_u32(cpu, mem, 2)? as i32;
     let Some(dcanvas) = canvas(os, hdc) else { return Ok(GDI_FAIL) };
     let Some(dc) = os.win32k_state.dcs.iter_mut().find(|(h, _)| *h == hdc).map(|(_, d)| d) else {
         return Ok(GDI_FAIL);
@@ -633,11 +632,9 @@ pub(super) fn nt_gdi_line_to(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn M
     if pen.style == PS_NULL {
         return Ok(1);
     }
-    let (ox, oy) = dcanvas.org;
-    let from = (from.0.clamp(-limit, limit) + ox, from.1.clamp(-limit, limit) + oy);
-    let points: Vec<(i32, i32)> = g::Bresenham::new(from.0, from.1, x + ox, y + oy)
-        .filter(|(px, py)| dcanvas.clip.contains(*px, *py))
-        .collect();
+    let (ox, oy) = (dcanvas.org.0 as i64, dcanvas.org.1 as i64);
+    let line = g::Line::new(from.0 as i64 + ox, from.1 as i64 + oy, x as i64 + ox, y as i64 + oy);
+    let points: Vec<(i32, i32)> = line.pixels(dcanvas.clip).collect();
     let (Some(l), Some(t)) = (
         points.iter().map(|p| p.0).min(),
         points.iter().map(|p| p.1).min(),
@@ -1233,5 +1230,29 @@ mod tests {
         mem.write_u16(name, 10).unwrap();
         assert_eq!(call(nt_gdi_open_dcw, &mut os, &mut mem, &[name, 0, 0, 0, 0, 0, 0, 0]), 0);
         assert_ne!(call(nt_gdi_open_dcw, &mut os, &mut mem, &[name, 0, 0, 0, 1, 0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn line_to_between_extreme_coordinates_draws_only_the_part_on_the_bitmap() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 4, 4, 32, true);
+        let pen = create_pen(&mut os, &mut mem, 0, 0x00FF_FFFF);
+        call(nt_gdi_select_pen, &mut os, &mut mem, &[dc as u64, pen as u64]);
+        let (lo, hi) = (i32::MIN as u32 as u64, i32::MAX as u64);
+        call(nt_gdi_move_to, &mut os, &mut mem, &[dc as u64, lo, 2, 0]);
+        assert_eq!(call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, hi, 2]), 1);
+        assert_eq!(row_rgb(&mem, &os, bm, 2, 4), [WHITE; 4]);
+        assert_eq!(row_rgb(&mem, &os, bm, 1, 4), [0; 4]);
+        assert_eq!(row_rgb(&mem, &os, bm, 3, 4), [0; 4]);
+
+        call(nt_gdi_move_to, &mut os, &mut mem, &[dc as u64, 3, lo, 0]);
+        assert_eq!(call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, 3, hi]), 1);
+        assert_eq!((0..4).map(|y| rgb(&mem, &os, bm, 3, y)).collect::<Vec<_>>(), [WHITE; 4]);
+
+        call(nt_gdi_move_to, &mut os, &mut mem, &[dc as u64, lo, lo, 0]);
+        assert_eq!(call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, hi, lo]), 1);
+        call(nt_gdi_move_to, &mut os, &mut mem, &[dc as u64, lo, 100, 0]);
+        assert_eq!(call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, hi, 101]), 1);
+        assert_eq!(row_rgb(&mem, &os, bm, 0, 4), [0, 0, 0, WHITE]);
     }
 }

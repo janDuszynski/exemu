@@ -1,6 +1,5 @@
 pub(crate) const COORD_LIMIT: i32 = 1 << 28;
 pub(crate) const MAX_PIXELS: u64 = 1 << 24;
-pub(crate) const LINE_STEP_LIMIT: i64 = 1 << 20;
 
 pub(crate) const BI_RGB: u32 = 0;
 pub(crate) const BI_BITFIELDS: u32 = 3;
@@ -237,54 +236,98 @@ pub(crate) fn blit(dst: &mut Pixmap, spec: &Blit) -> u64 {
     written
 }
 
-pub(crate) struct Bresenham {
-    x: i64,
-    y: i64,
-    dx: i64,
-    dy: i64,
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Line {
+    x0: i64,
+    y0: i64,
     sx: i64,
     sy: i64,
-    err: i64,
-    remaining: i64,
+    major: i64,
+    minor: i64,
+    shallow: bool,
 }
 
-impl Bresenham {
-    pub(crate) fn new(x0: i32, y0: i32, x1: i32, y1: i32) -> Bresenham {
-        let (x0, y0, x1, y1) = (x0 as i64, y0 as i64, x1 as i64, y1 as i64);
-        let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
-        let remaining = if dx.max(-dy) > LINE_STEP_LIMIT { 0 } else { dx.max(-dy) };
-        Bresenham {
-            x: x0,
-            y: y0,
-            dx,
-            dy,
+impl Line {
+    pub(crate) fn new(x0: i64, y0: i64, x1: i64, y1: i64) -> Line {
+        let (dx, dy) = ((x1 - x0).abs(), (y1 - y0).abs());
+        Line {
+            x0,
+            y0,
             sx: if x0 < x1 { 1 } else { -1 },
             sy: if y0 < y1 { 1 } else { -1 },
-            err: dx + dy,
-            remaining,
+            major: dx.max(dy),
+            minor: dx.min(dy),
+            shallow: dx >= dy,
         }
     }
-}
 
-impl Iterator for Bresenham {
-    type Item = (i32, i32);
+    fn minor_offset(&self, k: i64) -> i64 {
+        let (k, major, minor) = (k as i128, self.major as i128, self.minor as i128);
+        ((2 * minor * k + major) / (2 * major)) as i64
+    }
 
-    fn next(&mut self) -> Option<(i32, i32)> {
-        if self.remaining <= 0 {
-            return None;
+    fn at(&self, k: i64) -> (i64, i64) {
+        let off = self.minor_offset(k);
+        if self.shallow {
+            (self.x0 + self.sx * k, self.y0 + self.sy * off)
+        } else {
+            (self.x0 + self.sx * off, self.y0 + self.sy * k)
         }
-        let out = (self.x as i32, self.y as i32);
-        let e2 = 2 * self.err;
-        if e2 >= self.dy {
-            self.err += self.dy;
-            self.x += self.sx;
+    }
+
+    pub(crate) fn pixels(&self, clip: Rect) -> impl Iterator<Item = (i32, i32)> + '_ {
+        let (lo, hi) = self.visible_steps(clip);
+        (lo..hi).map(|k| {
+            let (x, y) = self.at(k);
+            (x as i32, y as i32)
+        })
+    }
+
+    fn visible_steps(&self, clip: Rect) -> (i64, i64) {
+        if self.major == 0 || clip.is_empty() {
+            return (0, 0);
         }
-        if e2 <= self.dx {
-            self.err += self.dx;
-            self.y += self.sy;
+        let (major_range, minor_range, start, step) = if self.shallow {
+            ((clip.l as i64, clip.r as i64), (clip.t as i64, clip.b as i64), self.x0, self.sx)
+        } else {
+            ((clip.t as i64, clip.b as i64), (clip.l as i64, clip.r as i64), self.y0, self.sy)
+        };
+        let (mut lo, mut hi) = if step > 0 {
+            (major_range.0 - start, major_range.1 - start)
+        } else {
+            (start - major_range.1 + 1, start - major_range.0 + 1)
+        };
+        lo = lo.max(0);
+        hi = hi.min(self.major);
+        if lo >= hi {
+            return (0, 0);
         }
-        self.remaining -= 1;
-        Some(out)
+        let (minor_start, minor_step) = if self.shallow { (self.y0, self.sy) } else { (self.x0, self.sx) };
+        let minor_at = |k: i64| minor_start + minor_step * self.minor_offset(k);
+        let first = |range: (i64, i64), reached: &dyn Fn(i64) -> bool| -> i64 {
+            let (mut a, mut b) = range;
+            while a < b {
+                let mid = a + (b - a) / 2;
+                if reached(mid) {
+                    b = mid;
+                } else {
+                    a = mid + 1;
+                }
+            }
+            a
+        };
+        let (from, to) = if minor_step > 0 {
+            (
+                first((lo, hi), &|k| minor_at(k) >= minor_range.0),
+                first((lo, hi), &|k| minor_at(k) >= minor_range.1),
+            )
+        } else {
+            (
+                first((lo, hi), &|k| minor_at(k) < minor_range.1),
+                first((lo, hi), &|k| minor_at(k) < minor_range.0),
+            )
+        };
+        (from, to.max(from))
     }
 }
 
@@ -819,18 +862,103 @@ mod tests {
         assert!(huge.width() >= 0 && huge.height() >= 0);
     }
 
+    const WIDE_OPEN: Rect = Rect { l: -1000, t: -1000, r: 1000, b: 1000 };
+
+    fn line_pixels(x0: i64, y0: i64, x1: i64, y1: i64, clip: Rect) -> Vec<(i32, i32)> {
+        Line::new(x0, y0, x1, y1).pixels(clip).collect()
+    }
+
+    fn reference_line(x0: i64, y0: i64, x1: i64, y1: i64) -> Vec<(i32, i32)> {
+        let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
+        let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
+        let (mut x, mut y, mut err) = (x0, y0, dx + dy);
+        let mut out = Vec::new();
+        for _ in 0..dx.max(-dy) {
+            out.push((x as i32, y as i32));
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+        out
+    }
+
     #[test]
     fn the_last_pixel_of_a_line_is_excluded() {
-        let pts: Vec<_> = Bresenham::new(0, 0, 5, 0).collect();
-        assert_eq!(pts, [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
-        let diag: Vec<_> = Bresenham::new(0, 0, 3, 3).collect();
-        assert_eq!(diag, [(0, 0), (1, 1), (2, 2)]);
-        let up: Vec<_> = Bresenham::new(2, 4, 2, 1).collect();
-        assert_eq!(up, [(2, 4), (2, 3), (2, 2)]);
-        let shallow: Vec<_> = Bresenham::new(0, 0, 5, 2).collect();
-        assert_eq!(shallow, [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2)]);
-        assert_eq!(Bresenham::new(3, 3, 3, 3).count(), 0);
-        assert_eq!(Bresenham::new(i32::MIN, 0, i32::MAX, 0).count(), 0);
+        assert_eq!(line_pixels(0, 0, 5, 0, WIDE_OPEN), [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+        assert_eq!(line_pixels(0, 0, 3, 3, WIDE_OPEN), [(0, 0), (1, 1), (2, 2)]);
+        assert_eq!(line_pixels(2, 4, 2, 1, WIDE_OPEN), [(2, 4), (2, 3), (2, 2)]);
+        assert_eq!(
+            line_pixels(0, 0, 5, 2, WIDE_OPEN),
+            [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2)]
+        );
+        assert!(line_pixels(3, 3, 3, 3, WIDE_OPEN).is_empty());
+    }
+
+    #[test]
+    fn the_closed_form_line_is_the_stepping_line_in_every_direction() {
+        for x0 in -5..=5 {
+            for y0 in -5..=5 {
+                for x1 in -5..=5 {
+                    for y1 in -5..=5 {
+                        assert_eq!(
+                            line_pixels(x0, y0, x1, y1, WIDE_OPEN),
+                            reference_line(x0, y0, x1, y1),
+                            "({x0},{y0})->({x1},{y1})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn clipping_a_line_keeps_exactly_the_pixels_the_whole_line_has_inside() {
+        let clip = Rect::new(-2, -3, 4, 3);
+        for (x0, y0, x1, y1) in [
+            (-9, -7, 11, 6),
+            (11, 6, -9, -7),
+            (-9, 0, 9, 1),
+            (0, -9, 1, 9),
+            (9, 9, -9, -9),
+            (-9, 2, 9, 2),
+            (1, -9, 1, 9),
+            (-30, -4, 30, 5),
+        ] {
+            let want: Vec<_> = reference_line(x0, y0, x1, y1)
+                .into_iter()
+                .filter(|(x, y)| clip.contains(*x, *y))
+                .collect();
+            assert!(!want.is_empty(), "({x0},{y0})->({x1},{y1}) must cross the clip");
+            assert_eq!(line_pixels(x0, y0, x1, y1, clip), want, "({x0},{y0})->({x1},{y1})");
+        }
+    }
+
+    #[test]
+    fn a_line_with_extreme_endpoints_costs_only_its_visible_pixels() {
+        let (lo, hi) = (i32::MIN as i64, i32::MAX as i64);
+        let surface = Rect::new(0, 0, 8, 8);
+        assert_eq!(
+            line_pixels(lo, 3, hi, 3, surface),
+            (0..8).map(|x| (x, 3)).collect::<Vec<_>>(),
+            "a horizontal line across the whole i32 range draws its crossing of the surface"
+        );
+        assert_eq!(
+            line_pixels(2, hi, 2, lo, surface),
+            (0..8).rev().map(|y| (2, y)).collect::<Vec<_>>()
+        );
+        let diag = line_pixels(lo, lo, hi, hi, surface);
+        assert_eq!(diag, (0..8).map(|v| (v, v)).collect::<Vec<_>>());
+        assert!(line_pixels(lo, lo, hi, lo, surface).is_empty(), "above the surface");
+        assert!(line_pixels(lo, 100, hi, 101, surface).is_empty(), "below the surface");
+        assert!(line_pixels(100, lo, 101, hi, surface).is_empty(), "right of the surface");
+        assert!(line_pixels(lo, lo, lo + 5, lo + 5, surface).is_empty(), "wholly outside");
+        assert!(line_pixels(lo, lo, hi, hi, Rect::new(0, 0, 0, 0)).is_empty());
     }
 
     fn info_bytes(width: i32, height: i32, bpp: u16, compression: u32, clr_used: u32) -> Vec<u8> {
