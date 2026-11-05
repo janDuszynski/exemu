@@ -160,11 +160,11 @@ mod tests {
         assert_eq!(cpu.rip, ntdll_base + RVA_LDR_INITIALIZE_THUNK, "rip = LdrInitializeThunk");
         assert_eq!(cpu.reg(Reg::Rcx), ctx, "RCX = &CONTEXT");
 
-        assert_ne!(mem.read_u32(ctx + CTX_CONTEXT_FLAGS).unwrap(), 0, "ContextFlags set");
-        assert_eq!(mem.read_u64(ctx + CTX_RIP).unwrap(), ntdll_base + RVA_RTL_USER_THREAD_START);
-        assert_eq!(mem.read_u64(ctx + CTX_RCX).unwrap(), entry, "CONTEXT.Rcx = EntryPoint");
-        assert_eq!(mem.read_u64(ctx + CTX_RDX).unwrap(), arg, "CONTEXT.Rdx = Arg");
-        let rsp = mem.read_u64(ctx + CTX_RSP).unwrap();
+        assert_ne!(mem.read_u32_at(ctx, CTX_CONTEXT_FLAGS).unwrap(), 0, "ContextFlags set");
+        assert_eq!(mem.read_u64_at(ctx, CTX_RIP).unwrap(), ntdll_base + RVA_RTL_USER_THREAD_START);
+        assert_eq!(mem.read_u64_at(ctx, CTX_RCX).unwrap(), entry, "CONTEXT.Rcx = EntryPoint");
+        assert_eq!(mem.read_u64_at(ctx, CTX_RDX).unwrap(), arg, "CONTEXT.Rdx = Arg");
+        let rsp = mem.read_u64_at(ctx, CTX_RSP).unwrap();
         assert_eq!(rsp & 0xf, 0, "CONTEXT.Rsp 16-byte aligned");
         assert!(rsp <= STACK_TOP && rsp > STACK_TOP - 0x1000, "CONTEXT.Rsp near the stack top");
     }
