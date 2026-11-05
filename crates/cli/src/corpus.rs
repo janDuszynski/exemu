@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::toml_lite::{quote, Value};
@@ -102,10 +103,28 @@ impl Options {
     pub fn new(exemu_bin: PathBuf) -> Options {
         Options {
             exemu_bin: absolute(exemu_bin),
-            workroot: std::env::temp_dir().join("exemu-corpus"),
+            workroot: private_workroot(),
             only: None,
             quick: false,
             on_start: None,
+        }
+    }
+}
+
+static WORKROOT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn private_workroot() -> PathBuf {
+    let seq = WORKROOT_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("exemu-corpus-{}-{seq}", std::process::id()))
+}
+
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(root) = self.0.parent() {
+            let _ = std::fs::remove_dir(root);
         }
     }
 }
@@ -337,6 +356,7 @@ pub fn run_entry(m: &Manifest, e: &Entry, opts: &Options) -> Result<Observed, St
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work)
         .map_err(|err| format!("cannot create scratch dir {}: {err}", work.display()))?;
+    let _scratch = Scratch(work.clone());
 
     let dir = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
     let leaf = exe.file_name().ok_or_else(|| format!("{}: not a file", exe.display()))?;
@@ -729,6 +749,29 @@ pub fn cmd_corpus(rest: &[String]) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn options_never_share_a_workroot() {
+        let a = Options::new(PathBuf::from("exemu"));
+        let b = Options::new(PathBuf::from("exemu"));
+        assert_ne!(a.workroot, b.workroot);
+        assert!(a.workroot.to_string_lossy().contains(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn scratch_removes_only_its_own_tree() {
+        let a = Options::new(PathBuf::from("exemu")).workroot;
+        let b = Options::new(PathBuf::from("exemu")).workroot;
+        let (wa, wb) = (a.join("row"), b.join("row"));
+        std::fs::create_dir_all(&wa).unwrap();
+        std::fs::create_dir_all(&wb).unwrap();
+        std::fs::write(wb.join("f"), b"x").unwrap();
+        drop(Scratch(wa.clone()));
+        assert!(!wa.exists() && !a.exists());
+        assert!(wb.join("f").exists());
+        drop(Scratch(wb));
+        assert!(!b.exists());
+    }
 
     const SAMPLE: &str = r#"# header comment
 # second line
