@@ -235,9 +235,9 @@ fn wstr_len(value: &str) -> u64 {
 
 fn write_cstr(mem: &mut dyn Memory, ptr: u64, value: &str) -> Result<u64> {
     for (i, b) in value.as_bytes().iter().enumerate() {
-        mem.write_u8(ptr + i as u64, *b)?;
+        mem.write_u8_at(ptr, i as u64, *b)?;
     }
-    mem.write_u8(ptr + value.len() as u64, 0)?;
+    mem.write_u8_at(ptr, value.len() as u64, 0)?;
     Ok(value.len() as u64 + 1)
 }
 
@@ -253,16 +253,16 @@ pub(crate) struct Wfx {
 impl Wfx {
     fn read(mem: &dyn Memory, ptr: u64) -> Result<Wfx> {
         let tag = mem.read_u16(ptr)?;
-        let sub_tag = if tag == WAVE_FORMAT_EXTENSIBLE && mem.read_u16(ptr + 16)? >= WAVEFORMATEXTENSIBLE_EXTRA {
-            mem.read_u32(ptr + 24)?
+        let sub_tag = if tag == WAVE_FORMAT_EXTENSIBLE && mem.read_u16_at(ptr, 16)? >= WAVEFORMATEXTENSIBLE_EXTRA {
+            mem.read_u32_at(ptr, 24)?
         } else {
             0
         };
         Ok(Wfx {
             tag,
-            channels: mem.read_u16(ptr + 2)?,
-            sample_rate: mem.read_u32(ptr + 4)?,
-            bits: mem.read_u16(ptr + 14)?,
+            channels: mem.read_u16_at(ptr, 2)?,
+            sample_rate: mem.read_u32_at(ptr, 4)?,
+            bits: mem.read_u16_at(ptr, 14)?,
             sub_tag,
         })
     }
@@ -277,16 +277,16 @@ impl Wfx {
 fn write_mix_format(mem: &mut dyn Memory, ptr: u64) -> Result<()> {
     let block_align = MIX_FRAME_BYTES as u16;
     mem.write_u16(ptr, WAVE_FORMAT_EXTENSIBLE)?;
-    mem.write_u16(ptr + 2, MIX_CHANNELS)?;
-    mem.write_u32(ptr + 4, MIX_SAMPLE_RATE)?;
-    mem.write_u32(ptr + 8, MIX_SAMPLE_RATE * MIX_FRAME_BYTES)?;
-    mem.write_u16(ptr + 12, block_align)?;
-    mem.write_u16(ptr + 14, MIX_BITS)?;
-    mem.write_u16(ptr + 16, WAVEFORMATEXTENSIBLE_EXTRA)?;
-    mem.write_u16(ptr + 18, MIX_BITS)?;
-    mem.write_u32(ptr + 20, SPEAKER_STEREO)?;
+    mem.write_u16_at(ptr, 2, MIX_CHANNELS)?;
+    mem.write_u32_at(ptr, 4, MIX_SAMPLE_RATE)?;
+    mem.write_u32_at(ptr, 8, MIX_SAMPLE_RATE * MIX_FRAME_BYTES)?;
+    mem.write_u16_at(ptr, 12, block_align)?;
+    mem.write_u16_at(ptr, 14, MIX_BITS)?;
+    mem.write_u16_at(ptr, 16, WAVEFORMATEXTENSIBLE_EXTRA)?;
+    mem.write_u16_at(ptr, 18, MIX_BITS)?;
+    mem.write_u32_at(ptr, 20, SPEAKER_STEREO)?;
     for (i, b) in KSDATAFORMAT_SUBTYPE_IEEE_FLOAT.iter().enumerate() {
-        mem.write_u8(ptr + 24 + i as u64, *b)?;
+        mem.write_u8_at(ptr, 24 + i as u64, *b)?;
     }
     Ok(())
 }
@@ -302,49 +302,49 @@ impl WinOs {
     }
 
     fn audio_get_endpoint_ids(&mut self, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-        let flow = mem.read_u32(args + EP_IDS_FLOW)?;
+        let flow = mem.read_u32_at(args, EP_IDS_FLOW)?;
         if flow != E_RENDER {
-            mem.write_u32(args + EP_IDS_NUM, 0)?;
-            mem.write_u32(args + EP_IDS_DEFAULT_IDX, 0)?;
-            mem.write_u32(args + EP_IDS_RESULT, S_OK)?;
+            mem.write_u32_at(args, EP_IDS_NUM, 0)?;
+            mem.write_u32_at(args, EP_IDS_DEFAULT_IDX, 0)?;
+            mem.write_u32_at(args, EP_IDS_RESULT, S_OK)?;
             return Ok(S_OK);
         }
         let name_off = ENDPOINT_STRIDE;
         let id_off = name_off + wstr_len(ENDPOINT_NAME);
         let needed = id_off + ENDPOINT_ID.len() as u64 + 1;
-        let size = mem.read_u32(args + EP_IDS_SIZE)? as u64;
-        let buf = mem.read_u64(args + EP_IDS_ENDPOINTS)?;
+        let size = mem.read_u32_at(args, EP_IDS_SIZE)? as u64;
+        let buf = mem.read_u64_at(args, EP_IDS_ENDPOINTS)?;
         if buf == 0 || size < needed {
-            mem.write_u32(args + EP_IDS_SIZE, needed as u32)?;
-            mem.write_u32(args + EP_IDS_RESULT, HRESULT_ERROR_INSUFFICIENT_BUFFER)?;
+            mem.write_u32_at(args, EP_IDS_SIZE, needed as u32)?;
+            mem.write_u32_at(args, EP_IDS_RESULT, HRESULT_ERROR_INSUFFICIENT_BUFFER)?;
             return Ok(S_OK);
         }
-        mem.write_u32(buf + ENDPOINT_NAME_OFF, name_off as u32)?;
-        mem.write_u32(buf + ENDPOINT_ID_OFF, id_off as u32)?;
+        mem.write_u32_at(buf, ENDPOINT_NAME_OFF, name_off as u32)?;
+        mem.write_u32_at(buf, ENDPOINT_ID_OFF, id_off as u32)?;
         write_wstr(mem, buf + name_off, ENDPOINT_NAME)?;
         write_cstr(mem, buf + id_off, ENDPOINT_ID)?;
-        mem.write_u32(args + EP_IDS_NUM, 1)?;
-        mem.write_u32(args + EP_IDS_DEFAULT_IDX, 0)?;
-        mem.write_u32(args + EP_IDS_RESULT, S_OK)?;
+        mem.write_u32_at(args, EP_IDS_NUM, 1)?;
+        mem.write_u32_at(args, EP_IDS_DEFAULT_IDX, 0)?;
+        mem.write_u32_at(args, EP_IDS_RESULT, S_OK)?;
         Ok(S_OK)
     }
 
     fn audio_create_stream(&mut self, mem: &mut dyn Memory, args: u64) -> Result<u32> {
         let fail = |mem: &mut dyn Memory, hr: u32| -> Result<u32> {
-            mem.write_u32(args + CREATE_RESULT, hr)?;
+            mem.write_u32_at(args, CREATE_RESULT, hr)?;
             Ok(S_OK)
         };
-        if mem.read_u32(args + CREATE_FLOW)? != E_RENDER {
+        if mem.read_u32_at(args, CREATE_FLOW)? != E_RENDER {
             return fail(mem, AUDCLNT_E_WRONG_ENDPOINT_TYPE);
         }
-        if mem.read_u32(args + CREATE_SHARE)? != SHARE_SHARED {
+        if mem.read_u32_at(args, CREATE_SHARE)? != SHARE_SHARED {
             return fail(mem, AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED);
         }
-        let device = read_cstr(mem, mem.read_u64(args + CREATE_DEVICE)?);
+        let device = read_cstr(mem, mem.read_u64_at(args, CREATE_DEVICE)?);
         if device != ENDPOINT_ID {
             return fail(mem, AUDCLNT_E_DEVICE_INVALIDATED);
         }
-        let fmt_ptr = mem.read_u64(args + CREATE_FMT)?;
+        let fmt_ptr = mem.read_u64_at(args, CREATE_FMT)?;
         if fmt_ptr == 0 {
             return fail(mem, E_POINTER);
         }
@@ -352,7 +352,7 @@ impl WinOs {
         if !fmt.is_mix_format() {
             return fail(mem, AUDCLNT_E_UNSUPPORTED_FORMAT);
         }
-        let duration = mem.read_u64(args + CREATE_DURATION)?;
+        let duration = mem.read_u64_at(args, CREATE_DURATION)?;
         let frames = duration.saturating_mul(MIX_SAMPLE_RATE as u64) / 10_000_000;
         let capacity = frames.clamp(1, MAX_BUFFER_FRAMES as u64) as u32;
         if frames > MAX_BUFFER_FRAMES as u64 {
@@ -377,59 +377,59 @@ impl WinOs {
                 position: 0,
             },
         );
-        let count_ptr = mem.read_u64(args + CREATE_CHANNEL_COUNT)?;
+        let count_ptr = mem.read_u64_at(args, CREATE_CHANNEL_COUNT)?;
         if count_ptr != 0 {
             mem.write_u32(count_ptr, MIX_CHANNELS as u32)?;
         }
-        let stream_ptr = mem.read_u64(args + CREATE_STREAM)?;
+        let stream_ptr = mem.read_u64_at(args, CREATE_STREAM)?;
         if stream_ptr != 0 {
             mem.write_u64(stream_ptr, handle)?;
         }
-        mem.write_u32(args + CREATE_RESULT, S_OK)?;
+        mem.write_u32_at(args, CREATE_RESULT, S_OK)?;
         Ok(S_OK)
     }
 
     fn audio_get_render_buffer(&mut self, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-        let handle = mem.read_u64(args + RENDER_GET_STREAM)?;
-        let frames = mem.read_u32(args + RENDER_GET_FRAMES)?;
+        let handle = mem.read_u64_at(args, RENDER_GET_STREAM)?;
+        let frames = mem.read_u32_at(args, RENDER_GET_FRAMES)?;
         let Some(stream) = self.audio.streams.get_mut(&handle) else {
-            mem.write_u32(args + RENDER_GET_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
+            mem.write_u32_at(args, RENDER_GET_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
             return Ok(S_OK);
         };
         if stream.held.is_some() {
-            mem.write_u32(args + RENDER_GET_RESULT, AUDCLNT_E_OUT_OF_ORDER)?;
+            mem.write_u32_at(args, RENDER_GET_RESULT, AUDCLNT_E_OUT_OF_ORDER)?;
             return Ok(S_OK);
         }
         if frames > stream.capacity {
-            mem.write_u32(args + RENDER_GET_RESULT, AUDCLNT_E_BUFFER_TOO_LARGE)?;
+            mem.write_u32_at(args, RENDER_GET_RESULT, AUDCLNT_E_BUFFER_TOO_LARGE)?;
             return Ok(S_OK);
         }
         let buffer = stream.buffer;
         stream.held = Some(frames);
-        let data_ptr = mem.read_u64(args + RENDER_GET_DATA)?;
+        let data_ptr = mem.read_u64_at(args, RENDER_GET_DATA)?;
         if data_ptr == 0 {
-            mem.write_u32(args + RENDER_GET_RESULT, E_POINTER)?;
+            mem.write_u32_at(args, RENDER_GET_RESULT, E_POINTER)?;
             return Ok(S_OK);
         }
         mem.write_u64(data_ptr, buffer)?;
-        mem.write_u32(args + RENDER_GET_RESULT, S_OK)?;
+        mem.write_u32_at(args, RENDER_GET_RESULT, S_OK)?;
         Ok(S_OK)
     }
 
     fn audio_release_render_buffer(&mut self, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-        let handle = mem.read_u64(args + RENDER_REL_STREAM)?;
-        let written = mem.read_u32(args + RENDER_REL_FRAMES)?;
-        let flags = mem.read_u32(args + RENDER_REL_FLAGS)?;
+        let handle = mem.read_u64_at(args, RENDER_REL_STREAM)?;
+        let written = mem.read_u32_at(args, RENDER_REL_FRAMES)?;
+        let flags = mem.read_u32_at(args, RENDER_REL_FLAGS)?;
         let Some(stream) = self.audio.streams.get_mut(&handle) else {
-            mem.write_u32(args + RENDER_REL_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
+            mem.write_u32_at(args, RENDER_REL_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
             return Ok(S_OK);
         };
         let Some(held) = stream.held else {
-            mem.write_u32(args + RENDER_REL_RESULT, AUDCLNT_E_OUT_OF_ORDER)?;
+            mem.write_u32_at(args, RENDER_REL_RESULT, AUDCLNT_E_OUT_OF_ORDER)?;
             return Ok(S_OK);
         };
         if written > held {
-            mem.write_u32(args + RENDER_REL_RESULT, AUDCLNT_E_INVALID_SIZE)?;
+            mem.write_u32_at(args, RENDER_REL_RESULT, AUDCLNT_E_INVALID_SIZE)?;
             return Ok(S_OK);
         }
         stream.held = None;
@@ -439,23 +439,23 @@ impl WinOs {
         let mut pcm = vec![0u8; bytes];
         if flags & 1 == 0 {
             for (i, b) in pcm.iter_mut().enumerate() {
-                *b = mem.read_u8(base + i as u64)?;
+                *b = mem.read_u8_at(base, i as u64)?;
             }
         }
         self.audio_sink.write(&pcm);
-        mem.write_u32(args + RENDER_REL_RESULT, S_OK)?;
+        mem.write_u32_at(args, RENDER_REL_RESULT, S_OK)?;
         Ok(S_OK)
     }
 
     fn audio_stream_out(&mut self, mem: &mut dyn Memory, args: u64, code: u32) -> Result<u32> {
-        let handle = mem.read_u64(args + STREAM_OUT_STREAM)?;
-        let out = mem.read_u64(args + STREAM_OUT_PTR)?;
+        let handle = mem.read_u64_at(args, STREAM_OUT_STREAM)?;
+        let out = mem.read_u64_at(args, STREAM_OUT_PTR)?;
         let Some(stream) = self.audio.streams.get(&handle) else {
-            mem.write_u32(args + STREAM_OUT_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
+            mem.write_u32_at(args, STREAM_OUT_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
             return Ok(S_OK);
         };
         if out == 0 {
-            mem.write_u32(args + STREAM_OUT_RESULT, E_POINTER)?;
+            mem.write_u32_at(args, STREAM_OUT_RESULT, E_POINTER)?;
             return Ok(S_OK);
         }
         match code {
@@ -464,22 +464,22 @@ impl WinOs {
             CODE_GET_LATENCY => mem.write_u64(out, DEFAULT_PERIOD)?,
             CODE_GET_FREQUENCY => mem.write_u64(out, MIX_SAMPLE_RATE as u64)?,
             CODE_GET_NEXT_PACKET_SIZE => {
-                mem.write_u32(args + STREAM_OUT_RESULT, AUDCLNT_E_WRONG_ENDPOINT_TYPE)?;
+                mem.write_u32_at(args, STREAM_OUT_RESULT, AUDCLNT_E_WRONG_ENDPOINT_TYPE)?;
                 return Ok(S_OK);
             }
             _ => {
-                mem.write_u32(args + STREAM_OUT_RESULT, E_NOTIMPL)?;
+                mem.write_u32_at(args, STREAM_OUT_RESULT, E_NOTIMPL)?;
                 return Ok(S_OK);
             }
         }
-        mem.write_u32(args + STREAM_OUT_RESULT, S_OK)?;
+        mem.write_u32_at(args, STREAM_OUT_RESULT, S_OK)?;
         Ok(S_OK)
     }
 
     fn audio_stream_only(&mut self, mem: &mut dyn Memory, args: u64, code: u32) -> Result<u32> {
-        let handle = mem.read_u64(args + STREAM_ONLY_STREAM)?;
+        let handle = mem.read_u64_at(args, STREAM_ONLY_STREAM)?;
         let Some(stream) = self.audio.streams.get_mut(&handle) else {
-            mem.write_u32(args + STREAM_ONLY_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
+            mem.write_u32_at(args, STREAM_ONLY_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
             return Ok(S_OK);
         };
         let hr = match code {
@@ -512,7 +512,7 @@ impl WinOs {
             }
             _ => E_NOTIMPL,
         };
-        mem.write_u32(args + STREAM_ONLY_RESULT, hr)?;
+        mem.write_u32_at(args, STREAM_ONLY_RESULT, hr)?;
         Ok(S_OK)
     }
 }
@@ -533,7 +533,7 @@ fn entry_process_detach(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memor
 
 fn entry_main_loop(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
     if args != 0 {
-        let event = mem.read_u64(args + LOOP_ARG)?;
+        let event = mem.read_u64_at(args, LOOP_ARG)?;
         os.signal_event_handle(event);
     }
     Ok(STATUS_SUCCESS)
@@ -552,14 +552,14 @@ fn entry_create_stream(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory
 }
 
 fn entry_release_stream(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    let handle = mem.read_u64(args + RELEASE_STREAM_STREAM)?;
+    let handle = mem.read_u64_at(args, RELEASE_STREAM_STREAM)?;
     if let Some(stream) = os.audio.streams.remove(&handle) {
         let _ = mem.unmap(stream.buffer, stream.capacity as u64 * MIX_FRAME_BYTES as u64);
     }
     if os.audio.streams.is_empty() {
         os.audio_sink.close();
     }
-    mem.write_u32(args + RELEASE_STREAM_RESULT, S_OK)?;
+    mem.write_u32_at(args, RELEASE_STREAM_RESULT, S_OK)?;
     Ok(STATUS_SUCCESS)
 }
 
@@ -584,17 +584,17 @@ fn entry_release_render_buffer(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dy
 }
 
 fn entry_capture(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    mem.write_u32(args + STREAM_ONLY_RESULT, AUDCLNT_E_WRONG_ENDPOINT_TYPE)?;
+    mem.write_u32_at(args, STREAM_ONLY_RESULT, AUDCLNT_E_WRONG_ENDPOINT_TYPE)?;
     Ok(STATUS_SUCCESS)
 }
 
 fn entry_is_format_supported(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    let hr = if mem.read_u32(args + FMT_SUPPORTED_FLOW)? != E_RENDER {
+    let hr = if mem.read_u32_at(args, FMT_SUPPORTED_FLOW)? != E_RENDER {
         AUDCLNT_E_WRONG_ENDPOINT_TYPE
-    } else if mem.read_u32(args + FMT_SUPPORTED_SHARE)? != SHARE_SHARED {
+    } else if mem.read_u32_at(args, FMT_SUPPORTED_SHARE)? != SHARE_SHARED {
         AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
     } else {
-        let fmt_ptr = mem.read_u64(args + FMT_SUPPORTED_FMT)?;
+        let fmt_ptr = mem.read_u64_at(args, FMT_SUPPORTED_FMT)?;
         if fmt_ptr == 0 {
             E_POINTER
         } else if Wfx::read(mem, fmt_ptr)?.is_mix_format() {
@@ -603,7 +603,7 @@ fn entry_is_format_supported(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn
             S_FALSE
         }
     };
-    mem.write_u32(args + FMT_SUPPORTED_RESULT, hr)?;
+    mem.write_u32_at(args, FMT_SUPPORTED_RESULT, hr)?;
     Ok(STATUS_SUCCESS)
 }
 
@@ -613,15 +613,15 @@ fn entry_get_loopback_capture_device(
     mem: &mut dyn Memory,
     args: u64,
 ) -> Result<u32> {
-    mem.write_u32(args + 0x1c, E_NOTIMPL)?;
+    mem.write_u32_at(args, 0x1c, E_NOTIMPL)?;
     Ok(STATUS_SUCCESS)
 }
 
 fn entry_get_mix_format(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    let hr = if mem.read_u32(args + MIX_FMT_FLOW)? != E_RENDER {
+    let hr = if mem.read_u32_at(args, MIX_FMT_FLOW)? != E_RENDER {
         AUDCLNT_E_WRONG_ENDPOINT_TYPE
     } else {
-        let fmt = mem.read_u64(args + MIX_FMT_FMT)?;
+        let fmt = mem.read_u64_at(args, MIX_FMT_FMT)?;
         if fmt == 0 {
             E_POINTER
         } else {
@@ -629,20 +629,20 @@ fn entry_get_mix_format(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memo
             S_OK
         }
     };
-    mem.write_u32(args + MIX_FMT_RESULT, hr)?;
+    mem.write_u32_at(args, MIX_FMT_RESULT, hr)?;
     Ok(STATUS_SUCCESS)
 }
 
 fn entry_get_device_period(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    let def = mem.read_u64(args + PERIOD_DEF)?;
+    let def = mem.read_u64_at(args, PERIOD_DEF)?;
     if def != 0 {
         mem.write_u64(def, DEFAULT_PERIOD)?;
     }
-    let min = mem.read_u64(args + PERIOD_MIN)?;
+    let min = mem.read_u64_at(args, PERIOD_MIN)?;
     if min != 0 {
         mem.write_u64(min, MIN_PERIOD)?;
     }
-    mem.write_u32(args + PERIOD_RESULT, S_OK)?;
+    mem.write_u32_at(args, PERIOD_RESULT, S_OK)?;
     Ok(STATUS_SUCCESS)
 }
 
@@ -663,21 +663,21 @@ fn entry_get_frequency(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory
 }
 
 fn entry_get_position(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    let handle = mem.read_u64(args + POSITION_STREAM)?;
+    let handle = mem.read_u64_at(args, POSITION_STREAM)?;
     let Some(stream) = os.audio.streams.get(&handle) else {
-        mem.write_u32(args + POSITION_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
+        mem.write_u32_at(args, POSITION_RESULT, AUDCLNT_E_NOT_INITIALIZED)?;
         return Ok(STATUS_SUCCESS);
     };
     let pos = stream.position;
-    let ptr = mem.read_u64(args + POSITION_POS)?;
+    let ptr = mem.read_u64_at(args, POSITION_POS)?;
     if ptr != 0 {
         mem.write_u64(ptr, pos)?;
     }
-    let qpc = mem.read_u64(args + POSITION_QPC)?;
+    let qpc = mem.read_u64_at(args, POSITION_QPC)?;
     if qpc != 0 {
         mem.write_u64(qpc, crate::time::filetime_now())?;
     }
-    mem.write_u32(args + POSITION_RESULT, S_OK)?;
+    mem.write_u32_at(args, POSITION_RESULT, S_OK)?;
     Ok(STATUS_SUCCESS)
 }
 
@@ -686,22 +686,22 @@ fn entry_set_volumes(_os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory
 }
 
 fn entry_set_event_handle(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    mem.write_u32(args + EVENT_RESULT, E_NOTIMPL)?;
+    mem.write_u32_at(args, EVENT_RESULT, E_NOTIMPL)?;
     Ok(STATUS_SUCCESS)
 }
 
 fn entry_set_sample_rate(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    mem.write_u32(args + SAMPLE_RATE_RESULT, E_NOTIMPL)?;
+    mem.write_u32_at(args, SAMPLE_RATE_RESULT, E_NOTIMPL)?;
     Ok(STATUS_SUCCESS)
 }
 
 fn entry_test_connect(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    mem.write_u32(args + TEST_CONNECT_PRIORITY, PRIORITY_PREFERRED)?;
+    mem.write_u32_at(args, TEST_CONNECT_PRIORITY, PRIORITY_PREFERRED)?;
     Ok(STATUS_SUCCESS)
 }
 
 fn entry_get_prop_value(_os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory, args: u64) -> Result<u32> {
-    mem.write_u32(args + 0x20, E_NOTIMPL)?;
+    mem.write_u32_at(args, 0x20, E_NOTIMPL)?;
     Ok(STATUS_SUCCESS)
 }
 
