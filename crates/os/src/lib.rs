@@ -362,6 +362,7 @@ impl WinOs {
         os.set_syscall_handler(fs::SSDT_NT_READ_FILE, fs::ssdt_nt_read_file);
         os.set_syscall_handler(fs::SSDT_NT_WRITE_FILE, fs::ssdt_nt_write_file);
         os.set_syscall_handler(fs::SSDT_NT_QUERY_INFORMATION_FILE, fs::ssdt_nt_query_information_file);
+        os.set_syscall_handler(fs::SSDT_NT_SET_INFORMATION_FILE, fs::ssdt_nt_set_information_file);
         os.set_syscall_handler(fs::SSDT_NT_QUERY_DIRECTORY_FILE, fs::ssdt_nt_query_directory_file);
         os.set_syscall_handler(
             fs::SSDT_NT_QUERY_VOLUME_INFORMATION_FILE,

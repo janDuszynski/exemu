@@ -5,8 +5,14 @@ use exemu_core::{CpuState, Memory, Result};
 
 use crate::WinOs;
 
+mod set_info;
+
+pub(crate) use set_info::ssdt_nt_set_information_file;
+
 pub struct OpenFile {
     pub file: std::fs::File,
+    pub path: PathBuf,
+    pub delete_on_close: bool,
 }
 
 #[derive(Clone)]
@@ -92,10 +98,10 @@ impl WinOs {
         Some(PathBuf::from(dir).join(leaf))
     }
 
-    fn alloc_handle(&mut self, f: std::fs::File) -> u64 {
+    fn alloc_handle(&mut self, f: std::fs::File, path: PathBuf) -> u64 {
         let h = self.next_handle;
         self.next_handle += 4;
-        self.files.insert(h, OpenFile { file: f });
+        self.files.insert(h, OpenFile { file: f, path, delete_on_close: false });
         h
     }
 
@@ -130,7 +136,7 @@ impl WinOs {
             }
         }
         match opts.open(&path) {
-            Ok(f) => self.alloc_handle(f),
+            Ok(f) => self.alloc_handle(f, path),
             Err(_) => {
                 self.set_last_error(2);
                 INVALID_HANDLE_VALUE
@@ -159,7 +165,19 @@ impl WinOs {
         }
         self.file_dirs.remove(&handle);
         self.find_handles.remove(&handle);
-        self.files.remove(&handle).is_some()
+        match self.files.remove(&handle) {
+            Some(of) => {
+                if of.delete_on_close {
+                    let _ = if of.path.is_dir() {
+                        std::fs::remove_dir(&of.path)
+                    } else {
+                        std::fs::remove_file(&of.path)
+                    };
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     pub(crate) fn alloc_khandle(&mut self) -> u64 {
@@ -484,6 +502,7 @@ const FILE_OVERWRITE_IF: u32 = 5;
 
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const FILE_DELETE_ON_CLOSE: u32 = 0x0000_1000;
 
 const FILE_WRITE_DATA: u64 = 0x0000_0002;
 const FILE_APPEND_DATA: u64 = 0x0000_0004;
@@ -507,6 +526,7 @@ pub(crate) const SSDT_NT_CREATE_FILE: u32 = 0x55;
 pub(crate) const SSDT_NT_READ_FILE: u32 = 0x06;
 pub(crate) const SSDT_NT_WRITE_FILE: u32 = 0x08;
 pub(crate) const SSDT_NT_QUERY_INFORMATION_FILE: u32 = 0x11;
+pub(crate) const SSDT_NT_SET_INFORMATION_FILE: u32 = 0x27;
 pub(crate) const SSDT_NT_QUERY_DIRECTORY_FILE: u32 = 0x35;
 pub(crate) const SSDT_NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 0x49;
 pub(crate) const SSDT_NT_OPEN_FILE: u32 = 0x33;
@@ -643,9 +663,14 @@ impl WinOs {
         };
 
         let is_dir = file.metadata().map(|m| m.is_dir()).unwrap_or(false);
-        let handle = self.alloc_handle(file);
+        let handle = self.alloc_handle(file, path);
         if is_dir {
             self.file_dirs.insert(handle, name.clone());
+        }
+        if options & FILE_DELETE_ON_CLOSE != 0 {
+            if let Some(of) = self.files.get_mut(&handle) {
+                of.delete_on_close = true;
+            }
         }
 
         let information = match disposition {
@@ -709,7 +734,7 @@ impl WinOs {
         };
 
         let is_dir = file.metadata().map(|m| m.is_dir()).unwrap_or(false);
-        let handle = self.alloc_handle(file);
+        let handle = self.alloc_handle(file, path);
         if is_dir {
             self.file_dirs.insert(handle, name.clone());
         }
