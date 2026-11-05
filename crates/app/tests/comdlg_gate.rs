@@ -60,6 +60,29 @@ fn assert_no_hollow_success(r: &HashMap<String, String>) {
     }
 }
 
+fn dialog_sizes(calls: &[DriverCall]) -> Vec<(i32, i32)> {
+    calls
+        .iter()
+        .filter_map(|c| match c {
+            DriverCall::CreateWindow { params, .. } if params.class_name == "#32770" => {
+                Some((params.cx, params.cy))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_both_dialogs_laid_out(calls: &[DriverCall], state: &str) {
+    let sizes = dialog_sizes(calls);
+    assert_eq!(sizes.len(), 2, "comdlg32 built both dialogs. Got {sizes:?}. {state}");
+    assert!(
+        sizes.iter().all(|&(cx, cy)| cx > 0 && cy > 0),
+        "the first dialog opens before any window exists, so DIALOG_CreateIndirect measures its \
+         font on GetDC(NULL); without a screen DC there it lays the dialog out 0x0. Got {sizes:?}. {state}"
+    );
+    assert_eq!(sizes[0], sizes[1], "both legs lay out the same template alike. {state}");
+}
+
 fn run_on_wine(tag: &str) -> (exemu_app::RunResult, Vec<DriverCall>) {
     let (res, calls) = run_on_wine_picking(tag, None);
     (res.expect("the comdlg sample runs to completion on the Wine boot"), calls)
@@ -244,7 +267,7 @@ fn driving_both_dialogs_opens_the_first_pick_and_saves_to_the_second() {
     );
 
     let picks = format!("{}|{}", comdlg_sample::PICK_FILE_NAME, comdlg_sample::SAVE_FILE_NAME);
-    let (driven, _) = run_on_wine_picking("pick", Some(&picks));
+    let (driven, calls) = run_on_wine_picking("pick", Some(&picks));
     let res = driven.unwrap_or_else(|e| {
         panic!(
             "the driven dialog must run to completion. 0xc0000005 at 0x10 in \
@@ -256,6 +279,7 @@ fn driving_both_dialogs_opens_the_first_pick_and_saves_to_the_second() {
     let r = report(&res.stdout);
     eprintln!("comdlg wine drive: exit={} steps={} {r:?}", res.exit_code, res.steps);
 
+    assert_both_dialogs_laid_out(&calls, &format!("{r:?}"));
     assert_no_hollow_success(&r);
     assert_eq!(num(&r, comdlg_sample::TAG_OPEN_RET), 1, "GetOpenFileNameW answered TRUE");
     assert_eq!(
@@ -355,13 +379,7 @@ fn a_32bit_guest_drives_both_dialogs_through_wow64() {
     let res = run.unwrap_or_else(|e| panic!("the WoW64 drive must run to completion: {e}\n{state}"));
     eprintln!("comdlg wow64 drive: exit={} steps={} {state}", res.exit_code, res.steps);
 
-    let dialogs = log
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|c| matches!(c, DriverCall::CreateWindow { params, .. } if params.class_name == "#32770"))
-        .count();
-    assert_eq!(dialogs, 2, "the 32-bit comdlg32 built both dialogs. {state}");
+    assert_both_dialogs_laid_out(&log.lock().unwrap(), &state);
     assert_eq!(u32_at(data::OPEN_RET), 1, "GetOpenFileNameW answered TRUE. {state}");
     assert_eq!(
         open,
