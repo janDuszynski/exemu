@@ -56,7 +56,7 @@ end-to-end on the default path.
 
 ### …and so does the 32-bit one, through WoW64 (W6.2)
 A 32-bit twin of the comdlg sample (`comdlg_sample::wow64`) runs the same two
-legs as a WoW64 process. It met six walls, each its own commit:
+legs as a WoW64 process. It met five walls, each its own commit:
 - **No builtin classes.** The i386 user32 hands `NtUserInitializeClientPfnArrays`
   ntdll32's `Ntdll*WndProc_*` stubs, each a `jmp dword [abs32]` (`FF 25`) into the
   `user_procs` copy `RtlInitializeNtUserPfn` made — not the x64 `48 FF 25` thunk
@@ -69,9 +69,6 @@ legs as a WoW64 process. It met six walls, each its own commit:
   faulted on it. Classes now keep what they were registered with (extra bytes,
   icons, cursor, the client menu name) and the answer follows win32u: the menu
   name for the charset asked, the instance asked about (0 for user32's own).
-- **`GetDC(NULL)` failed before any window existed**, so `DIALOG_CreateIndirect`
-  measured its font on no DC and laid the dialog out with base units 0,0. It is
-  now a screen DC with nothing to draw into.
 - **A `LONG` wrote eight bytes.** 32-bit dialogs keep `DWLP_MSGRESULT`,
   `DWLP_DLGPROC` and `DWLP_USER` four bytes apart, so `DefDlgProc`'s
   `SetWindowLongW(DWLP_MSGRESULT, 0)` zeroed the dialog procedure and
@@ -85,9 +82,23 @@ legs as a WoW64 process. It met six walls, each its own commit:
   `GWLP_USERDATA` arrived as `0xffffffeb`, read as an extra-bytes offset, and
   `ShellView_WndProc` got a NULL `this` on `WM_CREATE`.
 - **The result:** both legs answer TRUE with the typed paths, the 32-bit guest
-  reads the seeded file and writes its payload, exit 0. `comdlg_gate` pins it.
-  Window geometry sums on guest coordinates now wrap instead of panicking a debug
-  host.
+  reads the seeded file and writes its payload, exit 0 at 175.8M instructions.
+  `comdlg_gate` pins it. Window geometry sums on guest coordinates now wrap
+  instead of panicking a debug host.
+- **`GetDC(NULL)` is a screen DC before any window exists.** It answered 0, so
+  `DIALOG_CreateIndirect` measured its font on no DC and the first dialog of a
+  run, on either architecture, was created 0x0 with every control 0x0; the
+  second one found the first's window and came out 463x415. The drive returned
+  its paths either way, which is why no gate noticed: both drive gates now
+  assert that both dialogs are laid out, non-empty and alike, and go red without
+  this. A unit test also drives `NtUserSetWindowLong{,Ptr}` and every
+  `GetWindowLong` selector through the syscall entry, which the `LONG` tests
+  above never did.
+- **Not yet: monitors.** `GetMonitorInfoW`, `MonitorFromRect`/`MonitorFromPoint`
+  (`NtUserCallTwoParam` 2 and 4) and `MonitorFromWindow` (`NtUserCallHwndParam`
+  0x16) answer 0 and write nothing, so `DIALOG_CreateIndirect` clamps the dialog
+  to an uninitialised `MONITORINFO.rcWork`: the 32-bit dialog opens at
+  (0x600321F2, 0x0037FB90), the 64-bit one at (0, 0) only by the same accident.
 
 ### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
 - **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
