@@ -241,9 +241,33 @@ pub fn build() -> Vec<u8> {
     put_u32(&mut f, dir(12) + 4, thunks * 4);
 
     let sec = opt + OPT_HEADER_SIZE;
-    write_section(&mut f, sec, b".text", text.len() as u32, TEXT_RVA, text_raw as u32, text_ptr as u32, 0x6000_0020);
-    write_section(&mut f, sec + 40, b".rdata", rd.len() as u32, RDATA_RVA, rdata_raw as u32, rdata_ptr as u32, 0x4000_0040);
-    write_section(&mut f, sec + 80, b".data", data::LEN, DATA_RVA, 0, 0, 0xC000_0080);
+    let text_header = SectionHeader {
+        name: b".text",
+        vsize: text.len() as u32,
+        vaddr: TEXT_RVA,
+        raw_size: text_raw as u32,
+        raw_ptr: text_ptr as u32,
+        chars: 0x6000_0020,
+    };
+    let rdata_header = SectionHeader {
+        name: b".rdata",
+        vsize: rd.len() as u32,
+        vaddr: RDATA_RVA,
+        raw_size: rdata_raw as u32,
+        raw_ptr: rdata_ptr as u32,
+        chars: 0x4000_0040,
+    };
+    let data_header = SectionHeader {
+        name: b".data",
+        vsize: data::LEN,
+        vaddr: DATA_RVA,
+        raw_size: 0,
+        raw_ptr: 0,
+        chars: 0xC000_0080,
+    };
+    write_section(&mut f, sec, text_header);
+    write_section(&mut f, sec + 40, rdata_header);
+    write_section(&mut f, sec + 80, data_header);
 
     f[text_ptr..text_ptr + text.len()].copy_from_slice(&text);
     f[rdata_ptr..rdata_ptr + rd.len()].copy_from_slice(&rd);
@@ -459,13 +483,22 @@ fn build_text(iat: &dyn Fn(u32) -> u32, strings: &Strings) -> Vec<u8> {
     a.code
 }
 
-fn write_section(f: &mut [u8], at: usize, name: &[u8], vsize: u32, vaddr: u32, raw_size: u32, raw_ptr: u32, chars: u32) {
-    f[at..at + name.len()].copy_from_slice(name);
-    put_u32(f, at + 8, vsize);
-    put_u32(f, at + 12, vaddr);
-    put_u32(f, at + 16, raw_size);
-    put_u32(f, at + 20, raw_ptr);
-    put_u32(f, at + 36, chars);
+struct SectionHeader<'a> {
+    name: &'a [u8],
+    vsize: u32,
+    vaddr: u32,
+    raw_size: u32,
+    raw_ptr: u32,
+    chars: u32,
+}
+
+fn write_section(f: &mut [u8], at: usize, h: SectionHeader) {
+    f[at..at + h.name.len()].copy_from_slice(h.name);
+    put_u32(f, at + 8, h.vsize);
+    put_u32(f, at + 12, h.vaddr);
+    put_u32(f, at + 16, h.raw_size);
+    put_u32(f, at + 20, h.raw_ptr);
+    put_u32(f, at + 36, h.chars);
 }
 
 fn put_u16(f: &mut [u8], at: usize, v: u16) {
