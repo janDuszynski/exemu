@@ -728,10 +728,10 @@ mod tests {
         mem.write_u64_at(PARAMS, pp::STD_ERROR, std_handles[2]).unwrap();
         let cmd_buf = SCRATCH + 0x200;
         write_wstr(mem, cmd_buf, command_line);
-        write_unicode_string(mem, guest_addr(PARAMS, pp::COMMAND_LINE, 0)?, cmd_buf, command_line.len() * 2);
+        write_unicode_string(mem, PARAMS + pp::COMMAND_LINE, cmd_buf, command_line.len() * 2);
         let cwd_buf = SCRATCH + 0x400;
         write_wstr(mem, cwd_buf, "C:\\");
-        write_unicode_string(mem, guest_addr(PARAMS, pp::CURRENT_DIRECTORY, 0)?, cwd_buf, 6);
+        write_unicode_string(mem, PARAMS + pp::CURRENT_DIRECTORY, cwd_buf, 6);
 
         let name_buf = SCRATCH + 0x600;
         write_wstr(mem, name_buf, image_nt_path);
@@ -980,11 +980,11 @@ mod tests {
         assert_eq!(mem.read_u64_at(params, pp::STD_ERROR).unwrap(), HANDLE_STDERR);
         assert_eq!(mem.read_u64_at(params, pp::CONSOLE_HANDLE).unwrap(), 0);
         assert_eq!(
-            crate::fs::read_unicode_string(&mem, guest_addr(params, pp::IMAGE_PATH_NAME, 0)?).unwrap(),
+            crate::fs::read_unicode_string(&mem, params + pp::IMAGE_PATH_NAME).unwrap(),
             "C:\\parent.exe"
         );
         assert_eq!(
-            crate::fs::read_unicode_string(&mem, guest_addr(params, pp::CURRENT_DIRECTORY, 0)?).unwrap(),
+            crate::fs::read_unicode_string(&mem, params + pp::CURRENT_DIRECTORY).unwrap(),
             "C:\\"
         );
         let env = os.read_environment_block(&mem, params).unwrap();

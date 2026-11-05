@@ -253,7 +253,7 @@ mod tests {
 
         let close = 0x5_1000;
         make_req(&mut mem, close, REQ_CLOSE_HANDLE);
-        os.write_obj_handle(&mut mem, guest_addr(close, body::CLOSE_HANDLE, 0)?, handle).unwrap();
+        os.write_obj_handle(&mut mem, close + body::CLOSE_HANDLE, handle).unwrap();
         assert_eq!(os.wine_server_call(close, &mut CpuState::default(), &mut mem).unwrap(), STATUS_SUCCESS);
         make_req(&mut mem, close, REQ_CLOSE_HANDLE);
         assert_eq!(os.wine_server_call(close, &mut CpuState::default(), &mut mem).unwrap(), STATUS_INVALID_HANDLE);
@@ -273,19 +273,19 @@ mod tests {
 
         let dup = 0x5_1000;
         make_req(&mut mem, dup, REQ_DUP_HANDLE);
-        os.write_obj_handle(&mut mem, guest_addr(dup, body::DUP_SRC_HANDLE, 0)?, h1).unwrap();
+        os.write_obj_handle(&mut mem, dup + body::DUP_SRC_HANDLE, h1).unwrap();
         assert_eq!(os.wine_server_call(dup, &mut CpuState::default(), &mut mem).unwrap(), STATUS_SUCCESS);
         let h2 = mem.read_u32_at(dup, 8).unwrap() as u64;
         assert!(h2 != 0 && h2 != h1, "a distinct duplicate handle");
 
         let close = 0x5_2000;
         make_req(&mut mem, close, REQ_CLOSE_HANDLE);
-        os.write_obj_handle(&mut mem, guest_addr(close, body::CLOSE_HANDLE, 0)?, h1).unwrap();
+        os.write_obj_handle(&mut mem, close + body::CLOSE_HANDLE, h1).unwrap();
         os.wine_server_call(close, &mut CpuState::default(), &mut mem).unwrap();
         assert!(os.kobject_is_signaled_for_test(h2), "duplicate survives the original's close");
 
         make_req(&mut mem, dup, REQ_DUP_HANDLE);
-        os.write_obj_handle(&mut mem, guest_addr(dup, body::DUP_SRC_HANDLE, 0)?, 0xdead_beef).unwrap();
+        os.write_obj_handle(&mut mem, dup + body::DUP_SRC_HANDLE, 0xdead_beef).unwrap();
         assert_eq!(os.wine_server_call(dup, &mut CpuState::default(), &mut mem).unwrap(), STATUS_INVALID_HANDLE);
     }
 
@@ -303,7 +303,7 @@ mod tests {
 
         let sel_op = 0x5_2000;
         mem.write_u32_at(sel_op, select_op::OP, SELECT_WAIT).unwrap();
-        os.write_obj_handle(&mut mem, guest_addr(sel_op, select_op::HANDLES, 0)?, handle).unwrap();
+        os.write_obj_handle(&mut mem, sel_op + select_op::HANDLES, handle).unwrap();
 
         let sel = 0x5_1000;
         make_req(&mut mem, sel, REQ_SELECT);
@@ -329,7 +329,7 @@ mod tests {
 
         let sel_op = 0x5_2000;
         mem.write_u32_at(sel_op, select_op::OP, SELECT_WAIT).unwrap();
-        os.write_obj_handle(&mut mem, guest_addr(sel_op, select_op::HANDLES, 0)?, handle).unwrap();
+        os.write_obj_handle(&mut mem, sel_op + select_op::HANDLES, handle).unwrap();
         let sel = 0x5_1000;
         make_req(&mut mem, sel, REQ_SELECT);
         mem.write_u32_at(sel, info::DATA_COUNT, 1).unwrap();
@@ -353,7 +353,7 @@ mod tests {
 
         let sel_op = 0x5_2000;
         mem.write_u32_at(sel_op, select_op::OP, SELECT_WAIT).unwrap();
-        os.write_obj_handle(&mut mem, guest_addr(sel_op, select_op::HANDLES, 0)?, handle).unwrap();
+        os.write_obj_handle(&mut mem, sel_op + select_op::HANDLES, handle).unwrap();
         let sel = 0x5_1000;
         make_req(&mut mem, sel, REQ_SELECT);
         mem.write_u64_at(sel, body::SELECT_TIMEOUT, TIMEOUT_INFINITE).unwrap();
