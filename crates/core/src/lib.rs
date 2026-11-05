@@ -33,7 +33,7 @@ pub use error::{EmuError, Result};
 pub use gui::{Control, ControlKind, DialogTemplate, DrawOp, Gui, GuiEvent, NoGui};
 pub use hooks::Hooks;
 pub use image::{ImageLoader, ModuleExports, NoImageLoader};
-pub use memory::{align_up, guest_addr, Memory, Perm, Region, CODE_PAGE_SIZE};
+pub use memory::{checked_align_up, guest_addr, Memory, Perm, Region, CODE_PAGE_SIZE};
 pub use pe::{
     ActivationContext, AssemblyIdentity, Export, Import, ImportSymbol, ManifestInfo, PeImage,
     Reloc, Section, Tls,

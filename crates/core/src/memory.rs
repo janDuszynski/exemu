@@ -54,8 +54,11 @@ pub fn guest_addr(base: u64, off: u64, len: usize) -> Result<u64> {
 }
 
 #[inline]
-pub fn align_up(v: u64, align: u64) -> u64 {
-    v.saturating_add(align - 1) & !(align - 1)
+pub fn checked_align_up(v: u64, align: u64) -> Option<u64> {
+    if !align.is_power_of_two() {
+        return None;
+    }
+    v.checked_add(align - 1).map(|x| x & !(align - 1))
 }
 
 pub trait Memory {
@@ -266,11 +269,14 @@ mod tests {
     }
 
     #[test]
-    fn align_up_saturates_instead_of_wrapping() {
-        assert_eq!(align_up(1, 0x1000), 0x1000);
-        assert_eq!(align_up(0x1000, 0x1000), 0x1000);
-        assert_eq!(align_up(u64::MAX, 0x1000), 0xffff_ffff_ffff_f000);
-        assert_eq!(align_up(u64::MAX - 5, 0x10000), 0xffff_ffff_ffff_0000);
+    fn checked_align_up_refuses_to_round_down() {
+        assert_eq!(checked_align_up(1, 0x1000), Some(0x1000));
+        assert_eq!(checked_align_up(0x1000, 0x1000), Some(0x1000));
+        assert_eq!(checked_align_up(0xffff_ffff_ffff_f000, 0x1000), Some(0xffff_ffff_ffff_f000));
+        assert_eq!(checked_align_up(0xffff_ffff_ffff_f001, 0x1000), None);
+        assert_eq!(checked_align_up(u64::MAX, 0x1000), None);
+        assert_eq!(checked_align_up(7, 0), None);
+        assert_eq!(checked_align_up(7, 12), None);
     }
 
     #[test]
