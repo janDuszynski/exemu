@@ -10,6 +10,7 @@ use crate::wow64_boot;
 mod debug;
 mod exception;
 mod fault;
+mod layout;
 mod load;
 mod run;
 

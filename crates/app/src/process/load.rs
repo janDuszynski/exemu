@@ -1,6 +1,6 @@
 use exemu_core::debug::DebugControl;
 use exemu_core::{Cpu, EmuError, GuestClock, Memory, Perm, Region, Result};
-use exemu_cpu::{Bits, Interpreter, FS_BASE_32, GS_BASE};
+use exemu_cpu::{Bits, Interpreter};
 use exemu_loader as loader;
 use exemu_memory::VirtualMemory;
 use exemu_os::{winedebug, WinConfig, WinOs};
@@ -10,89 +10,13 @@ use crate::config::RunConfig;
 use crate::kuser::{map_kuser_shared_data, KUSER_SHARED_DATA_BASE, KUSER_SYSTEM_CALL};
 use crate::{prefix_dirs, spawn, winsxs, wow64_boot, wow64_image, PAGE};
 
+use super::layout::Layout;
 use super::Process;
 
 const TEB_SIZE: u64 = 0x2000;
 const ENV_SIZE: u64 = 0x1000;
 const API_SIZE: u64 = 0x0010_0000;
 const JIT_CODE_BYTES: usize = 32 << 20;
-
-struct Layout {
-    stack_base: u64,
-    stack_size: u64,
-    heap_base: u64,
-    heap_size: u64,
-    api_base: u64,
-    dll_base: u64,
-    dll_size: u64,
-    env_base: u64,
-    teb_base: u64,
-    peb_addr: u64,
-    teb_self: u64,
-    teb_peb: u64,
-    teb_stack_base: u64,
-    teb_stack_limit: u64,
-    peb_image_base: u64,
-    peb_ldr_off: u64,
-    peb_loaderlock_off: u64,
-    valloc_base: u64,
-}
-
-impl Layout {
-    fn for_bits(is_64bit: bool) -> Layout {
-        if is_64bit {
-            Layout {
-                stack_base: 0x0000_0010_0000_0000,
-                stack_size: 0x0020_0000,
-                heap_base: 0x0000_0002_0000_0000,
-                heap_size: 0x0400_0000,
-                api_base: 0x0000_7EFF_0000_0000,
-                dll_base: 0x0000_0006_0000_0000,
-                dll_size: 0x0800_0000,
-                env_base: 0x0000_0000_5000_0000,
-                teb_base: GS_BASE,
-                peb_addr: GS_BASE + 0x2000,
-                teb_self: 0x30,
-                teb_peb: 0x60,
-                teb_stack_base: 0x08,
-                teb_stack_limit: 0x10,
-                peb_image_base: 0x10,
-                peb_ldr_off: 0x18,
-                peb_loaderlock_off: 0x110,
-                valloc_base: 0x0000_0040_0000_0000,
-            }
-        } else {
-            Layout {
-                stack_base: 0x0018_0000,
-                stack_size: 0x0020_0000,
-                heap_base: 0x1000_0000,
-                heap_size: 0x0400_0000,
-                api_base: 0x7000_0000,
-                dll_base: 0x2000_0000,
-                dll_size: 0x0400_0000,
-                env_base: 0x0010_0000,
-                teb_base: FS_BASE_32,
-                peb_addr: FS_BASE_32 + 0x2000,
-                teb_self: 0x18,
-                teb_peb: 0x30,
-                teb_stack_base: 0x04,
-                teb_stack_limit: 0x08,
-                peb_image_base: 0x08,
-                peb_ldr_off: 0x0c,
-                peb_loaderlock_off: 0xa0,
-                valloc_base: 0x3000_0000,
-            }
-        }
-    }
-
-    fn for_wow64() -> Layout {
-        Layout {
-            teb_base: wow64_boot::WOW64_TEB64,
-            peb_addr: wow64_boot::WOW64_PEB64,
-            ..Layout::for_bits(true)
-        }
-    }
-}
 
 impl Process {
     pub fn load(pe_bytes: &[u8], cfg: &mut RunConfig) -> Result<Process> {
@@ -601,6 +525,7 @@ fn data_import_seed(name: &str, cmd_a: u64, cmd_w: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exemu_cpu::GS_BASE;
 
     #[test]
     fn wine_debug_pages_are_mapped_and_writable() {
