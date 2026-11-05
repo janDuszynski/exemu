@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use exemu_core::{checked_align_up, CpuState, Export, ImageLoader, ImportSymbol, Memory, ModuleExports, Result};
+use exemu_core::{guest_addr, checked_align_up, CpuState, Export, ImageLoader, ImportSymbol, Memory, ModuleExports, Result};
 
 use crate::WinOs;
 
@@ -578,9 +578,9 @@ impl WinOs {
         for off in self.ldr_list_offsets() {
             let head = ldr + off;
             self.write_ptr(mem, head, head)?;
-            self.write_ptr(mem, head + ptr, head)?;
+            self.write_ptr(mem, guest_addr(head, ptr, 0)?, head)?;
         }
-        self.write_ptr(mem, self.cfg.peb_addr + self.cfg.peb_ldr_off, ldr)?;
+        self.write_ptr(mem, guest_addr(self.cfg.peb_addr, self.cfg.peb_ldr_off, 0)?, ldr)?;
 
         self.seed_peb(mem)?;
 
@@ -590,11 +590,11 @@ impl WinOs {
         self.write_ptr(mem, cs, 0)?;
         mem.write_u32_at(cs, ptr, (-1_i32) as u32)?;
         mem.write_u32_at(cs, ptr + 4, 0)?;
-        self.write_ptr(mem, cs + ptr + 8, 0)?;
-        self.write_ptr(mem, cs + ptr + 8 + ptr, 0)?;
-        self.write_ptr(mem, cs + ptr + 8 + 2 * ptr, 0)?;
+        self.write_ptr(mem, guest_addr(cs, ptr + 8, 0)?, 0)?;
+        self.write_ptr(mem, guest_addr(cs, ptr + 8 + ptr, 0)?, 0)?;
+        self.write_ptr(mem, guest_addr(cs, ptr + 8 + 2 * ptr, 0)?, 0)?;
         if self.cfg.peb_loaderlock_off != 0 {
-            self.write_ptr(mem, self.cfg.peb_addr + self.cfg.peb_loaderlock_off, cs)?;
+            self.write_ptr(mem, guest_addr(self.cfg.peb_addr, self.cfg.peb_loaderlock_off, 0)?, cs)?;
         }
 
         let name = if self.cfg.image_name.is_empty() {
@@ -640,7 +640,7 @@ impl WinOs {
         mem.write_u32_at(peb, off_session_id, 0)?;
 
         let pp = self.build_process_parameters(mem)?;
-        self.write_ptr(mem, peb + off_process_params, pp)?;
+        self.write_ptr(mem, guest_addr(peb, off_process_params, 0)?, pp)?;
         Ok(())
     }
 
@@ -674,25 +674,25 @@ impl WinOs {
         mem.write_u64_at(pp, 0x30, crate::HANDLE_STDERR)?;
 
         let (cd_buf, cd_len) = self.ldr_write_wstr(mem, "C:\\")?;
-        self.write_unicode_string(mem, pp + 0x38, cd_buf, cd_len)?;
+        self.write_unicode_string(mem, guest_addr(pp, 0x38, 0)?, cd_buf, cd_len)?;
         let (dll_buf, dll_len) = self.ldr_write_wstr(mem, "C:\\windows\\system32")?;
-        self.write_unicode_string(mem, pp + 0x50, dll_buf, dll_len)?;
+        self.write_unicode_string(mem, guest_addr(pp, 0x50, 0)?, dll_buf, dll_len)?;
         let (img_buf, img_len) = self.ldr_write_wstr(mem, &self.cfg.module_path_w.clone())?;
-        self.write_unicode_string(mem, pp + 0x60, img_buf, img_len)?;
+        self.write_unicode_string(mem, guest_addr(pp, 0x60, 0)?, img_buf, img_len)?;
         if self.cfg.cmdline_ptr_w != 0 {
             let cmd_len = wstr_byte_len(mem, self.cfg.cmdline_ptr_w)?;
-            self.write_unicode_string(mem, pp + 0x70, self.cfg.cmdline_ptr_w, cmd_len)?;
+            self.write_unicode_string(mem, guest_addr(pp, 0x70, 0)?, self.cfg.cmdline_ptr_w, cmd_len)?;
         } else {
-            self.write_unicode_string(mem, pp + 0x70, img_buf, img_len)?;
+            self.write_unicode_string(mem, guest_addr(pp, 0x70, 0)?, img_buf, img_len)?;
         }
 
         let (env_buf, env_bytes) = self.write_env_block(mem)?;
-        self.write_ptr(mem, pp + 0x80, env_buf)?;
+        self.write_ptr(mem, guest_addr(pp, 0x80, 0)?, env_buf)?;
         mem.write_u64_at(pp, 0x3f0, env_bytes)?;
 
         let (empty_buf, _) = self.ldr_write_wstr(mem, "")?;
         for off in [0xb0u64, 0xc0, 0xd0, 0xe0] {
-            self.write_unicode_string(mem, pp + off, empty_buf, 0)?;
+            self.write_unicode_string(mem, guest_addr(pp, off, 0)?, empty_buf, 0)?;
         }
         Ok(pp)
     }
@@ -706,15 +706,15 @@ impl WinOs {
         mem.write_u32_at(pp, 0x04, PP_SIZE as u32)?;
         mem.write_u32_at(pp, 0x08, 0x1)?;
         let (img_buf, img_len) = self.ldr_write_wstr(mem, &self.cfg.module_path_w.clone())?;
-        self.write_unicode_string(mem, pp + 0x38, img_buf, img_len)?;
+        self.write_unicode_string(mem, guest_addr(pp, 0x38, 0)?, img_buf, img_len)?;
         if self.cfg.cmdline_ptr_w != 0 {
             let cmd_len = wstr_byte_len(mem, self.cfg.cmdline_ptr_w)?;
-            self.write_unicode_string(mem, pp + 0x40, self.cfg.cmdline_ptr_w, cmd_len)?;
+            self.write_unicode_string(mem, guest_addr(pp, 0x40, 0)?, self.cfg.cmdline_ptr_w, cmd_len)?;
         } else {
-            self.write_unicode_string(mem, pp + 0x40, img_buf, img_len)?;
+            self.write_unicode_string(mem, guest_addr(pp, 0x40, 0)?, img_buf, img_len)?;
         }
         let (env_buf, _env_bytes) = self.write_env_block(mem)?;
-        self.write_ptr(mem, pp + 0x48, env_buf)?;
+        self.write_ptr(mem, guest_addr(pp, 0x48, 0)?, env_buf)?;
         Ok(pp)
     }
 
@@ -798,7 +798,7 @@ impl WinOs {
         mem.write(base, &ns.bytes)?;
         self.dll.api_set_map = base;
         let off = if self.cfg.is_64bit { 0x68u64 } else { 0x38 };
-        self.write_ptr(mem, self.cfg.peb_addr + off, base)?;
+        self.write_ptr(mem, guest_addr(self.cfg.peb_addr, off, 0)?, base)?;
         Ok(())
     }
 
@@ -816,7 +816,7 @@ impl WinOs {
         mem.write_u32_at(cs, ptr, (self.dll.loader_lock_depth - 1) as u32)?;
         mem.write_u32_at(cs, ptr + 4, self.dll.loader_lock_depth as u32)?;
         let owner = u64::from(self.current_tid);
-        self.write_ptr(mem, cs + ptr + 8, owner)?;
+        self.write_ptr(mem, guest_addr(cs, ptr + 8, 0)?, owner)?;
         Ok(())
     }
 
@@ -830,7 +830,7 @@ impl WinOs {
         if self.dll.loader_lock_depth == 0 {
             mem.write_u32_at(cs, ptr, (-1_i32) as u32)?;
             mem.write_u32_at(cs, ptr + 4, 0)?;
-            self.write_ptr(mem, cs + ptr + 8, 0)?;
+            self.write_ptr(mem, guest_addr(cs, ptr + 8, 0)?, 0)?;
         } else {
             mem.write_u32_at(cs, ptr, (self.dll.loader_lock_depth - 1) as u32)?;
             mem.write_u32_at(cs, ptr + 4, self.dll.loader_lock_depth as u32)?;
@@ -897,8 +897,8 @@ impl WinOs {
         mem.write_at(te, off_dllbase, &base.to_le_bytes()[..ptr as usize])?;
         mem.write_at(te, off_entry, &entry.to_le_bytes()[..ptr as usize])?;
         mem.write_at(te, off_size, &size.to_le_bytes()[..ptr as usize])?;
-        self.write_unicode_string(mem, te + off_full, full_buf.0, full_buf.1)?;
-        self.write_unicode_string(mem, te + off_basename, base_buf.0, base_buf.1)?;
+        self.write_unicode_string(mem, guest_addr(te, off_full, 0)?, full_buf.0, full_buf.1)?;
+        self.write_unicode_string(mem, guest_addr(te, off_basename, 0)?, base_buf.0, base_buf.1)?;
 
         let list_offs = self.ldr_list_offsets();
         let link_offs = self.ldr_entry_link_offsets();
@@ -911,11 +911,11 @@ impl WinOs {
     }
 
     fn list_insert_tail(&self, mem: &mut dyn Memory, head: u64, link: u64, ptr: u64) -> Result<()> {
-        let blink = self.read_ptr(mem, head + ptr)?;
+        let blink = self.read_ptr(mem, guest_addr(head, ptr, 0)?)?;
         self.write_ptr(mem, link, head)?;
-        self.write_ptr(mem, link + ptr, blink)?;
+        self.write_ptr(mem, guest_addr(link, ptr, 0)?, blink)?;
         self.write_ptr(mem, blink, link)?;
-        self.write_ptr(mem, head + ptr, link)?;
+        self.write_ptr(mem, guest_addr(head, ptr, 0)?, link)?;
         Ok(())
     }
 
