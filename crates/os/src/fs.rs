@@ -5,6 +5,9 @@ use exemu_core::{CpuState, Memory, Result};
 
 use crate::WinOs;
 
+const TEB32_LAST_ERROR_VALUE: u64 = 0x34;
+const TEB64_LAST_ERROR_VALUE: u64 = 0x68;
+
 pub struct OpenFile {
     pub file: std::fs::File,
 }
@@ -99,7 +102,7 @@ impl WinOs {
         h
     }
 
-    pub(crate) fn create_file(&mut self, name: &str, access: u64, disposition: u64) -> u64 {
+    pub(crate) fn create_file(&mut self, mem: &mut dyn Memory, name: &str, access: u64, disposition: u64) -> u64 {
         let Some(path) = self.host_path(name) else {
             return INVALID_HANDLE_VALUE;
         };
@@ -132,7 +135,7 @@ impl WinOs {
         match opts.open(&path) {
             Ok(f) => self.alloc_handle(f),
             Err(_) => {
-                self.set_last_error(2);
+                self.set_last_error(mem, 2);
                 INVALID_HANDLE_VALUE
             }
         }
@@ -231,9 +234,9 @@ impl WinOs {
         }
     }
 
-    pub(crate) fn move_file(&mut self, src: &str, dst: &str) -> bool {
+    pub(crate) fn move_file(&mut self, mem: &mut dyn Memory, src: &str, dst: &str) -> bool {
         let (Some(s), Some(d)) = (self.host_path(src), self.host_path(dst)) else {
-            self.set_last_error(2);
+            self.set_last_error(mem, 2);
             return false;
         };
         if let Some(parent) = d.parent() {
@@ -245,17 +248,17 @@ impl WinOs {
         if std::fs::copy(&s, &d).is_ok() && std::fs::remove_file(&s).is_ok() {
             return true;
         }
-        self.set_last_error(2);
+        self.set_last_error(mem, 2);
         false
     }
 
-    pub(crate) fn copy_file(&mut self, src: &str, dst: &str, fail_if_exists: bool) -> bool {
+    pub(crate) fn copy_file(&mut self, mem: &mut dyn Memory, src: &str, dst: &str, fail_if_exists: bool) -> bool {
         let (Some(s), Some(d)) = (self.host_path(src), self.host_path(dst)) else {
-            self.set_last_error(2);
+            self.set_last_error(mem, 2);
             return false;
         };
         if fail_if_exists && d.exists() {
-            self.set_last_error(80);
+            self.set_last_error(mem, 80);
             return false;
         }
         if let Some(parent) = d.parent() {
@@ -264,7 +267,7 @@ impl WinOs {
         if std::fs::copy(&s, &d).is_ok() {
             true
         } else {
-            self.set_last_error(2);
+            self.set_last_error(mem, 2);
             false
         }
     }
@@ -289,8 +292,23 @@ impl WinOs {
         Ok(units.len() as u64)
     }
 
-    pub(crate) fn set_last_error(&mut self, code: u32) {
-        self.last_error = code;
+    fn last_error_slot(&self) -> Option<u64> {
+        let teb = self.threads.get(self.current)?.teb_base;
+        if teb == 0 {
+            return None;
+        }
+        let offset = if self.cfg.is_64bit { TEB64_LAST_ERROR_VALUE } else { TEB32_LAST_ERROR_VALUE };
+        Some(teb + offset)
+    }
+
+    pub(crate) fn set_last_error(&mut self, mem: &mut dyn Memory, code: u32) {
+        if let Some(slot) = self.last_error_slot() {
+            let _ = mem.write_u32(slot, code);
+        }
+    }
+
+    pub(crate) fn get_last_error(&self, mem: &dyn Memory) -> u32 {
+        self.last_error_slot().and_then(|slot| mem.read_u32(slot).ok()).unwrap_or(0)
     }
 
     pub(crate) fn find_first_file(
@@ -306,7 +324,7 @@ impl WinOs {
         };
 
         let Some(host_dir) = self.host_path(dir) else {
-            self.set_last_error(2);
+            self.set_last_error(mem, 2);
             return Ok(INVALID_HANDLE_VALUE);
         };
 
@@ -364,7 +382,7 @@ impl WinOs {
         });
 
         if entries.is_empty() {
-            self.set_last_error(2);
+            self.set_last_error(mem, 2);
             return Ok(INVALID_HANDLE_VALUE);
         }
 
@@ -384,7 +402,7 @@ impl WinOs {
         data_ptr: u64,
     ) -> Result<u64> {
         let Some(state) = self.find_handles.get_mut(&handle) else {
-            self.set_last_error(18);
+            self.set_last_error(mem, 18);
             return Ok(0);
         };
         if state.pos < state.entries.len() {
@@ -394,7 +412,7 @@ impl WinOs {
             write_find_data(mem, data_ptr, &entry, wide)?;
             Ok(1)
         } else {
-            self.set_last_error(18);
+            self.set_last_error(mem, 18);
             Ok(0)
         }
     }

@@ -111,7 +111,6 @@ pub struct WinOs {
     next_thunk: u64,
     heap_next: u64,
     heap_sizes: HashMap<u64, u64>,
-    last_error: u32,
 
     zero_stubs: Vec<String>,
 
@@ -245,7 +244,6 @@ impl WinOs {
             next_thunk: api_base,
             heap_next: heap_base,
             heap_sizes: HashMap::new(),
-            last_error: 0,
             zero_stubs: Vec::new(),
             vm_allocs: Vec::new(),
             valloc_next: valloc_base,
@@ -721,7 +719,7 @@ impl WinOs {
         }
     }
 
-    fn heap_alloc(&mut self, size: u64) -> u64 {
+    fn heap_alloc(&mut self, mem: &mut dyn Memory, size: u64) -> u64 {
         let align = 16u64;
         let ptr = (self.heap_next + align - 1) & !(align - 1);
         let stored = size.max(1);
@@ -733,7 +731,7 @@ impl WinOs {
                 ptr
             }
             _ => {
-                self.last_error = 8;
+                self.set_last_error(mem, 8);
                 0
             }
         }
@@ -743,7 +741,7 @@ impl WinOs {
         if let Some(&cell) = self.crt_globals.get(name) {
             return Ok(cell);
         }
-        let cell = self.heap_alloc(8);
+        let cell = self.heap_alloc(mem, 8);
         let seed = match name {
             "__p__acmdln" => self.cfg.cmdline_ptr_a,
             "__p__wcmdln" => self.cfg.cmdline_ptr_w,

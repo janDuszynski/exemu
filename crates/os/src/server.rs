@@ -106,7 +106,7 @@ impl WinOs {
     fn srv_create_event(&mut self, req: u64, mem: &mut dyn Memory) -> Result<u32> {
         let manual = mem.read_u32(req + body::CREATE_EVENT_MANUAL)? != 0;
         let initial = mem.read_u32(req + body::CREATE_EVENT_INITIAL)? != 0;
-        let handle = self.make_object(SyncKind::Event, None, manual, initial, 0, 0);
+        let handle = self.make_object(mem, SyncKind::Event, None, manual, initial, (0, 0));
         self.write_obj_handle(mem, req + 8, handle)?;
         Ok(STATUS_SUCCESS)
     }

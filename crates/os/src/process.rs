@@ -558,7 +558,7 @@ impl WinOs {
 
         let image = if !app.is_empty() { app.clone() } else { first_token(&cmd) };
         if image.is_empty() {
-            self.set_last_error(ERROR_INVALID_PARAMETER);
+            self.set_last_error(mem, ERROR_INVALID_PARAMETER);
             return Ok(crate::api::Outcome::Return(0));
         }
         let image = self.full_path_name(&image);
@@ -569,11 +569,11 @@ impl WinOs {
             match self.create_child_process(&image, &command_line, &cwd, inherit) {
                 Ok(v) => v,
                 Err(STATUS_OBJECT_NAME_NOT_FOUND) => {
-                    self.set_last_error(ERROR_FILE_NOT_FOUND);
+                    self.set_last_error(mem, ERROR_FILE_NOT_FOUND);
                     return Ok(crate::api::Outcome::Return(0));
                 }
                 Err(_) => {
-                    self.set_last_error(ERROR_NOT_SUPPORTED);
+                    self.set_last_error(mem, ERROR_NOT_SUPPORTED);
                     return Ok(crate::api::Outcome::Return(0));
                 }
             };
@@ -608,7 +608,7 @@ impl WinOs {
             self.child_exit_code(handle)
         };
         let Some(code) = code else {
-            self.set_last_error(ERROR_INVALID_HANDLE);
+            self.set_last_error(mem, ERROR_INVALID_HANDLE);
             return Ok(crate::api::Outcome::Return(0));
         };
         if out != 0 {

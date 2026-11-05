@@ -261,7 +261,7 @@ impl WinOs {
         }
 
         let Some((record, orig_context, work_context, frame_context, dispatcher)) =
-            self.alloc_dispatch_buffers()
+            self.alloc_dispatch_buffers(mem)
         else {
             return Err(exemu_core::EmuError::Os("out of heap for exception dispatch".into()));
         };
@@ -307,7 +307,7 @@ impl WinOs {
         let final_rsp = cpu.rsp() + 8;
 
         let Some((_r, orig_context, work_context, frame_context, dispatcher)) =
-            self.alloc_dispatch_buffers()
+            self.alloc_dispatch_buffers(mem)
         else {
             return Err(exemu_core::EmuError::Os("out of heap for unwind".into()));
         };
@@ -604,12 +604,12 @@ impl WinOs {
         Ok(STATUS_SUCCESS_NT)
     }
 
-    fn alloc_dispatch_buffers(&mut self) -> Option<(u64, u64, u64, u64, u64)> {
-        let record = self.heap_alloc(EXCEPTION_RECORD_SIZE);
-        let orig = self.heap_alloc(CONTEXT_SIZE);
-        let work = self.heap_alloc(CONTEXT_SIZE);
-        let frame = self.heap_alloc(CONTEXT_SIZE);
-        let disp = self.heap_alloc(DISPATCHER_CONTEXT_SIZE);
+    fn alloc_dispatch_buffers(&mut self, mem: &mut dyn Memory) -> Option<(u64, u64, u64, u64, u64)> {
+        let record = self.heap_alloc(mem, EXCEPTION_RECORD_SIZE);
+        let orig = self.heap_alloc(mem, CONTEXT_SIZE);
+        let work = self.heap_alloc(mem, CONTEXT_SIZE);
+        let frame = self.heap_alloc(mem, CONTEXT_SIZE);
+        let disp = self.heap_alloc(mem, DISPATCHER_CONTEXT_SIZE);
         if [record, orig, work, frame, disp].contains(&0) {
             return None;
         }

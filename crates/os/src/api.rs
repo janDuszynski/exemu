@@ -1187,12 +1187,12 @@ impl WinOs {
             Api::GetProcessHeap => ret(HANDLE_PROCESS_HEAP),
             Api::HeapAlloc => {
                 let size = self.arg(cpu, mem, 2)?;
-                ret(self.heap_alloc(size))
+                ret(self.heap_alloc(mem, size))
             }
             Api::HeapReAlloc => {
                 let old = self.arg(cpu, mem, 2)?;
                 let new_size = self.arg(cpu, mem, 3)?;
-                let new = self.heap_alloc(new_size);
+                let new = self.heap_alloc(mem, new_size);
                 if new != 0 && old != 0 {
                     let old_size = self.heap_sizes.get(&old).copied().unwrap_or(new_size);
                     let copy_len = old_size.min(new_size);
@@ -1342,9 +1342,10 @@ impl WinOs {
             }
             Api::UnhandledExceptionFilter => ret(1),
 
-            Api::GetLastError => ret(self.last_error as u64),
+            Api::GetLastError => ret(self.get_last_error(mem) as u64),
             Api::SetLastError => {
-                self.last_error = self.arg(cpu, mem, 0)? as u32;
+                let code = self.arg(cpu, mem, 0)? as u32;
+                self.set_last_error(mem, code);
                 Ok(Outcome::Return(0))
             }
 
@@ -1409,7 +1410,7 @@ impl WinOs {
             Api::GetEnvironmentStrings { wide } => {
                 if *wide {
                     let units = self.env_block_utf16();
-                    let ptr = self.heap_alloc(units.len() as u64 * 2);
+                    let ptr = self.heap_alloc(mem, units.len() as u64 * 2);
                     if ptr != 0 {
                         for (i, u) in units.iter().enumerate() {
                             mem.write_u16(ptr + i as u64 * 2, *u)?;
@@ -1418,7 +1419,7 @@ impl WinOs {
                     ret(ptr)
                 } else {
                     let bytes = self.env_block_ansi();
-                    let ptr = self.heap_alloc(bytes.len() as u64);
+                    let ptr = self.heap_alloc(mem, bytes.len() as u64);
                     if ptr != 0 {
                         mem.write(ptr, &bytes)?;
                     }
@@ -1433,7 +1434,7 @@ impl WinOs {
                 let name = if *wide { read_wstr(mem, name_ptr)? } else { read_astr(mem, name_ptr)? };
                 match self.env_get(&name).map(str::to_owned) {
                     None => {
-                        self.last_error = 203;
+                        self.set_last_error(mem, 203);
                         ret(0)
                     }
                     Some(value) => {
@@ -1529,7 +1530,7 @@ impl WinOs {
                     return ret(bytes.len() as u64);
                 }
                 if bytes.len() > cb as usize {
-                    self.last_error = 122;
+                    self.set_last_error(mem, 122);
                     return ret(0);
                 }
                 mem.write(mbstr, &bytes)?;
@@ -1558,7 +1559,7 @@ impl WinOs {
                     return ret(units.len() as u64);
                 }
                 if units.len() > cch as usize {
-                    self.last_error = 122;
+                    self.set_last_error(mem, 122);
                     return ret(0);
                 }
                 for (i, u) in units.iter().enumerate() {
@@ -1610,7 +1611,7 @@ impl WinOs {
             }
             Api::TlsGetValue { fiber } => {
                 let index = self.arg(cpu, mem, 0)?;
-                self.last_error = 0;
+                self.set_last_error(mem, 0);
                 ret(self.tls_get(*fiber, index))
             }
             Api::TlsFree { fiber } => {
@@ -1620,17 +1621,17 @@ impl WinOs {
 
             Api::Malloc => {
                 let size = self.arg(cpu, mem, 0)?;
-                ret(self.heap_alloc(size))
+                ret(self.heap_alloc(mem, size))
             }
             Api::Calloc => {
                 let num = self.arg(cpu, mem, 0)?;
                 let size = self.arg(cpu, mem, 1)?;
-                ret(self.heap_alloc(num.saturating_mul(size)))
+                ret(self.heap_alloc(mem, num.saturating_mul(size)))
             }
             Api::Realloc => {
                 let old = self.arg(cpu, mem, 0)?;
                 let size = self.arg(cpu, mem, 1)?;
-                let new = self.heap_alloc(size);
+                let new = self.heap_alloc(mem, size);
                 if new != 0 && old != 0 {
                     for i in 0..size {
                         let b = mem.read_u8(old + i)?;
@@ -1686,7 +1687,7 @@ impl WinOs {
                 let argc_ptr = self.arg(cpu, mem, 0)?;
                 let argv_ptr = self.arg(cpu, mem, 1)?;
                 let env_ptr = self.arg(cpu, mem, 2)?;
-                let argv_arr = self.heap_alloc(16);
+                let argv_arr = self.heap_alloc(mem, 16);
                 if argv_arr != 0 {
                     mem.write_u64(argv_arr, self.cfg.cmdline_ptr_a)?;
                     mem.write_u64(argv_arr + 8, 0)?;
@@ -1698,7 +1699,7 @@ impl WinOs {
                     mem.write_u64(argv_ptr, argv_arr)?;
                 }
                 if env_ptr != 0 {
-                    let env_arr = self.heap_alloc(8);
+                    let env_arr = self.heap_alloc(mem, 8);
                     mem.write_u64(env_ptr, env_arr)?;
                 }
                 ret(0)
@@ -1939,7 +1940,7 @@ impl WinOs {
                 if !self.gdi.windows.contains_key(&hwnd) {
                     return ret(hwnd);
                 }
-                let cs = self.heap_alloc(80);
+                let cs = self.heap_alloc(mem, 80);
                 if cs != 0 {
                     mem.write_u64(cs, lp_param)?;
                 }
@@ -2303,7 +2304,7 @@ impl WinOs {
                 let name = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 let access = self.arg(cpu, mem, 1)?;
                 let disposition = self.arg(cpu, mem, 4)?;
-                ret(self.create_file(&name, access, disposition))
+                ret(self.create_file(mem, &name, access, disposition))
             }
             Api::ReadFileApi => {
                 let handle = self.arg(cpu, mem, 0)?;
@@ -2399,13 +2400,13 @@ impl WinOs {
             Api::MoveFile { wide, .. } => {
                 let src = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 let dst = read_path(mem, self.arg(cpu, mem, 1)?, *wide)?;
-                ret(self.move_file(&src, &dst) as u64)
+                ret(self.move_file(mem, &src, &dst) as u64)
             }
             Api::CopyFile { wide } => {
                 let src = read_path(mem, self.arg(cpu, mem, 0)?, *wide)?;
                 let dst = read_path(mem, self.arg(cpu, mem, 1)?, *wide)?;
                 let fail_if_exists = self.arg(cpu, mem, 2)? != 0;
-                ret(self.copy_file(&src, &dst, fail_if_exists) as u64)
+                ret(self.copy_file(mem, &src, &dst, fail_if_exists) as u64)
             }
             Api::SetFileTimeApi => ret(TRUE),
             Api::GetModuleFileNameW => {
@@ -2418,12 +2419,12 @@ impl WinOs {
 
             Api::GlobalAlloc => {
                 let size = self.arg(cpu, mem, 1)?;
-                ret(self.heap_alloc(size))
+                ret(self.heap_alloc(mem, size))
             }
             Api::GlobalReAlloc => {
                 let old = self.arg(cpu, mem, 0)?;
                 let size = self.arg(cpu, mem, 1)?;
-                let new = self.heap_alloc(size);
+                let new = self.heap_alloc(mem, size);
                 if new != 0 && old != 0 {
                     let mut tmp = vec![0u8; size as usize];
                     mem.read(old, &mut tmp)?;

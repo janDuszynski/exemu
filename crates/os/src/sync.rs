@@ -89,10 +89,10 @@ impl WinOs {
         }
     }
 
-    pub(crate) fn make_object(&mut self, kind: SyncKind, name: Option<String>, manual: bool, signaled: bool, count: i32, max: i32) -> u64 {
+    pub(crate) fn make_object(&mut self, mem: &mut dyn Memory, kind: SyncKind, name: Option<String>, manual: bool, signaled: bool, (count, max): (i32, i32)) -> u64 {
         if let Some(n) = &name {
             if let Some(&h) = self.named_kobjects.get(n) {
-                self.set_last_error(183);
+                self.set_last_error(mem, 183);
                 return h;
             }
         }
@@ -126,50 +126,50 @@ impl WinOs {
     }
 
     pub(crate) fn create_sync(&mut self, cpu: &mut CpuState, mem: &mut dyn Memory, kind: SyncKind, ex: bool, wide: bool) -> Result<Outcome> {
-        self.set_last_error(0);
+        self.set_last_error(mem, 0);
         let h = match (kind, ex) {
             (SyncKind::Event, false) => {
                 let manual = self.arg(cpu, mem, 1)? != 0;
                 let initial = self.arg(cpu, mem, 2)? != 0;
                 let name = self.read_name(mem, self.arg(cpu, mem, 3)?, wide)?;
-                self.make_object(kind, name, manual, initial, 0, 0)
+                self.make_object(mem, kind, name, manual, initial, (0, 0))
             }
             (SyncKind::Event, true) => {
                 let name = self.read_name(mem, self.arg(cpu, mem, 1)?, wide)?;
                 let flags = self.arg(cpu, mem, 2)?;
-                self.make_object(kind, name, flags & 1 != 0, flags & 2 != 0, 0, 0)
+                self.make_object(mem, kind, name, flags & 1 != 0, flags & 2 != 0, (0, 0))
             }
             (SyncKind::Mutex, false) => {
                 let owned = self.arg(cpu, mem, 1)? != 0;
                 let name = self.read_name(mem, self.arg(cpu, mem, 2)?, wide)?;
-                self.make_object(kind, name, false, owned, 0, 0)
+                self.make_object(mem, kind, name, false, owned, (0, 0))
             }
             (SyncKind::Mutex, true) => {
                 let name = self.read_name(mem, self.arg(cpu, mem, 1)?, wide)?;
                 let flags = self.arg(cpu, mem, 2)?;
-                self.make_object(kind, name, false, flags & 1 != 0, 0, 0)
+                self.make_object(mem, kind, name, false, flags & 1 != 0, (0, 0))
             }
             (SyncKind::Semaphore, false) => {
                 let init = self.arg(cpu, mem, 1)? as i32;
                 let max = self.arg(cpu, mem, 2)? as i32;
                 let name = self.read_name(mem, self.arg(cpu, mem, 3)?, wide)?;
-                self.make_object(kind, name, false, false, init, max)
+                self.make_object(mem, kind, name, false, false, (init, max))
             }
             (SyncKind::Semaphore, true) => {
                 let init = self.arg(cpu, mem, 1)? as i32;
                 let max = self.arg(cpu, mem, 2)? as i32;
                 let name = self.read_name(mem, self.arg(cpu, mem, 3)?, wide)?;
-                self.make_object(kind, name, false, false, init, max)
+                self.make_object(mem, kind, name, false, false, (init, max))
             }
             (SyncKind::Timer, false) => {
                 let manual = self.arg(cpu, mem, 1)? != 0;
                 let name = self.read_name(mem, self.arg(cpu, mem, 2)?, wide)?;
-                self.make_object(kind, name, manual, false, 0, 0)
+                self.make_object(mem, kind, name, manual, false, (0, 0))
             }
             (SyncKind::Timer, true) => {
                 let name = self.read_name(mem, self.arg(cpu, mem, 1)?, wide)?;
                 let flags = self.arg(cpu, mem, 2)?;
-                self.make_object(kind, name, flags & 2 != 0, false, 0, 0)
+                self.make_object(mem, kind, name, flags & 2 != 0, false, (0, 0))
             }
         };
         Ok(Outcome::Return(h))
@@ -180,7 +180,7 @@ impl WinOs {
         match name.and_then(|n| self.named_kobjects.get(&n).copied()) {
             Some(h) => Ok(Outcome::Return(h)),
             None => {
-                self.set_last_error(2);
+                self.set_last_error(mem, 2);
                 Ok(Outcome::Return(0))
             }
         }
@@ -339,7 +339,7 @@ impl WinOs {
         }
         let manual = event_type == NOTIFICATION_EVENT;
         let name = self.nt_object_attr_name(mem, objattr)?;
-        let handle = self.make_object(SyncKind::Event, name, manual, initial, 0, 0);
+        let handle = self.make_object(mem, SyncKind::Event, name, manual, initial, (0, 0));
         self.write_ptr(mem, handle_out, handle)?;
         Ok(NT_STATUS_SUCCESS)
     }
@@ -390,7 +390,7 @@ impl WinOs {
             return Ok(STATUS_INVALID_PARAMETER);
         }
         let name = self.nt_object_attr_name(mem, objattr)?;
-        let handle = self.make_object(SyncKind::Mutex, name, false, initial_owner, 0, 0);
+        let handle = self.make_object(mem, SyncKind::Mutex, name, false, initial_owner, (0, 0));
         self.write_ptr(mem, handle_out, handle)?;
         Ok(NT_STATUS_SUCCESS)
     }
@@ -407,7 +407,7 @@ impl WinOs {
             return Ok(STATUS_INVALID_PARAMETER);
         }
         let name = self.nt_object_attr_name(mem, objattr)?;
-        let handle = self.make_object(SyncKind::Semaphore, name, false, false, initial, max);
+        let handle = self.make_object(mem, SyncKind::Semaphore, name, false, false, (initial, max));
         self.write_ptr(mem, handle_out, handle)?;
         Ok(NT_STATUS_SUCCESS)
     }

@@ -125,11 +125,11 @@ impl WinOs {
 
         if addr_req == 0 {
             let Some(base) = self.vm_find_free_below(mem, size, max_addr) else {
-                self.last_error = 8;
+                self.set_last_error(mem, 8);
                 return Ok(0);
             };
             if mem.map_fixed(base, size, Perm::RWX, "valloc").is_err() {
-                self.last_error = 8;
+                self.set_last_error(mem, 8);
                 return Ok(0);
             }
             self.vm_insert(VmAlloc { base, size, protect, committed, mtype: MEM_PRIVATE });

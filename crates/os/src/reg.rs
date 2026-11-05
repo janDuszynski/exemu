@@ -299,7 +299,7 @@ impl WinOs {
         let phk_result = self.arg(cpu, mem, 7)?;
         let lpdw_disp = self.arg(cpu, mem, 8)?;
         let Some(path) = self.reg_join(hkey, &subkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         let existed = self.reg_hive.contains_key(&path);
@@ -320,11 +320,11 @@ impl WinOs {
         let subkey = read_path(mem, self.arg(cpu, mem, 1)?, wide)?;
         let phk_result = self.arg(cpu, mem, 4)?;
         let Some(path) = self.reg_join(hkey, &subkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         if !self.reg_key_exists(&path) {
-            self.last_error = ERROR_FILE_NOT_FOUND as u32;
+            self.set_last_error(mem, ERROR_FILE_NOT_FOUND as u32);
             return Ok(Outcome::Return(ERROR_FILE_NOT_FOUND));
         }
         let handle = self.alloc_khandle();
@@ -342,7 +342,7 @@ impl WinOs {
         let lp_data = self.arg(cpu, mem, 4)?;
         let cb_data = self.arg(cpu, mem, 5)? as usize;
         let Some(path) = self.reg_path_of(hkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         let mut data = vec![0u8; cb_data];
@@ -360,11 +360,11 @@ impl WinOs {
         let lp_data = self.arg(cpu, mem, 4)?;
         let lpcb_data = self.arg(cpu, mem, 5)?;
         let Some(path) = self.reg_path_of(hkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         let Some((_, ty, data)) = self.reg_value(&path, &name) else {
-            self.last_error = ERROR_FILE_NOT_FOUND as u32;
+            self.set_last_error(mem, ERROR_FILE_NOT_FOUND as u32);
             return Ok(Outcome::Return(ERROR_FILE_NOT_FOUND));
         };
         if lp_type != 0 {
@@ -398,13 +398,13 @@ impl WinOs {
         let hkey = self.arg(cpu, mem, 0)?;
         let name = read_path(mem, self.arg(cpu, mem, 1)?, wide)?;
         let Some(path) = self.reg_path_of(hkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         if self.reg_value_remove(&path, &name) {
             Ok(Outcome::Return(ERROR_SUCCESS))
         } else {
-            self.last_error = ERROR_FILE_NOT_FOUND as u32;
+            self.set_last_error(mem, ERROR_FILE_NOT_FOUND as u32);
             Ok(Outcome::Return(ERROR_FILE_NOT_FOUND))
         }
     }
@@ -413,7 +413,7 @@ impl WinOs {
         let hkey = self.arg(cpu, mem, 0)?;
         let subkey = read_path(mem, self.arg(cpu, mem, 1)?, wide)?;
         let Some(path) = self.reg_join(hkey, &subkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         let descendants = format!("{path}\\");
@@ -428,7 +428,7 @@ impl WinOs {
         let cch_ptr = self.arg(cpu, mem, 3)?;
         let ft_ptr = self.arg(cpu, mem, 7)?;
         let Some(base) = self.reg_path_of(hkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         let subs = self.subkeys(&base);
@@ -451,7 +451,7 @@ impl WinOs {
         let data_ptr = self.arg(cpu, mem, 6)?;
         let cb_ptr = self.arg(cpu, mem, 7)?;
         let Some(path) = self.reg_path_of(hkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         let mut items: Vec<(String, u32, Vec<u8>)> = match self.reg_hive.get(&path) {
@@ -494,7 +494,7 @@ impl WinOs {
         let c_max_vlen = self.arg(cpu, mem, 9)?;
         let ft_ptr = self.arg(cpu, mem, 11)?;
         let Some(base) = self.reg_path_of(hkey) else {
-            self.last_error = ERROR_INVALID_HANDLE as u32;
+            self.set_last_error(mem, ERROR_INVALID_HANDLE as u32);
             return Ok(Outcome::Return(ERROR_INVALID_HANDLE));
         };
         let subs = self.subkeys(&base);

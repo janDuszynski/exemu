@@ -306,7 +306,7 @@ impl WinOs {
     ) -> Result<Option<(u64, u32)>> {
         let stack_size = align_up(req_stack.max(THREAD_STACK_SIZE), 0x1000);
         let Some(stack_base) = self.map_anywhere(mem, stack_size, Perm::RWX, "thread-stack") else {
-            self.last_error = 8;
+            self.set_last_error(mem, 8);
             return Ok(None);
         };
         let stack_top = stack_base + stack_size;
@@ -316,7 +316,7 @@ impl WinOs {
 
         let Some(teb_base) = self.new_thread_teb(mem, tid, stack_base, stack_top) else {
             let _ = mem.unmap(stack_base, stack_size);
-            self.last_error = 8;
+            self.set_last_error(mem, 8);
             return Ok(None);
         };
 
@@ -396,18 +396,18 @@ impl WinOs {
         };
         let stack32_size = align_up(req_stack.max(THREAD_STACK_SIZE), 0x1000);
         let Some(stack32) = self.map_anywhere_low(mem, stack32_size, Perm::RW, "wow64-thread-stack32") else {
-            self.last_error = 8;
+            self.set_last_error(mem, 8);
             return Ok(None);
         };
         let Some(stack64) = self.map_anywhere(mem, THREAD_STACK_SIZE, Perm::RWX, "wow64-thread-stack64") else {
             let _ = mem.unmap(stack32, stack32_size);
-            self.last_error = 8;
+            self.set_last_error(mem, 8);
             return Ok(None);
         };
         let Some(block) = self.map_anywhere_low(mem, WOW64_THREAD_BLOCK, Perm::RW, "wow64-thread-teb") else {
             let _ = mem.unmap(stack32, stack32_size);
             let _ = mem.unmap(stack64, THREAD_STACK_SIZE);
-            self.last_error = 8;
+            self.set_last_error(mem, 8);
             return Ok(None);
         };
         let (teb64, teb32, area) = (block, block + THREAD_TEB_SIZE, block + WOW64_THREAD_CPU_AREA);

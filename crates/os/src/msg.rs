@@ -86,7 +86,7 @@ impl WinOs {
         let wparam = self.arg(cpu, mem, 2)?;
         let lparam = self.arg(cpu, mem, 3)?;
         let Some(idx) = self.threads.iter().position(|t| t.tid == tid) else {
-            self.set_last_error(1444);
+            self.set_last_error(mem, 1444);
             return Ok(Outcome::Return(0));
         };
         self.enqueue(idx, PostedMsg { hwnd: 0, message, wparam, lparam });
