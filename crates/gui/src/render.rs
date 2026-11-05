@@ -18,6 +18,13 @@ const C_DKBORDER: u32 = 0x0050_5050;
 const C_PROGRESS: u32 = 0x0006_B025;
 
 const HIT_PAD: usize = 5;
+const GLYPH: usize = 8;
+const CHECK_BOX: usize = 12;
+const CHECK_TEXT_INDENT: usize = 16;
+const EDIT_TEXT_INDENT: usize = 3;
+const DIALOG_WIDTH_RANGE: (usize, usize) = (240, 1200);
+const DIALOG_HEIGHT_RANGE: (usize, usize) = (120, 900);
+const PERCENT_MAX: u32 = 100;
 
 #[derive(Clone)]
 pub struct Rect {
@@ -44,7 +51,10 @@ impl Renderer {
     pub fn size_for(tpl: &DialogTemplate) -> (usize, usize) {
         let w = (PAD * 2) + (tpl.cx as f32 * SX) as usize;
         let h = (PAD * 2) + (tpl.cy as f32 * SY) as usize;
-        (w.clamp(240, 1200), h.clamp(120, 900))
+        (
+            w.clamp(DIALOG_WIDTH_RANGE.0, DIALOG_WIDTH_RANGE.1),
+            h.clamp(DIALOG_HEIGHT_RANGE.0, DIALOG_HEIGHT_RANGE.1),
+        )
     }
 
     pub fn new(w: usize, h: usize) -> Self {
@@ -85,7 +95,7 @@ impl Renderer {
     fn glyph(&mut self, ch: char, x: usize, y: usize, c: u32) {
         if let Some(rows) = font8x8::BASIC_FONTS.get(ch) {
             for (ry, bits) in rows.iter().enumerate() {
-                for rx in 0..8 {
+                for rx in 0..GLYPH {
                     if bits & (1 << rx) != 0 {
                         self.px(x + rx, y + ry, c);
                     }
@@ -96,17 +106,17 @@ impl Renderer {
     fn text(&mut self, s: &str, x: usize, y: usize, c: u32) {
         let mut cx = x;
         for ch in s.chars() {
-            if cx + 8 > self.w {
+            if cx + GLYPH > self.w {
                 break;
             }
             self.glyph(ch, cx, y, c);
-            cx += 8;
+            cx += GLYPH;
         }
     }
     fn text_centered(&mut self, s: &str, r: &Rect, c: u32) {
-        let tw = s.chars().count() * 8;
+        let tw = s.chars().count() * GLYPH;
         let tx = r.x + r.w.saturating_sub(tw) / 2;
-        let ty = r.y + r.h.saturating_sub(8) / 2;
+        let ty = r.y + r.h.saturating_sub(GLYPH) / 2;
         self.text(s, tx, ty, c);
     }
 
@@ -135,7 +145,7 @@ impl Renderer {
                 ControlKind::Edit => {
                     self.fill(&r, C_WHITE);
                     self.frame(&r, C_BORDER);
-                    self.text(&text, r.x + 3, r.y + r.h.saturating_sub(8) / 2, C_TEXT);
+                    self.text(&text, r.x + EDIT_TEXT_INDENT, r.y + r.h.saturating_sub(GLYPH) / 2, C_TEXT);
                 }
                 ControlKind::Button { default } => {
                     self.fill(&r, if off { C_BTN_DIS } else { C_BTN });
@@ -150,10 +160,10 @@ impl Renderer {
                     }
                 }
                 ControlKind::Check => {
-                    let box_r = Rect { x: r.x, y: r.y + r.h.saturating_sub(12) / 2, w: 12, h: 12 };
+                    let box_r = Rect { x: r.x, y: r.y + r.h.saturating_sub(CHECK_BOX) / 2, w: CHECK_BOX, h: CHECK_BOX };
                     self.fill(&box_r, C_WHITE);
                     self.frame(&box_r, C_BORDER);
-                    self.text(&text, r.x + 16, r.y + r.h.saturating_sub(8) / 2, if off { C_GRAY_TEXT } else { C_TEXT });
+                    self.text(&text, r.x + CHECK_TEXT_INDENT, r.y + r.h.saturating_sub(GLYPH) / 2, if off { C_GRAY_TEXT } else { C_TEXT });
                     if !off {
                         push_hit(&mut self.hits, ctl.id, &r);
                     }
@@ -162,7 +172,7 @@ impl Renderer {
                     self.fill(&r, C_WHITE);
                     self.frame(&r, C_BORDER);
                     if let Ok(p) = text.trim_end_matches('%').parse::<u32>() {
-                        let fw = r.w.saturating_sub(2) * (p.min(100) as usize) / 100;
+                        let fw = r.w.saturating_sub(2) * (p.min(PERCENT_MAX) as usize) / PERCENT_MAX as usize;
                         let bar = Rect { x: r.x + 1, y: r.y + 1, w: fw, h: r.h.saturating_sub(2) };
                         self.fill(&bar, C_PROGRESS);
                     }
