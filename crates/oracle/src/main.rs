@@ -83,6 +83,11 @@ fn jit_main(argv: &[String]) {
         i += 1;
     }
 
+    if cut && laps < 2 {
+        eprintln!("--cut needs --laps 2 or more: a single lap is never cut");
+        std::process::exit(2);
+    }
+
     let mut total_div = 0u64;
     for bits in bits_list {
         let name = match bits {

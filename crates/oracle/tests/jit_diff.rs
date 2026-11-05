@@ -89,10 +89,21 @@ fn run_debug(
     match debug {
         DebugMix::Watch => {
             assert_eq!(s.armed_tlb_fills, 0, "an entry was cached while a watchpoint was armed");
+            assert!(
+                s.watch_stops > s.debug_split / 2,
+                "only {} accesses refused in {} trials that reached a watchpoint",
+                s.watch_stops,
+                s.debug_split
+            );
         }
         DebugMix::Break => {
             assert!(s.armed_tlb_fills > 0, "arming a breakpoint disabled the guest-memory TLB");
-            assert!(s.breakpoint_stops > 0, "no chain ever stopped at an armed address");
+            assert!(
+                s.breakpoint_stops > s.debug_split / 2,
+                "only {} chains stopped at an armed address in {} trials that reached one",
+                s.breakpoint_stops,
+                s.debug_split
+            );
         }
         DebugMix::Off => {}
     }
