@@ -70,6 +70,7 @@ impl Rig {
                 props: Vec::new(),
                 dialog_info: 0,
                 dialog_cancelled: false,
+                menu_bar: 0,
             },
         ));
         hwnd

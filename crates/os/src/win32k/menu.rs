@@ -3,6 +3,10 @@ use exemu_core::{CpuState, Memory, Result};
 use super::{alloc_handle, WS_CHILD};
 use crate::WinOs;
 
+mod layout;
+
+pub(super) use layout::menu_height;
+
 const NT_USER_CREATE_MENU: u32 = 0x1366;
 const NT_USER_CREATE_POPUP_MENU: u32 = 0x1368;
 const NT_USER_DESTROY_MENU: u32 = 0x1382;
@@ -607,6 +611,11 @@ pub(super) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_DRAW_MENU_BAR, nt_user_draw_menu_bar);
     os.set_win32k_handler(NT_USER_THUNKED_MENU_INFO, nt_user_thunked_menu_info);
     os.set_win32k_handler(NT_USER_THUNKED_MENU_ITEM_INFO, nt_user_thunked_menu_item_info);
+    layout::register(os);
+}
+
+pub(super) fn relayout_window(os: &mut WinOs, hwnd: u32) {
+    layout::relayout_window(os, hwnd);
 }
 
 fn nt_user_create_menu(os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn Memory) -> Result<u32> {
@@ -623,21 +632,27 @@ fn nt_user_create_popup_menu(os: &mut WinOs, _cpu: &mut CpuState, _mem: &mut dyn
 
 fn nt_user_destroy_menu(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let handle = os.syscall_arg(cpu, mem, 0)? as u32;
-    Ok(bool_u32(os.win32k_state.menus.destroy(handle)))
+    let done = os.win32k_state.menus.destroy(handle);
+    layout::relayout_all(os);
+    Ok(bool_u32(done))
 }
 
 fn nt_user_delete_menu(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let handle = os.syscall_arg(cpu, mem, 0)? as u32;
     let id = os.syscall_arg(cpu, mem, 1)? as u32;
     let flags = os.syscall_arg(cpu, mem, 2)? as u32;
-    Ok(bool_u32(os.win32k_state.menus.remove_item(handle, id, flags, true)))
+    let done = os.win32k_state.menus.remove_item(handle, id, flags, true);
+    layout::relayout_all(os);
+    Ok(bool_u32(done))
 }
 
 fn nt_user_remove_menu(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let handle = os.syscall_arg(cpu, mem, 0)? as u32;
     let id = os.syscall_arg(cpu, mem, 1)? as u32;
     let flags = os.syscall_arg(cpu, mem, 2)? as u32;
-    Ok(bool_u32(os.win32k_state.menus.remove_item(handle, id, flags, false)))
+    let done = os.win32k_state.menus.remove_item(handle, id, flags, false);
+    layout::relayout_all(os);
+    Ok(bool_u32(done))
 }
 
 pub(super) fn attach(os: &mut WinOs, hwnd: u32, menu: u32) -> bool {
@@ -649,6 +664,7 @@ pub(super) fn attach(os: &mut WinOs, hwnd: u32, menu: u32) -> bool {
         return false;
     }
     window.id = u64::from(menu);
+    layout::relayout_window(os, hwnd);
     true
 }
 
@@ -674,6 +690,7 @@ fn nt_user_enable_menu_item(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
 
 fn nt_user_draw_menu_bar(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hwnd = os.syscall_arg(cpu, mem, 0)? as u32;
+    layout::relayout_window(os, hwnd);
     Ok(bool_u32(os.win32k_state.window(hwnd).is_some()))
 }
 
@@ -692,7 +709,9 @@ fn nt_user_thunked_menu_item_info(
         method::ITEM_ID | method::STATE | method::DEFAULT_ITEM => NO_ITEM,
         _ => 0,
     };
-    guarded(thunked_menu_item_info(os, mem, [handle, pos, flags], which, info, text), failure)
+    let result = guarded(thunked_menu_item_info(os, mem, [handle, pos, flags], which, info, text), failure);
+    layout::relayout_all(os);
+    result
 }
 
 fn thunked_menu_item_info(

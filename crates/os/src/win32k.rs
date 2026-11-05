@@ -580,6 +580,7 @@ struct Window {
     props: Vec<(String, u64)>,
     dialog_info: u64,
     dialog_cancelled: bool,
+    menu_bar: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -1390,8 +1391,11 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
             props: Vec::new(),
             dialog_info: 0,
             dialog_cancelled: false,
+            menu_bar: 0,
         },
     ));
+
+    menu::relayout_window(os, hwnd);
 
     let params = WindowParams {
         class_atom,
@@ -1574,6 +1578,7 @@ fn nt_user_set_window_pos(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memo
         None => None,
     };
     if let Some(rect) = rect {
+        menu::relayout_window(os, hwnd);
         os.driver.window_pos_changing(hwnd);
         os.driver.window_pos_changed(hwnd, rect);
         Ok(1)
@@ -1779,6 +1784,7 @@ fn system_metric(index: u32) -> u32 {
     const SM_CYSCREEN: u32 = 1;
     const SM_CXBORDER: u32 = 5;
     const SM_CYBORDER: u32 = 6;
+    const SM_CYMENU: u32 = 15;
     const SM_CXICON: u32 = 11;
     const SM_CYICON: u32 = 12;
     const SM_CXCURSOR: u32 = 13;
@@ -1791,6 +1797,7 @@ fn system_metric(index: u32) -> u32 {
         SM_CXSCREEN => 1920,
         SM_CYSCREEN => 1080,
         SM_CXBORDER | SM_CYBORDER => 1,
+        SM_CYMENU => menu::menu_height(),
         SM_CXICON | SM_CYICON | SM_CXCURSOR | SM_CYCURSOR => 32,
         SM_CXEDGE | SM_CYEDGE => 2,
         SM_CXSMICON | SM_CYSMICON => 16,
@@ -2032,7 +2039,7 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
                 let (ox, oy) = os.win32k_state.client_origin(hwnd);
                 let screen = os.win32k_state.window(owner).map(|w| (w.rect[0], w.rect[1])).unwrap_or((0, 0));
                 let (x, y) = (screen.0 + ox, screen.1 + oy);
-                [x, y, x + cx as i32, y + cy as i32]
+                [x, y, x + cx as i32, y + cy as i32 + w.menu_bar]
             };
             let out = mem.read_u64(param + CALL_RECT_PARAM_RECT)?;
             if out == 0 {
@@ -2178,7 +2185,7 @@ fn nt_user_internal_get_window_text(
 
 fn client_size(w: &Window) -> (u32, u32) {
     let cx = w.rect[2].max(1) as u32;
-    let cy = w.rect[3].max(1) as u32;
+    let cy = w.rect[3].saturating_sub(w.menu_bar).max(1) as u32;
     (cx, cy)
 }
 
@@ -4484,6 +4491,7 @@ mod tests {
                 props: Vec::new(),
                 dialog_info: 0,
                 dialog_cancelled: false,
+                menu_bar: 0,
             },
         ));
         hwnd
@@ -5173,6 +5181,7 @@ mod tests {
                 props: Vec::new(),
                 dialog_info: 0,
                 dialog_cancelled: false,
+                menu_bar: 0,
             },
         ));
         let mut mem = VirtualMemory::new();
