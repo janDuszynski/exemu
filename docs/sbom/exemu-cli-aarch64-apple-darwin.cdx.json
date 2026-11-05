@@ -955,9 +955,7 @@
         "pkg:cargo/exemu-app@0.0.4",
         "pkg:cargo/exemu-audio@0.0.4",
         "pkg:cargo/exemu-core@0.0.4",
-        "pkg:cargo/exemu-cpu@0.0.4",
-        "pkg:cargo/exemu-gui@0.0.4",
-        "pkg:cargo/exemu-loader@0.0.4"
+        "pkg:cargo/exemu-gui@0.0.4"
       ]
     },
     {
