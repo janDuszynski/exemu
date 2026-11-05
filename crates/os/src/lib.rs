@@ -10,6 +10,7 @@ mod exc;
 pub mod folders;
 mod fs;
 mod gdi;
+mod gdi_draw;
 mod msg;
 pub mod net;
 mod nls;
