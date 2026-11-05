@@ -132,6 +132,7 @@ impl WinOs {
             ("ws2_32.dll", false) => crate::net::ws2_32_unixlib(),
             ("ws2_32.dll", true) => crate::net::ws2_32_wow64_unixlib(),
             (crate::crypt32::CRYPT32_MODULE, false) => crate::crypt32::crypt32_unixlib(),
+            (crate::crypt32::CRYPT32_MODULE, true) => crate::crypt32::crypt32_wow64_unixlib(),
             (crate::audio::DRIVER_MODULE, false) => crate::audio::coreaudio_unixlib(),
             _ => return None,
         };

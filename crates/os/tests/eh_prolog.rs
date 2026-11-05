@@ -60,6 +60,45 @@ fn eh_prolog_builds_seh_frame() {
     assert_eq!(cpu.gpr_read(Reg::Rax as u8, 4), SCOPETABLE as u64, "eax preserved");
 }
 
+const SECOND_TEB: u64 = 0x7EF9_0000;
+const SECOND_OLD_HEAD: u32 = 0xCAFE_F00D;
+
+fn run_prolog_on(os: &mut WinOs, mem: &mut VirtualMemory, cpu: &mut CpuState) {
+    cpu.set_rsp(S);
+    cpu.gpr_write(Reg::Rax as u8, 4, SCOPETABLE as u64);
+    cpu.gpr_write(Reg::Rbp as u8, 4, CALLER_EBP as u64);
+    mem.write_u32(S, RETADDR).unwrap();
+    let thunk = os.resolve_import("msvcrt.dll", &ImportSymbol::Named("_EH_prolog".into()));
+    cpu.rip = thunk;
+    assert_eq!(os.intercept(thunk, cpu, mem).unwrap(), Some(Exit::Continue));
+}
+
+#[test]
+fn eh_prolog_links_into_the_current_threads_teb() {
+    let (mut os, mut mem) = setup();
+    mem.map(Region::new("teb2", SECOND_TEB, 0x1000, Perm::RW)).unwrap();
+    mem.write_u32(FS_BASE_32, OLD_HEAD).unwrap();
+    mem.write_u32(SECOND_TEB, SECOND_OLD_HEAD).unwrap();
+    let mut cpu = CpuState::new();
+    cpu.fs_base = SECOND_TEB;
+    run_prolog_on(&mut os, &mut mem, &mut cpu);
+
+    assert_eq!(mem.read_u32(SECOND_TEB).unwrap() as u64, S - 12, "second teb fs:[0] linked");
+    assert_eq!(mem.read_u32(S - 12).unwrap(), SECOND_OLD_HEAD, "prev head from second teb");
+    assert_eq!(mem.read_u32(FS_BASE_32).unwrap(), OLD_HEAD, "default teb fs:[0] untouched");
+}
+
+#[test]
+fn eh_prolog_uses_only_the_low_32_bits_of_fs_base() {
+    let (mut os, mut mem) = setup();
+    mem.map(Region::new("teb2", SECOND_TEB, 0x1000, Perm::RW)).unwrap();
+    mem.write_u32(SECOND_TEB, SECOND_OLD_HEAD).unwrap();
+    let mut cpu = CpuState::new();
+    cpu.fs_base = SECOND_TEB | 0x1_0000_0000;
+    run_prolog_on(&mut os, &mut mem, &mut cpu);
+    assert_eq!(mem.read_u32(SECOND_TEB).unwrap() as u64, S - 12);
+}
+
 #[test]
 fn eh_prolog_frame_round_trips_via_inline_epilog() {
     let (mut os, mut mem) = setup();
