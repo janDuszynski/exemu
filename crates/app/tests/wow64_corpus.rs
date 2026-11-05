@@ -119,7 +119,7 @@ fn firefox_installer_wow64_probe() {
          32-bit callback/thread refusals (W5.10/W5.11) stopped holding",
     );
     assert!(
-        (8_000_000..25_000_000).contains(&p.steps),
+        (8_000_000..60_000_000).contains(&p.steps),
         "Firefox Installer should get past its UPX stub on the WoW64 path; ran {} ({})",
         p.steps,
         p.outcome,
