@@ -479,16 +479,25 @@ impl WinOs {
         if ptr == 0 {
             return Ok(NtTimeout::Infinite);
         }
-        Ok(if mem.read_u64(ptr)? == 0 { NtTimeout::Poll } else { NtTimeout::Finite })
+        let raw = mem.read_u64(ptr)? as i64;
+        Ok(if raw == 0 { NtTimeout::Poll } else { NtTimeout::Finite(crate::net::nt_relative_timeout(raw)) })
     }
 
     fn nt_wait(&mut self, cpu: &mut CpuState, handles: Vec<u64>, all: bool, timeout: NtTimeout) -> Result<u32> {
         let tid = self.current_tid;
+        self.refresh_socket_events();
         if self.nt_wait_satisfiable(&handles, all, tid) {
             return Ok(self.nt_wait_acquire(&handles, all, tid));
         }
         if timeout == NtTimeout::Poll {
             return Ok(STATUS_TIMEOUT);
+        }
+        let limit = match timeout {
+            NtTimeout::Finite(d) => d,
+            _ => crate::net::BLOCKING_WAIT_LIMIT,
+        };
+        if self.wait_for_socket_events(&handles, all, tid, limit) {
+            return Ok(self.nt_wait_acquire(&handles, all, tid));
         }
         self.rewind_syscall(cpu);
         let infinite = timeout == NtTimeout::Infinite;
@@ -603,7 +612,7 @@ pub(crate) const SSDT_NT_CREATE_SEMAPHORE: u32 = 0x83;
 enum NtTimeout {
     Infinite,
     Poll,
-    Finite,
+    Finite(std::time::Duration),
 }
 
 pub(crate) fn ssdt_nt_create_event(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {

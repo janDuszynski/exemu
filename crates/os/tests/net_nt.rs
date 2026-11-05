@@ -547,7 +547,7 @@ fn failure_statuses_are_the_ones_ws2_32_can_translate() {
     let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_START_LISTEN, IN_PTR, net::LISTEN_PARAMS_LEN as u64, 0, 0);
     assert_eq!(st, STATUS_INVALID_PARAMETER);
 
-    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_EVENT_SELECT, IN_PTR, 16, 0, 0);
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_ASYNC_SELECT, IN_PTR, 16, 0, 0);
     assert_eq!(st, STATUS_NOT_IMPLEMENTED);
 
     mem.write_u32(IN_PTR, 0).unwrap();
@@ -712,6 +712,164 @@ fn sio_keepalive_vals_arrives_as_the_wine_keepalive_ioctl_and_sets_the_options()
     mem.write(IN_PTR, &[0u8; 12]).unwrap();
     assert_eq!(ioctl(&mut os, &mut mem, sock, KEEPALIVE_VALS, IN_PTR, 12, 0, 0), STATUS_SUCCESS);
     assert_eq!(get_option(&mut os, &mut mem, sock, 0x0012_037c), (STATUS_SUCCESS, 0));
+}
+
+const NT_CREATE_EVENT: u32 = 0x48;
+const NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x04;
+const STATUS_TIMEOUT: u64 = 0x102;
+const STATUS_CANT_WAIT: u64 = 0xC000_00D0;
+const STATUS_INVALID_HANDLE_VALUE: u64 = 0xC000_0008;
+const WSAECONNREFUSED: u32 = 10061;
+const FD_READ_POLL: u32 = 0x1;
+const FD_CLOSE_POLL: u32 = 0x18;
+const AFD_POLL_WRITE: u32 = 0x4;
+const AFD_POLL_CONNECT: u32 = 0x40;
+const AFD_POLL_CONNECT_ERR: u32 = 0x100;
+const TIMEOUT_PTR: u64 = SCRATCH + 0xC00;
+const ENUM_OUT_LEN: u64 = 0x38;
+
+fn create_event(os: &mut WinOs, mem: &mut VirtualMemory) -> u64 {
+    let st = syscall(os, mem, NT_CREATE_EVENT, &[HANDLE_PTR, 0x1F0003, 0, 0, 0]);
+    assert_eq!(st, STATUS_SUCCESS);
+    mem.read_u64(HANDLE_PTR).unwrap()
+}
+
+fn wait_event(os: &mut WinOs, mem: &mut VirtualMemory, event: u64, relative_100ns: i64) -> u64 {
+    mem.write_u64(TIMEOUT_PTR, relative_100ns as u64).unwrap();
+    syscall(os, mem, NT_WAIT_FOR_SINGLE_OBJECT, &[event, 0, TIMEOUT_PTR])
+}
+
+fn event_select(os: &mut WinOs, mem: &mut VirtualMemory, sock: u64, event: u64, mask: u32) -> u64 {
+    mem.write_u64(IN_PTR, event).unwrap();
+    mem.write_u32(IN_PTR + 8, mask).unwrap();
+    mem.write_u32(IN_PTR + 12, 0).unwrap();
+    ioctl(os, mem, sock, net::IOCTL_AFD_EVENT_SELECT, IN_PTR, 0x10, 0, 0)
+}
+
+fn enum_events(os: &mut WinOs, mem: &mut VirtualMemory, sock: u64, event: u64) -> (u64, u32) {
+    let st = ioctl(os, mem, sock, net::IOCTL_AFD_ENUM_NETWORK_EVENTS, event, 0, OUT_PTR, ENUM_OUT_LEN);
+    (st, mem.read_u32(OUT_PTR).unwrap())
+}
+
+#[test]
+fn event_select_signals_the_event_when_bytes_arrive_and_enum_rearms_it_until_the_next_recv() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert_eq!(connect(&mut os, &mut mem, sock, addr), STATUS_SUCCESS);
+    let (mut peer, _) = listener.accept().unwrap();
+    let event = create_event(&mut os, &mut mem);
+
+    assert_eq!(event_select(&mut os, &mut mem, sock, event, FD_READ_POLL | FD_CLOSE_POLL), STATUS_SUCCESS);
+    assert_eq!(wait_event(&mut os, &mut mem, event, 0), STATUS_TIMEOUT, "nothing to read yet");
+
+    peer.write_all(b"ping").unwrap();
+    peer.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while wait_event(&mut os, &mut mem, event, 0) != STATUS_SUCCESS {
+        assert!(Instant::now() < deadline, "a zero-timeout wait never saw the bytes arrive");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    peer.write_all(b"!").unwrap();
+    assert_eq!(wait_event(&mut os, &mut mem, event, -50_000_000), STATUS_SUCCESS, "a signaled wait does not block");
+
+    assert_eq!(enum_events(&mut os, &mut mem, sock, event), (STATUS_SUCCESS, FD_READ_POLL));
+    assert_eq!(information(&mem), ENUM_OUT_LEN);
+    assert_eq!(wait_event(&mut os, &mut mem, event, 0), STATUS_TIMEOUT, "enum reset the event and read stays quiet until recv");
+
+    assert_eq!(recv_once(&mut os, &mut mem, sock), STATUS_SUCCESS);
+    peer.write_all(b"pong").unwrap();
+    peer.flush().unwrap();
+    assert_eq!(wait_event(&mut os, &mut mem, event, -50_000_000), STATUS_SUCCESS, "recv re-armed FD_READ");
+}
+
+#[test]
+fn event_select_reports_close_and_cancels_with_an_empty_mask() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert_eq!(connect(&mut os, &mut mem, sock, addr), STATUS_SUCCESS);
+    let (peer, _) = listener.accept().unwrap();
+    let event = create_event(&mut os, &mut mem);
+    assert_eq!(event_select(&mut os, &mut mem, sock, event, FD_CLOSE_POLL), STATUS_SUCCESS);
+    assert!(os_is_nonblocking_after_event_select(&mut os, &mut mem, sock));
+    drop(peer);
+    assert_eq!(wait_event(&mut os, &mut mem, event, -50_000_000), STATUS_SUCCESS);
+    let (st, flags) = enum_events(&mut os, &mut mem, sock, event);
+    assert_eq!(st, STATUS_SUCCESS);
+    assert_ne!(flags & FD_CLOSE_POLL, 0, "the peer's close surfaces as the close event");
+
+    assert_eq!(event_select(&mut os, &mut mem, sock, 0, 0), STATUS_SUCCESS);
+    assert_eq!(wait_event(&mut os, &mut mem, event, 0), STATUS_TIMEOUT);
+    assert_eq!(enum_events(&mut os, &mut mem, sock, 0), (STATUS_SUCCESS, 0));
+}
+
+fn os_is_nonblocking_after_event_select(os: &mut WinOs, mem: &mut VirtualMemory, sock: u64) -> bool {
+    recv_once(os, mem, sock) == STATUS_DEVICE_NOT_READY
+}
+
+#[test]
+fn event_select_rejects_an_event_that_is_not_an_event_and_enum_a_short_buffer() {
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert_eq!(event_select(&mut os, &mut mem, sock, 0xDEAD_0000, FD_READ_POLL), STATUS_INVALID_HANDLE_VALUE);
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_ENUM_NETWORK_EVENTS, 0, 0, OUT_PTR, 8);
+    assert_eq!(st, STATUS_BUFFER_TOO_SMALL);
+}
+
+#[test]
+fn a_nonblocking_connect_reports_cant_wait_then_completes_through_select_and_events() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    set_nonblocking(&mut os, &mut mem, sock, true);
+    let event = create_event(&mut os, &mut mem);
+    assert_eq!(event_select(&mut os, &mut mem, sock, event, 0x140), STATUS_SUCCESS);
+
+    assert_eq!(connect(&mut os, &mut mem, sock, addr), STATUS_CANT_WAIT, "WSAEWOULDBLOCK, the connection is in progress");
+    assert_eq!(wait_event(&mut os, &mut mem, event, -50_000_000), STATUS_SUCCESS, "FD_CONNECT fired");
+    assert_eq!(enum_events(&mut os, &mut mem, sock, event), (STATUS_SUCCESS, AFD_POLL_CONNECT));
+    assert_eq!(wait_event(&mut os, &mut mem, event, 0), STATUS_TIMEOUT, "connect reports once");
+    assert_eq!(get_option(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_GET_SO_ERROR), (STATUS_SUCCESS, 0));
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_GET_PEER_NAME, 0, 0, OUT_PTR, 16);
+    assert_eq!(st, STATUS_SUCCESS);
+    assert_eq!(read_sockaddr_in(&mem, OUT_PTR), (addr.port(), [127, 0, 0, 1]));
+    let (_peer, _) = listener.accept().unwrap();
+}
+
+#[test]
+fn a_refused_nonblocking_connect_surfaces_in_select_so_error_and_the_event() {
+    let closed = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    set_nonblocking(&mut os, &mut mem, sock, true);
+    let event = create_event(&mut os, &mut mem);
+    assert_eq!(event_select(&mut os, &mut mem, sock, event, 0x140), STATUS_SUCCESS);
+    assert_eq!(connect(&mut os, &mut mem, sock, closed), STATUS_CANT_WAIT);
+
+    mem.write_u64(IN_PTR, 0).unwrap();
+    mem.write_u32(IN_PTR + 8, 1).unwrap();
+    mem.write_u64(IN_PTR + 0x10, sock).unwrap();
+    mem.write_u32(IN_PTR + 0x18, AFD_POLL_WRITE | AFD_POLL_CONNECT_ERR).unwrap();
+    mem.write_u32(IN_PTR + 0x1c, 0).unwrap();
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_SELECT, IN_PTR, 0x20, IN_PTR, 0x20);
+    assert_eq!(st, STATUS_SUCCESS);
+    assert_eq!(mem.read_u32(IN_PTR + 8).unwrap(), 1);
+    assert_ne!(mem.read_u32(IN_PTR + 0x18).unwrap() & AFD_POLL_CONNECT_ERR, 0);
+    assert_eq!(mem.read_u32(IN_PTR + 0x1c).unwrap(), 0xC000_0236, "the poll entry carries the refusal status");
+
+    assert_eq!(get_option(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_GET_SO_ERROR), (STATUS_SUCCESS, WSAECONNREFUSED));
+    assert_eq!(get_option(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_GET_SO_ERROR), (STATUS_SUCCESS, 0), "SO_ERROR clears");
+
+    assert_eq!(wait_event(&mut os, &mut mem, event, -50_000_000), STATUS_SUCCESS);
+    assert_eq!(enum_events(&mut os, &mut mem, sock, event), (STATUS_SUCCESS, AFD_POLL_CONNECT_ERR));
+    assert_eq!(mem.read_u32(OUT_PTR + 4 + 8 * 4).unwrap(), 0xC000_0236);
 }
 
 #[test]

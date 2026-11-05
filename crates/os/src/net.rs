@@ -1,8 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
 
+mod events;
 mod opts;
 
+pub(crate) use events::nt_relative_timeout;
 pub use opts::*;
+
+use events::EventSelect;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
@@ -99,6 +103,7 @@ const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_PENDING: u32 = 0x0000_0103;
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
 const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
+const STATUS_CANT_WAIT: u32 = 0xC000_00D0;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -121,6 +126,13 @@ const SOCK_DGRAM: i32 = 2;
 
 const SOCKADDR_IN_LEN: usize = 16;
 const SOCKADDR_IN6_LEN: usize = 28;
+
+const WSAECONNREFUSED: u32 = 10061;
+const WSAECONNRESET: u32 = 10054;
+const WSAECONNABORTED: u32 = 10053;
+const WSAENETUNREACH: u32 = 10051;
+const WSAEHOSTUNREACH: u32 = 10065;
+const WSAETIMEDOUT: u32 = 10060;
 
 const SD_RECEIVE: u32 = 0;
 const SD_SEND: u32 = 1;
@@ -156,6 +168,11 @@ pub(crate) struct Socket {
     nonblocking: bool,
     opts: BTreeMap<u32, u32>,
     pending_error: u32,
+    event: Option<EventSelect>,
+    write_armed: bool,
+    connect_armed: bool,
+    connect_error: u32,
+    read_masked: u32,
 }
 
 impl Socket {
@@ -174,6 +191,11 @@ impl Socket {
             nonblocking: false,
             opts: BTreeMap::new(),
             pending_error: 0,
+            event: None,
+            write_armed: false,
+            connect_armed: false,
+            connect_error: STATUS_SUCCESS,
+            read_masked: 0,
         }
     }
 
@@ -213,6 +235,18 @@ fn status_for(e: &std::io::Error) -> u32 {
         ErrorKind::TimedOut => STATUS_IO_TIMEOUT,
         ErrorKind::PermissionDenied => STATUS_NETWORK_UNREACHABLE,
         _ => STATUS_HOST_UNREACHABLE,
+    }
+}
+
+fn wsa_error_for_status(status: u32) -> u32 {
+    match status {
+        STATUS_CONNECTION_REFUSED => WSAECONNREFUSED,
+        STATUS_CONNECTION_RESET => WSAECONNRESET,
+        STATUS_CONNECTION_ABORTED => WSAECONNABORTED,
+        STATUS_NETWORK_UNREACHABLE => WSAENETUNREACH,
+        STATUS_HOST_UNREACHABLE => WSAEHOSTUNREACH,
+        STATUS_IO_TIMEOUT => WSAETIMEDOUT,
+        _ => WSAEHOSTUNREACH,
     }
 }
 
@@ -482,6 +516,8 @@ impl WinOs {
             IOCTL_AFD_WINE_GET_SOCKET_INFO => self.afd_get_socket_info(mem, req)?,
             IOCTL_AFD_SELECT => self.afd_select(mem, req)?,
             IOCTL_AFD_WINE_OP_210 => OK,
+            IOCTL_AFD_EVENT_SELECT => self.afd_event_select(mem, req)?,
+            IOCTL_AFD_ENUM_NETWORK_EVENTS => self.afd_enum_network_events(mem, req)?,
             IOCTL_AFD_WINE_FIONBIO => self.afd_fionbio(mem, req)?,
             IOCTL_AFD_WINE_KEEPALIVE_VALS => self.afd_keepalive_vals(mem, req)?,
             code if is_option_ioctl(code) => self.afd_option(mem, req)?,
@@ -605,14 +641,28 @@ impl WinOs {
             (Endpoint::Unbound, _) => {}
         }
 
-        match TcpStream::connect_timeout(&addr, BLOCKING_WAIT_LIMIT) {
+        let outcome = TcpStream::connect_timeout(&addr, BLOCKING_WAIT_LIMIT);
+        let sock = self.socket_mut(req.handle);
+        let nonblocking = sock.nonblocking;
+        match outcome {
             Ok(s) => {
-                let _ = s.set_nodelay(tcp_nodelay_of(self.socket_mut(req.handle)));
+                let _ = s.set_nodelay(tcp_nodelay_of(sock));
                 let _ = s.set_nonblocking(true);
-                self.socket_mut(req.handle).ep = Endpoint::Stream(s);
-                Ok(OK)
+                sock.ep = Endpoint::Stream(s);
+                sock.connect_armed = true;
+                sock.connect_error = STATUS_SUCCESS;
+                Ok(if nonblocking { OpResult::Done(STATUS_CANT_WAIT, 0) } else { OK })
             }
-            Err(e) => Ok(OpResult::Done(status_for(&e), 0)),
+            Err(e) => {
+                let status = status_for(&e);
+                if nonblocking {
+                    sock.connect_armed = true;
+                    sock.connect_error = status;
+                    sock.pending_error = wsa_error_for_status(status);
+                    return Ok(OpResult::Done(STATUS_CANT_WAIT, 0));
+                }
+                Ok(OpResult::Done(status, 0))
+            }
         }
     }
 
@@ -621,6 +671,7 @@ impl WinOs {
             return Ok(OpResult::Done(STATUS_ACCESS_VIOLATION, 0));
         }
         let sock = self.socket_mut(req.handle);
+        sock.read_masked &= !events::RECV_REARMED;
         let stream = match sock.pending.pop_front() {
             Some(s) => s,
             None => {
@@ -664,6 +715,7 @@ impl WinOs {
         let cap: u64 = bufs.iter().map(|b| b.len).sum();
 
         let sock = self.socket_mut(req.handle);
+        sock.read_masked &= !events::RECV_REARMED;
         if sock.rd_shutdown {
             return Ok(OK);
         }
@@ -718,7 +770,7 @@ impl WinOs {
         if sock.wr_shutdown {
             return Ok(OpResult::Done(STATUS_PIPE_DISCONNECTED, 0));
         }
-        Ok(match &mut sock.ep {
+        let result = match &mut sock.ep {
             Endpoint::Stream(s) => from_io(s.write(&data), |n| OpResult::Done(STATUS_SUCCESS, n as u64)),
             Endpoint::Datagram(d) => {
                 let r = match to {
@@ -728,7 +780,11 @@ impl WinOs {
                 from_io(r, |n| OpResult::Done(STATUS_SUCCESS, n as u64))
             }
             _ => OpResult::Done(STATUS_INVALID_CONNECTION, 0),
-        })
+        };
+        if matches!(result, OpResult::WouldBlock) {
+            sock.write_armed = true;
+        }
+        Ok(result)
     }
 
     fn afd_shutdown(&mut self, mem: &mut dyn Memory, req: &Request) -> Result<OpResult> {
@@ -792,25 +848,26 @@ impl WinOs {
         let timeout = mem.read_u64(p)? as i64;
         let count = mem.read_u32(p + POLL_PARAMS_COUNT_OFF)?.min(MAX_POLL_ENTRIES);
 
-        let mut ready: Vec<(u64, u32)> = Vec::new();
+        let mut ready: Vec<(u64, u32, u32)> = Vec::new();
         for i in 0..count as u64 {
             let e = p + POLL_PARAMS_HEADER + i * POLL_ENTRY_STRIDE;
             let handle = mem.read_u64(e)?;
             let want = mem.read_u32(e + POLL_ENTRY_FLAGS_OFF)?;
             let got = self.afd_readiness(handle) & want;
             if got != 0 {
-                ready.push((handle, got));
+                let status = self.sockets.get(&handle).map_or(STATUS_SUCCESS, |s| s.connect_error);
+                ready.push((handle, got, status));
             }
         }
 
         if ready.is_empty() && timeout != 0 {
             return Ok(OpResult::WouldBlock);
         }
-        for (i, (handle, flags)) in ready.iter().enumerate() {
+        for (i, (handle, flags, status)) in ready.iter().enumerate() {
             let e = p + POLL_PARAMS_HEADER + i as u64 * POLL_ENTRY_STRIDE;
             mem.write_u64(e, *handle)?;
             mem.write_u32(e + POLL_ENTRY_FLAGS_OFF, *flags)?;
-            mem.write_u32(e + POLL_ENTRY_STATUS_OFF, STATUS_SUCCESS)?;
+            mem.write_u32(e + POLL_ENTRY_STATUS_OFF, *status)?;
         }
         mem.write_u32(p + POLL_PARAMS_COUNT_OFF, ready.len() as u32)?;
         Ok(OpResult::Done(
@@ -826,6 +883,9 @@ impl WinOs {
         let mut flags = 0;
         if sock.wr_shutdown && sock.rd_shutdown {
             flags |= AFD_POLL_HUP;
+        }
+        if sock.connect_error != STATUS_SUCCESS {
+            flags |= AFD_POLL_CONNECT_ERR;
         }
         match &mut sock.ep {
             Endpoint::Stream(s) => {
