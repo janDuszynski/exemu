@@ -338,6 +338,7 @@ fn file_capability(os: &mut WinOs, mem: &mut VirtualMemory, dll: &Dll, sandbox: 
     const FILE_CREATED: u64 = 2;
     const GENERIC_WRITE: u64 = 0x4000_0000;
 
+    std::fs::create_dir_all(sandbox.join("C").join("out")).unwrap();
     let handle_ptr = SCRATCH;
     let iosb_ptr = SCRATCH + 0x10;
     let byteoff_ptr = SCRATCH + 0x20;

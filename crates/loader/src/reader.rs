@@ -14,14 +14,9 @@ impl<'a> Reader<'a> {
     }
 
     fn slice(&self, off: usize, len: usize) -> Result<&'a [u8]> {
-        self.data
-            .get(off..off + len)
+        off.checked_add(len)
+            .and_then(|end| self.data.get(off..end))
             .ok_or_else(|| EmuError::InvalidPe(format!("read of {len} bytes at {off:#x} out of bounds")))
-    }
-
-    #[allow(dead_code)]
-    pub fn u8(&self, off: usize) -> Result<u8> {
-        Ok(self.slice(off, 1)?[0])
     }
 
     pub fn u16(&self, off: usize) -> Result<u16> {
@@ -44,13 +39,16 @@ impl<'a> Reader<'a> {
     pub fn bytes(&self, off: usize, len: usize) -> Result<Vec<u8>> {
         Ok(self.slice(off, len)?.to_vec())
     }
+}
 
-    #[allow(dead_code)]
-    pub fn cstr(&self, off: usize) -> Result<String> {
-        let mut end = off;
-        while end < self.data.len() && self.data[end] != 0 {
-            end += 1;
-        }
-        Ok(String::from_utf8_lossy(&self.data[off..end]).into_owned())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_whose_end_overflows_are_errors() {
+        let r = Reader::new(&[0u8; 8]);
+        assert!(r.bytes(usize::MAX, 2).is_err());
+        assert!(r.u32(usize::MAX - 1).is_err());
     }
 }
