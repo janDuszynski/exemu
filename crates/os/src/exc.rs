@@ -1,5 +1,5 @@
 use exemu_core::cpu::{SEL_CS32, SEL_CS64, SEL_DATA};
-use exemu_core::{CpuState, Memory, Result};
+use exemu_core::{guest_addr, CpuState, Memory, Result};
 
 pub(crate) const CONTEXT_SIZE: u64 = 0x4d0;
 
@@ -512,7 +512,7 @@ impl WinOs {
             mem.write_u64_at(new_rsp, 0x4D0 + i * 8, 0)?;
         }
 
-        write_exception_record(mem, new_rsp + 0x4F0, code, 0, address, info)?;
+        write_exception_record(mem, guest_addr(new_rsp, 0x4F0, 0)?, code, 0, address, info)?;
 
         mem.write_u64_at(new_rsp, 0x590, fault_rip)?;
         mem.write_u64_at(new_rsp, 0x598, cs as u64)?;
