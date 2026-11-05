@@ -21,7 +21,35 @@ use exemu_core::gui::{ControlKind, DialogTemplate, Gui, GuiEvent};
 use exemu_core::{UserDriver, WindowParams};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 
+use host::DEFAULT_TITLE;
 use render::Renderer;
+
+const IDOK: u32 = 1;
+const IDCANCEL: u32 = 2;
+const CUSTOM_WIDTH_RANGE: (usize, usize) = (120, 1600);
+const CUSTOM_HEIGHT_RANGE: (usize, usize) = (80, 1000);
+const DIALOG_INPUT_WARMUP: u32 = 40;
+const CUSTOM_INPUT_WARMUP: u32 = 20;
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+const BACKGROUND_GREY: u32 = 0x00C0_C0C0;
+
+fn custom_window_size(w: u32, h: u32) -> (usize, usize) {
+    (
+        (w as usize).clamp(CUSTOM_WIDTH_RANGE.0, CUSTOM_WIDTH_RANGE.1),
+        (h as usize).clamp(CUSTOM_HEIGHT_RANGE.0, CUSTOM_HEIGHT_RANGE.1),
+    )
+}
+
+fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> bool {
+    let Ok(file) = std::fs::File::create(path) else { return false };
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    if let Ok(mut w) = enc.write_header() {
+        let _ = w.write_image_data(rgba);
+    }
+    true
+}
 
 #[cfg(target_os = "macos")]
 fn become_foreground_app() {
@@ -52,7 +80,7 @@ fn default_button(tpl: &DialogTemplate) -> u32 {
         .iter()
         .find(|c| matches!(c.kind, ControlKind::Button { default: true }))
         .map(|c| c.id)
-        .unwrap_or(1)
+        .unwrap_or(IDOK)
 }
 
 fn button_label(tpl: Option<&DialogTemplate>, id: u32) -> String {
@@ -94,7 +122,7 @@ impl MinifbGui {
             r: Renderer::new(1, 1),
             tpl: None,
             texts: HashMap::new(),
-            default_id: 1,
+            default_id: IDOK,
             prev_down: false,
             warmup: 0,
             disabled: HashSet::new(),
@@ -123,7 +151,7 @@ impl MinifbGui {
             if !block {
                 return None;
             }
-            std::thread::sleep(std::time::Duration::from_millis(8));
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -143,7 +171,7 @@ impl MinifbGui {
 impl Gui for MinifbGui {
     fn open(&mut self, tpl: &DialogTemplate) {
         let (w, h) = Renderer::size_for(tpl);
-        let title = if tpl.title.is_empty() { "exemu" } else { &tpl.title };
+        let title = if tpl.title.is_empty() { DEFAULT_TITLE } else { &tpl.title };
         let opts = WindowOptions { resize: false, topmost: true, ..WindowOptions::default() };
         self.window = Window::new(title, w, h, opts).ok();
         become_foreground_app();
@@ -152,7 +180,7 @@ impl Gui for MinifbGui {
         self.default_id = default_button(tpl);
         self.tpl = Some(tpl.clone());
         self.prev_down = false;
-        self.warmup = 40;
+        self.warmup = DIALOG_INPUT_WARMUP;
         self.disabled.clear();
         self.custom = false;
         self.repaint();
@@ -180,15 +208,15 @@ impl Gui for MinifbGui {
     }
 
     fn open_window(&mut self, title: &str, w: u32, h: u32) {
-        let (w, h) = ((w as usize).clamp(120, 1600), (h as usize).clamp(80, 1000));
+        let (w, h) = custom_window_size(w, h);
         let opts = WindowOptions { resize: false, topmost: true, ..WindowOptions::default() };
         self.window = Window::new(title, w, h, opts).ok();
         become_foreground_app();
         self.r = Renderer::new(w, h);
-        self.r.apply(&exemu_core::DrawOp::Clear(0x00C0_C0C0));
+        self.r.apply(&exemu_core::DrawOp::Clear(BACKGROUND_GREY));
         self.custom = true;
         self.prev_down = false;
-        self.warmup = 20;
+        self.warmup = CUSTOM_INPUT_WARMUP;
         self.tpl = None;
         eprintln!("[exemu-gui] custom window \"{title}\" {w}x{h} — GDI-drawn; close it to continue");
         self.repaint();
@@ -257,7 +285,7 @@ impl Gui for MinifbGui {
                     return Some(GuiEvent::Command(self.default_id));
                 }
                 if esc {
-                    return Some(GuiEvent::Command(2));
+                    return Some(GuiEvent::Command(IDCANCEL));
                 }
                 if pressed {
                     if let Some(id) = self.r.hit_test(pos.0 as usize, pos.1 as usize) {
@@ -272,7 +300,7 @@ impl Gui for MinifbGui {
             if !block {
                 return None;
             }
-            std::thread::sleep(std::time::Duration::from_millis(8));
+            std::thread::sleep(POLL_INTERVAL);
         }
     }
 
@@ -308,7 +336,7 @@ impl OffscreenGui {
             r: Renderer::new(1, 1),
             tpl: None,
             texts: HashMap::new(),
-            default_id: 1,
+            default_id: IDOK,
             shot: 0,
             set_calls: 0,
             clicked: false,
@@ -325,13 +353,7 @@ impl OffscreenGui {
         let kind = if self.custom { "window" } else { "dialog" };
         let path = self.dir.join(format!("{kind}-{:02}-{tag}.png", self.shot));
         self.shot += 1;
-        if let Ok(file) = std::fs::File::create(&path) {
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), self.r.w as u32, self.r.h as u32);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            if let Ok(mut w) = enc.write_header() {
-                let _ = w.write_image_data(&self.r.to_rgba());
-            }
+        if write_png(&path, self.r.w as u32, self.r.h as u32, &self.r.to_rgba()) {
             eprintln!("[exemu-gui] wrote {}", path.display());
         }
     }
@@ -351,9 +373,9 @@ impl Gui for OffscreenGui {
     }
 
     fn open_window(&mut self, _title: &str, w: u32, h: u32) {
-        let (w, h) = ((w as usize).clamp(120, 1600), (h as usize).clamp(80, 1000));
+        let (w, h) = custom_window_size(w, h);
         self.r = Renderer::new(w, h);
-        self.r.apply(&exemu_core::DrawOp::Clear(0x00C0_C0C0));
+        self.r.apply(&exemu_core::DrawOp::Clear(BACKGROUND_GREY));
         self.custom = true;
         self.open = true;
         self.clicked = false;
@@ -468,13 +490,7 @@ impl Presenter for OffscreenPresenter {
         let Some(dir) = &self.dir else { return };
         let path = dir.join(format!("hwnd{hwnd:08x}-frame{:04}.png", self.frame_count));
         let rgba = bgra_to_rgba(pixels);
-        if let Ok(file) = std::fs::File::create(&path) {
-            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-            enc.set_color(png::ColorType::Rgba);
-            enc.set_depth(png::BitDepth::Eight);
-            if let Ok(mut w) = enc.write_header() {
-                let _ = w.write_image_data(&rgba);
-            }
+        if write_png(&path, width, height, &rgba) {
             eprintln!("[exemu-gui] presenter: wrote {}", path.display());
         }
     }
