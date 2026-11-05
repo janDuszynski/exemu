@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use exemu_core::{CpuState, Memory, Result};
+use exemu_core::{guest_addr, CpuState, Memory, Result};
 
 use crate::api::{read_path, write_astr, Outcome};
 use crate::WinOs;
@@ -627,7 +627,7 @@ fn write_key_value_info(
             mem.write_u32(buf, 0)?;
             mem.write_u32_at(buf, 4, ty)?;
             mem.write_u32_at(buf, 8, name_bytes)?;
-            write_utf16_bounded(mem, buf + 12, name, length - 12)?;
+            write_utf16_bounded(mem, guest_addr(buf, 12, 0)?, name, length - 12)?;
         }
         KEY_VALUE_FULL_INFORMATION => {
             mem.write_u32(buf, 0)?;
@@ -635,7 +635,7 @@ fn write_key_value_info(
             mem.write_u32_at(buf, 8, 20 + name_bytes)?;
             mem.write_u32_at(buf, 12, data_len)?;
             mem.write_u32_at(buf, 16, name_bytes)?;
-            write_utf16_bounded(mem, buf + 20, name, length.saturating_sub(20))?;
+            write_utf16_bounded(mem, guest_addr(buf, 20, 0)?, name, length.saturating_sub(20))?;
             let data_at = 20 + name_bytes as u64;
             if length > data_at {
                 let n = ((length - data_at) as usize).min(data.len());
@@ -852,7 +852,7 @@ impl WinOs {
         } else {
             mem.write_u32_at(buf, 12, name_bytes)?;
         }
-        write_utf16_bounded(mem, buf + name_off, &name, length - name_off)?;
+        write_utf16_bounded(mem, guest_addr(buf, name_off, 0)?, &name, length - name_off)?;
         Ok(if length < header as u64 { STATUS_BUFFER_OVERFLOW } else { NT_SUCCESS })
     }
 
@@ -890,7 +890,7 @@ impl WinOs {
                 } else {
                     mem.write_u32_at(buf, 12, name_bytes)?;
                 }
-                write_utf16_bounded(mem, buf + name_off, &name, length - name_off)?;
+                write_utf16_bounded(mem, guest_addr(buf, name_off, 0)?, &name, length - name_off)?;
                 Ok(if length < header as u64 { STATUS_BUFFER_OVERFLOW } else { NT_SUCCESS })
             }
             KEY_FULL_INFORMATION => {
@@ -933,7 +933,7 @@ impl WinOs {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
                 mem.write_u32(buf, name_bytes)?;
-                write_utf16_bounded(mem, buf + 4, &path, length - 4)?;
+                write_utf16_bounded(mem, guest_addr(buf, 4, 0)?, &path, length - 4)?;
                 Ok(if length < header as u64 { STATUS_BUFFER_OVERFLOW } else { NT_SUCCESS })
             }
             _ => Ok(STATUS_INVALID_PARAMETER),
