@@ -1,4 +1,4 @@
-use exemu_core::{CpuState, EmuError, Memory, Reg, Result};
+use exemu_core::{guest_addr, CpuState, EmuError, Memory, Reg, Result};
 
 use crate::api::Outcome;
 use crate::thread::WaitDesc;
@@ -278,7 +278,7 @@ impl WinOs {
 
         let mut handles = Vec::with_capacity(count as usize);
         for i in 0..count as u64 {
-            handles.push(self.read_ptr(mem, arr + i * stride)?);
+            handles.push(self.read_ptr(mem, guest_addr(arr, i * stride, 0)?)?);
         }
 
         let signaled = |h: &u64| self.kobjects.get(h).map_or(true, |o| o.is_signaled(tid));
@@ -465,7 +465,7 @@ impl WinOs {
         let stride = self.handle_stride();
         let mut handles = Vec::with_capacity(count as usize);
         for i in 0..count as u64 {
-            let h = self.read_ptr(mem, handles_ptr + i * stride)?;
+            let h = self.read_ptr(mem, guest_addr(handles_ptr, i * stride, 0)?)?;
             if !self.kobjects.contains_key(&h) {
                 return Ok(STATUS_INVALID_HANDLE);
             }
