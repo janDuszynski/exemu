@@ -208,7 +208,7 @@ impl Interpreter {
                 Rm::Mem { .. } => ctx.rm_addr(),
                 Rm::Reg(_) => unreachable!("mod!=3 decoded as register"),
             };
-            self.x87_mem_form(mem, esc, reg, addr)
+            self.x87_mem_form(mem, esc, reg, addr, Self::opsize(ctx) == 2)
         }
     }
 
@@ -416,13 +416,108 @@ impl Interpreter {
     fn db_e0_group(&mut self, low: u8) -> Result<()> {
         match low {
             2 => { self.state.x87.sw &= !(0x80ff); }
-            3 => {
-                self.state.x87.cw = 0x037F;
-                self.state.x87.sw = 0x0000;
-                self.state.x87.tw = 0xFFFF;
-            }
+            3 => self.fninit(),
             0 | 1 | 4 => {}
             _ => return Err(EmuError::Unsupported(format!("x87 DB E0-group /{low}"))),
+        }
+        Ok(())
+    }
+
+    fn fninit(&mut self) {
+        self.state.x87.cw = 0x037F;
+        self.state.x87.sw = 0x0000;
+        self.state.x87.tw = 0xFFFF;
+    }
+
+    fn saved_tag_word(&self) -> u16 {
+        let x = &self.state.x87;
+        let mut out = 0u16;
+        for phys in 0..8usize {
+            let tag = if (x.tw >> (phys * 2)) & 0b11 == 0b11 { 0b11 } else { tag_of(x.st[phys]) };
+            out |= tag << (phys * 2);
+        }
+        out
+    }
+
+    fn fnstenv(&self, mem: &mut dyn Memory, addr: u64, env16: bool) -> Result<()> {
+        let x = &self.state.x87;
+        let tw = self.saved_tag_word();
+        if env16 {
+            mem.write_u16(addr, x.cw)?;
+            mem.write_u16(addr + 2, x.sw)?;
+            mem.write_u16(addr + 4, tw)?;
+            mem.write_u16(addr + 6, x.fip as u16)?;
+            mem.write_u16(addr + 8, x.fcs)?;
+            mem.write_u16(addr + 10, x.fdp as u16)?;
+            mem.write_u16(addr + 12, x.fds)?;
+        } else {
+            mem.write_u32(addr, u32::from(x.cw))?;
+            mem.write_u32(addr + 4, u32::from(x.sw))?;
+            mem.write_u32(addr + 8, u32::from(tw))?;
+            mem.write_u32(addr + 12, x.fip as u32)?;
+            mem.write_u32(addr + 16, u32::from(x.fcs) | (u32::from(x.fop & 0x7FF) << 16))?;
+            mem.write_u32(addr + 20, x.fdp as u32)?;
+            mem.write_u32(addr + 24, u32::from(x.fds))?;
+        }
+        Ok(())
+    }
+
+    fn fldenv(&mut self, mem: &mut dyn Memory, addr: u64, env16: bool) -> Result<()> {
+        if env16 {
+            let cw = mem.read_u16(addr)?;
+            let sw = mem.read_u16(addr + 2)?;
+            let tw = mem.read_u16(addr + 4)?;
+            let ip = mem.read_u16(addr + 6)?;
+            let cs = mem.read_u16(addr + 8)?;
+            let dp = mem.read_u16(addr + 10)?;
+            let ds = mem.read_u16(addr + 12)?;
+            let x = &mut self.state.x87;
+            x.cw = cw;
+            x.sw = sw;
+            x.tw = tw;
+            x.fip = u64::from(ip);
+            x.fcs = cs;
+            x.fdp = u64::from(dp);
+            x.fds = ds;
+        } else {
+            let cw = mem.read_u16(addr)?;
+            let sw = mem.read_u16(addr + 4)?;
+            let tw = mem.read_u16(addr + 8)?;
+            let ip = mem.read_u32(addr + 12)?;
+            let csop = mem.read_u32(addr + 16)?;
+            let dp = mem.read_u32(addr + 20)?;
+            let ds = mem.read_u16(addr + 24)?;
+            let x = &mut self.state.x87;
+            x.cw = cw;
+            x.sw = sw;
+            x.tw = tw;
+            x.fip = u64::from(ip);
+            x.fcs = csop as u16;
+            x.fop = ((csop >> 16) & 0x7FF) as u16;
+            x.fdp = u64::from(dp);
+            x.fds = ds;
+        }
+        Ok(())
+    }
+
+    fn fnsave(&mut self, mem: &mut dyn Memory, addr: u64, env16: bool) -> Result<()> {
+        self.fnstenv(mem, addr, env16)?;
+        let regs = addr + if env16 { 14 } else { 28 };
+        for i in 0..8u8 {
+            let v = self.fpu_read_ext(i);
+            write_ext(mem, regs + u64::from(i) * 10, v)?;
+        }
+        self.fninit();
+        Ok(())
+    }
+
+    fn frstor(&mut self, mem: &mut dyn Memory, addr: u64, env16: bool) -> Result<()> {
+        self.fldenv(mem, addr, env16)?;
+        let regs = addr + if env16 { 14 } else { 28 };
+        for i in 0..8u8 {
+            let v = read_ext(mem, regs + u64::from(i) * 10)?;
+            let p = self.state.x87.phys(i);
+            self.state.x87.st[p] = v;
         }
         Ok(())
     }
@@ -496,7 +591,7 @@ impl Interpreter {
         x * exp2(ni)
     }
 
-    fn x87_mem_form(&mut self, mem: &mut dyn Memory, esc: u8, reg: u8, addr: u64) -> Result<()> {
+    fn x87_mem_form(&mut self, mem: &mut dyn Memory, esc: u8, reg: u8, addr: u64, env16: bool) -> Result<()> {
         match esc {
             0xD8 => {
                 let v = f32::from_bits(mem.read_u32(addr)?) as f64;
@@ -506,7 +601,9 @@ impl Interpreter {
                 0 => { let v = f32::from_bits(mem.read_u32(addr)?) as f64; self.fpu_push_f64(v); }
                 2 => { let v = self.store_f32(self.fpu_read(0)); mem.write_u32(addr, v)?; }
                 3 => { let v = self.store_f32(self.fpu_read(0)); mem.write_u32(addr, v)?; self.fpu_pop(); }
+                4 => self.fldenv(mem, addr, env16)?,
                 5 => { self.state.x87.cw = mem.read_u16(addr)?; }
+                6 => self.fnstenv(mem, addr, env16)?,
                 7 => { mem.write_u16(addr, self.state.x87.cw)?; }
                 _ => return Err(EmuError::Unsupported(format!("x87 D9 mem /{reg}"))),
             },
@@ -528,6 +625,8 @@ impl Interpreter {
                 1 => { let v = self.to_signed_int(self.fpu_read(0), 8, true); mem.write_u64(addr, v as u64)?; self.fpu_pop(); }
                 2 => { let v = self.store_f64(self.fpu_read(0)); mem.write_u64(addr, v)?; }
                 3 => { let v = self.store_f64(self.fpu_read(0)); mem.write_u64(addr, v)?; self.fpu_pop(); }
+                4 => self.frstor(mem, addr, env16)?,
+                6 => self.fnsave(mem, addr, env16)?,
                 7 => { mem.write_u16(addr, self.state.x87.sw)?; }
                 _ => return Err(EmuError::Unsupported(format!("x87 DD mem /{reg}"))),
             },

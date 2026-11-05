@@ -199,6 +199,100 @@ fn fld_fstp_sub_one_magnitude_no_exponent_underflow() {
     }
 }
 
+fn mov_rax_data() -> Vec<u8> {
+    let mut code = vec![0x48, 0xB8];
+    code.extend_from_slice(&DATA.to_le_bytes());
+    code
+}
+
+fn two_value_stack() -> Vec<u8> {
+    let mut code = mov_rax_data();
+    code.extend_from_slice(&[0xD9, 0xE8, 0xD9, 0xEE]);
+    code
+}
+
+#[test]
+fn fnsave_32bit_layout_tag_word_and_reinit() {
+    let mut m = mem();
+    let mut code = two_value_stack();
+    code.extend_from_slice(&[0xDD, 0x30]);
+    let cpu = run(&mut m, &code, 4);
+    assert_eq!(m.read_u16(DATA).unwrap(), 0x037F);
+    assert_eq!(m.read_u16(DATA + 4).unwrap(), 0x3000);
+    assert_eq!(m.read_u16(DATA + 8).unwrap(), 0x1FFF);
+    assert_eq!(m.read_u16(DATA + 28).unwrap(), 0x0000);
+    assert_eq!(m.read_u16(DATA + 28 + 10 + 8).unwrap(), 0x3FFF);
+    assert_eq!(m.read_u64(DATA + 28 + 10).unwrap(), 0x8000_0000_0000_0000);
+    let x = &cpu.state().x87;
+    assert_eq!((x.cw, x.sw, x.tw), (0x037F, 0, 0xFFFF));
+}
+
+#[test]
+fn fnsave_16bit_layout_uses_94_bytes() {
+    let mut m = mem();
+    m.write(DATA, &[0xAA; 128]).unwrap();
+    let mut code = two_value_stack();
+    code.extend_from_slice(&[0x66, 0xDD, 0x30]);
+    run(&mut m, &code, 4);
+    assert_eq!(m.read_u16(DATA).unwrap(), 0x037F);
+    assert_eq!(m.read_u16(DATA + 2).unwrap(), 0x3000);
+    assert_eq!(m.read_u16(DATA + 4).unwrap(), 0x1FFF);
+    assert_eq!(m.read_u16(DATA + 14 + 10 + 8).unwrap(), 0x3FFF);
+    assert_eq!(m.read_u8(DATA + 94).unwrap(), 0xAA);
+    assert_eq!(m.read_u8(DATA + 93).unwrap(), 0x00);
+}
+
+#[test]
+fn fnsave_frstor_round_trip_both_sizes() {
+    for prefix in [&[][..], &[0x66][..]] {
+        let mut m = mem();
+        let mut code = two_value_stack();
+        code.extend_from_slice(prefix);
+        code.extend_from_slice(&[0xDD, 0x30]);
+        code.extend_from_slice(prefix);
+        code.extend_from_slice(&[0xDD, 0x20]);
+        let cpu = run(&mut m, &code, 5);
+        let x = &cpu.state().x87;
+        assert_eq!(x.top(), 6);
+        assert_eq!(x.sw & 0x3800, 0x3000);
+        assert_eq!(exemu_cpu_ext_to_f64(x.st[x.phys(0)]), 0.0);
+        assert_eq!(exemu_cpu_ext_to_f64(x.st[x.phys(1)]), 1.0);
+        assert_eq!(x.tw, 0x1FFF);
+    }
+}
+
+#[test]
+fn fnstenv_fldenv_layouts_and_registers_untouched() {
+    let mut m = mem();
+    m.write(DATA, &[0xAA; 64]).unwrap();
+    let mut code = two_value_stack();
+    code.extend_from_slice(&[0xD9, 0x30]);
+    code.extend_from_slice(&[0x66, 0xD9, 0x70, 0x20]);
+    let cpu = run(&mut m, &code, 5);
+    assert_eq!(m.read_u16(DATA + 8).unwrap(), 0x1FFF);
+    assert_eq!(m.read_u32(DATA + 4).unwrap(), 0x3000);
+    assert_eq!(m.read_u16(DATA + 0x20 + 4).unwrap(), 0x1FFF);
+    assert_eq!(m.read_u8(DATA + 0x20 + 14).unwrap(), 0xAA);
+    assert_eq!(m.read_u8(DATA + 28).unwrap(), 0xAA);
+    let x = &cpu.state().x87;
+    assert_eq!(x.sw & 0x3800, 0x3000);
+    assert_eq!(x.tw, 0x1FFF);
+}
+
+#[test]
+fn fldenv_loads_control_status_and_tags_without_touching_registers() {
+    let mut m = mem();
+    m.write_u32(DATA, 0x0000_0C7F).unwrap();
+    m.write_u32(DATA + 4, 0x0000_2800).unwrap();
+    m.write_u32(DATA + 8, 0x0000_FFFF).unwrap();
+    let mut code = mov_rax_data();
+    code.extend_from_slice(&[0xD9, 0xE8, 0xD9, 0x20]);
+    let cpu = run(&mut m, &code, 3);
+    let x = &cpu.state().x87;
+    assert_eq!((x.cw, x.sw, x.tw), (0x0C7F, 0x2800, 0xFFFF));
+    assert_eq!(x.st[7], 0x3FFF_u128 << 64 | 0x8000_0000_0000_0000);
+}
+
 fn exemu_cpu_ext_to_f64(v: u128) -> f64 {
     let sign = ((v >> 79) & 1) as u64;
     let exp = ((v >> 64) & 0x7fff) as u32;
