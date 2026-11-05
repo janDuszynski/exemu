@@ -91,6 +91,12 @@ end-to-end on the default path.
   budget of 0, which stops at every block, so `thread.rs` and the differential
   could not fail on a floor budget. `JitStats::budget_refusals` counts only the
   stops that turned away a block with budget left, and those gates assert on it.
+  The differential also fails a single-lap run that retires fewer instructions
+  than the block it was given the whole budget for (a JIT that refused some
+  blocks outright used to pass), floors the breakpoint and watchpoint stops
+  against the trials that reached what they armed, and `--cut` without
+  `--laps` is now an error instead of a silent no-op. Two engine tests pin the
+  link limit (a link into the longest cached block) and the `u32` budget clamp.
 - The Firefox and SteamSetup Wine-path entries now have `--jit` twins in
   `corpus.toml`, pinned to the interpreter numbers.
 
