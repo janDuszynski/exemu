@@ -13,6 +13,7 @@ mod fault;
 mod layout;
 mod load;
 mod run;
+mod sandbox;
 
 pub struct Process {
     mem: VirtualMemory,
