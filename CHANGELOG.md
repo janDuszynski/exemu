@@ -94,6 +94,17 @@ legs as a WoW64 process. It met five walls, each its own commit:
   this. A unit test also drives `NtUserSetWindowLong{,Ptr}` and every
   `GetWindowLong` selector through the syscall entry, which the `LONG` tests
   above never did.
+- **The two WoW64 corpus pins move** because 32-bit dialogs now exist:
+  `SteamSetup.exe (wine wow64)` 31,276,184 → 43,029,612 and `Firefox
+  Installer.exe (wine wow64)` 14,797,513 → 32,208,232, exit codes (2, 1) and
+  artifacts unchanged. NSIS now builds its “Installer integrity check has
+  failed” message box and the 7-Zip SFX its “Progress” dialog and a “Can not
+  open the file as archive” message box, where each `CreateWindowEx` used to
+  fail. Reverting only the ntdll32 thunk resolution restores SteamSetup to the
+  instruction; Firefox needs the `GetDC(NULL)` change reverted too (the two do
+  not add: +9,254 with the thunks reverted alone). Those message boxes are laid
+  out with base units 0,0 (`DIALOG_CreateIndirect units = 0,0` on the
+  message-box-font path), which is the next layout wall.
 - **Not yet: monitors.** `GetMonitorInfoW`, `MonitorFromRect`/`MonitorFromPoint`
   (`NtUserCallTwoParam` 2 and 4) and `MonitorFromWindow` (`NtUserCallHwndParam`
   0x16) answer 0 and write nothing, so `DIALOG_CreateIndirect` clamps the dialog
