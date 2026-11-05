@@ -1,4 +1,8 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+
+mod opts;
+
+pub use opts::*;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
@@ -94,6 +98,7 @@ pub const AFD_POLL_ALWAYS: u32 = AFD_POLL_HUP | AFD_POLL_RESET | AFD_POLL_CONNEC
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_PENDING: u32 = 0x0000_0103;
 const STATUS_NOT_IMPLEMENTED: u32 = 0xC000_0002;
+const STATUS_DEVICE_NOT_READY: u32 = 0xC000_00A3;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 const STATUS_INVALID_HANDLE: u32 = 0xC000_0008;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
@@ -148,6 +153,9 @@ pub(crate) struct Socket {
     peer: Option<SocketAddr>,
     rd_shutdown: bool,
     wr_shutdown: bool,
+    nonblocking: bool,
+    opts: BTreeMap<u32, u32>,
+    pending_error: u32,
 }
 
 impl Socket {
@@ -163,6 +171,9 @@ impl Socket {
             peer: None,
             rd_shutdown: false,
             wr_shutdown: false,
+            nonblocking: false,
+            opts: BTreeMap::new(),
+            pending_error: 0,
         }
     }
 
@@ -399,6 +410,10 @@ impl WinOs {
                 write_iosb(mem, iosb, status, info)?;
                 Ok(status)
             }
+            OpResult::WouldBlock if code != IOCTL_AFD_SELECT && self.socket_is_nonblocking(handle) => {
+                write_iosb(mem, iosb, STATUS_DEVICE_NOT_READY, 0)?;
+                Ok(STATUS_DEVICE_NOT_READY)
+            }
             OpResult::WouldBlock => self.afd_block(cpu, mem, &req, iosb),
         }
     }
@@ -467,6 +482,8 @@ impl WinOs {
             IOCTL_AFD_WINE_GET_SOCKET_INFO => self.afd_get_socket_info(mem, req)?,
             IOCTL_AFD_SELECT => self.afd_select(mem, req)?,
             IOCTL_AFD_WINE_OP_210 => OK,
+            IOCTL_AFD_WINE_FIONBIO => self.afd_fionbio(mem, req)?,
+            code if is_option_ioctl(code) => self.afd_option(mem, req)?,
             _ => OpResult::Done(STATUS_NOT_IMPLEMENTED, 0),
         })
     }
@@ -589,7 +606,7 @@ impl WinOs {
 
         match TcpStream::connect_timeout(&addr, BLOCKING_WAIT_LIMIT) {
             Ok(s) => {
-                let _ = s.set_nodelay(true);
+                let _ = s.set_nodelay(tcp_nodelay_of(self.socket_mut(req.handle)));
                 let _ = s.set_nonblocking(true);
                 self.socket_mut(req.handle).ep = Endpoint::Stream(s);
                 Ok(OK)

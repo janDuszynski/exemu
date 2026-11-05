@@ -578,3 +578,130 @@ fn the_afd_device_does_not_shadow_the_filesystem() {
     let st = syscall(&mut os, &mut mem, NT_READ_FILE, &[sock, 0, 0, 0, IOSB_PTR, DATA_PTR, 16, 0, 0]);
     assert_eq!(st, STATUS_INVALID_HANDLE);
 }
+
+const STATUS_DEVICE_NOT_READY: u64 = 0xC000_00A3;
+const STATUS_BUFFER_TOO_SMALL: u64 = 0xC000_0023;
+
+const OPTION_PAIRS: &[(&str, u32, u32, u32)] = &[
+    ("SO_BROADCAST", 0x0012_0374, 0x0012_0370, 0),
+    ("SO_KEEPALIVE", 0x0012_0380, 0x0012_037c, 0),
+    ("SO_LINGER", 0x0012_0388, 0x0012_0384, 0),
+    ("SO_OOBINLINE", 0x0012_0390, 0x0012_038c, 0),
+    ("SO_RCVBUF", 0x0012_0394, 0x0012_0398, 65536),
+    ("SO_RCVTIMEO", 0x0012_039c, 0x0012_03a0, 0),
+    ("SO_REUSEADDR", 0x0012_03a8, 0x0012_03a4, 0),
+    ("SO_SNDBUF", 0x0012_03ac, 0x0012_03b0, 65536),
+    ("SO_SNDTIMEO", 0x0012_03b8, 0x0012_03b4, 0),
+    ("TCP_NODELAY", 0x0012_0474, 0x0012_0470, 0),
+    ("TCP_KEEPIDLE", 0x0012_04b0, 0x0012_04ac, 7200),
+    ("TCP_KEEPCNT", 0x0012_04b8, 0x0012_04b4, 10),
+    ("TCP_KEEPINTVL", 0x0012_04c0, 0x0012_04bc, 1),
+];
+
+fn get_option(os: &mut WinOs, mem: &mut VirtualMemory, sock: u64, code: u32) -> (u64, u32) {
+    mem.write_u32(OUT_PTR, 0xDEAD_BEEF).unwrap();
+    let st = ioctl(os, mem, sock, code, 0, 0, OUT_PTR, 4);
+    (st, mem.read_u32(OUT_PTR).unwrap())
+}
+
+fn set_option(os: &mut WinOs, mem: &mut VirtualMemory, sock: u64, code: u32, value: u32) -> u64 {
+    mem.write_u32(IN_PTR, value).unwrap();
+    ioctl(os, mem, sock, code, IN_PTR, 4, 0, 0)
+}
+
+fn bind_and_listen(os: &mut WinOs, mem: &mut VirtualMemory, sock: u64) {
+    mem.write_u32(IN_PTR, 0).unwrap();
+    write_sockaddr_in(mem, IN_PTR + net::BIND_PARAMS_HEADER, "127.0.0.1:0".parse().unwrap());
+    assert_eq!(ioctl(os, mem, sock, net::IOCTL_AFD_BIND, IN_PTR, 4 + 16, OUT_PTR, 16), STATUS_SUCCESS);
+    mem.write(IN_PTR, &[0u8; 12]).unwrap();
+    mem.write_u32(IN_PTR + net::LISTEN_BACKLOG_OFF, 4).unwrap();
+    let st = ioctl(os, mem, sock, net::IOCTL_AFD_START_LISTEN, IN_PTR, net::LISTEN_PARAMS_LEN as u64, 0, 0);
+    assert_eq!(st, STATUS_SUCCESS);
+}
+
+fn set_nonblocking(os: &mut WinOs, mem: &mut VirtualMemory, sock: u64, on: bool) {
+    mem.write_u32(IN_PTR, u32::from(on)).unwrap();
+    assert_eq!(ioctl(os, mem, sock, net::IOCTL_AFD_WINE_FIONBIO, IN_PTR, 4, 0, 0), STATUS_SUCCESS);
+}
+
+fn recv_once(os: &mut WinOs, mem: &mut VirtualMemory, sock: u64) -> u64 {
+    write_recv_params(mem, 64, false);
+    ioctl(os, mem, sock, net::IOCTL_AFD_WINE_RECVMSG, IN_PTR, net::RECVMSG_PARAMS_LEN as u64, 0, 0)
+}
+
+#[test]
+fn every_socket_option_ioctl_ws2_32_issues_stores_and_returns_its_value() {
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    for (i, &(name, set, get, default)) in OPTION_PAIRS.iter().enumerate() {
+        assert_eq!(get_option(&mut os, &mut mem, sock, get), (STATUS_SUCCESS, default), "{name} default");
+        assert_eq!(information(&mem), 4, "{name} reports four bytes");
+        let value = 0x100 + i as u32;
+        assert_eq!(set_option(&mut os, &mut mem, sock, set, value), STATUS_SUCCESS, "{name} set");
+        assert_eq!(get_option(&mut os, &mut mem, sock, get), (STATUS_SUCCESS, value), "{name} round trip");
+    }
+    let (other, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    let (name, _, get, default) = OPTION_PAIRS[0];
+    assert_eq!(get_option(&mut os, &mut mem, other, get), (STATUS_SUCCESS, default), "{name} is per socket");
+}
+
+#[test]
+fn option_ioctls_refuse_a_buffer_too_small_for_a_dword() {
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_SET_TCP_NODELAY, IN_PTR, 2, 0, 0);
+    assert_eq!(st, STATUS_BUFFER_TOO_SMALL);
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_GET_TCP_NODELAY, 0, 0, OUT_PTR, 2);
+    assert_eq!(st, STATUS_BUFFER_TOO_SMALL);
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_FIONBIO, IN_PTR, 0, 0, 0);
+    assert_eq!(st, STATUS_BUFFER_TOO_SMALL);
+}
+
+#[test]
+fn so_acceptconn_follows_listen_and_so_error_reads_clean() {
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert_eq!(get_option(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_GET_SO_ACCEPTCONN), (STATUS_SUCCESS, 0));
+    assert_eq!(get_option(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_GET_SO_ERROR), (STATUS_SUCCESS, 0));
+    bind_and_listen(&mut os, &mut mem, sock);
+    assert_eq!(get_option(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_GET_SO_ACCEPTCONN), (STATUS_SUCCESS, 1));
+}
+
+#[test]
+fn a_nonblocking_receive_reports_device_not_ready_until_data_arrives() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert_eq!(connect(&mut os, &mut mem, sock, addr), STATUS_SUCCESS);
+    let (mut peer, _) = listener.accept().unwrap();
+    set_nonblocking(&mut os, &mut mem, sock, true);
+
+    let started = Instant::now();
+    assert_eq!(recv_once(&mut os, &mut mem, sock), STATUS_DEVICE_NOT_READY);
+    assert!(started.elapsed() < Duration::from_secs(5), "the call returned instead of waiting");
+
+    peer.write_all(b"now").unwrap();
+    peer.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let n = loop {
+        let st = recv_once(&mut os, &mut mem, sock);
+        if st == STATUS_SUCCESS {
+            break information(&mem);
+        }
+        assert_eq!(st, STATUS_DEVICE_NOT_READY);
+        assert!(Instant::now() < deadline, "the bytes never arrived");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(received(&mem, n), b"now");
+}
+
+#[test]
+fn a_nonblocking_accept_with_no_pending_connection_reports_device_not_ready() {
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    bind_and_listen(&mut os, &mut mem, sock);
+    set_nonblocking(&mut os, &mut mem, sock, true);
+    let st = ioctl(&mut os, &mut mem, sock, net::IOCTL_AFD_WINE_ACCEPT, 0, 0, OUT_PTR, net::ACCEPT_OUT_LEN as u64);
+    assert_eq!(st, STATUS_DEVICE_NOT_READY);
+}
