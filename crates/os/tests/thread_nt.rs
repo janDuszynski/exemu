@@ -14,6 +14,9 @@ const NT_TERMINATE_THREAD: u32 = 0x53;
 const NT_SUSPEND_THREAD: u32 = 0xf5;
 const NT_RESUME_THREAD: u32 = 0x52;
 const NT_QUERY_INFORMATION_THREAD: u32 = 0x25;
+const NT_QUERY_SYSTEM_INFORMATION: u32 = 0x36;
+const SYSTEM_BASIC_INFORMATION: u64 = 0;
+const SYSTEM_BASIC_INFORMATION_SIZE: u64 = 0x40;
 
 const STATUS_SUCCESS: u64 = 0;
 const NT_CURRENT_THREAD: u64 = u64::MAX - 1;
@@ -243,4 +246,32 @@ fn nt_suspend_resume_terminate_another_thread() {
         0xC000_0008,
         "STATUS_INVALID_HANDLE for an unknown thread handle"
     );
+}
+
+#[test]
+fn nt_query_system_basic_information_reports_page_size() {
+    let (mut os, mut mem) = setup();
+    let buf = SCRATCH + 0x200;
+    let ret_len = SCRATCH + 0x40;
+    mem.write(buf, &[0xCC; SYSTEM_BASIC_INFORMATION_SIZE as usize]).unwrap();
+    let st = syscall(
+        &mut os,
+        &mut mem,
+        NT_QUERY_SYSTEM_INFORMATION,
+        &[SYSTEM_BASIC_INFORMATION, buf, SYSTEM_BASIC_INFORMATION_SIZE, ret_len],
+    );
+    assert_eq!(st, STATUS_SUCCESS, "SystemBasicInformation is served");
+    assert_eq!(mem.read_u32(ret_len).unwrap() as u64, SYSTEM_BASIC_INFORMATION_SIZE);
+    assert_eq!(mem.read_u32(buf + 0x08).unwrap(), 0x1000, "PageSize");
+    assert_eq!(mem.read_u32(buf + 0x18).unwrap(), 0x1_0000, "AllocationGranularity");
+    assert_eq!(mem.read_u64(buf + 0x28).unwrap(), 0x7FFF_FFFE_FFFF, "HighestUserAddress of a 64-bit process");
+    assert_eq!(mem.read_u32(buf + 0x38).unwrap() & 0xFF, 1, "NumberOfProcessors");
+
+    let short = syscall(
+        &mut os,
+        &mut mem,
+        NT_QUERY_SYSTEM_INFORMATION,
+        &[SYSTEM_BASIC_INFORMATION, buf, SYSTEM_BASIC_INFORMATION_SIZE - 4, ret_len],
+    );
+    assert_eq!(short, 0xC000_0004, "STATUS_INFO_LENGTH_MISMATCH below sizeof");
 }

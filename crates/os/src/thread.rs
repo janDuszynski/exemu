@@ -870,7 +870,7 @@ impl WinOs {
         let buffer = self.syscall_arg(cpu, mem, 1)?;
         let length = self.syscall_arg(cpu, mem, 2)?;
         let return_length = self.syscall_arg(cpu, mem, 3)?;
-        if class != SYSTEM_EMULATION_BASIC_INFORMATION {
+        if class != SYSTEM_BASIC_INFORMATION && class != SYSTEM_EMULATION_BASIC_INFORMATION {
             return Ok(STATUS_NOT_IMPLEMENTED);
         }
         const NEED: u64 = 0x40;
@@ -881,7 +881,8 @@ impl WinOs {
         mem.write_u32(buffer + 0x08, 0x1000)?;
         mem.write_u32(buffer + 0x18, 0x1_0000)?;
         mem.write_u64(buffer + 0x20, 0x1_0000)?;
-        mem.write_u64(buffer + 0x28, 0x7FFF_FFFF)?;
+        let highest_user = if class == SYSTEM_BASIC_INFORMATION { HIGHEST_USER_ADDRESS_64 } else { 0x7FFF_FFFF };
+        mem.write_u64(buffer + 0x28, highest_user)?;
         mem.write_u64(buffer + 0x30, 1)?;
         mem.write_u8(buffer + 0x38, 1)?;
         if return_length != 0 {
@@ -933,6 +934,8 @@ impl WinOs {
 const NT_CURRENT_THREAD: u64 = u64::MAX - 1;
 const CREATE_SUSPENDED_NT: u32 = 0x0000_0001;
 const THREAD_BASIC_INFORMATION: u32 = 0;
+const SYSTEM_BASIC_INFORMATION: u32 = 0;
+const HIGHEST_USER_ADDRESS_64: u64 = 0x7FFF_FFFE_FFFF;
 const SYSTEM_EMULATION_BASIC_INFORMATION: u32 = 0x3e;
 use crate::wow64::{THREAD_WOW64_CONTEXT, WOW64_CONTEXT_SIZE};
 
