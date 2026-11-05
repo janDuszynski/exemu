@@ -316,13 +316,14 @@ mod nt {
     }
 
     #[test]
-    fn nt_query_with_buffer_at_the_top_of_the_address_space_is_an_error() {
+    fn nt_query_with_buffer_ending_at_the_top_of_the_address_space_is_an_error() {
         let (mut os, mut mem) = setup();
+        mem.map(Region::new("top", 0xFFFF_FFFF_FFFF_F000, 0x1000, Perm::RW)).unwrap();
         let r = try_syscall(
             &mut os,
             &mut mem,
             NT_QUERY,
-            &[SELF_PROCESS, SCRATCH, MEMORY_BASIC_INFORMATION, u64::MAX - 2, 0x30, 0],
+            &[SELF_PROCESS, SCRATCH, MEMORY_BASIC_INFORMATION, u64::MAX - 7, 0x30, 0],
         );
         assert!(matches!(r, Err(EmuError::Unmapped { .. })), "{r:?}");
     }
