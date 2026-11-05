@@ -5352,6 +5352,60 @@ mod tests {
         assert_eq!(get_window_long(&os, hwnd, 13, LONG_SIZE), 0, "a LONG must fit inside the extra bytes");
     }
 
+    fn window_long_syscall(
+        os: &mut WinOs,
+        mem: &mut VirtualMemory,
+        handler: fn(&mut WinOs, &mut CpuState, &mut dyn Memory) -> Result<u32>,
+        args: [u64; 3],
+    ) -> u64 {
+        let mut cpu = CpuState::default();
+        for (reg, v) in [Reg::R10, Reg::Rdx, Reg::R8].into_iter().zip(args) {
+            cpu.set_reg(reg, v);
+        }
+        os.syscall_result64 = None;
+        let status = handler(os, &mut cpu, mem).unwrap();
+        os.syscall_result64.unwrap_or(u64::from(status))
+    }
+
+    #[test]
+    fn the_long_syscalls_move_four_bytes_and_the_long_ptr_syscalls_eight() {
+        const DWLP_MSGRESULT: u64 = 0;
+        const DWLP_DLGPROC: u64 = 4;
+        const DWLP_USER: u64 = 8;
+        const DLGPROC: u64 = 0x0190_1234;
+        const USER: u64 = 0x1122_3344_5566_7788;
+        let (mut os, mut mem, hwnd) = message_call_fixture();
+        let h = u64::from(hwnd);
+        let get = |code| [h, DWLP_USER, code];
+
+        window_long_syscall(&mut os, &mut mem, nt_user_set_window_long, [h, DWLP_DLGPROC, DLGPROC]);
+        window_long_syscall(&mut os, &mut mem, nt_user_set_window_long, [h, DWLP_MSGRESULT, 0]);
+        assert_eq!(
+            window_long_syscall(
+                &mut os,
+                &mut mem,
+                nt_user_call_hwnd_param,
+                [h, DWLP_DLGPROC, call_hwnd_param::GET_WINDOW_LONG_W]
+            ),
+            DLGPROC,
+            "a 32-bit DefDlgProc's SetWindowLongW(DWLP_MSGRESULT, 0) leaves DWLP_DLGPROC alone"
+        );
+
+        window_long_syscall(&mut os, &mut mem, nt_user_set_window_long_ptr, [h, DWLP_USER, USER]);
+        for (code, want) in [
+            (call_hwnd_param::GET_WINDOW_LONG_PTR_W, USER),
+            (call_hwnd_param::GET_WINDOW_LONG_PTR_A, USER),
+            (call_hwnd_param::GET_WINDOW_LONG_W, USER & 0xFFFF_FFFF),
+            (call_hwnd_param::GET_WINDOW_LONG_A, USER & 0xFFFF_FFFF),
+        ] {
+            assert_eq!(
+                window_long_syscall(&mut os, &mut mem, nt_user_call_hwnd_param, get(code)),
+                want,
+                "NtUserCallHwndParam selector {code:#x}"
+            );
+        }
+    }
+
     #[test]
     fn gdi_handles_encode_their_type_in_the_high_word() {
         for (slot, ty, _) in STOCK_OBJECTS {
