@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use exemu_core::{CpuState, Memory, Result};
 
 use super::{
@@ -5,14 +7,22 @@ use super::{
     NT_GDI_PAT_BLT, SURFACE_BPP,
 };
 use crate::gdi_draw::{
-    self as g, Blit, Brush, PixelFormat, Pixmap, Rect, SrcSpec, MAX_PIXELS,
+    self as g, Blit, Brush, DibInfo, PixelFormat, Pixmap, Rect, SrcSpec, MAX_PIXELS,
 };
 use crate::WinOs;
 
 pub(super) const NT_GDI_BIT_BLT: u32 = 0x1097;
 pub(super) const NT_GDI_STRETCH_BLT: u32 = 0x128f;
 pub(super) const NT_GDI_GET_PIXEL: u32 = 0x1217;
+pub(super) const NT_GDI_SET_DIBITS_TO_DEVICE: u32 = 0x1278;
+pub(super) const NT_GDI_STRETCH_DIBITS: u32 = 0x1290;
 
+const SRCCOPY: u32 = 0x00CC_0020;
+const DIB_RGB_COLORS: u32 = 0;
+const DIB_MAX_BYTES: u64 = MAX_PIXELS * 4;
+const BITFIELDS_MASKS_BYTES: usize = 12;
+const DIB_INFO_HEADER_SIZE: usize = 40;
+const DIB_COMPRESSION_OFF: usize = 16;
 const GDI_FAIL: u32 = 0;
 const CLR_INVALID: u32 = 0xFFFF_FFFF;
 const COLORREF_MASK: u32 = 0x00FF_FFFF;
@@ -181,8 +191,13 @@ fn resolve_brush(os: &WinOs, hdc: u32) -> Option<Brush> {
     None
 }
 
+enum SrcData<'a> {
+    Canvas(&'a Canvas),
+    Pixels(&'a Pixmap),
+}
+
 struct SrcRef<'a> {
-    canvas: &'a Canvas,
+    data: SrcData<'a>,
     rect: Rect,
 }
 
@@ -215,26 +230,31 @@ fn transfer(
     } else {
         Brush::Solid(0)
     };
-    let src_pix = if g::rop_uses_source(t.rop) {
+    let src_pix: Option<Cow<Pixmap>> = if g::rop_uses_source(t.rop) {
         let Some(src) = &t.src else { return Ok(false) };
-        let unscaled = t.dest.width() == src.rect.width()
-            && t.dest.height() == src.rect.height()
-            && t.flip == (false, false);
-        let needed = if unscaled {
-            visible.offset(src.rect.l - t.dest.l, src.rect.t - t.dest.t)
-        } else {
-            src.rect
-        }
-        .intersect(&src.canvas.image.bounds());
-        if needed.area() > MAX_PIXELS {
-            return Ok(false);
-        }
-        let mut pix = src.canvas.image.load(mem, needed)?;
-        if src.canvas.mono_ddb {
-            let (text, bk) = dc_colors(os, mem, hdc);
-            recolor_mono(&mut pix, text, bk);
-        }
-        Some(pix)
+        Some(match &src.data {
+            SrcData::Pixels(p) => Cow::Borrowed(*p),
+            SrcData::Canvas(c) => {
+                let unscaled = t.dest.width() == src.rect.width()
+                    && t.dest.height() == src.rect.height()
+                    && t.flip == (false, false);
+                let needed = if unscaled {
+                    visible.offset(src.rect.l - t.dest.l, src.rect.t - t.dest.t)
+                } else {
+                    src.rect
+                }
+                .intersect(&c.image.bounds());
+                if needed.area() > MAX_PIXELS {
+                    return Ok(false);
+                }
+                let mut pix = c.image.load(mem, needed)?;
+                if c.mono_ddb {
+                    let (text, bk) = dc_colors(os, mem, hdc);
+                    recolor_mono(&mut pix, text, bk);
+                }
+                Cow::Owned(pix)
+            }
+        })
     } else {
         None
     };
@@ -242,7 +262,7 @@ fn transfer(
     let spec = Blit {
         dest: t.dest,
         src: match (&src_pix, &t.src) {
-            (Some(pix), Some(src)) => Some(SrcSpec { pix, rect: src.rect }),
+            (Some(pix), Some(src)) => Some(SrcSpec { pix: pix.as_ref(), rect: src.rect }),
             _ => None,
         },
         flip_x: t.flip.0,
@@ -324,7 +344,10 @@ fn blt(
         dest: dest_rect(&dcanvas, dst.0, dst.1, dst.2, dst.3),
         src: scanvas
             .as_ref()
-            .map(|c| SrcRef { canvas: c, rect: src_rect(c, src.0, src.1, src.2, src.3) }),
+            .map(|c| SrcRef {
+            data: SrcData::Canvas(c),
+            rect: src_rect(c, src.0, src.1, src.2, src.3),
+        }),
         flip,
         rop,
     };
@@ -360,11 +383,145 @@ pub(super) fn nt_gdi_get_pixel(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn
     Ok(((v & 0xFF) << 16) | (v & 0xFF00) | ((v >> 16) & 0xFF))
 }
 
+fn read_dib_info(mem: &dyn Memory, bmi: u64) -> Option<DibInfo> {
+    let mut first = [0u8; 4];
+    mem.read(bmi, &mut first).ok()?;
+    let header = g::dib_header_size(u32::from_le_bytes(first))?;
+    let mut buf = vec![0u8; header];
+    mem.read(bmi, &mut buf).ok()?;
+    let compression = buf
+        .get(DIB_COMPRESSION_OFF..DIB_COMPRESSION_OFF + 4)
+        .map_or(g::BI_RGB, |c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    if header == DIB_INFO_HEADER_SIZE && compression == g::BI_BITFIELDS {
+        buf.resize(header + BITFIELDS_MASKS_BYTES, 0);
+        mem.read(bmi + header as u64, &mut buf[header..]).ok()?;
+    }
+    let total = DibInfo::parse(&buf)?.total_header_len();
+    if total > buf.len() {
+        let have = buf.len();
+        buf.resize(total, 0);
+        mem.read(bmi + have as u64, &mut buf[have..]).ok()?;
+    }
+    DibInfo::parse(&buf)
+}
+
+fn read_dib_bits(mem: &dyn Memory, info: &DibInfo, bits: u64, rows: u32) -> Option<Vec<u8>> {
+    let len = (info.stride() as u64).checked_mul(rows as u64)?;
+    if len > DIB_MAX_BYTES {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    mem.read(bits, &mut buf).ok()?;
+    Some(buf)
+}
+
+fn dib_usable(info: &DibInfo, usage: u32) -> bool {
+    info.decodable() && (info.bpp > 8 || usage == DIB_RGB_COLORS)
+}
+
+pub(super) fn record_dib_format(os: &mut WinOs, mem: &dyn Memory, handle: u32, bmi: u64) {
+    if let Some(info) = read_dib_info(mem, bmi).filter(|i| g::bpp_supported(i.bpp)) {
+        os.win32k_state.draw.formats.push((handle, info.format));
+    }
+}
+
+pub(super) fn nt_gdi_set_dibits_to_device(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let hdc = os.syscall_arg_u32(cpu, mem, 0)?;
+    let x = os.syscall_arg_u32(cpu, mem, 1)? as i32;
+    let y = os.syscall_arg_u32(cpu, mem, 2)? as i32;
+    let cx = os.syscall_arg_u32(cpu, mem, 3)?;
+    let cy = os.syscall_arg_u32(cpu, mem, 4)?;
+    let limit = g::COORD_LIMIT;
+    let xs = (os.syscall_arg_u32(cpu, mem, 5)? as i32).clamp(-limit, limit);
+    let ys = (os.syscall_arg_u32(cpu, mem, 6)? as i32).clamp(-limit, limit);
+    let start = os.syscall_arg_u32(cpu, mem, 7)?;
+    let lines = os.syscall_arg_u32(cpu, mem, 8)?;
+    let bits = os.syscall_arg(cpu, mem, 9)?;
+    let bmi = os.syscall_arg(cpu, mem, 10)?;
+    let usage = os.syscall_arg_u32(cpu, mem, 11)?;
+    if bits == 0 || bmi == 0 || cx > limit as u32 || cy > limit as u32 {
+        return Ok(GDI_FAIL);
+    }
+    let Some(info) = read_dib_info(mem, bmi).filter(|i| dib_usable(i, usage)) else {
+        return Ok(GDI_FAIL);
+    };
+    let rows = lines.min((info.height as u32).saturating_sub(start));
+    let Some(buf) = read_dib_bits(mem, &info, bits, rows) else { return Ok(GDI_FAIL) };
+    let Some(scans) = g::decode_scans(&info, &buf, start, rows) else { return Ok(GDI_FAIL) };
+    let Some(dcanvas) = canvas(os, hdc) else { return Ok(GDI_FAIL) };
+    let (cx, cy) = (cx as i32, cy as i32);
+    let visual = g::visual_source(&info, &scans, xs, ys, cx, cy);
+    let t = Transfer {
+        dest: dest_rect(&dcanvas, x, y, cx, cy),
+        src: Some(SrcRef {
+            data: SrcData::Pixels(&visual),
+            rect: Rect::from_extent(xs, 0, cx, cy),
+        }),
+        flip: (false, false),
+        rop: SRCCOPY,
+    };
+    if !transfer(os, mem, hdc, &dcanvas, &t)? {
+        return Ok(GDI_FAIL);
+    }
+    Ok(rows)
+}
+
+pub(super) fn nt_gdi_stretch_dibits(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let hdc = os.syscall_arg_u32(cpu, mem, 0)?;
+    let x = os.syscall_arg_u32(cpu, mem, 1)? as i32;
+    let y = os.syscall_arg_u32(cpu, mem, 2)? as i32;
+    let cx = os.syscall_arg_u32(cpu, mem, 3)? as i32;
+    let cy = os.syscall_arg_u32(cpu, mem, 4)? as i32;
+    let xs = os.syscall_arg_u32(cpu, mem, 5)? as i32;
+    let ys = os.syscall_arg_u32(cpu, mem, 6)? as i32;
+    let cxs = os.syscall_arg_u32(cpu, mem, 7)? as i32;
+    let cys = os.syscall_arg_u32(cpu, mem, 8)? as i32;
+    let bits = os.syscall_arg(cpu, mem, 9)?;
+    let bmi = os.syscall_arg(cpu, mem, 10)?;
+    let usage = os.syscall_arg_u32(cpu, mem, 11)?;
+    let rop = os.syscall_arg_u32(cpu, mem, 12)?;
+    if bits == 0 || bmi == 0 {
+        return Ok(GDI_FAIL);
+    }
+    let Some(info) = read_dib_info(mem, bmi).filter(|i| dib_usable(i, usage)) else {
+        return Ok(GDI_FAIL);
+    };
+    let rows = info.height as u32;
+    let Some(buf) = read_dib_bits(mem, &info, bits, rows) else { return Ok(GDI_FAIL) };
+    let Some(scans) = g::decode_scans(&info, &buf, 0, rows) else { return Ok(GDI_FAIL) };
+    let Some(dcanvas) = canvas(os, hdc) else { return Ok(GDI_FAIL) };
+    let srect = Rect::from_extent(xs, ys, cxs, cys);
+    let visual = g::visual_source(&info, &scans, srect.l, srect.t, srect.width(), srect.height());
+    let t = Transfer {
+        dest: dest_rect(&dcanvas, x, y, cx, cy),
+        src: Some(SrcRef {
+            data: SrcData::Pixels(&visual),
+            rect: Rect::new(srect.l, 0, srect.r, srect.height()),
+        }),
+        flip: ((cx < 0) != (cxs < 0), (cy < 0) != (cys < 0)),
+        rop,
+    };
+    if !transfer(os, mem, hdc, &dcanvas, &t)? {
+        return Ok(GDI_FAIL);
+    }
+    Ok(srect.height() as u32)
+}
+
 pub(super) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_GDI_BIT_BLT, nt_gdi_bit_blt);
     os.set_win32k_handler(NT_GDI_STRETCH_BLT, nt_gdi_stretch_blt);
     os.set_win32k_handler(NT_GDI_PAT_BLT, nt_gdi_pat_blt);
     os.set_win32k_handler(NT_GDI_GET_PIXEL, nt_gdi_get_pixel);
+    os.set_win32k_handler(NT_GDI_SET_DIBITS_TO_DEVICE, nt_gdi_set_dibits_to_device);
+    os.set_win32k_handler(NT_GDI_STRETCH_DIBITS, nt_gdi_stretch_dibits);
 }
 
 #[cfg(test)]
@@ -548,5 +705,246 @@ mod tests {
         let (dc, _) = dc_with_bitmap(&mut os, &mut mem, 4, 4, 32, true);
         let huge = [dc as u64, 0x8000_0000, 0x8000_0000, 0x7FFF_FFFF, 0x7FFF_FFFF, 0, 0, 0, BLACKNESS];
         assert_eq!(call(nt_gdi_bit_blt, &mut os, &mut mem, &huge), 1);
+    }
+
+    const BMI: u64 = 0x11_0000;
+    const BITS: u64 = 0x11_4000;
+    const RED: u32 = 0x00FF_0000;
+    const GREEN: u32 = 0x0000_FF00;
+    const BLUE: u32 = 0x0000_00FF;
+    const WHITE: u32 = 0x00FF_FFFF;
+
+    fn write_bmi(mem: &mut VirtualMemory, width: i32, height: i32, bpp: u16, palette: &[u32]) {
+        let mut h = vec![0u8; 40];
+        h[0..4].copy_from_slice(&40u32.to_le_bytes());
+        h[4..8].copy_from_slice(&width.to_le_bytes());
+        h[8..12].copy_from_slice(&height.to_le_bytes());
+        h[12..14].copy_from_slice(&1u16.to_le_bytes());
+        h[14..16].copy_from_slice(&bpp.to_le_bytes());
+        h[32..36].copy_from_slice(&(palette.len() as u32).to_le_bytes());
+        for c in palette {
+            h.extend_from_slice(&[*c as u8, (*c >> 8) as u8, (*c >> 16) as u8, 0]);
+        }
+        mem.write(BMI, &h).unwrap();
+    }
+
+    fn rgb(mem: &VirtualMemory, os: &WinOs, hbm: u32, x: i32, y: i32) -> u32 {
+        pixel(mem, os, hbm, x, y) & 0xFF_FFFF
+    }
+
+    fn setdib(
+        os: &mut WinOs,
+        mem: &mut VirtualMemory,
+        hdc: u32,
+        dest: (i32, i32, u32, u32),
+        src: (i32, i32),
+        scans: (u32, u32),
+        usage: u64,
+    ) -> u32 {
+        let a = [
+            hdc as u64,
+            dest.0 as u32 as u64,
+            dest.1 as u32 as u64,
+            dest.2 as u64,
+            dest.3 as u64,
+            src.0 as u32 as u64,
+            src.1 as u32 as u64,
+            scans.0 as u64,
+            scans.1 as u64,
+            BITS,
+            BMI,
+            usage,
+        ];
+        call(nt_gdi_set_dibits_to_device, os, mem, &a)
+    }
+
+    fn fill_four(mem: &mut VirtualMemory, values: [u32; 4]) {
+        for (i, v) in values.iter().enumerate() {
+            mem.write_u32(BITS + i as u64 * 4, *v).unwrap();
+        }
+    }
+
+    #[test]
+    fn set_dibits_places_a_bottom_up_dib_with_its_last_scanline_on_top() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 4, 4, 32, true);
+        write_bmi(&mut mem, 2, 2, 32, &[]);
+        fill_four(&mut mem, [RED, GREEN, BLUE, WHITE]);
+        assert_eq!(setdib(&mut os, &mut mem, dc, (1, 1, 2, 2), (0, 0), (0, 2), 0), 2);
+        assert_eq!(rgb(&mem, &os, bm, 1, 1), BLUE);
+        assert_eq!(rgb(&mem, &os, bm, 2, 1), WHITE);
+        assert_eq!(rgb(&mem, &os, bm, 1, 2), RED);
+        assert_eq!(rgb(&mem, &os, bm, 2, 2), GREEN);
+        assert_eq!(pixel(&mem, &os, bm, 0, 0), 0);
+        assert_eq!(pixel(&mem, &os, bm, 3, 3), 0);
+    }
+
+    #[test]
+    fn set_dibits_keeps_a_top_down_dib_upright() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 2, 2, 32, true);
+        write_bmi(&mut mem, 2, -2, 32, &[]);
+        fill_four(&mut mem, [RED, GREEN, BLUE, WHITE]);
+        setdib(&mut os, &mut mem, dc, (0, 0, 2, 2), (0, 0), (0, 2), 0);
+        assert_eq!(rgb(&mem, &os, bm, 0, 0), RED);
+        assert_eq!(rgb(&mem, &os, bm, 1, 1), WHITE);
+    }
+
+    #[test]
+    fn set_dibits_decodes_every_depth_to_the_same_four_colours() {
+        let palette = [RED, GREEN, BLUE, WHITE];
+        let cases: [(u16, Vec<u32>, Vec<u8>); 5] = [
+            (4, palette.to_vec(), vec![0x01, 0x23, 0, 0]),
+            (8, palette.to_vec(), vec![0, 1, 2, 3]),
+            (
+                16,
+                vec![],
+                [0x7C00u16, 0x03E0, 0x001F, 0x7FFF].iter().flat_map(|v| v.to_le_bytes()).collect(),
+            ),
+            (24, vec![], vec![0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 0, 0, 0, 0]),
+            (32, vec![], palette.iter().flat_map(|v| v.to_le_bytes()).collect()),
+        ];
+        for (bpp, pal, bytes) in cases {
+            let (mut os, mut mem) = harness();
+            let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 4, 1, 32, true);
+            write_bmi(&mut mem, 4, 1, bpp, &pal);
+            mem.write(BITS, &bytes).unwrap();
+            assert_eq!(setdib(&mut os, &mut mem, dc, (0, 0, 4, 1), (0, 0), (0, 1), 0), 1, "{bpp} bpp");
+            let got: Vec<u32> = (0..4).map(|x| rgb(&mem, &os, bm, x, 0)).collect();
+            assert_eq!(got, palette, "{bpp} bpp");
+        }
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 4, 1, 32, true);
+        write_bmi(&mut mem, 4, 1, 1, &[0, WHITE]);
+        mem.write(BITS, &[0b1010_0000, 0, 0, 0]).unwrap();
+        setdib(&mut os, &mut mem, dc, (0, 0, 4, 1), (0, 0), (0, 1), 0);
+        let got: Vec<u32> = (0..4).map(|x| rgb(&mem, &os, bm, x, 0)).collect();
+        assert_eq!(got, [WHITE, 0, WHITE, 0]);
+    }
+
+    #[test]
+    fn set_dibits_clips_at_every_destination_edge_and_honours_the_source_origin() {
+        for (dx, dy) in [(-1, 0), (3, 0), (0, -1), (0, 3), (-1, -1), (3, 3)] {
+            let (mut os, mut mem) = harness();
+            let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 4, 4, 32, true);
+            write_bmi(&mut mem, 2, -2, 32, &[]);
+            fill_four(&mut mem, [0xFF00_0001, 0xFF00_0002, 0xFF00_0003, 0xFF00_0004]);
+            assert_eq!(setdib(&mut os, &mut mem, dc, (dx, dy, 2, 2), (0, 0), (0, 2), 0), 2);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let (sx, sy) = (x - dx, y - dy);
+                    let inside = (0..2).contains(&sx) && (0..2).contains(&sy);
+                    let want = if inside { (sy * 2 + sx + 1) as u32 } else { 0 };
+                    assert_eq!(rgb(&mem, &os, bm, x, y), want, "dest ({dx},{dy}) pixel ({x},{y})");
+                }
+            }
+        }
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 2, 2, 32, true);
+        write_bmi(&mut mem, 2, -2, 32, &[]);
+        fill_four(&mut mem, [1, 2, 3, 4]);
+        setdib(&mut os, &mut mem, dc, (0, 0, 1, 1), (1, 1), (0, 2), 0);
+        assert_eq!(rgb(&mem, &os, bm, 0, 0), 4);
+    }
+
+    #[test]
+    fn set_dibits_draws_only_the_scanlines_the_buffer_holds() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 1, 4, 32, true);
+        write_bmi(&mut mem, 1, 4, 32, &[]);
+        mem.write_u32(BITS, 0xFF00_00AA).unwrap();
+        mem.write_u32(BITS + 4, 0xFF00_00BB).unwrap();
+        assert_eq!(setdib(&mut os, &mut mem, dc, (0, 0, 1, 4), (0, 0), (1, 2), 0), 2);
+        let col: Vec<u32> = (0..4).map(|y| rgb(&mem, &os, bm, 0, y)).collect();
+        assert_eq!(col, [0, 0xBB, 0xAA, 0]);
+    }
+
+    #[test]
+    fn set_dibits_refuses_bad_input_without_drawing() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 2, 2, 32, true);
+        write_bmi(&mut mem, 2, 2, 32, &[]);
+        fill_four(&mut mem, [WHITE; 4]);
+        let unmapped = [dc as u64, 0, 0, 2, 2, 0, 0, 0, 2, 0x5000_0000, BMI, 0];
+        assert_eq!(call(nt_gdi_set_dibits_to_device, &mut os, &mut mem, &unmapped), 0);
+        let no_bmi = [dc as u64, 0, 0, 2, 2, 0, 0, 0, 2, BITS, 0x5000_0000, 0];
+        assert_eq!(call(nt_gdi_set_dibits_to_device, &mut os, &mut mem, &no_bmi), 0);
+        write_bmi(&mut mem, 2, 2, 8, &[RED, GREEN]);
+        assert_eq!(setdib(&mut os, &mut mem, dc, (0, 0, 2, 2), (0, 0), (0, 2), 1), 0);
+        write_bmi(&mut mem, 2, 2, 32, &[]);
+        assert_eq!(setdib(&mut os, &mut mem, 0, (0, 0, 2, 2), (0, 0), (0, 2), 0), 0);
+        assert_eq!(pixel(&mem, &os, bm, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_dib_section_remembers_its_colour_table_for_later_blits() {
+        let (mut os, mut mem) = harness();
+        write_bmi(&mut mem, 2, 1, 8, &[GREEN, BLUE]);
+        let bits_out = 0x11_8000u64;
+        let args = [0, 0, 0, BMI, 0, 0, 0, 0, bits_out];
+        let hbm = call(crate::win32k::nt_gdi_create_dib_section, &mut os, &mut mem, &args);
+        assert_ne!(hbm, 0);
+        let bits = mem.read_u64(bits_out).unwrap();
+        mem.write(bits, &[1, 0, 0, 0]).unwrap();
+        let src = alloc_memory_dc(&mut os, &mut mem).unwrap();
+        call(nt_gdi_select_bitmap, &mut os, &mut mem, &[src as u64, hbm as u64]);
+        let (dst, dbm) = dc_with_bitmap(&mut os, &mut mem, 2, 1, 32, true);
+        call(nt_gdi_bit_blt, &mut os, &mut mem, &[dst as u64, 0, 0, 2, 1, src as u64, 0, 0, SRCCOPY]);
+        assert_eq!(rgb(&mem, &os, dbm, 0, 0), BLUE);
+        assert_eq!(rgb(&mem, &os, dbm, 1, 0), GREEN);
+    }
+
+    fn stretchdib(
+        os: &mut WinOs,
+        mem: &mut VirtualMemory,
+        hdc: u32,
+        dest: (i32, i32, i32, i32),
+        src: (i32, i32, i32, i32),
+        rop: u64,
+    ) -> u32 {
+        let a = [
+            hdc as u64,
+            dest.0 as u32 as u64,
+            dest.1 as u32 as u64,
+            dest.2 as u32 as u64,
+            dest.3 as u32 as u64,
+            src.0 as u32 as u64,
+            src.1 as u32 as u64,
+            src.2 as u32 as u64,
+            src.3 as u32 as u64,
+            BITS,
+            BMI,
+            0,
+            rop,
+        ];
+        call(nt_gdi_stretch_dibits, os, mem, &a)
+    }
+
+    #[test]
+    fn stretch_dibits_scales_nearest_and_flips_on_a_negative_destination_height() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 4, 4, 32, true);
+        write_bmi(&mut mem, 2, 2, 32, &[]);
+        fill_four(&mut mem, [RED, GREEN, BLUE, WHITE]);
+        assert_eq!(stretchdib(&mut os, &mut mem, dc, (0, 0, 4, 4), (0, 0, 2, 2), SRCCOPY), 2);
+        let col = |os: &WinOs, mem: &VirtualMemory, x| -> Vec<u32> {
+            (0..4).map(|y| rgb(mem, os, bm, x, y)).collect()
+        };
+        assert_eq!(col(&os, &mem, 0), [BLUE, BLUE, RED, RED]);
+        assert_eq!(col(&os, &mem, 3), [WHITE, WHITE, GREEN, GREEN]);
+        stretchdib(&mut os, &mut mem, dc, (0, 4, 4, -4), (0, 0, 2, 2), SRCCOPY);
+        assert_eq!(col(&os, &mem, 0), [RED, RED, BLUE, BLUE]);
+    }
+
+    #[test]
+    fn stretch_dibits_honours_a_rop_that_ignores_the_source() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 2, 2, 32, true);
+        write_bmi(&mut mem, 1, 1, 32, &[]);
+        fill_four(&mut mem, [WHITE, 0, 0, 0]);
+        stretchdib(&mut os, &mut mem, dc, (0, 0, 2, 2), (0, 0, 1, 1), SRCCOPY);
+        assert_eq!(rgb(&mem, &os, bm, 1, 1), WHITE);
+        stretchdib(&mut os, &mut mem, dc, (0, 0, 2, 2), (0, 0, 1, 1), BLACKNESS);
+        assert_eq!(rgb(&mem, &os, bm, 1, 1), 0);
     }
 }

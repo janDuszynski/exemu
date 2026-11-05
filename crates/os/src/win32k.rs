@@ -3142,7 +3142,7 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 }
 
 pub mod abi {
-    pub const SYSCALLS: [(&str, u32); 41] = [
+    pub const SYSCALLS: [(&str, u32); 43] = [
         ("NtUserBuildHwndList", super::NT_USER_BUILD_HWND_LIST),
         ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
         ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
@@ -3184,6 +3184,8 @@ pub mod abi {
         ("NtGdiBitBlt", super::draw::NT_GDI_BIT_BLT),
         ("NtGdiStretchBlt", super::draw::NT_GDI_STRETCH_BLT),
         ("NtGdiGetPixel", super::draw::NT_GDI_GET_PIXEL),
+        ("NtGdiSetDIBitsToDeviceInternal", super::draw::NT_GDI_SET_DIBITS_TO_DEVICE),
+        ("NtGdiStretchDIBitsInternal", super::draw::NT_GDI_STRETCH_DIBITS),
     ];
 
     pub const CALL_HWND: [(&str, u64); 7] = [
@@ -3530,6 +3532,7 @@ fn nt_gdi_create_dib_section(
     if bits == 0 {
         return Ok(0);
     }
+    draw::record_dib_format(os, mem, handle, bmi);
     if out_bits != 0 {
         mem.write_u64(out_bits, bits)?;
     }
