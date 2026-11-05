@@ -88,9 +88,9 @@ impl WinOs {
         let (_, _, w, h) = self.gdi.windows.get(&hwnd).map(|win| win.rect).unwrap_or((0, 0, 640, 480));
         if rect != 0 {
             mem.write_u32(rect, 0)?;
-            mem.write_u32(rect + 4, 0)?;
-            mem.write_u32(rect + 8, w as u32)?;
-            mem.write_u32(rect + 12, h as u32)?;
+            mem.write_u32_at(rect, 4, 0)?;
+            mem.write_u32_at(rect, 8, w as u32)?;
+            mem.write_u32_at(rect, 12, h as u32)?;
         }
         Ok(Outcome::Return(1))
     }
@@ -101,9 +101,9 @@ impl WinOs {
         let (x, y, w, h) = self.gdi.windows.get(&hwnd).map(|win| win.rect).unwrap_or((0, 0, 640, 480));
         if rect != 0 {
             mem.write_u32(rect, x as u32)?;
-            mem.write_u32(rect + 4, y as u32)?;
-            mem.write_u32(rect + 8, (x + w) as u32)?;
-            mem.write_u32(rect + 12, (y + h) as u32)?;
+            mem.write_u32_at(rect, 4, y as u32)?;
+            mem.write_u32_at(rect, 8, (x + w) as u32)?;
+            mem.write_u32_at(rect, 12, (y + h) as u32)?;
         }
         Ok(Outcome::Return(1))
     }
@@ -180,7 +180,7 @@ impl WinOs {
         let p = self.arg(cpu, mem, 0)?;
         if p != 0 {
             mem.write_u32(p, 0)?;
-            mem.write_u32(p + 4, 0)?;
+            mem.write_u32_at(p, 4, 0)?;
         }
         Ok(Outcome::Return(1))
     }
