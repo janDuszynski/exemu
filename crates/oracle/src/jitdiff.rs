@@ -695,7 +695,9 @@ fn run_one(jit: &mut Jit, cfg: &JitFuzzConfig, plan: &TrialPlan, index: u64) -> 
         return run_lapped(jit, plan, laps, cuts, Twin { mem_j, cpu_j, mem_i, cpu_i });
     }
     let one_block = Compiler::compile(&mem_j, mode, plan.at, MAX_INSNS, None, u64::MAX).insns;
+    let smc_before = jit.stats().unlinks + jit.stats().smc_false_hits;
     let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, u64::from(one_block));
+    let wrote_code = jit.stats().unlinks + jit.stats().smc_false_hits != smc_before;
 
     let retired = match run {
         Run::NotCompiled => {
@@ -706,6 +708,15 @@ fn run_one(jit: &mut Jit, cfg: &JitFuzzConfig, plan: &TrialPlan, index: u64) -> 
         }
         Run::Executed { insns } | Run::SideExit { insns } | Run::Faulted { insns } => insns,
     };
+
+    if !matches!(run, Run::Faulted { .. }) && !wrote_code && retired != one_block {
+        return (
+            run,
+            Some(format!(
+                "the JIT retired {retired} of the {one_block} instructions of a block it was given the whole budget for: {run:?}"
+            )),
+        );
+    }
 
     let mut hooks = NoHooks;
     for step in 0..retired {
