@@ -721,6 +721,8 @@ struct Dc {
     clip: [i32; 4],
     bitmap: u32,
     font: u32,
+    pen: u32,
+    pos: (i32, i32),
 }
 
 #[derive(Default)]
@@ -999,9 +1001,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_GDI_EXT_TEXT_OUT_W, nt_gdi_ext_text_out_w);
     os.set_win32k_handler(NT_GDI_RECTANGLE, nt_gdi_rectangle);
     os.set_win32k_handler(NT_GDI_CREATE_SOLID_BRUSH, nt_gdi_create_solid_brush);
-    os.set_win32k_handler(NT_GDI_CREATE_PEN, nt_gdi_create_pen);
     os.set_win32k_handler(NT_GDI_SELECT_BRUSH, nt_gdi_select_brush);
-    os.set_win32k_handler(NT_GDI_SELECT_PEN, nt_gdi_select_pen);
     os.set_win32k_handler(NT_GDI_GET_AND_SET_DC_DWORD, nt_gdi_get_and_set_dc_dword);
     os.set_win32k_handler(NT_GDI_SELECT_FONT, nt_gdi_select_font);
     os.set_win32k_handler(NT_GDI_CREATE_RECT_RGN, nt_gdi_create_rect_rgn);
@@ -2244,7 +2244,16 @@ fn alloc_dc(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<u32> {
     mem.write_u32(obj + DC_ATTR_ORG_X, org.0 as u32)?;
     mem.write_u32(obj + DC_ATTR_ORG_Y, org.1 as u32)?;
     mem.write_u32(obj + DC_ATTR_BK_COLOR, DEFAULT_BK_COLOR)?;
-    os.win32k_state.dcs.push((hdc, Dc { hwnd, brush: 0, org, clip, bitmap: 0, font: STOCK_SYSTEM_FONT }));
+    os.win32k_state.dcs.push((hdc, Dc {
+            hwnd,
+            brush: 0,
+            org,
+            clip,
+            bitmap: 0,
+            font: STOCK_SYSTEM_FONT,
+            pen: 0,
+            pos: (0, 0),
+        }));
     Ok(hdc)
 }
 
@@ -3142,7 +3151,7 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 }
 
 pub mod abi {
-    pub const SYSCALLS: [(&str, u32); 43] = [
+    pub const SYSCALLS: [(&str, u32); 47] = [
         ("NtUserBuildHwndList", super::NT_USER_BUILD_HWND_LIST),
         ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
         ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
@@ -3186,6 +3195,10 @@ pub mod abi {
         ("NtGdiGetPixel", super::draw::NT_GDI_GET_PIXEL),
         ("NtGdiSetDIBitsToDeviceInternal", super::draw::NT_GDI_SET_DIBITS_TO_DEVICE),
         ("NtGdiStretchDIBitsInternal", super::draw::NT_GDI_STRETCH_DIBITS),
+        ("NtGdiMoveTo", super::draw::NT_GDI_MOVE_TO),
+        ("NtGdiLineTo", super::draw::NT_GDI_LINE_TO),
+        ("NtGdiCreatePatternBrushInternal", super::draw::NT_GDI_CREATE_PATTERN_BRUSH),
+        ("NtGdiOpenDCW", super::draw::NT_GDI_OPEN_DCW),
     ];
 
     pub const CALL_HWND: [(&str, u64); 7] = [
@@ -3296,10 +3309,6 @@ fn nt_gdi_create_solid_brush(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn M
     alloc_brush(os, mem, color)
 }
 
-fn nt_gdi_create_pen(os: &mut WinOs, _cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
-    Ok(alloc_gdi_object(os, mem, gdi_type::PEN)?.map(|(h, _)| h).unwrap_or(0))
-}
-
 fn nt_gdi_select_brush(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
     let brush = os.syscall_arg(cpu, mem, 1)? as u32;
@@ -3309,10 +3318,6 @@ fn nt_gdi_select_brush(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory)
     let previous = dc.brush;
     dc.brush = brush;
     Ok(previous)
-}
-
-fn nt_gdi_select_pen(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
-    Ok(os.syscall_arg(cpu, mem, 1)? as u32)
 }
 
 fn prop_key(mem: &dyn Memory, name: u64) -> Result<String> {
@@ -3476,6 +3481,8 @@ fn alloc_memory_dc(os: &mut WinOs, mem: &mut dyn Memory) -> Result<u32> {
         clip: [0, 0, 0, 0],
         bitmap: 0,
         font: STOCK_SYSTEM_FONT,
+        pen: 0,
+        pos: (0, 0),
     };
     os.win32k_state.dcs.push((hdc, dc));
     Ok(hdc)

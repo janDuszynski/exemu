@@ -3,8 +3,9 @@ use std::borrow::Cow;
 use exemu_core::{CpuState, Memory, Result};
 
 use super::{
-    colorref_to_bgra, gdi_client_object, Bitmap, DC_ATTR_BK_COLOR, DC_ATTR_TEXT_COLOR,
-    NT_GDI_PAT_BLT, SURFACE_BPP,
+    alloc_gdi_object, alloc_memory_dc, colorref_to_bgra, gdi_client_object, gdi_type,
+    read_unicode_string, Bitmap, DC_ATTR_BK_COLOR, DC_ATTR_TEXT_COLOR, NT_GDI_CREATE_PEN,
+    NT_GDI_PAT_BLT, NT_GDI_SELECT_PEN, SURFACE_BPP,
 };
 use crate::gdi_draw::{
     self as g, Blit, Brush, DibInfo, PixelFormat, Pixmap, Rect, SrcSpec, MAX_PIXELS,
@@ -16,6 +17,10 @@ pub(super) const NT_GDI_STRETCH_BLT: u32 = 0x128f;
 pub(super) const NT_GDI_GET_PIXEL: u32 = 0x1217;
 pub(super) const NT_GDI_SET_DIBITS_TO_DEVICE: u32 = 0x1278;
 pub(super) const NT_GDI_STRETCH_DIBITS: u32 = 0x1290;
+pub(super) const NT_GDI_MOVE_TO: u32 = 0x1243;
+pub(super) const NT_GDI_LINE_TO: u32 = 0x123a;
+pub(super) const NT_GDI_CREATE_PATTERN_BRUSH: u32 = 0x10b9;
+pub(super) const NT_GDI_OPEN_DCW: u32 = 0x1246;
 
 const SRCCOPY: u32 = 0x00CC_0020;
 const DIB_RGB_COLORS: u32 = 0;
@@ -23,19 +28,59 @@ const DIB_MAX_BYTES: u64 = MAX_PIXELS * 4;
 const BITFIELDS_MASKS_BYTES: usize = 12;
 const DIB_INFO_HEADER_SIZE: usize = 40;
 const DIB_COMPRESSION_OFF: usize = 16;
+const PS_STYLE_MASK: u32 = 0xF;
+const PS_NULL: u32 = 5;
+const PEN_SLOT_WHITE: u32 = 0x26;
+const PEN_SLOT_BLACK: u32 = 0x27;
+const PEN_SLOT_NULL: u32 = 0x28;
+const MAX_PATTERN_PIXELS: u64 = 1 << 20;
+const BLACK_RGB: u32 = 0;
+const POINT_SIZE: u64 = 8;
 const GDI_FAIL: u32 = 0;
 const CLR_INVALID: u32 = 0xFFFF_FFFF;
 const COLORREF_MASK: u32 = 0x00FF_FFFF;
 const WHITE_RGB: u32 = 0x00FF_FFFF;
 
+#[derive(Clone, Copy)]
+struct Pen {
+    style: u32,
+    color: u32,
+}
+
+struct PatternBrush {
+    pix: Pixmap,
+    mono: bool,
+}
+
 #[derive(Default)]
 pub(super) struct DrawState {
     formats: Vec<(u32, PixelFormat)>,
+    pens: Vec<(u32, Pen)>,
+    patterns: Vec<(u32, PatternBrush)>,
+}
+
+fn stock_pen_handle(slot: u32) -> u32 {
+    ((gdi_type::PEN as u32) << 16) | slot
 }
 
 impl DrawState {
     pub(super) fn forget(&mut self, handle: u32) {
         self.formats.retain(|(h, _)| *h != handle);
+        self.pens.retain(|(h, _)| *h != handle);
+        self.patterns.retain(|(h, _)| *h != handle);
+    }
+
+    fn pen(&self, handle: u32) -> Option<Pen> {
+        if let Some((_, p)) = self.pens.iter().find(|(h, _)| *h == handle) {
+            return Some(*p);
+        }
+        let solid = |color| Some(Pen { style: 0, color });
+        match handle {
+            h if h == stock_pen_handle(PEN_SLOT_WHITE) => solid(WHITE_RGB),
+            h if h == stock_pen_handle(PEN_SLOT_BLACK) => solid(BLACK_RGB),
+            h if h == stock_pen_handle(PEN_SLOT_NULL) => Some(Pen { style: PS_NULL, color: 0 }),
+            _ => None,
+        }
     }
 
     fn format(&self, handle: u32) -> Option<&PixelFormat> {
@@ -180,10 +225,18 @@ fn dc_colors(os: &WinOs, mem: &dyn Memory, hdc: u32) -> (u32, u32) {
     )
 }
 
-fn resolve_brush(os: &WinOs, hdc: u32) -> Option<Brush> {
+fn resolve_brush(os: &WinOs, mem: &dyn Memory, hdc: u32) -> Option<Brush> {
     let handle = os.win32k_state.dc(hdc).map_or(0, |d| d.brush);
     if handle == 0 {
         return Some(Brush::Solid(colorref_to_bgra(WHITE_RGB)));
+    }
+    if let Some((_, pattern)) = os.win32k_state.draw.patterns.iter().find(|(h, _)| *h == handle) {
+        let mut pix = pattern.pix.clone();
+        if pattern.mono {
+            let (text, bk) = dc_colors(os, mem, hdc);
+            recolor_mono(&mut pix, text, bk);
+        }
+        return Some(Brush::Pattern(pix));
     }
     if let Some((_, color)) = os.win32k_state.brushes.iter().find(|(h, _)| *h == handle) {
         return Some(Brush::Solid(colorref_to_bgra(*color)));
@@ -223,7 +276,7 @@ fn transfer(
         return Ok(false);
     }
     let brush = if g::rop_uses_pattern(t.rop) {
-        match resolve_brush(os, hdc) {
+        match resolve_brush(os, mem, hdc) {
             Some(b) => b,
             None => return Ok(true),
         }
@@ -515,6 +568,128 @@ pub(super) fn nt_gdi_stretch_dibits(
     Ok(srect.height() as u32)
 }
 
+pub(super) fn nt_gdi_create_pen(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let style = os.syscall_arg_u32(cpu, mem, 0)?;
+    let color = os.syscall_arg_u32(cpu, mem, 2)?;
+    let Some((handle, _)) = alloc_gdi_object(os, mem, gdi_type::PEN)? else { return Ok(GDI_FAIL) };
+    let pen = Pen { style: style & PS_STYLE_MASK, color };
+    os.win32k_state.draw.pens.push((handle, pen));
+    Ok(handle)
+}
+
+pub(super) fn nt_gdi_select_pen(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let hdc = os.syscall_arg_u32(cpu, mem, 0)?;
+    let pen = os.syscall_arg_u32(cpu, mem, 1)?;
+    if os.win32k_state.draw.pen(pen).is_none() {
+        return Ok(GDI_FAIL);
+    }
+    let Some(dc) = os.win32k_state.dcs.iter_mut().find(|(h, _)| *h == hdc).map(|(_, d)| d) else {
+        return Ok(GDI_FAIL);
+    };
+    let previous = std::mem::replace(&mut dc.pen, pen);
+    Ok(if previous == 0 { stock_pen_handle(PEN_SLOT_BLACK) } else { previous })
+}
+
+pub(super) fn nt_gdi_move_to(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg_u32(cpu, mem, 0)?;
+    let x = os.syscall_arg_u32(cpu, mem, 1)? as i32;
+    let y = os.syscall_arg_u32(cpu, mem, 2)? as i32;
+    let out = os.syscall_arg(cpu, mem, 3)?;
+    let Some(dc) = os.win32k_state.dcs.iter_mut().find(|(h, _)| *h == hdc).map(|(_, d)| d) else {
+        return Ok(GDI_FAIL);
+    };
+    let previous = std::mem::replace(&mut dc.pos, (x, y));
+    if out != 0 {
+        let mut point = [0u8; POINT_SIZE as usize];
+        point[..4].copy_from_slice(&previous.0.to_le_bytes());
+        point[4..].copy_from_slice(&previous.1.to_le_bytes());
+        if mem.write(out, &point).is_err() {
+            return Ok(GDI_FAIL);
+        }
+    }
+    Ok(1)
+}
+
+pub(super) fn nt_gdi_line_to(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let hdc = os.syscall_arg_u32(cpu, mem, 0)?;
+    let limit = g::COORD_LIMIT;
+    let x = (os.syscall_arg_u32(cpu, mem, 1)? as i32).clamp(-limit, limit);
+    let y = (os.syscall_arg_u32(cpu, mem, 2)? as i32).clamp(-limit, limit);
+    let Some(dcanvas) = canvas(os, hdc) else { return Ok(GDI_FAIL) };
+    let Some(dc) = os.win32k_state.dcs.iter_mut().find(|(h, _)| *h == hdc).map(|(_, d)| d) else {
+        return Ok(GDI_FAIL);
+    };
+    let (from, pen_handle) = (dc.pos, dc.pen);
+    dc.pos = (x, y);
+    let pen = os.win32k_state.draw.pen(pen_handle).unwrap_or(Pen { style: 0, color: BLACK_RGB });
+    if pen.style == PS_NULL {
+        return Ok(1);
+    }
+    let (ox, oy) = dcanvas.org;
+    let from = (from.0.clamp(-limit, limit) + ox, from.1.clamp(-limit, limit) + oy);
+    let points: Vec<(i32, i32)> = g::Bresenham::new(from.0, from.1, x + ox, y + oy)
+        .filter(|(px, py)| dcanvas.clip.contains(*px, *py))
+        .collect();
+    let (Some(l), Some(t)) = (
+        points.iter().map(|p| p.0).min(),
+        points.iter().map(|p| p.1).min(),
+    ) else {
+        return Ok(1);
+    };
+    let r = points.iter().map(|p| p.0).max().unwrap_or(l) + 1;
+    let b = points.iter().map(|p| p.1).max().unwrap_or(t) + 1;
+    let bbox = Rect::new(l, t, r, b);
+    if bbox.area() > MAX_PIXELS {
+        return Ok(GDI_FAIL);
+    }
+    let mut pix = dcanvas.image.load(mem, bbox)?;
+    let color = colorref_to_bgra(pen.color);
+    for (px, py) in points {
+        let alpha = pix.get(px, py).unwrap_or(0) & 0xFF00_0000;
+        pix.set(px, py, alpha | (color & 0x00FF_FFFF));
+    }
+    dcanvas.image.store(mem, &pix)?;
+    Ok(1)
+}
+
+pub(super) fn nt_gdi_create_pattern_brush(
+    os: &mut WinOs,
+    cpu: &mut CpuState,
+    mem: &mut dyn Memory,
+) -> Result<u32> {
+    let hbm = os.syscall_arg_u32(cpu, mem, 0)?;
+    let Some(b) = os.win32k_state.bitmap(hbm) else { return Ok(GDI_FAIL) };
+    let Some(image) = bitmap_image(os, hbm, &b) else { return Ok(GDI_FAIL) };
+    if image.bounds().area() > MAX_PATTERN_PIXELS {
+        return Ok(GDI_FAIL);
+    }
+    let pix = image.load(mem, image.bounds())?;
+    let mono = b.bpp == 1 && os.win32k_state.draw.format(hbm).is_none();
+    let Some((handle, _)) = alloc_gdi_object(os, mem, gdi_type::BRUSH)? else {
+        return Ok(GDI_FAIL);
+    };
+    os.win32k_state.draw.patterns.push((handle, PatternBrush { pix, mono }));
+    Ok(handle)
+}
+
+pub(super) fn nt_gdi_open_dcw(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
+    let device = os.syscall_arg(cpu, mem, 0)?;
+    let is_display = os.syscall_arg_u32(cpu, mem, 4)? != 0;
+    let name = if device == 0 { String::new() } else { read_unicode_string(mem, device).unwrap_or_default() };
+    if !is_display && !name.to_ascii_uppercase().contains("DISPLAY") {
+        return Ok(GDI_FAIL);
+    }
+    alloc_memory_dc(os, mem)
+}
+
 pub(super) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_GDI_BIT_BLT, nt_gdi_bit_blt);
     os.set_win32k_handler(NT_GDI_STRETCH_BLT, nt_gdi_stretch_blt);
@@ -522,6 +697,12 @@ pub(super) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_GDI_GET_PIXEL, nt_gdi_get_pixel);
     os.set_win32k_handler(NT_GDI_SET_DIBITS_TO_DEVICE, nt_gdi_set_dibits_to_device);
     os.set_win32k_handler(NT_GDI_STRETCH_DIBITS, nt_gdi_stretch_dibits);
+    os.set_win32k_handler(NT_GDI_CREATE_PEN, nt_gdi_create_pen);
+    os.set_win32k_handler(NT_GDI_SELECT_PEN, nt_gdi_select_pen);
+    os.set_win32k_handler(NT_GDI_MOVE_TO, nt_gdi_move_to);
+    os.set_win32k_handler(NT_GDI_LINE_TO, nt_gdi_line_to);
+    os.set_win32k_handler(NT_GDI_CREATE_PATTERN_BRUSH, nt_gdi_create_pattern_brush);
+    os.set_win32k_handler(NT_GDI_OPEN_DCW, nt_gdi_open_dcw);
 }
 
 #[cfg(test)]
@@ -946,5 +1127,111 @@ mod tests {
         assert_eq!(rgb(&mem, &os, bm, 1, 1), WHITE);
         stretchdib(&mut os, &mut mem, dc, (0, 0, 2, 2), (0, 0, 1, 1), BLACKNESS);
         assert_eq!(rgb(&mem, &os, bm, 1, 1), 0);
+    }
+
+    fn create_pen(os: &mut WinOs, mem: &mut VirtualMemory, style: u64, color: u64) -> u32 {
+        call(nt_gdi_create_pen, os, mem, &[style, 1, color, 0])
+    }
+
+    fn row_rgb(mem: &VirtualMemory, os: &WinOs, hbm: u32, y: i32, w: i32) -> Vec<u32> {
+        (0..w).map(|x| rgb(mem, os, hbm, x, y)).collect()
+    }
+
+    #[test]
+    fn line_to_draws_from_the_current_position_with_the_selected_pen_and_skips_the_last_pixel() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 6, 3, 32, true);
+        let pen = create_pen(&mut os, &mut mem, 0, 0x0033_2211);
+        assert_ne!(pen, 0);
+        let stock = call(nt_gdi_select_pen, &mut os, &mut mem, &[dc as u64, pen as u64]);
+        assert_eq!(stock, stock_pen_handle(PEN_SLOT_BLACK), "a fresh DC holds BLACK_PEN");
+        assert_eq!(call(nt_gdi_move_to, &mut os, &mut mem, &[dc as u64, 1, 1, 0]), 1);
+        assert_eq!(call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, 5, 1]), 1);
+        assert_eq!(row_rgb(&mem, &os, bm, 1, 6), [0, 0x112233, 0x112233, 0x112233, 0x112233, 0]);
+        assert_eq!(call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, 5, 3]), 1);
+        assert_eq!(rgb(&mem, &os, bm, 5, 1), 0x112233, "the next segment starts at the previous end");
+        assert_eq!(rgb(&mem, &os, bm, 5, 2), 0x112233, "x = 5 down to the excluded row 3");
+        assert_eq!(rgb(&mem, &os, bm, 4, 2), 0);
+        let out = 0x11_C000u64;
+        call(nt_gdi_move_to, &mut os, &mut mem, &[dc as u64, 0, 0, out]);
+        assert_eq!((mem.read_u32(out).unwrap(), mem.read_u32(out + 4).unwrap()), (5, 3));
+    }
+
+    #[test]
+    fn line_to_clips_to_the_bitmap_and_a_null_pen_only_moves() {
+        let (mut os, mut mem) = harness();
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 4, 1, 32, true);
+        let pen = create_pen(&mut os, &mut mem, 0, 0x00FF_FFFF);
+        call(nt_gdi_select_pen, &mut os, &mut mem, &[dc as u64, pen as u64]);
+        call(nt_gdi_move_to, &mut os, &mut mem, &[dc as u64, (-3i32) as u32 as u64, 0, 0]);
+        assert_eq!(call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, 100, 0]), 1);
+        assert_eq!(row_rgb(&mem, &os, bm, 0, 4), [WHITE; 4]);
+
+        call(nt_gdi_bit_blt, &mut os, &mut mem, &[dc as u64, 0, 0, 4, 1, 0, 0, 0, BLACKNESS]);
+        let null_pen = create_pen(&mut os, &mut mem, 5, 0x00FF_FFFF);
+        call(nt_gdi_select_pen, &mut os, &mut mem, &[dc as u64, null_pen as u64]);
+        call(nt_gdi_move_to, &mut os, &mut mem, &[dc as u64, 0, 0, 0]);
+        call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, 3, 0]);
+        assert_eq!(row_rgb(&mem, &os, bm, 0, 4), [0; 4]);
+        let giant = [dc as u64, 0, 0, 0, 0];
+        call(nt_gdi_move_to, &mut os, &mut mem, &giant);
+        assert_eq!(call(nt_gdi_line_to, &mut os, &mut mem, &[dc as u64, 0x7FFF_FFFF, 0x7FFF_FFFF]), 1);
+    }
+
+    #[test]
+    fn select_pen_rejects_an_unknown_handle_and_returns_the_previous_pen() {
+        let (mut os, mut mem) = harness();
+        let (dc, _) = dc_with_bitmap(&mut os, &mut mem, 2, 2, 32, true);
+        assert_eq!(call(nt_gdi_select_pen, &mut os, &mut mem, &[dc as u64, 0x0030_0999]), 0);
+        let a = create_pen(&mut os, &mut mem, 0, 1);
+        let b = create_pen(&mut os, &mut mem, 0, 2);
+        call(nt_gdi_select_pen, &mut os, &mut mem, &[dc as u64, a as u64]);
+        assert_eq!(call(nt_gdi_select_pen, &mut os, &mut mem, &[dc as u64, b as u64]), a);
+    }
+
+    #[test]
+    fn a_pattern_brush_built_from_a_bitmap_tiles_through_patblt() {
+        let (mut os, mut mem) = harness();
+        let (_, tile) = dc_with_bitmap(&mut os, &mut mem, 2, 2, 32, true);
+        put(&mut mem, &os, tile, 0, 0, 0xFF00_0001);
+        put(&mut mem, &os, tile, 1, 0, 0xFF00_0002);
+        put(&mut mem, &os, tile, 0, 1, 0xFF00_0003);
+        put(&mut mem, &os, tile, 1, 1, 0xFF00_0004);
+        let brush = call(nt_gdi_create_pattern_brush, &mut os, &mut mem, &[tile as u64, 0, 0]);
+        assert_ne!(brush, 0);
+        assert_eq!(brush >> 16, gdi_type::BRUSH as u32);
+        put(&mut mem, &os, tile, 0, 0, 0xFFFF_FFFF);
+
+        let (dc, bm) = dc_with_bitmap(&mut os, &mut mem, 4, 2, 32, true);
+        call(nt_gdi_select_brush, &mut os, &mut mem, &[dc as u64, brush as u64]);
+        assert_eq!(call(nt_gdi_pat_blt, &mut os, &mut mem, &[dc as u64, 0, 0, 4, 2, PATCOPY]), 1);
+        assert_eq!(row_rgb(&mem, &os, bm, 0, 4), [1, 2, 1, 2], "the brush kept its own copy");
+        assert_eq!(row_rgb(&mem, &os, bm, 1, 4), [3, 4, 3, 4]);
+    }
+
+    #[test]
+    fn open_dcw_answers_a_dc_for_display_and_refuses_other_devices() {
+        let (mut os, mut mem) = harness();
+        let name = 0x11_D000u64;
+        let text: Vec<u16> = "DISPLAY".encode_utf16().chain([0]).collect();
+        let buf = name + 0x20;
+        for (i, u) in text.iter().enumerate() {
+            mem.write_u16(buf + i as u64 * 2, *u).unwrap();
+        }
+        mem.write_u16(name, 14).unwrap();
+        mem.write_u16(name + 2, 16).unwrap();
+        mem.write_u64(name + 8, buf).unwrap();
+        let hdc = call(nt_gdi_open_dcw, &mut os, &mut mem, &[name, 0, 0, 0, 0, 0, 0, 0]);
+        assert_ne!(hdc, 0);
+        assert_eq!(hdc >> 16, gdi_type::DC as u32);
+        assert!(os.win32k_state.dc(hdc).is_some());
+
+        let text: Vec<u16> = "EPSON".encode_utf16().chain([0]).collect();
+        for (i, u) in text.iter().enumerate() {
+            mem.write_u16(buf + i as u64 * 2, *u).unwrap();
+        }
+        mem.write_u16(name, 10).unwrap();
+        assert_eq!(call(nt_gdi_open_dcw, &mut os, &mut mem, &[name, 0, 0, 0, 0, 0, 0, 0]), 0);
+        assert_ne!(call(nt_gdi_open_dcw, &mut os, &mut mem, &[name, 0, 0, 0, 1, 0, 0, 0]), 0);
     }
 }
