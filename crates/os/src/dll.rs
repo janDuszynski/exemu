@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use exemu_core::{CpuState, Export, ImageLoader, ImportSymbol, Memory, ModuleExports, Result};
+use exemu_core::{checked_align_up, CpuState, Export, ImageLoader, ImportSymbol, Memory, ModuleExports, Result};
 
 use crate::WinOs;
 
@@ -89,10 +89,6 @@ fn canonical_name(images: &dyn ImageLoader, raw: &str) -> String {
         }
         None => raw.to_string(),
     }
-}
-
-fn align_up(v: u64, a: u64) -> u64 {
-    v.div_ceil(a) * a
 }
 
 impl WinOs {
@@ -221,12 +217,18 @@ impl WinOs {
         if self.dll.arena_next == 0 {
             self.dll.arena_next = self.cfg.dll_base;
         }
-        let base = align_up(self.dll.arena_next, PAGE);
-        let img_size = align_up(image.size_of_image as u64, PAGE).max(PAGE);
-        if base + img_size > self.cfg.dll_base + self.cfg.dll_size {
+        let (Some(base), Some(img_size)) = (
+            checked_align_up(self.dll.arena_next, PAGE),
+            checked_align_up(image.size_of_image as u64, PAGE),
+        ) else {
             return Ok(None);
-        }
-        self.dll.arena_next = base + img_size;
+        };
+        let img_size = img_size.max(PAGE);
+        let arena_end = self.cfg.dll_base.saturating_add(self.cfg.dll_size);
+        let Some(next) = base.checked_add(img_size).filter(|&end| end <= arena_end) else {
+            return Ok(None);
+        };
+        self.dll.arena_next = next;
         let ptr_size = if self.cfg.is_64bit { 8 } else { 4 };
 
         let preferred = image.image_base;
@@ -243,7 +245,7 @@ impl WinOs {
         mem.write(base, &image.headers)?;
         for s in &image.sections {
             if !s.data.is_empty() {
-                mem.write(base + s.rva as u64, &s.data)?;
+                mem.write_at(base, s.rva as u64, &s.data)?;
             }
         }
 
@@ -270,7 +272,7 @@ impl WinOs {
 
         for imp in &image.imports {
             let addr = self.resolve_import_addr(&imp.dll, &imp.symbol);
-            mem.write(base + imp.iat_rva as u64, &addr.to_le_bytes()[..ptr_size])?;
+            mem.write_at(base, imp.iat_rva as u64, &addr.to_le_bytes()[..ptr_size])?;
         }
         if self.cfg.trace {
             eprintln!(
@@ -352,12 +354,18 @@ impl WinOs {
         if self.dll.arena_next == 0 {
             self.dll.arena_next = self.cfg.dll_base;
         }
-        let base = align_up(self.dll.arena_next, PAGE);
-        let img_size = align_up(image.size_of_image as u64, PAGE).max(PAGE);
-        if base + img_size > self.cfg.dll_base + self.cfg.dll_size {
+        let (Some(base), Some(img_size)) = (
+            checked_align_up(self.dll.arena_next, PAGE),
+            checked_align_up(image.size_of_image as u64, PAGE),
+        ) else {
             return Ok(None);
-        }
-        self.dll.arena_next = base + img_size;
+        };
+        let img_size = img_size.max(PAGE);
+        let arena_end = self.cfg.dll_base.saturating_add(self.cfg.dll_size);
+        let Some(next) = base.checked_add(img_size).filter(|&end| end <= arena_end) else {
+            return Ok(None);
+        };
+        self.dll.arena_next = next;
         let ptr_size = if self.cfg.is_64bit { 8 } else { 4 };
 
         let preferred = image.image_base;
@@ -374,7 +382,7 @@ impl WinOs {
         mem.write(base, &image.headers)?;
         for s in &image.sections {
             if !s.data.is_empty() {
-                mem.write(base + s.rva as u64, &s.data)?;
+                mem.write_at(base, s.rva as u64, &s.data)?;
             }
         }
 
@@ -383,7 +391,7 @@ impl WinOs {
 
         for imp in &image.imports {
             let addr = self.resolve_import_addr(&imp.dll, &imp.symbol);
-            mem.write(base + imp.iat_rva as u64, &addr.to_le_bytes()[..ptr_size])?;
+            mem.write_at(base, imp.iat_rva as u64, &addr.to_le_bytes()[..ptr_size])?;
         }
         if self.cfg.trace {
             eprintln!(
@@ -566,7 +574,7 @@ impl WinOs {
         let ldr = self.ldr_alloc(ldr_size);
         self.dll.peb_ldr_data = ldr;
         mem.write_u32(ldr, ldr_size as u32)?;
-        mem.write_u32(ldr + 4, 1)?;
+        mem.write_u32_at(ldr, 4, 1)?;
         for off in self.ldr_list_offsets() {
             let head = ldr + off;
             self.write_ptr(mem, head, head)?;
@@ -580,8 +588,8 @@ impl WinOs {
         let cs = self.ldr_alloc(cs_size);
         self.dll.loader_lock = cs;
         self.write_ptr(mem, cs, 0)?;
-        mem.write_u32(cs + ptr, (-1_i32) as u32)?;
-        mem.write_u32(cs + ptr + 4, 0)?;
+        mem.write_u32_at(cs, ptr, (-1_i32) as u32)?;
+        mem.write_u32_at(cs, ptr + 4, 0)?;
         self.write_ptr(mem, cs + ptr + 8, 0)?;
         self.write_ptr(mem, cs + ptr + 8 + ptr, 0)?;
         self.write_ptr(mem, cs + ptr + 8 + 2 * ptr, 0)?;
@@ -623,13 +631,13 @@ impl WinOs {
             (0x02, 0x68, 0xA4, 0xA8, 0xAC, 0xB0, 0x1D4, 0x10)
         };
 
-        mem.write_u8(peb + off_being_debugged, 0)?;
-        mem.write_u32(peb + off_nt_global_flag, 0)?;
-        mem.write_u32(peb + off_os_major, 10)?;
-        mem.write_u32(peb + off_os_minor, 0)?;
-        mem.write_u16(peb + off_os_build, 19045)?;
-        mem.write_u32(peb + off_os_platform, 2)?;
-        mem.write_u32(peb + off_session_id, 0)?;
+        mem.write_u8_at(peb, off_being_debugged, 0)?;
+        mem.write_u32_at(peb, off_nt_global_flag, 0)?;
+        mem.write_u32_at(peb, off_os_major, 10)?;
+        mem.write_u32_at(peb, off_os_minor, 0)?;
+        mem.write_u16_at(peb, off_os_build, 19045)?;
+        mem.write_u32_at(peb, off_os_platform, 2)?;
+        mem.write_u32_at(peb, off_session_id, 0)?;
 
         let pp = self.build_process_parameters(mem)?;
         self.write_ptr(mem, peb + off_process_params, pp)?;
@@ -659,11 +667,11 @@ impl WinOs {
         mem.write(pp, &zero)?;
 
         mem.write_u32(pp, PP_SIZE as u32)?;
-        mem.write_u32(pp + 0x04, PP_SIZE as u32)?;
-        mem.write_u32(pp + 0x08, 0x1)?;
-        mem.write_u64(pp + 0x20, crate::HANDLE_STDIN)?;
-        mem.write_u64(pp + 0x28, crate::HANDLE_STDOUT)?;
-        mem.write_u64(pp + 0x30, crate::HANDLE_STDERR)?;
+        mem.write_u32_at(pp, 0x04, PP_SIZE as u32)?;
+        mem.write_u32_at(pp, 0x08, 0x1)?;
+        mem.write_u64_at(pp, 0x20, crate::HANDLE_STDIN)?;
+        mem.write_u64_at(pp, 0x28, crate::HANDLE_STDOUT)?;
+        mem.write_u64_at(pp, 0x30, crate::HANDLE_STDERR)?;
 
         let (cd_buf, cd_len) = self.ldr_write_wstr(mem, "C:\\")?;
         self.write_unicode_string(mem, pp + 0x38, cd_buf, cd_len)?;
@@ -680,7 +688,7 @@ impl WinOs {
 
         let (env_buf, env_bytes) = self.write_env_block(mem)?;
         self.write_ptr(mem, pp + 0x80, env_buf)?;
-        mem.write_u64(pp + 0x3f0, env_bytes)?;
+        mem.write_u64_at(pp, 0x3f0, env_bytes)?;
 
         let (empty_buf, _) = self.ldr_write_wstr(mem, "")?;
         for off in [0xb0u64, 0xc0, 0xd0, 0xe0] {
@@ -695,8 +703,8 @@ impl WinOs {
         let zero = [0u8; PP_SIZE as usize];
         mem.write(pp, &zero)?;
         mem.write_u32(pp, PP_SIZE as u32)?;
-        mem.write_u32(pp + 0x04, PP_SIZE as u32)?;
-        mem.write_u32(pp + 0x08, 0x1)?;
+        mem.write_u32_at(pp, 0x04, PP_SIZE as u32)?;
+        mem.write_u32_at(pp, 0x08, 0x1)?;
         let (img_buf, img_len) = self.ldr_write_wstr(mem, &self.cfg.module_path_w.clone())?;
         self.write_unicode_string(mem, pp + 0x38, img_buf, img_len)?;
         if self.cfg.cmdline_ptr_w != 0 {
@@ -744,27 +752,27 @@ impl WinOs {
 
         mem.write(pp, &vec![0u8; PP32_SIZE as usize])?;
         mem.write_u32(pp, PP32_SIZE as u32)?;
-        mem.write_u32(pp + 0x04, PP32_SIZE as u32)?;
-        mem.write_u32(pp + 0x08, 0x1)?;
+        mem.write_u32_at(pp, 0x04, PP32_SIZE as u32)?;
+        mem.write_u32_at(pp, 0x08, 0x1)?;
         let put = |mem: &mut dyn Memory, at: u64, buf: u64, units: &[u16]| -> Result<()> {
             for (i, u) in units.iter().enumerate() {
-                mem.write_u16(buf + (i * 2) as u64, *u)?;
+                mem.write_u16_at(buf, (i * 2) as u64, *u)?;
             }
-            mem.write_u16(buf + units.len() as u64 * 2, 0)?;
+            mem.write_u16_at(buf, units.len() as u64 * 2, 0)?;
             let bytes = (units.len() * 2) as u16;
             mem.write_u16(at, bytes)?;
-            mem.write_u16(at + 2, bytes + 2)?;
-            mem.write_u32(at + 4, buf as u32)?;
+            mem.write_u16_at(at, 2, bytes + 2)?;
+            mem.write_u32_at(at, 4, buf as u32)?;
             Ok(())
         };
         put(mem, pp + 0x24, cur_buf, &cur_units)?;
         put(mem, pp + 0x38, img_buf, &img_units)?;
         put(mem, pp + 0x40, cmd_buf, &cmd_units)?;
         for (i, u) in env_units.iter().enumerate() {
-            mem.write_u16(env_buf + (i * 2) as u64, *u)?;
+            mem.write_u16_at(env_buf, (i * 2) as u64, *u)?;
         }
-        mem.write_u32(pp + 0x48, env_buf as u32)?;
-        mem.write_u32(pp + PP32_ENVIRONMENT_SIZE, (env_units.len() * 2) as u32)?;
+        mem.write_u32_at(pp, 0x48, env_buf as u32)?;
+        mem.write_u32_at(pp, PP32_ENVIRONMENT_SIZE, (env_units.len() * 2) as u32)?;
         Ok(Some(pp))
     }
 
@@ -773,7 +781,7 @@ impl WinOs {
         let byte_len = (units.len() * 2) as u64;
         let addr = self.ldr_alloc(byte_len.max(2));
         for (i, u) in units.iter().enumerate() {
-            mem.write_u16(addr + (i * 2) as u64, *u)?;
+            mem.write_u16_at(addr, (i * 2) as u64, *u)?;
         }
         Ok((addr, byte_len))
     }
@@ -805,8 +813,8 @@ impl WinOs {
         }
         let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
         self.dll.loader_lock_depth += 1;
-        mem.write_u32(cs + ptr, (self.dll.loader_lock_depth - 1) as u32)?;
-        mem.write_u32(cs + ptr + 4, self.dll.loader_lock_depth as u32)?;
+        mem.write_u32_at(cs, ptr, (self.dll.loader_lock_depth - 1) as u32)?;
+        mem.write_u32_at(cs, ptr + 4, self.dll.loader_lock_depth as u32)?;
         let owner = u64::from(self.current_tid);
         self.write_ptr(mem, cs + ptr + 8, owner)?;
         Ok(())
@@ -820,12 +828,12 @@ impl WinOs {
         let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
         self.dll.loader_lock_depth -= 1;
         if self.dll.loader_lock_depth == 0 {
-            mem.write_u32(cs + ptr, (-1_i32) as u32)?;
-            mem.write_u32(cs + ptr + 4, 0)?;
+            mem.write_u32_at(cs, ptr, (-1_i32) as u32)?;
+            mem.write_u32_at(cs, ptr + 4, 0)?;
             self.write_ptr(mem, cs + ptr + 8, 0)?;
         } else {
-            mem.write_u32(cs + ptr, (self.dll.loader_lock_depth - 1) as u32)?;
-            mem.write_u32(cs + ptr + 4, self.dll.loader_lock_depth as u32)?;
+            mem.write_u32_at(cs, ptr, (self.dll.loader_lock_depth - 1) as u32)?;
+            mem.write_u32_at(cs, ptr + 4, self.dll.loader_lock_depth as u32)?;
         }
         Ok(())
     }
@@ -886,9 +894,9 @@ impl WinOs {
         let full_buf = self.ldr_write_wstr(mem, full_path)?;
         let base_buf = self.ldr_write_wstr(mem, base_name)?;
 
-        mem.write(te + off_dllbase, &base.to_le_bytes()[..ptr as usize])?;
-        mem.write(te + off_entry, &entry.to_le_bytes()[..ptr as usize])?;
-        mem.write(te + off_size, &size.to_le_bytes()[..ptr as usize])?;
+        mem.write_at(te, off_dllbase, &base.to_le_bytes()[..ptr as usize])?;
+        mem.write_at(te, off_entry, &entry.to_le_bytes()[..ptr as usize])?;
+        mem.write_at(te, off_size, &size.to_le_bytes()[..ptr as usize])?;
         self.write_unicode_string(mem, te + off_full, full_buf.0, full_buf.1)?;
         self.write_unicode_string(mem, te + off_basename, base_buf.0, base_buf.1)?;
 
@@ -916,18 +924,18 @@ impl WinOs {
         let byte_len = (units.len() * 2) as u16;
         let addr = self.ldr_alloc((units.len() * 2 + 2) as u64);
         for (i, u) in units.iter().enumerate() {
-            mem.write_u16(addr + (i * 2) as u64, *u)?;
+            mem.write_u16_at(addr, (i * 2) as u64, *u)?;
         }
-        mem.write_u16(addr + units.len() as u64 * 2, 0)?;
+        mem.write_u16_at(addr, units.len() as u64 * 2, 0)?;
         Ok((addr, byte_len))
     }
 
     fn write_unicode_string(&self, mem: &mut dyn Memory, at: u64, buffer: u64, byte_len: u16) -> Result<()> {
         mem.write_u16(at, byte_len)?;
-        mem.write_u16(at + 2, byte_len + 2)?;
+        mem.write_u16_at(at, 2, byte_len + 2)?;
         let buf_off = if self.cfg.is_64bit { 8 } else { 4 };
         let ptr = if self.cfg.is_64bit { 8 } else { 4 };
-        mem.write(at + buf_off, &buffer.to_le_bytes()[..ptr])?;
+        mem.write_at(at, buf_off, &buffer.to_le_bytes()[..ptr])?;
         Ok(())
     }
 }
@@ -955,7 +963,7 @@ fn data_export_value(cfg: &crate::WinConfig, name: &str) -> Option<u64> {
 fn wstr_byte_len(mem: &dyn Memory, addr: u64) -> Result<u16> {
     let mut units = 0u64;
     while units < 0x4000 {
-        if mem.read_u16(addr + units * 2)? == 0 {
+        if mem.read_u16_at(addr, units * 2)? == 0 {
             break;
         }
         units += 1;
