@@ -5,6 +5,7 @@ use crate::wndclass::{ClassClient, ClientMenuName, WndClassEx};
 use crate::WinOs;
 
 mod accel;
+mod kbdlayout;
 mod keystate;
 mod menu;
 #[cfg(test)]
@@ -1041,6 +1042,7 @@ pub(crate) fn register(os: &mut WinOs) {
     menu::register(os);
     accel::register(os);
     keystate::register(os);
+    kbdlayout::register(os);
 }
 
 fn alloc_handle(os: &mut WinOs) -> u32 {
