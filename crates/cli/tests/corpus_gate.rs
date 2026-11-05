@@ -42,7 +42,6 @@ fn corpus_pins_hold() {
 
     let full = matches!(std::env::var("EXEMU_CORPUS").as_deref(), Ok("full") | Ok("1"));
     let mut opts = Options::new(PathBuf::from(env!("CARGO_BIN_EXE_exemu")));
-    opts.workroot = std::env::temp_dir().join("exemu-corpus-gate");
     opts.quick = !full;
 
     let verdicts = exemu_cli::corpus::run_manifest(&manifest, &opts).expect("corpus run");
