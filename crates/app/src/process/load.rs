@@ -8,7 +8,7 @@ use exemu_os::{winedebug, WinConfig, WinOs};
 use crate::cmdline::{build_cmdline, truncate_cmdline};
 use crate::config::RunConfig;
 use crate::kuser::{map_kuser_shared_data, KUSER_SHARED_DATA_BASE, KUSER_SYSTEM_CALL};
-use crate::{image_loader, prefix_dirs, spawn, winsxs, wow64_boot, wow64_image, PAGE};
+use crate::{prefix_dirs, spawn, winsxs, wow64_boot, wow64_image, PAGE};
 
 use super::Process;
 
@@ -283,7 +283,7 @@ impl Process {
             file_dialog_pick: cfg.file_dialog_pick.clone(),
         });
 
-        os.set_image_loader(Box::new(image_loader::PeImageLoader));
+        os.set_image_loader(Box::new(exemu_loader::PeImageLoader));
         os.set_unwind_table(image.function_table.clone());
 
         os.set_environment(cfg.environment.clone());

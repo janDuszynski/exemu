@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod api_set;
+mod image_loader;
 mod manifest;
 mod reader;
 mod reloc;
@@ -9,6 +10,7 @@ mod resources;
 mod unwind;
 
 pub use api_set::resolve as resolve_api_set;
+pub use image_loader::PeImageLoader;
 pub use manifest::parse_from_pe_resources as parse_activation_context;
 pub use manifest::parse_from_external_manifest as parse_activation_context_from_manifest;
 pub use reloc::apply as apply_relocations;
