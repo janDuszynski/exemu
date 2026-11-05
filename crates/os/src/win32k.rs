@@ -3771,6 +3771,8 @@ fn nt_gdi_get_text_extent_ex_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn
     let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
     let str_ptr = os.syscall_arg(cpu, mem, 1)?;
     let count = os.syscall_arg(cpu, mem, 2)? as u32;
+    let max_extent = os.syscall_arg(cpu, mem, 3)? as u32 as i32;
+    let nfit_ptr = os.syscall_arg(cpu, mem, 4)?;
     let alp_dx = os.syscall_arg(cpu, mem, 5)?;
     let size = os.syscall_arg(cpu, mem, 6)?;
     if os.win32k_state.dc(hdc).is_none() {
@@ -3791,6 +3793,12 @@ fn nt_gdi_get_text_extent_ex_w(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn
         for i in 0..count {
             mem.write_u32(alp_dx + i as u64 * 4, (i + 1) * m.ave_char_width)?;
         }
+    }
+    if nfit_ptr != 0 {
+        let fit = (0..count)
+            .take_while(|&i| max_extent < 0 || (u64::from(i) + 1) * u64::from(m.ave_char_width) <= max_extent as u64)
+            .count();
+        mem.write_u32(nfit_ptr, fit as u32)?;
     }
     Ok(1)
 }
@@ -5515,5 +5523,45 @@ mod tests {
             assert_eq!(frames, 0, "kernel procedure {ty:#x} called the application's WndProc");
             assert_eq!(os.syscall_result64, Some(1), "type {ty:#x} answers WM_NCCREATE");
         }
+    }
+
+    #[test]
+    fn text_extent_ex_reports_how_many_characters_fit_the_extent() {
+        const SIZE_ARG_STACK: u64 = 0x10_8000 + 0x28;
+        const STR: u64 = 0x10_2000;
+        const NFIT: u64 = 0x10_3000;
+        const DXS: u64 = 0x10_3100;
+        const SIZE_OUT: u64 = 0x10_3200;
+        const CHARS: u32 = 8;
+        let (mut os, mut mem) = os_with_gdi();
+        let hdc = alloc_memory_dc(&mut os, &mut mem).unwrap();
+        for i in 0..CHARS {
+            mem.write_u16(STR + u64::from(i) * 2, u16::from(b'a')).unwrap();
+        }
+        let advance = os.win32k_state.dc_font(hdc).map(|f| f.metrics()).unwrap_or_else(default_metrics).ave_char_width;
+        assert!(advance > 0);
+
+        let query = |os: &mut WinOs, mem: &mut VirtualMemory, max_extent: i32, nfit: u64| {
+            mem.write_u64(SIZE_ARG_STACK, nfit).unwrap();
+            mem.write_u64(SIZE_ARG_STACK + 8, DXS).unwrap();
+            mem.write_u64(SIZE_ARG_STACK + 16, SIZE_OUT).unwrap();
+            let mut cpu = CpuState::default();
+            cpu.set_reg(Reg::R10, hdc as u64);
+            cpu.set_reg(Reg::Rdx, STR);
+            cpu.set_reg(Reg::R8, u64::from(CHARS));
+            cpu.set_reg(Reg::R9, u64::from(max_extent as u32));
+            nt_gdi_get_text_extent_ex_w(os, &mut cpu, mem).unwrap()
+        };
+
+        mem.write_u32(NFIT, 0xDEAD_BEEF).unwrap();
+        assert_eq!(query(&mut os, &mut mem, (advance * 3 + advance / 2) as i32, NFIT), 1);
+        assert_eq!(mem.read_u32(NFIT).unwrap(), 3, "three whole characters fit the extent");
+        assert_eq!(mem.read_u32(DXS + 4).unwrap(), 2 * advance, "dxs is the running total");
+
+        assert_eq!(query(&mut os, &mut mem, 0, NFIT), 1);
+        assert_eq!(mem.read_u32(NFIT).unwrap(), 0, "nothing fits a zero extent");
+
+        assert_eq!(query(&mut os, &mut mem, -1, NFIT), 1);
+        assert_eq!(mem.read_u32(NFIT).unwrap(), CHARS, "a negative extent is unlimited");
     }
 }
