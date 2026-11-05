@@ -237,17 +237,37 @@ fn vk_from_char(c: char) -> Option<u32> {
     up.is_ascii_alphanumeric().then_some(up as u32)
 }
 
+const MAC_KEY_RETURN: u16 = 0x24;
+const MAC_KEY_TAB: u16 = 0x30;
+const MAC_KEY_SPACE: u16 = 0x31;
+const MAC_KEY_DELETE: u16 = 0x33;
+const MAC_KEY_ESCAPE: u16 = 0x35;
+const MAC_KEY_LEFT: u16 = 0x7B;
+const MAC_KEY_RIGHT: u16 = 0x7C;
+const MAC_KEY_DOWN: u16 = 0x7D;
+const MAC_KEY_UP: u16 = 0x7E;
+
+const VK_BACK: u32 = 0x08;
+const VK_TAB: u32 = 0x09;
+const VK_RETURN: u32 = 0x0D;
+const VK_ESCAPE: u32 = 0x1B;
+const VK_SPACE: u32 = 0x20;
+const VK_LEFT: u32 = 0x25;
+const VK_UP: u32 = 0x26;
+const VK_RIGHT: u32 = 0x27;
+const VK_DOWN: u32 = 0x28;
+
 fn vk_from_key_code(code: u16) -> Option<u32> {
     let vk = match code {
-        0x24 => 0x0D,
-        0x30 => 0x09,
-        0x31 => 0x20,
-        0x33 => 0x08,
-        0x35 => 0x1B,
-        0x7B => 0x25,
-        0x7C => 0x27,
-        0x7D => 0x28,
-        0x7E => 0x26,
+        MAC_KEY_RETURN => VK_RETURN,
+        MAC_KEY_TAB => VK_TAB,
+        MAC_KEY_SPACE => VK_SPACE,
+        MAC_KEY_DELETE => VK_BACK,
+        MAC_KEY_ESCAPE => VK_ESCAPE,
+        MAC_KEY_LEFT => VK_LEFT,
+        MAC_KEY_RIGHT => VK_RIGHT,
+        MAC_KEY_DOWN => VK_DOWN,
+        MAC_KEY_UP => VK_UP,
         _ => return None,
     };
     Some(vk)
