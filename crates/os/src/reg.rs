@@ -587,7 +587,7 @@ fn write_utf16_bounded(mem: &mut dyn Memory, addr: u64, s: &str, max_bytes: u64)
         if n + 2 > max_bytes {
             break;
         }
-        mem.write_u16(addr + n, u)?;
+        mem.write_u16_at(addr, n, u)?;
         n += 2;
     }
     Ok(())
@@ -625,29 +625,29 @@ fn write_key_value_info(
     match class {
         KEY_VALUE_BASIC_INFORMATION => {
             mem.write_u32(buf, 0)?;
-            mem.write_u32(buf + 4, ty)?;
-            mem.write_u32(buf + 8, name_bytes)?;
+            mem.write_u32_at(buf, 4, ty)?;
+            mem.write_u32_at(buf, 8, name_bytes)?;
             write_utf16_bounded(mem, buf + 12, name, length - 12)?;
         }
         KEY_VALUE_FULL_INFORMATION => {
             mem.write_u32(buf, 0)?;
-            mem.write_u32(buf + 4, ty)?;
-            mem.write_u32(buf + 8, 20 + name_bytes)?;
-            mem.write_u32(buf + 12, data_len)?;
-            mem.write_u32(buf + 16, name_bytes)?;
+            mem.write_u32_at(buf, 4, ty)?;
+            mem.write_u32_at(buf, 8, 20 + name_bytes)?;
+            mem.write_u32_at(buf, 12, data_len)?;
+            mem.write_u32_at(buf, 16, name_bytes)?;
             write_utf16_bounded(mem, buf + 20, name, length.saturating_sub(20))?;
             let data_at = 20 + name_bytes as u64;
             if length > data_at {
                 let n = ((length - data_at) as usize).min(data.len());
-                mem.write(buf + data_at, &data[..n])?;
+                mem.write_at(buf, data_at, &data[..n])?;
             }
         }
         KEY_VALUE_PARTIAL_INFORMATION => {
             mem.write_u32(buf, 0)?;
-            mem.write_u32(buf + 4, ty)?;
-            mem.write_u32(buf + 8, data_len)?;
+            mem.write_u32_at(buf, 4, ty)?;
+            mem.write_u32_at(buf, 8, data_len)?;
             let n = ((length - 12) as usize).min(data.len());
-            mem.write(buf + 12, &data[..n])?;
+            mem.write_at(buf, 12, &data[..n])?;
         }
         _ => unreachable!(),
     }
@@ -659,8 +659,8 @@ impl WinOs {
         if objattr == 0 {
             return None;
         }
-        let root_dir = mem.read_u64(objattr + 0x08).ok()?;
-        let name_ptr = mem.read_u64(objattr + 0x10).ok()?;
+        let root_dir = mem.read_u64_at(objattr, 0x08).ok()?;
+        let name_ptr = mem.read_u64_at(objattr, 0x10).ok()?;
         let name = crate::fs::read_unicode_string(mem, name_ptr).unwrap_or_default();
         let joined = if root_dir != 0 {
             let base = self.reg_resolve(root_dir)?;
@@ -844,13 +844,13 @@ impl WinOs {
         }
         let lwt = self.filetime_now();
         mem.write_u64(buf, lwt)?;
-        mem.write_u32(buf + 8, 0)?;
+        mem.write_u32_at(buf, 8, 0)?;
         if class == KEY_NODE_INFORMATION {
-            mem.write_u32(buf + 12, 0)?;
-            mem.write_u32(buf + 16, 0)?;
-            mem.write_u32(buf + 20, name_bytes)?;
+            mem.write_u32_at(buf, 12, 0)?;
+            mem.write_u32_at(buf, 16, 0)?;
+            mem.write_u32_at(buf, 20, name_bytes)?;
         } else {
-            mem.write_u32(buf + 12, name_bytes)?;
+            mem.write_u32_at(buf, 12, name_bytes)?;
         }
         write_utf16_bounded(mem, buf + name_off, &name, length - name_off)?;
         Ok(if length < header as u64 { STATUS_BUFFER_OVERFLOW } else { NT_SUCCESS })
@@ -882,13 +882,13 @@ impl WinOs {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
                 mem.write_u64(buf, lwt)?;
-                mem.write_u32(buf + 8, 0)?;
+                mem.write_u32_at(buf, 8, 0)?;
                 if class == KEY_NODE_INFORMATION {
-                    mem.write_u32(buf + 12, 0)?;
-                    mem.write_u32(buf + 16, 0)?;
-                    mem.write_u32(buf + 20, name_bytes)?;
+                    mem.write_u32_at(buf, 12, 0)?;
+                    mem.write_u32_at(buf, 16, 0)?;
+                    mem.write_u32_at(buf, 20, name_bytes)?;
                 } else {
-                    mem.write_u32(buf + 12, name_bytes)?;
+                    mem.write_u32_at(buf, 12, name_bytes)?;
                 }
                 write_utf16_bounded(mem, buf + name_off, &name, length - name_off)?;
                 Ok(if length < header as u64 { STATUS_BUFFER_OVERFLOW } else { NT_SUCCESS })
@@ -912,15 +912,15 @@ impl WinOs {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
                 mem.write_u64(buf, lwt)?;
-                mem.write_u32(buf + 8, 0)?;
-                mem.write_u32(buf + 12, header)?;
-                mem.write_u32(buf + 16, 0)?;
-                mem.write_u32(buf + 20, subs.len() as u32)?;
-                mem.write_u32(buf + 24, max_name)?;
-                mem.write_u32(buf + 28, 0)?;
-                mem.write_u32(buf + 32, nvalues)?;
-                mem.write_u32(buf + 36, max_vn)?;
-                mem.write_u32(buf + 40, max_vl)?;
+                mem.write_u32_at(buf, 8, 0)?;
+                mem.write_u32_at(buf, 12, header)?;
+                mem.write_u32_at(buf, 16, 0)?;
+                mem.write_u32_at(buf, 20, subs.len() as u32)?;
+                mem.write_u32_at(buf, 24, max_name)?;
+                mem.write_u32_at(buf, 28, 0)?;
+                mem.write_u32_at(buf, 32, nvalues)?;
+                mem.write_u32_at(buf, 36, max_vn)?;
+                mem.write_u32_at(buf, 40, max_vl)?;
                 Ok(NT_SUCCESS)
             }
             KEY_NAME_INFORMATION => {
