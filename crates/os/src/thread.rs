@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use exemu_core::{CpuState, Memory, Perm, Reg, Result};
+use exemu_core::{checked_align_up, CpuState, Memory, Perm, Reg, Result};
 
 use crate::api::Outcome;
 use crate::msg::PostedMsg;
@@ -144,11 +144,6 @@ impl Thread {
     }
 }
 
-#[inline]
-fn align_up(v: u64, a: u64) -> u64 {
-    (v + a - 1) & !(a - 1)
-}
-
 impl WinOs {
 
     fn runnable(&self, i: usize) -> bool {
@@ -243,7 +238,7 @@ impl WinOs {
         stack_base: u64,
     ) -> Result<()> {
         if self.cfg.is_64bit {
-            let w = |mem: &mut dyn Memory, off: u64, v: u64| mem.write_u64(teb_base + off, v);
+            let w = |mem: &mut dyn Memory, off: u64, v: u64| mem.write_u64_at(teb_base, off, v);
             w(mem, teb64::NT_TIB_EXCEPTION_LIST, u64::MAX)?;
             w(mem, teb64::NT_TIB_STACK_BASE, stack_top)?;
             w(mem, teb64::NT_TIB_STACK_LIMIT, stack_base)?;
@@ -263,7 +258,7 @@ impl WinOs {
             w(mem, teb64::ACTIVATION_CONTEXT_STACK + 0x08, actx + 0x08)?;
             w(mem, teb64::ACTIVATION_CONTEXT_STACK + 0x10, actx + 0x08)?;
         } else {
-            let w4 = |mem: &mut dyn Memory, off: u64, v: u32| mem.write_u32(teb_base + off, v);
+            let w4 = |mem: &mut dyn Memory, off: u64, v: u32| mem.write_u32_at(teb_base, off, v);
             w4(mem, teb32::NT_TIB_EXCEPTION_LIST, u32::MAX)?;
             w4(mem, teb32::NT_TIB_STACK_BASE, stack_top as u32)?;
             w4(mem, teb32::NT_TIB_STACK_LIMIT, stack_base as u32)?;
@@ -304,7 +299,10 @@ impl WinOs {
         param: u64,
         suspended: bool,
     ) -> Result<Option<(u64, u32)>> {
-        let stack_size = align_up(req_stack.max(THREAD_STACK_SIZE), 0x1000);
+        let Some(stack_size) = checked_align_up(req_stack.max(THREAD_STACK_SIZE), 0x1000) else {
+            self.last_error = 8;
+            return Ok(None);
+        };
         let Some(stack_base) = self.map_anywhere(mem, stack_size, Perm::RWX, "thread-stack") else {
             self.last_error = 8;
             return Ok(None);
@@ -394,7 +392,10 @@ impl WinOs {
         let Some(w) = self.wow64_threading else {
             return Ok(None);
         };
-        let stack32_size = align_up(req_stack.max(THREAD_STACK_SIZE), 0x1000);
+        let Some(stack32_size) = checked_align_up(req_stack.max(THREAD_STACK_SIZE), 0x1000) else {
+            self.last_error = 8;
+            return Ok(None);
+        };
         let Some(stack32) = self.map_anywhere_low(mem, stack32_size, Perm::RW, "wow64-thread-stack32") else {
             self.last_error = 8;
             return Ok(None);
@@ -783,20 +784,20 @@ impl WinOs {
         };
         if self.cfg.is_64bit {
             mem.write_u32(buffer, exit_status)?;
-            mem.write_u64(buffer + 0x08, teb)?;
-            mem.write_u64(buffer + 0x10, PROCESS_ID)?;
-            mem.write_u64(buffer + 0x18, tid as u64)?;
-            mem.write_u64(buffer + 0x20, 1)?;
-            mem.write_u32(buffer + 0x28, 0)?;
-            mem.write_u32(buffer + 0x2C, 0)?;
+            mem.write_u64_at(buffer, 0x08, teb)?;
+            mem.write_u64_at(buffer, 0x10, PROCESS_ID)?;
+            mem.write_u64_at(buffer, 0x18, tid as u64)?;
+            mem.write_u64_at(buffer, 0x20, 1)?;
+            mem.write_u32_at(buffer, 0x28, 0)?;
+            mem.write_u32_at(buffer, 0x2C, 0)?;
         } else {
             mem.write_u32(buffer, exit_status)?;
-            mem.write_u32(buffer + 0x04, teb as u32)?;
-            mem.write_u32(buffer + 0x08, PROCESS_ID as u32)?;
-            mem.write_u32(buffer + 0x0C, tid)?;
-            mem.write_u32(buffer + 0x10, 1)?;
-            mem.write_u32(buffer + 0x14, 0)?;
-            mem.write_u32(buffer + 0x18, 0)?;
+            mem.write_u32_at(buffer, 0x04, teb as u32)?;
+            mem.write_u32_at(buffer, 0x08, PROCESS_ID as u32)?;
+            mem.write_u32_at(buffer, 0x0C, tid)?;
+            mem.write_u32_at(buffer, 0x10, 1)?;
+            mem.write_u32_at(buffer, 0x14, 0)?;
+            mem.write_u32_at(buffer, 0x18, 0)?;
         }
         if return_length != 0 {
             mem.write_u32(return_length, need as u32)?;
@@ -820,7 +821,7 @@ impl WinOs {
             return Ok(STATUS_INFO_LENGTH_MISMATCH);
         }
         let teb = if cpu.gs_base != 0 { cpu.gs_base } else { self.cfg.teb_base };
-        let area = mem.read_u64(teb + crate::wow64::TEB_CPU_AREA_PTR_OFF)?;
+        let area = mem.read_u64_at(teb, crate::wow64::TEB_CPU_AREA_PTR_OFF)?;
         if area == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
@@ -839,13 +840,13 @@ impl WinOs {
             return Ok(STATUS_INFO_LENGTH_MISMATCH);
         }
         let teb = if cpu.gs_base != 0 { cpu.gs_base } else { self.cfg.teb_base };
-        let area = mem.read_u64(teb + crate::wow64::TEB_CPU_AREA_PTR_OFF)?;
+        let area = mem.read_u64_at(teb, crate::wow64::TEB_CPU_AREA_PTR_OFF)?;
         if area == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
         let mut buf = vec![0u8; WOW64_CONTEXT_SIZE as usize];
         mem.read(buffer, &mut buf)?;
-        mem.write(area + crate::wow64::CPU_AREA_HEADER_LEN, &buf)?;
+        mem.write_at(area, crate::wow64::CPU_AREA_HEADER_LEN, &buf)?;
         let header = mem.read_u32(area)?;
         mem.write_u32(area, header | crate::wow64::CPU_AREA_RELOAD_BIT)?;
         Ok(STATUS_SUCCESS)
@@ -878,12 +879,12 @@ impl WinOs {
             return Ok(STATUS_INFO_LENGTH_MISMATCH);
         }
         mem.write(buffer, &[0u8; NEED as usize])?;
-        mem.write_u32(buffer + 0x08, 0x1000)?;
-        mem.write_u32(buffer + 0x18, 0x1_0000)?;
-        mem.write_u64(buffer + 0x20, 0x1_0000)?;
-        mem.write_u64(buffer + 0x28, 0x7FFF_FFFF)?;
-        mem.write_u64(buffer + 0x30, 1)?;
-        mem.write_u8(buffer + 0x38, 1)?;
+        mem.write_u32_at(buffer, 0x08, 0x1000)?;
+        mem.write_u32_at(buffer, 0x18, 0x1_0000)?;
+        mem.write_u64_at(buffer, 0x20, 0x1_0000)?;
+        mem.write_u64_at(buffer, 0x28, 0x7FFF_FFFF)?;
+        mem.write_u64_at(buffer, 0x30, 1)?;
+        mem.write_u8_at(buffer, 0x38, 1)?;
         if return_length != 0 {
             mem.write_u32(return_length, NEED as u32)?;
         }
@@ -921,7 +922,7 @@ impl WinOs {
             return Ok(STATUS_INFO_LENGTH_MISMATCH);
         }
         for (i, e) in entries.iter().enumerate() {
-            mem.write_u32(buffer + i as u64 * 4, *e)?;
+            mem.write_u32_at(buffer, i as u64 * 4, *e)?;
         }
         if return_length != 0 {
             mem.write_u32(return_length, need as u32)?;
@@ -1030,7 +1031,7 @@ mod tests {
         cpu.set_reg(Reg::R10, handle_out);
         os.set_syscall_guest_rsp_for_test(GUEST_RSP);
         for (i, v) in [(4u64, 0x40_1000u64), (5, 0), (6, 0), (7, 0), (8, 0x1000)] {
-            mem.write_u64(GUEST_RSP + 0x28 + (i - 4) * 8, v).unwrap();
+            mem.write_u64_at(GUEST_RSP, 0x28 + (i - 4) * 8, v).unwrap();
         }
         os.nt_create_thread_ex(&mut cpu, mem).unwrap()
     }
@@ -1091,18 +1092,18 @@ mod tests {
         let (s32, n32) = t.wow64_stack32;
         assert!(s32 != 0 && s32 + n32 <= u32::MAX as u64, "32-bit stack {s32:#x}+{n32:#x} is low");
         assert_eq!(
-            mem.read_u32(teb32 + crate::wow64::TEB32_STACK_BASE).unwrap() as u64,
+            mem.read_u32_at(teb32, crate::wow64::TEB32_STACK_BASE).unwrap() as u64,
             s32 + n32,
             "TEB32.NtTib.StackBase is that stack's top",
         );
 
-        let area = mem.read_u64(teb64 + crate::wow64::TEB_CPU_AREA_PTR_OFF).unwrap();
+        let area = mem.read_u64_at(teb64, crate::wow64::TEB_CPU_AREA_PTR_OFF).unwrap();
         assert_ne!(area, 0, "TEB64+0x1488 points at this thread's own CPU-reserved area");
         let ctx = area + crate::wow64::CPU_AREA_HEADER_LEN;
-        assert_eq!(mem.read_u32(ctx + crate::wow64::CTX_EIP).unwrap() as u64, START32);
-        assert_eq!(mem.read_u32(ctx + crate::wow64::CTX_EAX).unwrap() as u64, ENTRY);
-        assert_eq!(mem.read_u32(ctx + crate::wow64::CTX_SEGCS).unwrap(), crate::wow64::SEL_CS32);
-        let esp = mem.read_u32(ctx + crate::wow64::CTX_ESP).unwrap() as u64;
+        assert_eq!(mem.read_u32_at(ctx, crate::wow64::CTX_EIP).unwrap() as u64, START32);
+        assert_eq!(mem.read_u32_at(ctx, crate::wow64::CTX_EAX).unwrap() as u64, ENTRY);
+        assert_eq!(mem.read_u32_at(ctx, crate::wow64::CTX_SEGCS).unwrap(), crate::wow64::SEL_CS32);
+        let esp = mem.read_u32_at(ctx, crate::wow64::CTX_ESP).unwrap() as u64;
         assert!(esp > s32 && esp <= s32 + n32, "Esp {esp:#x} is inside the 32-bit stack");
 
         let (mut os, mut mem) = os_and_mem();
