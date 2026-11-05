@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use exemu_core::{AudioFormat, CpuState, Memory, Result};
+use exemu_core::{guest_addr, AudioFormat, CpuState, Memory, Result};
 
 use crate::unixlib::{UnixEntry, Unixlib};
 use crate::WinOs;
@@ -321,8 +321,8 @@ impl WinOs {
         }
         mem.write_u32_at(buf, ENDPOINT_NAME_OFF, name_off as u32)?;
         mem.write_u32_at(buf, ENDPOINT_ID_OFF, id_off as u32)?;
-        write_wstr(mem, buf + name_off, ENDPOINT_NAME)?;
-        write_cstr(mem, buf + id_off, ENDPOINT_ID)?;
+        write_wstr(mem, guest_addr(buf, name_off, 0)?, ENDPOINT_NAME)?;
+        write_cstr(mem, guest_addr(buf, id_off, 0)?, ENDPOINT_ID)?;
         mem.write_u32_at(args, EP_IDS_NUM, 1)?;
         mem.write_u32_at(args, EP_IDS_DEFAULT_IDX, 0)?;
         mem.write_u32_at(args, EP_IDS_RESULT, S_OK)?;
