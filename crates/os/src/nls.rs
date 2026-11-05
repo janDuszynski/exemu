@@ -655,8 +655,8 @@ mod tests {
         assert_eq!(mem.read_u32(lcid_out).unwrap(), SYSTEM_LCID, "system LCID reported");
         assert_ne!(mem.read_u64(size_out).unwrap(), 0, "mapping size reported");
 
-        let lt = base + mem.read_u32(base + HDR_LOCALE_TABLE_OFF as u64).unwrap() as u64;
-        let lcids = lt + mem.read_u32(lt + LT_LCIDS_OFF as u64).unwrap() as u64;
+        let lt = base + mem.read_u32_at(base, HDR_LOCALE_TABLE_OFF as u64).unwrap() as u64;
+        let lcids = lt + mem.read_u32_at(lt, LT_LCIDS_OFF as u64).unwrap() as u64;
         assert_eq!(mem.read_u32(lcids).unwrap(), SYSTEM_LCID, "walkable to LCID 0x409");
 
         let mut cpu2 = CpuState::default();
@@ -679,7 +679,7 @@ mod tests {
         let base_out = 0x2_0100u64;
         let size_out = 0x2_0200u64;
         let gsp = 0x2_0800u64;
-        mem.write_u64(gsp + 0x28, size_out).unwrap();
+        mem.write_u64_at(gsp, 0x28, size_out).unwrap();
 
         let get = |os: &mut WinOs, mem: &mut VirtualMemory, ty: u64, id: u64| -> (u64, u64) {
             mem.write_u64(base_out, 0).unwrap();
@@ -699,8 +699,8 @@ mod tests {
         let (st_1252, win1252) = get(&mut os, &mut mem, 0xb, 1252);
         assert_eq!(st_1252, STATUS_SUCCESS as u64, "1252 is supported");
         assert_ne!(ascii, win1252, "one section per codepage, not per type");
-        assert_eq!(mem.read_u16(ascii + 0x02).unwrap(), 20127, "the 20127 section says 20127");
-        assert_eq!(mem.read_u16(win1252 + 0x02).unwrap(), 1252, "and the 1252 one says 1252");
+        assert_eq!(mem.read_u16_at(ascii, 0x02).unwrap(), 20127, "the 20127 section says 20127");
+        assert_eq!(mem.read_u16_at(win1252, 0x02).unwrap(), 1252, "and the 1252 one says 1252");
 
         assert_eq!(get(&mut os, &mut mem, 0xb, 20127).1, ascii, "cached per codepage");
 
@@ -719,7 +719,7 @@ mod tests {
         let base_out = 0x2_0100u64;
         let size_out = 0x2_0200u64;
         let gsp = 0x2_0800u64;
-        mem.write_u64(gsp + 0x28, size_out).unwrap();
+        mem.write_u64_at(gsp, 0x28, size_out).unwrap();
 
         let mut cpu = CpuState::default();
         cpu.set_rsp(gsp);
@@ -736,6 +736,6 @@ mod tests {
         let base = mem.read_u64(base_out).unwrap();
         assert_ne!(base, 0, "a non-null section base was returned");
         assert_ne!(mem.read_u64(size_out).unwrap(), 0, "section size reported");
-        assert_eq!(mem.read_u16(base + 0x02).unwrap(), CP_UTF8, "opaque UTF-8-marked section");
+        assert_eq!(mem.read_u16_at(base, 0x02).unwrap(), CP_UTF8, "opaque UTF-8-marked section");
     }
 }
