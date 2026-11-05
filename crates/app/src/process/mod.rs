@@ -15,6 +15,7 @@ mod load;
 mod run;
 mod sandbox;
 mod wine;
+mod wow64;
 
 pub struct Process {
     mem: VirtualMemory,
