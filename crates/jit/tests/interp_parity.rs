@@ -1,6 +1,7 @@
 use exemu_core::hooks::NoHooks;
 use exemu_core::{Cpu, CpuState, Exit, Memory, Perm, Region};
 use exemu_cpu::{Bits, Interpreter};
+use exemu_jit::compile::{Compiler, MAX_INSNS};
 use exemu_jit::{Jit, Mode, Run};
 use exemu_memory::VirtualMemory;
 
@@ -55,9 +56,23 @@ fn parity(bits: Bits, code: &[u8], what: &str, seed: &CpuState) -> u32 {
     parity_with(bits, code, what, seed, Perm::RX)
 }
 
+fn block_len(mem: &VirtualMemory, mode: Mode) -> u64 {
+    u64::from(Compiler::compile(mem, mode, CODE, MAX_INSNS, None, u64::MAX).insns)
+}
+
 fn parity_with(bits: Bits, code: &[u8], what: &str, seed: &CpuState, code_perm: Perm) -> u32 {
+    parity_trail(bits, code, what, seed, code_perm).0
+}
+
+fn parity_trail(
+    bits: Bits,
+    code: &[u8],
+    what: &str,
+    seed: &CpuState,
+    code_perm: Perm,
+) -> (u32, Vec<u64>) {
     if !jit_available() {
-        return 0;
+        return (0, Vec::new());
     }
     let (mut mem_j, mut cpu_j) = build_with(bits, code, seed, code_perm);
     let (mut mem_i, mut cpu_i) = build_with(bits, code, seed, code_perm);
@@ -66,7 +81,8 @@ fn parity_with(bits: Bits, code: &[u8], what: &str, seed: &CpuState, code_perm: 
         Bits::B64 => Mode::Long,
     };
     let mut jit = Jit::new(256 * 1024).expect("JIT should be available");
-    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
+    let budget = block_len(&mem_j, mode);
+    let run = jit.run(cpu_j.state_mut(), &mut mem_j, mode, budget);
     let n = match run {
         Run::NotCompiled => panic!("{what}: the JIT compiled nothing at all"),
         Run::Executed { insns } | Run::SideExit { insns } | Run::Faulted { insns } => insns,
@@ -94,7 +110,7 @@ fn parity_with(bits: Bits, code: &[u8], what: &str, seed: &CpuState, code_perm: 
             );
         }
     }
-    n
+    (n, jit.recent_blocks())
 }
 
 fn seed(bits: Bits) -> CpuState {
@@ -333,7 +349,7 @@ fn deferred_flags_are_visible_when_a_store_rewrites_the_block() {
         0x80, 0x04, 0x25, 0x0E, 0x00, 0x01, 0x00, 0x07,
         0x4D, 0x31, 0xC0,
     ];
-    let n = parity_with(
+    let (_, trail) = parity_trail(
         Bits::B64,
         &code,
         "deferred flags when a store rewrites the block",
@@ -341,7 +357,7 @@ fn deferred_flags_are_visible_when_a_store_rewrites_the_block() {
         Perm::RWX,
     );
     if jit_available() {
-        assert_eq!(n, 2, "the block must stop on the store into its own bytes");
+        assert_eq!(trail[..2], [CODE, CODE + 11], "the block must stop on the store into its own bytes");
     }
 }
 
@@ -488,7 +504,7 @@ fn a_return_lands_on_the_address_that_was_pushed() {
         assert_eq!(n, 2, "the push and the ret both compile");
         let (mut mem, mut cpu) = build_with(bits, &code, &s, Perm::RX);
         let mut jit = Jit::new(64 * 1024).expect("JIT should be available");
-        jit.run(cpu.state_mut(), &mut mem, mode, 1);
+        jit.run(cpu.state_mut(), &mut mem, mode, 2);
         assert_eq!(cpu.state().rip, CODE + 0x40, "the ret took the pushed address");
         assert_eq!(cpu.state().gpr[4], s.gpr[4], "a push and a ret leave rsp where it was");
     }
@@ -511,7 +527,7 @@ fn a_return_releases_the_bytes_its_immediate_names() {
             assert_eq!(n, 2, "{what}: both compile");
             let (mut mem, mut cpu) = build_with(bits, &code, &s, Perm::RX);
             let mut jit = Jit::new(64 * 1024).expect("JIT should be available");
-            jit.run(cpu.state_mut(), &mut mem, mode, 1);
+            jit.run(cpu.state_mut(), &mut mem, mode, 2);
             assert_eq!(cpu.state().rip, CODE + 0x40, "{what}: target");
             assert_eq!(
                 cpu.state().gpr[4],
@@ -608,7 +624,8 @@ fn store_fault_parity(bits: Bits, code: &[u8], expect_retired: u32, what: &str) 
         Bits::B32 => Mode::Protected,
     };
     let mut jit = Jit::new(1 << 20).unwrap();
-    let ran = jit.run(cpu_j.state_mut(), &mut mem_j, mode, 1);
+    let budget = block_len(&mem_j, mode);
+    let ran = jit.run(cpu_j.state_mut(), &mut mem_j, mode, budget);
     assert_eq!(ran, Run::Faulted { insns: expect_retired }, "{what}: {ran:?}");
 
     let (mut mem_i, mut cpu_i) = ro_data(bits, code, &seed);

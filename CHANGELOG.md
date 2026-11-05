@@ -50,6 +50,37 @@ end-to-end on the default path.
   forwarder and api-set paths, which no corpus pin can see), clippy clean, and
   all 11 corpus pins identical to the instruction.
 
+### The JIT twin of a multithreaded Wine guest matches to the instruction (W8)
+- **The Firefox installer's Wine run was 31,119 instructions shorter under
+  `--jit`** (14,747,646 against the interpreter's 14,778,765). Every syscall, its
+  arguments and the virtual clock agreed in both modes until the first
+  preemptive thread switch, at instruction 11,030,780; there the interpreter
+  switched away from `rip=0x600136de` and the JIT from `0x600136e0`, one
+  instruction later, and from then on every switch drifted.
+- **Two halves of one contract were wrong.** The JIT treated its budget as a
+  floor: a chain stopped at the first block boundary *at or past* it, so the
+  timeslice end, the `KUSER_SHARED_DATA` refresh and the step cap fired a few
+  instructions late. It is now a ceiling: a call never retires more than it was
+  allowed, links are taken only while the longest cached block still fits, and
+  a block that would cross the ceiling is left to the interpreter. And the
+  scheduler's retire budget let bulk retirement run *through* the slice's last
+  step, which the interpreter spends on the switch itself without executing an
+  instruction; it now stops one short, so the switch happens in that same
+  interpreted step. Either half alone is not enough: the JIT ceiling alone gives
+  14,778,753, the scheduler change alone 14,747,646, both together 14,778,765.
+- **Why no test saw it.** The JIT differential let the JIT choose where to stop
+  and then caught the interpreter up to that count, and the only budget it ever
+  passed ended on a lap, which is a block boundary. Nothing could overshoot
+  where it looked. `exemu-oracle jit --laps K --cut` now cuts every lapped
+  trial at random budgets of 0..7 instructions against 3-instruction blocks and
+  fails if a call retires one instruction past what it was given;
+  `crates/jit/tests/budget.rs` stops a call/loop program at every instruction
+  count in both bitnesses against the interpreter; and
+  `crates/os/tests/thread.rs` runs two spinning threads for 230,017 steps in
+  both modes and compares the counters each thread reached.
+- The Firefox and SteamSetup Wine-path entries now have `--jit` twins in
+  `corpus.toml`, pinned to the interpreter numbers.
+
 ### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
 - **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
   `0x20..=0x37` are the stock objects, so a guest had **72 GDI handles for its

@@ -485,7 +485,7 @@ impl Compiler {
             self.asm.str(8, T0, R_CTX, ctx_off::RETIRED);
         }
         if let Some(slot) = slot {
-            self.asm.ldr(8, T1, R_CTX, ctx_off::BUDGET);
+            self.asm.ldr(8, T1, R_CTX, ctx_off::LINK_LIMIT);
             self.asm.cmp_reg(true, T0, T1);
             let spent = self.asm.b_cond_forward(Cond::Cs);
             let off = slot * SLOT_BYTES;

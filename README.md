@@ -503,12 +503,21 @@ an indirect `call` or `jmp`, which is how every import-table call and every jump
 table goes — reads the same slot through an **inline cache**, taking the link
 only if the slot cached a block for the address the guest just produced.
 
-Two things make that safe rather than merely fast. The **budget** moved into the
-emitted exit: it adds the block's instructions to a running total and stops at
-the first block boundary at which the total has reached what the caller allowed,
-which is the same boundary the block-at-a-time loop stopped at — so timeslice
-preemption, the `KUSER_SHARED_DATA` clock refresh and the step cap still fire at
-the identical guest instruction, and every corpus pin holds to the instruction.
+Two things make that safe rather than merely fast. The **budget** is a hard
+ceiling: a call never retires more instructions than the caller allowed. The
+emitted exit adds the block's instructions to a running total and takes a link
+only while the longest block in the cache still fits under the ceiling; past
+that point every boundary goes back to Rust, which enters the next block only if
+its own instruction count fits, and otherwise leaves the remainder to the
+interpreter one instruction at a time. That is what makes timeslice preemption,
+the `KUSER_SHARED_DATA` clock refresh and the step cap fire at the identical
+guest instruction in both modes. They did not always: until the budget became a
+ceiling, a chain stopped at the first block boundary *at or past* it, so on a
+multithreaded guest every thread switch landed a few instructions late and the
+Firefox installer's Wine run came out 31,119 instructions short of its
+interpreter twin. The scheduler's half of the same contract is that its retire
+budget stops one instruction short of the slice end, because the interpreter
+spends that slice's final step on the switch itself.
 And **unlinking is one increment**: each slot carries an epoch, and moving the
 engine's epoch retires every link at once, with no walk over the array, no
 patching of emitted code and no instruction-cache maintenance. That is what a

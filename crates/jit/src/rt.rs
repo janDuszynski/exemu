@@ -102,7 +102,7 @@ pub struct BlockCtx<'a, M: Memory + ?Sized> {
     pub read: ReadFn<M>,
     pub write: WriteFn<M>,
     pub retired: u64,
-    pub budget: u64,
+    pub link_limit: u64,
     pub links: *const LinkSlot,
     pub link_epoch: u64,
     pub pending: u64,
@@ -190,7 +190,7 @@ pub mod ctx_off {
     pub const READ: u32 = std::mem::offset_of!(Ctx, read) as u32;
     pub const WRITE: u32 = std::mem::offset_of!(Ctx, write) as u32;
     pub const RETIRED: u32 = std::mem::offset_of!(Ctx, retired) as u32;
-    pub const BUDGET: u32 = std::mem::offset_of!(Ctx, budget) as u32;
+    pub const LINK_LIMIT: u32 = std::mem::offset_of!(Ctx, link_limit) as u32;
     pub const LINKS: u32 = std::mem::offset_of!(Ctx, links) as u32;
     pub const LINK_EPOCH: u32 = std::mem::offset_of!(Ctx, link_epoch) as u32;
     pub const PENDING: u32 = std::mem::offset_of!(Ctx, pending) as u32;
@@ -329,7 +329,7 @@ mod tests {
             read: jit_read,
             write: jit_write,
             retired: 0,
-            budget: 0,
+            link_limit: 0,
             links: std::ptr::null(),
             link_epoch: 7,
             pending: NO_SLOT,
@@ -572,7 +572,7 @@ mod tests {
             ctx_off::READ,
             ctx_off::WRITE,
             ctx_off::RETIRED,
-            ctx_off::BUDGET,
+            ctx_off::LINK_LIMIT,
             ctx_off::LINKS,
             ctx_off::LINK_EPOCH,
             ctx_off::PENDING,
@@ -596,7 +596,7 @@ mod tests {
                     std::mem::offset_of!(BlockCtx<'static, $t>, read),
                     std::mem::offset_of!(BlockCtx<'static, $t>, write),
                     std::mem::offset_of!(BlockCtx<'static, $t>, retired),
-                    std::mem::offset_of!(BlockCtx<'static, $t>, budget),
+                    std::mem::offset_of!(BlockCtx<'static, $t>, link_limit),
                     std::mem::offset_of!(BlockCtx<'static, $t>, links),
                     std::mem::offset_of!(BlockCtx<'static, $t>, link_epoch),
                     std::mem::offset_of!(BlockCtx<'static, $t>, pending),

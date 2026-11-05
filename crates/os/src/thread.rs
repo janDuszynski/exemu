@@ -213,7 +213,7 @@ impl WinOs {
         if self.threads.len() < 2 {
             u64::MAX
         } else {
-            TIMESLICE.saturating_sub(self.sched_ticks)
+            TIMESLICE.saturating_sub(self.sched_ticks + 1)
         }
     }
 

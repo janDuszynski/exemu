@@ -13,6 +13,36 @@ fn run_laps(bits: Bits, count: u64, seed: u64, chain: u32, layouts: LayoutMix, l
     run_debug(bits, count, seed, chain, layouts, laps, DebugMix::Off);
 }
 
+fn run_cut(bits: Bits, count: u64, seed: u64, layouts: LayoutMix) {
+    if !jit_available() {
+        eprintln!("skipping: no JIT backend on this platform");
+        return;
+    }
+    let s = fuzz(&JitFuzzConfig {
+        bits,
+        count,
+        seed,
+        max_report: 8,
+        chain: 8,
+        layouts,
+        laps: 4,
+        debug: DebugMix::Off,
+        cut: true,
+    })
+    .expect("the JIT backend should be available here");
+    for d in &s.first {
+        eprintln!("{}", render(d));
+    }
+    assert_eq!(s.divergences, 0, "{} divergence(s) in {} trials", s.divergences, s.trials);
+    assert!(s.insns > count / 2, "only {} instructions compiled in {} trials", s.insns, s.trials);
+    assert!(s.links_taken > count / 4, "only {} native links taken", s.links_taken);
+    assert!(
+        s.budget_stops > count / 2,
+        "only {} chains stopped short of a block that would cross the budget",
+        s.budget_stops
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_debug(
     bits: Bits,
@@ -27,8 +57,18 @@ fn run_debug(
         eprintln!("skipping: no JIT backend on this platform");
         return;
     }
-    let s = fuzz(&JitFuzzConfig { bits, count, seed, max_report: 8, chain, layouts, laps, debug })
-        .expect("the JIT backend should be available here");
+    let s = fuzz(&JitFuzzConfig {
+        bits,
+        count,
+        seed,
+        max_report: 8,
+        chain,
+        layouts,
+        laps,
+        debug,
+        cut: false,
+    })
+    .expect("the JIT backend should be available here");
     for d in &s.first {
         eprintln!("{}", render(d));
     }
@@ -108,6 +148,18 @@ fn jit_matches_the_interpreter_across_native_links() {
 fn jit_matches_the_interpreter_across_native_links_at_the_boundary() {
     run_laps(Bits::B64, 4_000, 22, 8, LayoutMix::Edge, 4);
     run_laps(Bits::B32, 4_000, 22, 8, LayoutMix::Edge, 4);
+}
+
+#[test]
+fn jit_never_retires_past_a_budget_that_ends_inside_a_block() {
+    run_cut(Bits::B64, 4_000, 23, LayoutMix::Mixed);
+    run_cut(Bits::B32, 4_000, 23, LayoutMix::Mixed);
+}
+
+#[test]
+fn jit_never_retires_past_a_budget_at_the_address_boundary() {
+    run_cut(Bits::B64, 4_000, 24, LayoutMix::Edge);
+    run_cut(Bits::B32, 4_000, 24, LayoutMix::Edge);
 }
 
 #[test]
