@@ -53,6 +53,11 @@ pub fn guest_addr(base: u64, off: u64, len: usize) -> Result<u64> {
         .ok_or(EmuError::Unmapped { addr: base.wrapping_add(off), len })
 }
 
+#[inline]
+pub fn align_up(v: u64, align: u64) -> u64 {
+    v.saturating_add(align - 1) & !(align - 1)
+}
+
 pub trait Memory {
     fn read(&self, addr: u64, buf: &mut [u8]) -> Result<()>;
 
@@ -258,6 +263,14 @@ mod tests {
         m.write_u32_at(8, 4, 0xdead_beef).unwrap();
         assert_eq!(m.read_u32(12).unwrap(), 0xdead_beef);
         assert_eq!(m.read_u32_at(8, 4).unwrap(), 0xdead_beef);
+    }
+
+    #[test]
+    fn align_up_saturates_instead_of_wrapping() {
+        assert_eq!(align_up(1, 0x1000), 0x1000);
+        assert_eq!(align_up(0x1000, 0x1000), 0x1000);
+        assert_eq!(align_up(u64::MAX, 0x1000), 0xffff_ffff_ffff_f000);
+        assert_eq!(align_up(u64::MAX - 5, 0x10000), 0xffff_ffff_ffff_0000);
     }
 
     #[test]
