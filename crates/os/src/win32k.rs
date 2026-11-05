@@ -2018,7 +2018,7 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
         call_hwnd_param::GET_WINDOW_LONG
         | call_hwnd_param::GET_WINDOW_LONG_PTR_A
         | call_hwnd_param::GET_WINDOW_LONG_PTR_W => {
-            let value = get_window_long(os, hwnd, param as i64);
+            let value = get_window_long(os, hwnd, i64::from(param as i32));
             os.return_u64_from_syscall(value);
             Ok(0)
         }
