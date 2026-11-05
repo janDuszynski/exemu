@@ -147,9 +147,9 @@ impl WinOs {
 
         let inherit_handles = process_flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES != 0;
         let std_handles = [
-            mem.read_u64(params + pp::STD_INPUT)?,
-            mem.read_u64(params + pp::STD_OUTPUT)?,
-            mem.read_u64(params + pp::STD_ERROR)?,
+            mem.read_u64_at(params, pp::STD_INPUT)?,
+            mem.read_u64_at(params, pp::STD_OUTPUT)?,
+            mem.read_u64_at(params, pp::STD_ERROR)?,
         ];
         for h in std_handles {
             if h == 0 || h == u64::MAX {
@@ -210,11 +210,11 @@ impl WinOs {
         self.write_ptr(mem, thread_handle_out, thread_handle)?;
         if let Some(client_id) = attrs.client_id_out {
             mem.write_u64(client_id, pid as u64)?;
-            mem.write_u64(client_id + 8, tid as u64)?;
+            mem.write_u64_at(client_id, 8, tid as u64)?;
         }
         if let Some((ptr, len)) = attrs.image_info_out {
             for off in (0..len).step_by(8) {
-                mem.write_u64(ptr + off, 0)?;
+                mem.write_u64_at(ptr, off, 0)?;
             }
         }
         for (ptr, value) in attrs.return_lengths {
@@ -228,14 +228,14 @@ impl WinOs {
         mem: &dyn Memory,
         params: u64,
     ) -> Result<Vec<(String, String)>> {
-        let base = mem.read_u64(params + pp::ENVIRONMENT)?;
-        let size = mem.read_u64(params + pp::ENVIRONMENT_SIZE)?;
+        let base = mem.read_u64_at(params, pp::ENVIRONMENT)?;
+        let size = mem.read_u64_at(params, pp::ENVIRONMENT_SIZE)?;
         if base == 0 || !(4..=MAX_ENVIRONMENT_BYTES).contains(&size) {
             return Ok(Vec::new());
         }
         let mut units = Vec::with_capacity((size / 2) as usize);
         for i in 0..size / 2 {
-            units.push(mem.read_u16(base + i * 2)?);
+            units.push(mem.read_u16_at(base, i * 2)?);
         }
         let mut out = Vec::new();
         let mut cur: Vec<u16> = Vec::new();
@@ -266,24 +266,24 @@ impl WinOs {
         if list == 0 {
             return Ok(Ok(out));
         }
-        let total = mem.read_u64(list + ps_attr::TOTAL_LENGTH)?;
+        let total = mem.read_u64_at(list, ps_attr::TOTAL_LENGTH)?;
         if total < ps_attr::FIRST {
             return Ok(Err(STATUS_INVALID_PARAMETER));
         }
         let count = ((total - ps_attr::FIRST) / ps_attr::ENTRY_SIZE).min(ps_attr::MAX_ENTRIES);
         for i in 0..count {
             let e = list + ps_attr::FIRST + i * ps_attr::ENTRY_SIZE;
-            let packed = mem.read_u64(e + ps_attr::ATTRIBUTE)?;
-            let size = mem.read_u64(e + ps_attr::SIZE)?;
-            let value = mem.read_u64(e + ps_attr::VALUE)?;
-            let return_length = mem.read_u64(e + ps_attr::RETURN_LENGTH)?;
+            let packed = mem.read_u64_at(e, ps_attr::ATTRIBUTE)?;
+            let size = mem.read_u64_at(e, ps_attr::SIZE)?;
+            let value = mem.read_u64_at(e, ps_attr::VALUE)?;
+            let return_length = mem.read_u64_at(e, ps_attr::RETURN_LENGTH)?;
             let number = packed & ps_attr::NUMBER_MASK;
             match number {
                 ps_attr::IMAGE_NAME => {
                     if value != 0 && (2..=0x1000).contains(&size) {
                         let mut units = Vec::with_capacity((size / 2) as usize);
                         for k in 0..size / 2 {
-                            units.push(mem.read_u16(value + k * 2)?);
+                            units.push(mem.read_u16_at(value, k * 2)?);
                         }
                         out.image_name = Some(String::from_utf16_lossy(&units));
                     }
@@ -463,19 +463,19 @@ impl WinOs {
         };
         if self.cfg.is_64bit {
             mem.write_u32(buffer, exit_status)?;
-            mem.write_u32(buffer + 0x04, 0)?;
-            mem.write_u64(buffer + 0x08, peb)?;
-            mem.write_u64(buffer + 0x10, 1)?;
-            mem.write_u64(buffer + 0x18, 8)?;
-            mem.write_u64(buffer + 0x20, pid)?;
-            mem.write_u64(buffer + 0x28, if pid == crate::CURRENT_PROCESS_ID { 0 } else { crate::CURRENT_PROCESS_ID })?;
+            mem.write_u32_at(buffer, 0x04, 0)?;
+            mem.write_u64_at(buffer, 0x08, peb)?;
+            mem.write_u64_at(buffer, 0x10, 1)?;
+            mem.write_u64_at(buffer, 0x18, 8)?;
+            mem.write_u64_at(buffer, 0x20, pid)?;
+            mem.write_u64_at(buffer, 0x28, if pid == crate::CURRENT_PROCESS_ID { 0 } else { crate::CURRENT_PROCESS_ID })?;
         } else {
             mem.write_u32(buffer, exit_status)?;
-            mem.write_u32(buffer + 0x04, peb as u32)?;
-            mem.write_u32(buffer + 0x08, 1)?;
-            mem.write_u32(buffer + 0x0C, 8)?;
-            mem.write_u32(buffer + 0x10, pid as u32)?;
-            mem.write_u32(buffer + 0x14, if pid == crate::CURRENT_PROCESS_ID { 0 } else { crate::CURRENT_PROCESS_ID as u32 })?;
+            mem.write_u32_at(buffer, 0x04, peb as u32)?;
+            mem.write_u32_at(buffer, 0x08, 1)?;
+            mem.write_u32_at(buffer, 0x0C, 8)?;
+            mem.write_u32_at(buffer, 0x10, pid as u32)?;
+            mem.write_u32_at(buffer, 0x14, if pid == crate::CURRENT_PROCESS_ID { 0 } else { crate::CURRENT_PROCESS_ID as u32 })?;
         }
         if return_length != 0 {
             mem.write_u32(return_length, need as u32)?;
@@ -588,8 +588,8 @@ impl WinOs {
             let ptr = if self.cfg.is_64bit { 8u64 } else { 4 };
             self.write_ptr(mem, info, hprocess)?;
             self.write_ptr(mem, info + ptr, hthread)?;
-            mem.write_u32(info + ptr * 2, pid)?;
-            mem.write_u32(info + ptr * 2 + 4, tid)?;
+            mem.write_u32_at(info, ptr * 2, pid)?;
+            mem.write_u32_at(info, ptr * 2 + 4, tid)?;
         }
         Ok(crate::api::Outcome::Return(1))
     }
@@ -721,11 +721,11 @@ mod tests {
         extra_attr: Option<(u64, u64, u64)>,
     ) -> u32 {
         for off in (0..0x420u64).step_by(8) {
-            mem.write_u64(PARAMS + off, 0).unwrap();
+            mem.write_u64_at(PARAMS, off, 0).unwrap();
         }
-        mem.write_u64(PARAMS + pp::STD_INPUT, std_handles[0]).unwrap();
-        mem.write_u64(PARAMS + pp::STD_OUTPUT, std_handles[1]).unwrap();
-        mem.write_u64(PARAMS + pp::STD_ERROR, std_handles[2]).unwrap();
+        mem.write_u64_at(PARAMS, pp::STD_INPUT, std_handles[0]).unwrap();
+        mem.write_u64_at(PARAMS, pp::STD_OUTPUT, std_handles[1]).unwrap();
+        mem.write_u64_at(PARAMS, pp::STD_ERROR, std_handles[2]).unwrap();
         let cmd_buf = SCRATCH + 0x200;
         write_wstr(mem, cmd_buf, command_line);
         write_unicode_string(mem, PARAMS + pp::COMMAND_LINE, cmd_buf, command_line.len() * 2);
@@ -745,14 +745,14 @@ mod tests {
         if let Some(e) = extra_attr {
             entries.push(e);
         }
-        mem.write_u64(ATTRS + ps_attr::TOTAL_LENGTH, ps_attr::FIRST + entries.len() as u64 * ps_attr::ENTRY_SIZE)
+        mem.write_u64_at(ATTRS, ps_attr::TOTAL_LENGTH, ps_attr::FIRST + entries.len() as u64 * ps_attr::ENTRY_SIZE)
             .unwrap();
         for (i, (packed, size, value)) in entries.iter().enumerate() {
             let e = ATTRS + ps_attr::FIRST + i as u64 * ps_attr::ENTRY_SIZE;
-            mem.write_u64(e + ps_attr::ATTRIBUTE, *packed).unwrap();
-            mem.write_u64(e + ps_attr::SIZE, *size).unwrap();
-            mem.write_u64(e + ps_attr::VALUE, *value).unwrap();
-            mem.write_u64(e + ps_attr::RETURN_LENGTH, 0).unwrap();
+            mem.write_u64_at(e, ps_attr::ATTRIBUTE, *packed).unwrap();
+            mem.write_u64_at(e, ps_attr::SIZE, *size).unwrap();
+            mem.write_u64_at(e, ps_attr::VALUE, *value).unwrap();
+            mem.write_u64_at(e, ps_attr::RETURN_LENGTH, 0).unwrap();
         }
 
         let mut cpu = CpuState::default();
@@ -760,7 +760,7 @@ mod tests {
         cpu.set_reg(Reg::Rdx, SCRATCH + 8);
         os.set_syscall_guest_rsp_for_test(GUEST_RSP);
         let stack = |mem: &mut VirtualMemory, n: u64, v: u64| {
-            mem.write_u64(GUEST_RSP + 0x28 + (n - 4) * 8, v).unwrap();
+            mem.write_u64_at(GUEST_RSP, 0x28 + (n - 4) * 8, v).unwrap();
         };
         stack(mem, 4, 0);
         stack(mem, 5, 0);
@@ -775,16 +775,16 @@ mod tests {
     fn write_wstr(mem: &mut VirtualMemory, at: u64, s: &str) {
         let mut i = 0;
         for u in s.encode_utf16() {
-            mem.write_u16(at + i, u).unwrap();
+            mem.write_u16_at(at, i, u).unwrap();
             i += 2;
         }
-        mem.write_u16(at + i, 0).unwrap();
+        mem.write_u16_at(at, i, 0).unwrap();
     }
 
     fn write_unicode_string(mem: &mut VirtualMemory, at: u64, buf: u64, len: usize) {
         mem.write_u16(at, len as u16).unwrap();
-        mem.write_u16(at + 2, (len + 2) as u16).unwrap();
-        mem.write_u64(at + 8, buf).unwrap();
+        mem.write_u16_at(at, 2, (len + 2) as u16).unwrap();
+        mem.write_u64_at(at, 8, buf).unwrap();
     }
 
     fn fixture() -> (VirtualMemory, std::path::PathBuf) {
@@ -824,10 +824,10 @@ mod tests {
         assert_eq!(status, STATUS_SUCCESS);
 
         let hprocess = mem.read_u64(SCRATCH).unwrap();
-        let hthread = mem.read_u64(SCRATCH + 8).unwrap();
+        let hthread = mem.read_u64_at(SCRATCH, 8).unwrap();
         assert!(hprocess != 0 && hthread != 0 && hprocess != hthread);
-        let pid = mem.read_u64(SCRATCH + 0x800).unwrap();
-        let tid = mem.read_u64(SCRATCH + 0x808).unwrap();
+        let pid = mem.read_u64_at(SCRATCH, 0x800).unwrap();
+        let tid = mem.read_u64_at(SCRATCH, 0x808).unwrap();
         assert!(pid != 0 && tid != 0 && pid % 4 == 0 && tid % 4 == 0, "pid {pid} tid {tid}");
 
         assert!(seen.borrow().is_empty(), "a suspended child must not run");
@@ -860,7 +860,7 @@ mod tests {
         cpu.set_reg(Reg::R8, buf);
         cpu.set_reg(Reg::R9, 0x30);
         os.set_syscall_guest_rsp_for_test(GUEST_RSP);
-        mem.write_u64(GUEST_RSP + 0x28, 0).unwrap();
+        mem.write_u64_at(GUEST_RSP, 0x28, 0).unwrap();
         assert_eq!(os.nt_query_information_process(&mut cpu, mem).unwrap(), STATUS_SUCCESS);
         mem.read_u32(buf).unwrap()
     }
@@ -902,7 +902,7 @@ mod tests {
             None,
         );
         assert_eq!(status, STATUS_SUCCESS, "creation itself is fine");
-        let hthread = mem.read_u64(SCRATCH + 8).unwrap();
+        let hthread = mem.read_u64_at(SCRATCH, 8).unwrap();
         let hprocess = mem.read_u64(SCRATCH).unwrap();
         os.resume_child_thread(hthread);
         assert_eq!(query_exit_status(&mut os, &mut mem, hprocess), STATUS_UNSUCCESSFUL);
@@ -975,10 +975,10 @@ mod tests {
         });
         let params = os.build_process_parameters_for_test(&mut mem).unwrap();
 
-        assert_eq!(mem.read_u64(params + pp::STD_INPUT).unwrap(), HANDLE_STDIN);
-        assert_eq!(mem.read_u64(params + pp::STD_OUTPUT).unwrap(), HANDLE_STDOUT);
-        assert_eq!(mem.read_u64(params + pp::STD_ERROR).unwrap(), HANDLE_STDERR);
-        assert_eq!(mem.read_u64(params + pp::CONSOLE_HANDLE).unwrap(), 0);
+        assert_eq!(mem.read_u64_at(params, pp::STD_INPUT).unwrap(), HANDLE_STDIN);
+        assert_eq!(mem.read_u64_at(params, pp::STD_OUTPUT).unwrap(), HANDLE_STDOUT);
+        assert_eq!(mem.read_u64_at(params, pp::STD_ERROR).unwrap(), HANDLE_STDERR);
+        assert_eq!(mem.read_u64_at(params, pp::CONSOLE_HANDLE).unwrap(), 0);
         assert_eq!(
             crate::fs::read_unicode_string(&mem, params + pp::IMAGE_PATH_NAME).unwrap(),
             "C:\\parent.exe"
