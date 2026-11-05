@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 pub const SW_HIDE: i32 = 0;
 
+pub(crate) const DEFAULT_TITLE: &str = "exemu";
+
 #[derive(Debug, Clone)]
 pub enum WindowCommand {
     Create {
@@ -64,6 +66,12 @@ pub struct WindowModel {
     children: HashSet<u32>,
 }
 
+impl Top {
+    fn closed(w: u32, h: u32, title: &str) -> Self {
+        Top { w, h, title: title.to_string(), open: false, shown: false }
+    }
+}
+
 impl WindowModel {
     pub fn new() -> Self {
         WindowModel::default()
@@ -106,8 +114,7 @@ impl WindowModel {
     fn ensure_top(&mut self, hwnd: u32, w: u32, h: u32, title: &str) -> Vec<HostAction> {
         if !self.tops.contains_key(&hwnd) {
             self.order.push(hwnd);
-            let top = Top { w, h, title: title.to_string(), open: false, shown: false };
-            self.tops.insert(hwnd, top);
+            self.tops.insert(hwnd, Top::closed(w, h, title));
         }
         let Some(entry) = self.tops.get_mut(&hwnd) else { return Vec::new() };
         if entry.open {
@@ -127,16 +134,7 @@ impl WindowModel {
                 }
                 self.forget(*hwnd);
                 self.order.push(*hwnd);
-                self.tops.insert(
-                    *hwnd,
-                    Top {
-                        w: *w,
-                        h: *h,
-                        title: title.clone(),
-                        open: false,
-                        shown: false,
-                    },
-                );
+                self.tops.insert(*hwnd, Top::closed(*w, *h, title));
                 if !*visible {
                     return Vec::new();
                 }
@@ -181,14 +179,7 @@ impl WindowModel {
                 } else {
                     if !self.tops.contains_key(hwnd) {
                         self.order.push(*hwnd);
-                        let top = Top {
-                            w: *w,
-                            h: *h,
-                            title: "exemu".to_string(),
-                            open: false,
-                            shown: false,
-                        };
-                        self.tops.insert(*hwnd, top);
+                        self.tops.insert(*hwnd, Top::closed(*w, *h, DEFAULT_TITLE));
                     }
                     self.show(*hwnd)
                 };
@@ -209,7 +200,7 @@ impl WindowModel {
     }
 
     fn show(&mut self, hwnd: u32) -> Vec<HostAction> {
-        let mut actions = self.ensure_top(hwnd, 1, 1, "exemu");
+        let mut actions = self.ensure_top(hwnd, 1, 1, DEFAULT_TITLE);
         if let Some(top) = self.tops.get_mut(&hwnd) {
             top.shown = true;
         }
