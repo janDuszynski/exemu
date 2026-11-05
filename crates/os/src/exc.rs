@@ -113,24 +113,24 @@ pub(crate) fn write_exception_record(
     address: u64,
     params: &[u64],
 ) -> Result<()> {
-    mem.write_u32(addr + ER_CODE, code)?;
-    mem.write_u32(addr + ER_FLAGS, flags)?;
-    mem.write_u64(addr + ER_NESTED, 0)?;
-    mem.write_u64(addr + ER_ADDRESS, address)?;
+    mem.write_u32_at(addr, ER_CODE, code)?;
+    mem.write_u32_at(addr, ER_FLAGS, flags)?;
+    mem.write_u64_at(addr, ER_NESTED, 0)?;
+    mem.write_u64_at(addr, ER_ADDRESS, address)?;
     let n = params.len().min(15);
-    mem.write_u32(addr + ER_NUM_PARAMS, n as u32)?;
+    mem.write_u32_at(addr, ER_NUM_PARAMS, n as u32)?;
     for (i, &p) in params.iter().take(15).enumerate() {
-        mem.write_u64(addr + ER_INFO + i as u64 * 8, p)?;
+        mem.write_u64_at(addr, ER_INFO + i as u64 * 8, p)?;
     }
     Ok(())
 }
 
 pub(crate) fn set_record_flags(mem: &mut dyn Memory, addr: u64, flags: u32) -> Result<()> {
-    mem.write_u32(addr + ER_FLAGS, flags)
+    mem.write_u32_at(addr, ER_FLAGS, flags)
 }
 
 pub(crate) fn record_flags(mem: &dyn Memory, addr: u64) -> Result<u32> {
-    mem.read_u32(addr + ER_FLAGS)
+    mem.read_u32_at(addr, ER_FLAGS)
 }
 
 pub(crate) const DISPATCHER_CONTEXT_SIZE: u64 = 0x50;
@@ -152,15 +152,15 @@ pub(crate) fn write_dispatcher_context(
     d: &DispatcherContext,
 ) -> Result<()> {
     mem.write_u64(addr, d.control_pc)?;
-    mem.write_u64(addr + 0x08, d.image_base)?;
-    mem.write_u64(addr + 0x10, d.function_entry)?;
-    mem.write_u64(addr + 0x18, d.establisher_frame)?;
-    mem.write_u64(addr + 0x20, d.target_ip)?;
-    mem.write_u64(addr + 0x28, d.context_record)?;
-    mem.write_u64(addr + 0x30, d.language_handler)?;
-    mem.write_u64(addr + 0x38, d.handler_data)?;
-    mem.write_u64(addr + 0x40, 0)?;
-    mem.write_u64(addr + 0x48, 0)?;
+    mem.write_u64_at(addr, 0x08, d.image_base)?;
+    mem.write_u64_at(addr, 0x10, d.function_entry)?;
+    mem.write_u64_at(addr, 0x18, d.establisher_frame)?;
+    mem.write_u64_at(addr, 0x20, d.target_ip)?;
+    mem.write_u64_at(addr, 0x28, d.context_record)?;
+    mem.write_u64_at(addr, 0x30, d.language_handler)?;
+    mem.write_u64_at(addr, 0x38, d.handler_data)?;
+    mem.write_u64_at(addr, 0x40, 0)?;
+    mem.write_u64_at(addr, 0x48, 0)?;
     Ok(())
 }
 
@@ -204,15 +204,15 @@ const CONTEXT_FLOATING_POINT: u32 = CONTEXT_AMD64 | 0x8;
 const CONTEXT_ALL: u32 = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_FLOATING_POINT;
 
 pub(crate) fn write_context(mem: &mut dyn Memory, addr: u64, state: &CpuState) -> Result<()> {
-    mem.write_u32(addr + OFF_CONTEXT_FLAGS, CONTEXT_ALL)?;
-    mem.write_u32(addr + OFF_MXCSR, 0x1f80)?;
-    mem.write_u32(addr + OFF_EFLAGS, state.rflags as u32)?;
+    mem.write_u32_at(addr, OFF_CONTEXT_FLAGS, CONTEXT_ALL)?;
+    mem.write_u32_at(addr, OFF_MXCSR, 0x1f80)?;
+    mem.write_u32_at(addr, OFF_EFLAGS, state.rflags as u32)?;
     for (i, &v) in state.gpr.iter().enumerate() {
-        mem.write_u64(addr + OFF_GPR + i as u64 * 8, v)?;
+        mem.write_u64_at(addr, OFF_GPR + i as u64 * 8, v)?;
     }
-    mem.write_u64(addr + OFF_RIP, state.rip)?;
+    mem.write_u64_at(addr, OFF_RIP, state.rip)?;
     for (i, &v) in state.xmm.iter().enumerate() {
-        mem.write(addr + OFF_XMM0 + i as u64 * 16, &v.to_le_bytes())?;
+        mem.write_at(addr, OFF_XMM0 + i as u64 * 16, &v.to_le_bytes())?;
     }
     Ok(())
 }
@@ -220,14 +220,14 @@ pub(crate) fn write_context(mem: &mut dyn Memory, addr: u64, state: &CpuState) -
 pub(crate) fn read_context(mem: &dyn Memory, addr: u64) -> Result<CpuState> {
     let mut s = CpuState::new();
     for i in 0..16 {
-        s.gpr[i] = mem.read_u64(addr + OFF_GPR + i as u64 * 8)?;
+        s.gpr[i] = mem.read_u64_at(addr, OFF_GPR + i as u64 * 8)?;
     }
-    s.rip = mem.read_u64(addr + OFF_RIP)?;
-    let eflags = mem.read_u32(addr + OFF_EFLAGS)? as u64;
+    s.rip = mem.read_u64_at(addr, OFF_RIP)?;
+    let eflags = mem.read_u32_at(addr, OFF_EFLAGS)? as u64;
     s.rflags = (eflags & !exemu_core::flags::RESERVED_ONE) | exemu_core::flags::RESERVED_ONE;
     for i in 0..16 {
         let mut b = [0u8; 16];
-        mem.read(addr + OFF_XMM0 + i as u64 * 16, &mut b)?;
+        mem.read_at(addr, OFF_XMM0 + i as u64 * 16, &mut b)?;
         s.xmm[i] = u128::from_le_bytes(b);
     }
     Ok(s)
@@ -256,7 +256,7 @@ impl WinOs {
         let mut params = Vec::new();
         if args_ptr != 0 {
             for i in 0..nparams.min(15) {
-                params.push(mem.read_u64(args_ptr + i as u64 * 8)?);
+                params.push(mem.read_u64_at(args_ptr, i as u64 * 8)?);
             }
         }
 
@@ -502,23 +502,23 @@ impl WinOs {
             TrapMode::Long => SEL_CS64,
             TrapMode::Compat32 => SEL_CS32,
         };
-        mem.write_u16(new_rsp + OFF_SEG_CS, cs)?;
+        mem.write_u16_at(new_rsp, OFF_SEG_CS, cs)?;
         for off in [OFF_SEG_DS, OFF_SEG_ES, OFF_SEG_FS, OFF_SEG_GS, OFF_SEG_SS] {
-            mem.write_u16(new_rsp + off, SEL_DATA)?;
+            mem.write_u16_at(new_rsp, off, SEL_DATA)?;
         }
-        mem.write_u32(new_rsp + OFF_CONTEXT_FLAGS, CONTEXT_ALL | CONTEXT_SEGMENTS)?;
+        mem.write_u32_at(new_rsp, OFF_CONTEXT_FLAGS, CONTEXT_ALL | CONTEXT_SEGMENTS)?;
 
         for i in 0..3u64 {
-            mem.write_u64(new_rsp + 0x4D0 + i * 8, 0)?;
+            mem.write_u64_at(new_rsp, 0x4D0 + i * 8, 0)?;
         }
 
         write_exception_record(mem, new_rsp + 0x4F0, code, 0, address, info)?;
 
-        mem.write_u64(new_rsp + 0x590, fault_rip)?;
-        mem.write_u64(new_rsp + 0x598, cs as u64)?;
-        mem.write_u64(new_rsp + 0x5A0, rflags)?;
-        mem.write_u64(new_rsp + 0x5A8, old_rsp)?;
-        mem.write_u64(new_rsp + 0x5B0, SEL_DATA as u64)?;
+        mem.write_u64_at(new_rsp, 0x590, fault_rip)?;
+        mem.write_u64_at(new_rsp, 0x598, cs as u64)?;
+        mem.write_u64_at(new_rsp, 0x5A0, rflags)?;
+        mem.write_u64_at(new_rsp, 0x5A8, old_rsp)?;
+        mem.write_u64_at(new_rsp, 0x5B0, SEL_DATA as u64)?;
 
         cpu.set_rsp(new_rsp);
         cpu.rip = ntdll_base + RVA_KI_USER_EXCEPTION_DISPATCHER;
@@ -560,7 +560,7 @@ impl WinOs {
         if rec == 0 {
             return Ok(STATUS_ACCESS_VIOLATION);
         }
-        let (Ok(code), Ok(address)) = (mem.read_u32(rec + ER_CODE), mem.read_u64(rec + ER_ADDRESS))
+        let (Ok(code), Ok(address)) = (mem.read_u32_at(rec, ER_CODE), mem.read_u64_at(rec, ER_ADDRESS))
         else {
             return Ok(STATUS_ACCESS_VIOLATION);
         };
@@ -579,10 +579,10 @@ impl WinOs {
         let Some(ntdll) = self.module_base("ntdll.dll") else {
             return Ok(STATUS_NOT_IMPLEMENTED_NT);
         };
-        let nparams = mem.read_u32(rec + ER_NUM_PARAMS).unwrap_or(0).min(15) as u64;
+        let nparams = mem.read_u32_at(rec, ER_NUM_PARAMS).unwrap_or(0).min(15) as u64;
         let mut info = Vec::with_capacity(nparams as usize);
         for i in 0..nparams {
-            info.push(mem.read_u64(rec + ER_INFO + i * 8).unwrap_or(0));
+            info.push(mem.read_u64_at(rec, ER_INFO + i * 8).unwrap_or(0));
         }
         if ctx != 0 {
             if let Ok(restored) = read_context(mem, ctx) {
