@@ -83,7 +83,7 @@ impl WinOs {
         if req == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        let opcode = mem.read_u32(req + req_header::REQ)?;
+        let opcode = mem.read_u32_at(req, req_header::REQ)?;
         let status = match opcode {
             REQ_CREATE_EVENT => self.srv_create_event(req, mem)?,
             REQ_SELECT => self.srv_select(req, cpu, mem)?,
@@ -98,34 +98,34 @@ impl WinOs {
     }
 
     fn write_reply_error(&self, req: u64, mem: &mut dyn Memory, error: u32) -> Result<()> {
-        mem.write_u32(req + reply_header::ERROR, error)?;
-        mem.write_u32(req + reply_header::REPLY_SIZE, 0)?;
+        mem.write_u32_at(req, reply_header::ERROR, error)?;
+        mem.write_u32_at(req, reply_header::REPLY_SIZE, 0)?;
         Ok(())
     }
 
     fn srv_create_event(&mut self, req: u64, mem: &mut dyn Memory) -> Result<u32> {
-        let manual = mem.read_u32(req + body::CREATE_EVENT_MANUAL)? != 0;
-        let initial = mem.read_u32(req + body::CREATE_EVENT_INITIAL)? != 0;
+        let manual = mem.read_u32_at(req, body::CREATE_EVENT_MANUAL)? != 0;
+        let initial = mem.read_u32_at(req, body::CREATE_EVENT_INITIAL)? != 0;
         let handle = self.make_object(SyncKind::Event, None, manual, initial, 0, 0);
         self.write_obj_handle(mem, req + 8, handle)?;
         Ok(STATUS_SUCCESS)
     }
 
     fn srv_select(&mut self, req: u64, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
-        let _cookie = mem.read_u64(req + body::SELECT_COOKIE)?;
-        let _flags = mem.read_u32(req + body::SELECT_FLAGS)?;
-        let timeout = mem.read_u64(req + body::SELECT_TIMEOUT)?;
+        let _cookie = mem.read_u64_at(req, body::SELECT_COOKIE)?;
+        let _flags = mem.read_u32_at(req, body::SELECT_FLAGS)?;
+        let timeout = mem.read_u64_at(req, body::SELECT_TIMEOUT)?;
 
-        let data_count = mem.read_u32(req + info::DATA_COUNT)?;
+        let data_count = mem.read_u32_at(req, info::DATA_COUNT)?;
         if data_count == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        let iov_ptr = mem.read_u64(req + info::DATA)?;
-        let iov_size = mem.read_u32(req + info::DATA + 8)? as u64;
+        let iov_ptr = mem.read_u64_at(req, info::DATA)?;
+        let iov_size = mem.read_u32_at(req, info::DATA + 8)? as u64;
         if iov_ptr == 0 || iov_size < select_op::HANDLES {
             return Ok(STATUS_INVALID_PARAMETER);
         }
-        let op = mem.read_u32(iov_ptr + select_op::OP)?;
+        let op = mem.read_u32_at(iov_ptr, select_op::OP)?;
         let all = match op {
             SELECT_WAIT => false,
             SELECT_WAIT_ALL => true,
@@ -214,7 +214,7 @@ mod tests {
     }
 
     fn make_req(mem: &mut VirtualMemory, req: u64, opcode: u32) {
-        mem.write_u32(req + req_header::REQ, opcode).unwrap();
+        mem.write_u32_at(req, req_header::REQ, opcode).unwrap();
     }
 
     #[test]
@@ -230,13 +230,13 @@ mod tests {
         let mut os = os64();
         let req = 0x5_0000;
         make_req(&mut mem, req, REQ_CREATE_EVENT);
-        mem.write_u32(req + body::CREATE_EVENT_MANUAL, 1).unwrap();
-        mem.write_u32(req + body::CREATE_EVENT_INITIAL, 1).unwrap();
+        mem.write_u32_at(req, body::CREATE_EVENT_MANUAL, 1).unwrap();
+        mem.write_u32_at(req, body::CREATE_EVENT_INITIAL, 1).unwrap();
 
         let status = os.wine_server_call(req, &mut CpuState::default(), &mut mem).unwrap();
         assert_eq!(status, STATUS_SUCCESS);
-        assert_eq!(mem.read_u32(req + reply_header::ERROR).unwrap(), STATUS_SUCCESS);
-        let handle = mem.read_u32(req + 8).unwrap() as u64;
+        assert_eq!(mem.read_u32_at(req, reply_header::ERROR).unwrap(), STATUS_SUCCESS);
+        let handle = mem.read_u32_at(req, 8).unwrap() as u64;
         assert!(handle != 0, "a handle was minted");
         assert!(os.kobject_is_signaled_for_test(handle));
     }
@@ -249,7 +249,7 @@ mod tests {
         let create = 0x5_0000;
         make_req(&mut mem, create, REQ_CREATE_EVENT);
         os.wine_server_call(create, &mut CpuState::default(), &mut mem).unwrap();
-        let handle = mem.read_u32(create + 8).unwrap() as u64;
+        let handle = mem.read_u32_at(create, 8).unwrap() as u64;
 
         let close = 0x5_1000;
         make_req(&mut mem, close, REQ_CLOSE_HANDLE);
@@ -266,16 +266,16 @@ mod tests {
         let mut os = os64();
         let create = 0x5_0000;
         make_req(&mut mem, create, REQ_CREATE_EVENT);
-        mem.write_u32(create + body::CREATE_EVENT_MANUAL, 1).unwrap();
-        mem.write_u32(create + body::CREATE_EVENT_INITIAL, 1).unwrap();
+        mem.write_u32_at(create, body::CREATE_EVENT_MANUAL, 1).unwrap();
+        mem.write_u32_at(create, body::CREATE_EVENT_INITIAL, 1).unwrap();
         os.wine_server_call(create, &mut CpuState::default(), &mut mem).unwrap();
-        let h1 = mem.read_u32(create + 8).unwrap() as u64;
+        let h1 = mem.read_u32_at(create, 8).unwrap() as u64;
 
         let dup = 0x5_1000;
         make_req(&mut mem, dup, REQ_DUP_HANDLE);
         os.write_obj_handle(&mut mem, dup + body::DUP_SRC_HANDLE, h1).unwrap();
         assert_eq!(os.wine_server_call(dup, &mut CpuState::default(), &mut mem).unwrap(), STATUS_SUCCESS);
-        let h2 = mem.read_u32(dup + 8).unwrap() as u64;
+        let h2 = mem.read_u32_at(dup, 8).unwrap() as u64;
         assert!(h2 != 0 && h2 != h1, "a distinct duplicate handle");
 
         let close = 0x5_2000;
@@ -296,24 +296,24 @@ mod tests {
         let mut os = os64();
         let create = 0x5_0000;
         make_req(&mut mem, create, REQ_CREATE_EVENT);
-        mem.write_u32(create + body::CREATE_EVENT_MANUAL, 1).unwrap();
-        mem.write_u32(create + body::CREATE_EVENT_INITIAL, 1).unwrap();
+        mem.write_u32_at(create, body::CREATE_EVENT_MANUAL, 1).unwrap();
+        mem.write_u32_at(create, body::CREATE_EVENT_INITIAL, 1).unwrap();
         os.wine_server_call(create, &mut CpuState::default(), &mut mem).unwrap();
-        let handle = mem.read_u32(create + 8).unwrap() as u64;
+        let handle = mem.read_u32_at(create, 8).unwrap() as u64;
 
         let sel_op = 0x5_2000;
-        mem.write_u32(sel_op + select_op::OP, SELECT_WAIT).unwrap();
+        mem.write_u32_at(sel_op, select_op::OP, SELECT_WAIT).unwrap();
         os.write_obj_handle(&mut mem, sel_op + select_op::HANDLES, handle).unwrap();
 
         let sel = 0x5_1000;
         make_req(&mut mem, sel, REQ_SELECT);
-        mem.write_u64(sel + body::SELECT_TIMEOUT, TIMEOUT_INFINITE).unwrap();
-        mem.write_u32(sel + info::DATA_COUNT, 1).unwrap();
-        mem.write_u64(sel + info::DATA, sel_op).unwrap();
-        mem.write_u32(sel + info::DATA + 8, (select_op::HANDLES + 4) as u32).unwrap();
+        mem.write_u64_at(sel, body::SELECT_TIMEOUT, TIMEOUT_INFINITE).unwrap();
+        mem.write_u32_at(sel, info::DATA_COUNT, 1).unwrap();
+        mem.write_u64_at(sel, info::DATA, sel_op).unwrap();
+        mem.write_u32_at(sel, info::DATA + 8, (select_op::HANDLES + 4) as u32).unwrap();
 
         assert_eq!(os.wine_server_call(sel, &mut CpuState::default(), &mut mem).unwrap(), STATUS_SUCCESS);
-        assert_eq!(mem.read_u32(sel + reply_header::ERROR).unwrap(), STATUS_SUCCESS);
+        assert_eq!(mem.read_u32_at(sel, reply_header::ERROR).unwrap(), STATUS_SUCCESS);
         assert!(!os.unix_call_blocked_for_test(), "did not block on a signaled object");
     }
 
@@ -325,19 +325,19 @@ mod tests {
         let create = 0x5_0000;
         make_req(&mut mem, create, REQ_CREATE_EVENT);
         os.wine_server_call(create, &mut CpuState::default(), &mut mem).unwrap();
-        let handle = mem.read_u32(create + 8).unwrap() as u64;
+        let handle = mem.read_u32_at(create, 8).unwrap() as u64;
 
         let sel_op = 0x5_2000;
-        mem.write_u32(sel_op + select_op::OP, SELECT_WAIT).unwrap();
+        mem.write_u32_at(sel_op, select_op::OP, SELECT_WAIT).unwrap();
         os.write_obj_handle(&mut mem, sel_op + select_op::HANDLES, handle).unwrap();
         let sel = 0x5_1000;
         make_req(&mut mem, sel, REQ_SELECT);
-        mem.write_u32(sel + info::DATA_COUNT, 1).unwrap();
-        mem.write_u64(sel + info::DATA, sel_op).unwrap();
-        mem.write_u32(sel + info::DATA + 8, (select_op::HANDLES + 4) as u32).unwrap();
+        mem.write_u32_at(sel, info::DATA_COUNT, 1).unwrap();
+        mem.write_u64_at(sel, info::DATA, sel_op).unwrap();
+        mem.write_u32_at(sel, info::DATA + 8, (select_op::HANDLES + 4) as u32).unwrap();
 
         assert_eq!(os.wine_server_call(sel, &mut CpuState::default(), &mut mem).unwrap(), STATUS_TIMEOUT);
-        assert_eq!(mem.read_u32(sel + reply_header::ERROR).unwrap(), STATUS_TIMEOUT);
+        assert_eq!(mem.read_u32_at(sel, reply_header::ERROR).unwrap(), STATUS_TIMEOUT);
         assert!(!os.unix_call_blocked_for_test(), "a poll never blocks");
     }
 
@@ -349,17 +349,17 @@ mod tests {
         let create = 0x5_0000;
         make_req(&mut mem, create, REQ_CREATE_EVENT);
         os.wine_server_call(create, &mut CpuState::default(), &mut mem).unwrap();
-        let handle = mem.read_u32(create + 8).unwrap() as u64;
+        let handle = mem.read_u32_at(create, 8).unwrap() as u64;
 
         let sel_op = 0x5_2000;
-        mem.write_u32(sel_op + select_op::OP, SELECT_WAIT).unwrap();
+        mem.write_u32_at(sel_op, select_op::OP, SELECT_WAIT).unwrap();
         os.write_obj_handle(&mut mem, sel_op + select_op::HANDLES, handle).unwrap();
         let sel = 0x5_1000;
         make_req(&mut mem, sel, REQ_SELECT);
-        mem.write_u64(sel + body::SELECT_TIMEOUT, TIMEOUT_INFINITE).unwrap();
-        mem.write_u32(sel + info::DATA_COUNT, 1).unwrap();
-        mem.write_u64(sel + info::DATA, sel_op).unwrap();
-        mem.write_u32(sel + info::DATA + 8, (select_op::HANDLES + 4) as u32).unwrap();
+        mem.write_u64_at(sel, body::SELECT_TIMEOUT, TIMEOUT_INFINITE).unwrap();
+        mem.write_u32_at(sel, info::DATA_COUNT, 1).unwrap();
+        mem.write_u64_at(sel, info::DATA, sel_op).unwrap();
+        mem.write_u32_at(sel, info::DATA + 8, (select_op::HANDLES + 4) as u32).unwrap();
 
         assert_eq!(os.wine_server_call(sel, &mut CpuState::default(), &mut mem).unwrap(), STATUS_SUCCESS);
         assert!(!os.unix_call_blocked_for_test());
