@@ -117,7 +117,7 @@ fn commit_within_reservation() {
 }
 
 mod nt {
-    use exemu_core::{Cpu, Exit, Memory, Perm, Reg, Region};
+    use exemu_core::{Cpu, EmuError, Exit, Memory, Perm, Reg, Region};
     use exemu_cpu::{Bits, Interpreter, GS_BASE};
     use exemu_memory::VirtualMemory;
     use exemu_os::{WinConfig, WinOs};
@@ -143,6 +143,15 @@ mod nt {
     const STATUS_SUCCESS: u64 = 0;
 
     fn syscall(os: &mut WinOs, mem: &mut VirtualMemory, index: u32, args: &[u64]) -> u64 {
+        try_syscall(os, mem, index, args).unwrap()
+    }
+
+    fn try_syscall(
+        os: &mut WinOs,
+        mem: &mut VirtualMemory,
+        index: u32,
+        args: &[u64],
+    ) -> Result<u64, EmuError> {
         let mut asm: Vec<u8> = Vec::new();
         asm.extend_from_slice(&[0x48, 0xB9]);
         asm.extend_from_slice(&args.first().copied().unwrap_or(0).to_le_bytes());
@@ -168,13 +177,13 @@ mod nt {
             mem.write_u64(rsp + 0x28 + (n as u64 - 4) * 8, a).unwrap();
         }
         loop {
-            match cpu.step(mem, os).unwrap() {
+            match cpu.step(mem, os)? {
                 Exit::Continue => continue,
                 Exit::Halted => break,
                 other => panic!("unexpected exit: {other:?}"),
             }
         }
-        cpu.state().reg(Reg::Rax)
+        Ok(cpu.state().reg(Reg::Rax))
     }
 
     fn setup() -> (WinOs, VirtualMemory) {
@@ -266,5 +275,55 @@ mod nt {
             &[0xFFFF_FFFF_FFFF_FFFF, 0, 0, SCRATCH, MEM_COMMIT, PAGE_READWRITE as u64],
         );
         assert_eq!(st, 0xC000_000D, "NULL BaseAddress → STATUS_INVALID_PARAMETER");
+    }
+
+    const STATUS_NO_MEMORY: u64 = 0xC000_0017;
+    const SELF_PROCESS: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+    fn alloc_with(size: u64, base: u64) -> (u64, WinOs, VirtualMemory) {
+        let (mut os, mut mem) = setup();
+        mem.write_u64(SCRATCH, base).unwrap();
+        mem.write_u64(SCRATCH + 0x10, size).unwrap();
+        let st = syscall(
+            &mut os,
+            &mut mem,
+            NT_ALLOCATE,
+            &[SELF_PROCESS, SCRATCH, 0, SCRATCH + 0x10, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE as u64],
+        );
+        (st, os, mem)
+    }
+
+    #[test]
+    fn nt_allocate_size_that_overflows_alignment_is_no_memory() {
+        for size in [u64::MAX, u64::MAX - 0xFFE, 0xFFFF_FFFF_FFFF_F001] {
+            let (st, _, mem) = alloc_with(size, 0);
+            assert_eq!(st, STATUS_NO_MEMORY, "size {size:#x}");
+            assert_eq!(mem.read_u64(SCRATCH).unwrap(), 0, "base untouched");
+        }
+    }
+
+    #[test]
+    fn nt_allocate_fixed_base_wrapping_past_the_top_is_no_memory() {
+        let (st, mut os, mut mem) = alloc_with(0x1000, 0xFFFF_FFFF_FFFF_F000);
+        assert_eq!(st, STATUS_NO_MEMORY);
+        let probe = syscall(
+            &mut os,
+            &mut mem,
+            NT_QUERY,
+            &[SELF_PROCESS, SCRATCH, MEMORY_BASIC_INFORMATION, SCRATCH + 0x100, 0x30, 0],
+        );
+        assert_eq!(probe, STATUS_SUCCESS, "later queries still work");
+    }
+
+    #[test]
+    fn nt_query_with_buffer_at_the_top_of_the_address_space_is_an_error() {
+        let (mut os, mut mem) = setup();
+        let r = try_syscall(
+            &mut os,
+            &mut mem,
+            NT_QUERY,
+            &[SELF_PROCESS, SCRATCH, MEMORY_BASIC_INFORMATION, u64::MAX - 2, 0x30, 0],
+        );
+        assert!(matches!(r, Err(EmuError::Unmapped { .. })), "{r:?}");
     }
 }

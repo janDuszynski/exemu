@@ -1,4 +1,4 @@
-use exemu_core::{CpuState, Memory, Perm, Result};
+use exemu_core::{checked_align_up, CpuState, Memory, Perm, Result};
 
 use crate::api::Outcome;
 use crate::WinOs;
@@ -36,9 +36,10 @@ pub(crate) struct VmAlloc {
     pub mtype: u32,
 }
 
-#[inline]
-fn align_up(v: u64, a: u64) -> u64 {
-    (v + a - 1) & !(a - 1)
+impl VmAlloc {
+    pub(crate) fn end(&self) -> u64 {
+        self.base.saturating_add(self.size)
+    }
 }
 
 const PAGE_PROTECTION_MASK: u32 = 0xff;
@@ -121,7 +122,10 @@ impl WinOs {
         max_addr: u64,
     ) -> Result<u64> {
         let committed = alloc_type & MEM_COMMIT != 0;
-        let size = align_up(size_req.max(1), PAGE);
+        let Some(size) = checked_align_up(size_req.max(1), PAGE) else {
+            self.last_error = 8;
+            return Ok(0);
+        };
 
         if addr_req == 0 {
             let Some(base) = self.vm_find_free_below(mem, size, max_addr) else {
@@ -137,14 +141,18 @@ impl WinOs {
         }
 
         let base = addr_req & !(PAGE - 1);
-        if let Some(a) = self.vm_allocs.iter_mut().find(|a| base >= a.base && base < a.base + a.size) {
+        if base.checked_add(size).is_none() {
+            self.last_error = 8;
+            return Ok(0);
+        }
+        if let Some(a) = self.vm_allocs.iter_mut().find(|a| base >= a.base && base < a.end()) {
             a.committed = a.committed || committed;
             if protect != 0 {
                 a.protect = protect;
             }
             return Ok(base);
         }
-        let free_here = mem.next_region(base).map_or(true, |(rb, _, _)| rb >= base + size);
+        let free_here = mem.next_region(base).map_or(true, |(rb, _, _)| rb >= base.saturating_add(size));
         if free_here && mem.map_fixed(base, size, Perm::RWX, "valloc").is_ok() {
             self.vm_insert(VmAlloc { base, size, protect, committed, mtype: MEM_PRIVATE });
         }
@@ -159,7 +167,7 @@ impl WinOs {
                 let _ = mem.unmap(a.base, 0);
             }
         } else if free_type & MEM_DECOMMIT != 0 {
-            if let Some(a) = self.vm_allocs.iter_mut().find(|a| base >= a.base && base < a.base + a.size) {
+            if let Some(a) = self.vm_allocs.iter_mut().find(|a| base >= a.base && base < a.end()) {
                 a.committed = false;
             }
         }
@@ -170,9 +178,9 @@ impl WinOs {
         let old = self
             .vm_allocs
             .iter()
-            .find(|a| base >= a.base && base < a.base + a.size)
+            .find(|a| base >= a.base && base < a.end())
             .map_or(0x40, |a| a.protect);
-        if let Some(a) = self.vm_allocs.iter_mut().find(|a| base >= a.base && base < a.base + a.size) {
+        if let Some(a) = self.vm_allocs.iter_mut().find(|a| base >= a.base && base < a.end()) {
             a.protect = new_protect;
         }
         old
@@ -181,9 +189,9 @@ impl WinOs {
     pub(crate) fn vm_query_region(&mut self, mem: &mut dyn Memory, addr: u64, buf: u64) -> Result<Outcome> {
         let page_base = addr & !(PAGE - 1);
 
-        if let Some(a) = self.vm_allocs.iter().find(|a| addr >= a.base && addr < a.base + a.size) {
+        if let Some(a) = self.vm_allocs.iter().find(|a| addr >= a.base && addr < a.end()) {
             let (base, size, prot, comm, mtype) = (a.base, a.size, a.protect, a.committed, a.mtype);
-            let region_size = base + size - page_base;
+            let region_size = base.saturating_add(size) - page_base;
             let state = if comm { MEM_STATE_COMMIT } else { MEM_STATE_RESERVE };
             let prot_out = if comm { prot } else { 0 };
             return self.write_mbi(mem, buf, page_base, base, prot, region_size, state, prot_out, mtype);
@@ -192,7 +200,7 @@ impl WinOs {
         match mem.next_region(addr) {
             Some((rb, rsize, rperm)) if rb <= addr => {
                 let prot = protect_from_perm(rperm);
-                let region_size = rb + rsize - page_base;
+                let region_size = rb.saturating_add(rsize) - page_base;
                 self.write_mbi(mem, buf, page_base, rb, prot, region_size, MEM_STATE_COMMIT, prot, MEM_PRIVATE)
             }
             Some((rb, _, _)) => self.write_mbi(mem, buf, page_base, 0, 0, rb - page_base, MEM_STATE_FREE, 0, 0),
@@ -201,7 +209,7 @@ impl WinOs {
     }
 
     pub(crate) fn map_anywhere(&mut self, mem: &mut dyn Memory, size: u64, perm: exemu_core::Perm, name: &str) -> Option<u64> {
-        let base = self.vm_find_free(mem, size);
+        let base = self.vm_find_free(mem, size)?;
         mem.map_fixed(base, size, perm, name).ok().map(|()| base)
     }
 
@@ -218,7 +226,7 @@ impl WinOs {
 
     fn vm_find_free_below(&mut self, mem: &dyn Memory, size: u64, max_addr: u64) -> Option<u64> {
         if max_addr == u64::MAX {
-            return Some(self.vm_find_free(mem, size));
+            return self.vm_find_free(mem, size);
         }
         let mut base = LOW_ARENA_BASE;
         loop {
@@ -228,17 +236,17 @@ impl WinOs {
             match mem.next_region(base) {
                 None => return Some(base),
                 Some((rb, rsize, _)) => {
-                    if rb >= base + size {
+                    if rb >= base.saturating_add(size) {
                         return Some(base);
                     }
-                    base = align_up(rb + rsize, GRAN);
+                    base = checked_align_up(rb.saturating_add(rsize), GRAN)?;
                 }
             }
         }
     }
 
-    fn vm_find_free(&mut self, mem: &dyn Memory, size: u64) -> u64 {
-        let mut base = align_up(self.valloc_next, GRAN);
+    fn vm_find_free(&mut self, mem: &dyn Memory, size: u64) -> Option<u64> {
+        let mut base = checked_align_up(self.valloc_next, GRAN)?;
         loop {
             match mem.next_region(base) {
                 None => break,
@@ -246,12 +254,12 @@ impl WinOs {
                     if rb >= base.saturating_add(size) {
                         break;
                     }
-                    base = align_up(rb + rsize, GRAN);
+                    base = checked_align_up(rb.saturating_add(rsize), GRAN)?;
                 }
             }
         }
-        self.valloc_next = base + align_up(size, GRAN);
-        base
+        self.valloc_next = base.checked_add(checked_align_up(size, GRAN)?)?;
+        Some(base)
     }
 
     fn vm_insert(&mut self, a: VmAlloc) {
@@ -285,23 +293,23 @@ impl WinOs {
         }
         if self.cfg.is_64bit {
             mem.write_u64(buf, base)?;
-            mem.write_u64(buf + 0x08, alloc_base)?;
-            mem.write_u32(buf + 0x10, alloc_protect)?;
-            mem.write_u32(buf + 0x14, 0)?;
-            mem.write_u64(buf + 0x18, region_size)?;
-            mem.write_u32(buf + 0x20, state)?;
-            mem.write_u32(buf + 0x24, protect)?;
-            mem.write_u32(buf + 0x28, mtype)?;
-            mem.write_u32(buf + 0x2C, 0)?;
+            mem.write_u64_at(buf, 0x08, alloc_base)?;
+            mem.write_u32_at(buf, 0x10, alloc_protect)?;
+            mem.write_u32_at(buf, 0x14, 0)?;
+            mem.write_u64_at(buf, 0x18, region_size)?;
+            mem.write_u32_at(buf, 0x20, state)?;
+            mem.write_u32_at(buf, 0x24, protect)?;
+            mem.write_u32_at(buf, 0x28, mtype)?;
+            mem.write_u32_at(buf, 0x2C, 0)?;
             Ok(Outcome::Return(0x30))
         } else {
             mem.write_u32(buf, base as u32)?;
-            mem.write_u32(buf + 0x04, alloc_base as u32)?;
-            mem.write_u32(buf + 0x08, alloc_protect)?;
-            mem.write_u32(buf + 0x0C, region_size as u32)?;
-            mem.write_u32(buf + 0x10, state)?;
-            mem.write_u32(buf + 0x14, protect)?;
-            mem.write_u32(buf + 0x18, mtype)?;
+            mem.write_u32_at(buf, 0x04, alloc_base as u32)?;
+            mem.write_u32_at(buf, 0x08, alloc_protect)?;
+            mem.write_u32_at(buf, 0x0C, region_size as u32)?;
+            mem.write_u32_at(buf, 0x10, state)?;
+            mem.write_u32_at(buf, 0x14, protect)?;
+            mem.write_u32_at(buf, 0x18, mtype)?;
             Ok(Outcome::Return(0x1C))
         }
     }
@@ -331,13 +339,16 @@ impl WinOs {
         let addr_req = mem.read_u64(base_ptr)?;
         let size_req = mem.read_u64(size_ptr)?;
         let max_addr = zero_bits_ceiling(zero_bits);
+        let Some(aligned_size) = checked_align_up(size_req.max(1), PAGE) else {
+            return Ok(STATUS_NO_MEMORY);
+        };
         let base =
             self.vm_alloc_region_below(mem, addr_req, size_req, alloc_type, protect, max_addr)?;
         if base == 0 {
             return Ok(STATUS_NO_MEMORY);
         }
         mem.write_u64(base_ptr, base)?;
-        mem.write_u64(size_ptr, align_up(size_req.max(1), PAGE))?;
+mem.write_u64(size_ptr, aligned_size)?;
         Ok(STATUS_SUCCESS)
     }
 
@@ -416,12 +427,12 @@ impl WinOs {
             if rb >= end {
                 break;
             }
-            let covered = rb >= start && rb + rsize <= end;
+            let covered = rb >= start && rb.saturating_add(rsize) <= end;
             let perm_now = if covered { new_perm } else { perm.union(new_perm) };
             if perm_now != perm {
                 let _ = mem.protect(rb, rsize, perm_now);
             }
-            at = (rb + rsize).max(at + PAGE);
+            at = rb.saturating_add(rsize).max(at.saturating_add(PAGE));
         }
         Ok(Some(protect_from_perm(old_perm)))
     }
@@ -452,7 +463,7 @@ impl WinOs {
     fn vm_region_bounds(&self, addr: u64) -> Option<(u64, u64)> {
         self.vm_allocs
             .iter()
-            .find(|a| addr >= a.base && addr < a.base + a.size)
+            .find(|a| addr >= a.base && addr < a.end())
             .map(|a| (a.base, a.size))
     }
 }
@@ -497,7 +508,7 @@ mod tests {
         mem.write_u64(base_cell, addr).unwrap();
         mem.write_u64(size_cell, size).unwrap();
         mem.write_u32(old_cell, 0xA5A5_A5A5).unwrap();
-        mem.write_u64(gsp + 0x28, old_cell).unwrap();
+        mem.write_u64_at(gsp, 0x28, old_cell).unwrap();
         os.set_syscall_guest_rsp_for_test(gsp);
         let mut cpu = CpuState::default();
         cpu.set_reg(Reg::R10, u64::MAX);
