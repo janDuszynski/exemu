@@ -483,6 +483,7 @@ impl WinOs {
             IOCTL_AFD_SELECT => self.afd_select(mem, req)?,
             IOCTL_AFD_WINE_OP_210 => OK,
             IOCTL_AFD_WINE_FIONBIO => self.afd_fionbio(mem, req)?,
+            IOCTL_AFD_WINE_KEEPALIVE_VALS => self.afd_keepalive_vals(mem, req)?,
             code if is_option_ioctl(code) => self.afd_option(mem, req)?,
             _ => OpResult::Done(STATUS_NOT_IMPLEMENTED, 0),
         })

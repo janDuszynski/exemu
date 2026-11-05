@@ -697,6 +697,24 @@ fn a_nonblocking_receive_reports_device_not_ready_until_data_arrives() {
 }
 
 #[test]
+fn sio_keepalive_vals_arrives_as_the_wine_keepalive_ioctl_and_sets_the_options() {
+    const KEEPALIVE_VALS: u32 = 0x0012_0358;
+    const KEEPIDLE: u32 = 0x0012_04ac;
+    const KEEPINTVL: u32 = 0x0012_04bc;
+    let (mut os, mut mem) = setup();
+    let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    mem.write(IN_PTR, &[1, 0, 0, 0, 0x10, 0x27, 0, 0, 0xB8, 0x0B, 0, 0]).unwrap();
+    assert_eq!(ioctl(&mut os, &mut mem, sock, KEEPALIVE_VALS, IN_PTR, 12, 0, 0), STATUS_SUCCESS);
+    assert_eq!(get_option(&mut os, &mut mem, sock, 0x0012_037c), (STATUS_SUCCESS, 1));
+    assert_eq!(get_option(&mut os, &mut mem, sock, KEEPIDLE), (STATUS_SUCCESS, 10));
+    assert_eq!(get_option(&mut os, &mut mem, sock, KEEPINTVL), (STATUS_SUCCESS, 3));
+    assert_eq!(ioctl(&mut os, &mut mem, sock, KEEPALIVE_VALS, IN_PTR, 8, 0, 0), STATUS_BUFFER_TOO_SMALL);
+    mem.write(IN_PTR, &[0u8; 12]).unwrap();
+    assert_eq!(ioctl(&mut os, &mut mem, sock, KEEPALIVE_VALS, IN_PTR, 12, 0, 0), STATUS_SUCCESS);
+    assert_eq!(get_option(&mut os, &mut mem, sock, 0x0012_037c), (STATUS_SUCCESS, 0));
+}
+
+#[test]
 fn a_nonblocking_accept_with_no_pending_connection_reports_device_not_ready() {
     let (mut os, mut mem) = setup();
     let (sock, _) = make_socket(&mut os, &mut mem, AF_INET, SOCK_STREAM, IPPROTO_TCP);

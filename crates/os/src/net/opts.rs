@@ -1,6 +1,7 @@
 use super::*;
 
 pub const IOCTL_AFD_WINE_FIONBIO: u32 = ctl_code(209, METHOD_BUFFERED);
+pub const IOCTL_AFD_WINE_KEEPALIVE_VALS: u32 = ctl_code(214, METHOD_BUFFERED);
 
 pub const IOCTL_AFD_WINE_GET_SO_ACCEPTCONN: u32 = ctl_code(219, METHOD_BUFFERED);
 pub const IOCTL_AFD_WINE_GET_SO_BROADCAST: u32 = ctl_code(220, METHOD_BUFFERED);
@@ -37,6 +38,10 @@ const DEFAULT_KEEPCNT: u32 = 10;
 const DEFAULT_KEEPINTVL_SECS: u32 = 1;
 
 const OPTION_VALUE_LEN: u64 = 4;
+const KEEPALIVE_VALS_LEN: u64 = 12;
+const KEEPALIVE_TIME_OFF: u64 = 4;
+const KEEPALIVE_INTERVAL_OFF: u64 = 8;
+const MILLIS_PER_SECOND: u32 = 1000;
 
 const STATUS_BUFFER_TOO_SMALL: u32 = 0xC000_0023;
 
@@ -115,6 +120,22 @@ impl WinOs {
         }
         let enable = mem.read_u32(req.in_buf)? != 0;
         self.socket_mut(req.handle).nonblocking = enable;
+        Ok(OK)
+    }
+
+    pub(super) fn afd_keepalive_vals(&mut self, mem: &mut dyn Memory, req: &Request) -> Result<OpResult> {
+        if req.in_len < KEEPALIVE_VALS_LEN || req.in_buf == 0 {
+            return Ok(OpResult::Done(STATUS_BUFFER_TOO_SMALL, 0));
+        }
+        let on = mem.read_u32(req.in_buf)? != 0;
+        let time_ms = mem.read_u32(req.in_buf + KEEPALIVE_TIME_OFF)?;
+        let interval_ms = mem.read_u32(req.in_buf + KEEPALIVE_INTERVAL_OFF)?;
+        let sock = self.socket_mut(req.handle);
+        sock.opts.insert(IOCTL_AFD_WINE_SET_SO_KEEPALIVE, u32::from(on));
+        if on {
+            sock.opts.insert(IOCTL_AFD_WINE_SET_TCP_KEEPIDLE, time_ms / MILLIS_PER_SECOND);
+            sock.opts.insert(IOCTL_AFD_WINE_SET_TCP_KEEPINTVL, interval_ms / MILLIS_PER_SECOND);
+        }
         Ok(OK)
     }
 
