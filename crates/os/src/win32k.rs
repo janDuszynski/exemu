@@ -1,6 +1,7 @@
 use exemu_core::{CpuState, Memory, Perm, Result, WindowParams};
 
 use crate::api::read_wstr;
+use crate::wndclass::{ClassClient, ClientMenuName, WndClassEx};
 use crate::WinOs;
 
 const STATUS_SUCCESS: u32 = 0x0000_0000;
@@ -330,10 +331,6 @@ const CLASS_ATOM_BASE: u16 = 0xC000;
 const WS_VISIBLE: u32 = 0x1000_0000;
 const WS_CHILD: u32 = 0x4000_0000;
 
-const WNDCLASSEXW_WNDPROC: u64 = 0x08;
-const WNDCLASSEXW_STYLE: u64 = 0x04;
-const WNDCLASSEXW_CB_WND_EXTRA: u64 = 0x14;
-const WNDCLASSEXW_BACKGROUND: u64 = 0x30;
 const WND_EXTRA_MAX: u32 = 4096;
 
 const GWLP_WNDPROC: i64 = -4;
@@ -554,6 +551,7 @@ struct Class {
     style: u32,
     background: u64,
     wnd_extra: u32,
+    client: ClassClient,
 }
 
 #[allow(dead_code)]
@@ -1205,6 +1203,7 @@ fn register_builtin_classes(os: &mut WinOs) {
                 style: BUILTIN_CLASS_STYLE,
                 background: 0,
                 wnd_extra: BUILTIN_WND_EXTRA,
+                client: ClassClient::default(),
             },
         ));
     }
@@ -1262,8 +1261,37 @@ fn nt_user_get_atom_name(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memor
 
 fn nt_user_get_class_info_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
     let name_ptr = os.syscall_arg(cpu, mem, 1)?;
+    let wc = os.syscall_arg(cpu, mem, 2)?;
+    let menu_name = os.syscall_arg(cpu, mem, 3)?;
+    let ansi = os.syscall_arg_u32(cpu, mem, 4)? != 0;
     let name = read_unicode_string(mem, name_ptr)?;
-    Ok(os.win32k_state.class_by_name(&name).map(u32::from).unwrap_or(0))
+    let Some(atom) = os.win32k_state.class_by_name(&name) else {
+        return Ok(0);
+    };
+    let Some(class) = os.win32k_state.class_by_atom(atom) else {
+        return Ok(0);
+    };
+    if wc != 0 {
+        let class_name = if name_ptr != 0 { mem.read_u64(name_ptr + 8)? } else { 0 };
+        let info = WndClassEx {
+            style: class.style,
+            wndproc: class.wndproc,
+            cls_extra: class.client.cls_extra,
+            wnd_extra: class.wnd_extra,
+            instance: class.client.instance,
+            icon: class.client.icon,
+            cursor: class.client.cursor,
+            background: class.background,
+            menu_name: class.client.menu_name.for_charset(ansi),
+            class_name,
+            icon_sm: class.client.icon_sm,
+        };
+        info.write(mem, wc)?;
+    }
+    if menu_name != 0 {
+        class.client.menu_name.write(mem, menu_name)?;
+    }
+    Ok(u32::from(atom))
 }
 
 fn nt_user_register_class_ex_wow(
@@ -1273,18 +1301,17 @@ fn nt_user_register_class_ex_wow(
 ) -> Result<u32> {
     let wc = os.syscall_arg(cpu, mem, 0)?;
     let name_ptr = os.syscall_arg(cpu, mem, 1)?;
+    let menu_name_ptr = os.syscall_arg(cpu, mem, 3)?;
     let name = read_unicode_string(mem, name_ptr)?;
 
-    let (style, wndproc, background, wnd_extra) = if wc != 0 {
-        (
-            mem.read_u32(wc + WNDCLASSEXW_STYLE)?,
-            mem.read_u64(wc + WNDCLASSEXW_WNDPROC)?,
-            mem.read_u64(wc + WNDCLASSEXW_BACKGROUND)?,
-            mem.read_u32(wc + WNDCLASSEXW_CB_WND_EXTRA)?.min(WND_EXTRA_MAX),
-        )
-    } else {
-        (0, 0, 0, 0)
-    };
+    let registered = if wc != 0 { WndClassEx::read(mem, wc)? } else { WndClassEx::default() };
+    let client = ClassClient::registered(&registered, ClientMenuName::read(mem, menu_name_ptr)?);
+    let (style, wndproc, background, wnd_extra) = (
+        registered.style,
+        registered.wndproc,
+        registered.background,
+        registered.wnd_extra.min(WND_EXTRA_MAX),
+    );
 
     if let Some(existing) = os.win32k_state.class_by_name(&name) {
         return Ok(existing as u32);
@@ -1293,7 +1320,7 @@ fn nt_user_register_class_ex_wow(
     let atom = CLASS_ATOM_BASE.wrapping_add(os.win32k_state.classes.len() as u16);
     os.win32k_state
         .classes
-        .push((atom, Class { name, wndproc, style, background, wnd_extra }));
+        .push((atom, Class { name, wndproc, style, background, wnd_extra, client }));
     Ok(atom as u32)
 }
 
@@ -5014,11 +5041,98 @@ mod tests {
         assert_eq!(pe_image_size(&mem, base), Some(0x2A6000));
     }
 
+    fn write_class_name(mem: &mut VirtualMemory, us: u64, buffer: u64, name: &str) {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        for (i, u) in units.iter().enumerate() {
+            mem.write_u16(buffer + i as u64 * 2, *u).unwrap();
+        }
+        mem.write_u16(buffer + units.len() as u64 * 2, 0).unwrap();
+        mem.write_u16(us, (units.len() * 2) as u16).unwrap();
+        mem.write_u16(us + 2, (units.len() * 2 + 2) as u16).unwrap();
+        mem.write_u64(us + 8, buffer).unwrap();
+    }
+
+    #[test]
+    fn get_class_info_answers_what_the_class_was_registered_with() {
+        let (mut os, mut mem) = os_with_gdi();
+        let (wc_in, us, buffer, menu_in) = (0x10_1000u64, 0x10_1100u64, 0x10_1200u64, 0x10_1300u64);
+        let (wc_out, menu_out, query_us) = (0x10_2000u64, 0x10_2100u64, 0x10_2200u64);
+        write_class_name(&mut mem, us, buffer, "MenuClass");
+        let registered = WndClassEx {
+            style: 0x0b,
+            wndproc: 0x0040_1005,
+            cls_extra: 8,
+            wnd_extra: 16,
+            instance: 0x0040_0000,
+            icon: 0x0001_0042,
+            cursor: 0x0001_0043,
+            background: 6,
+            menu_name: 0x0040_3000,
+            class_name: buffer,
+            icon_sm: 0x0001_0044,
+        };
+        registered.write(&mut mem, wc_in).unwrap();
+        let menu = ClientMenuName { name_a: 0x0040_3100, name_w: 0x0040_3200, name_us: 0x0040_3300 };
+        menu.write(&mut mem, menu_in).unwrap();
+
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, wc_in);
+        cpu.set_reg(Reg::Rdx, us);
+        cpu.set_reg(Reg::R8, 0);
+        cpu.set_reg(Reg::R9, menu_in);
+        let atom = nt_user_register_class_ex_wow(&mut os, &mut cpu, &mut mem).unwrap();
+        assert_ne!(atom, 0);
+
+        let query_buffer = 0x10_2300u64;
+        write_class_name(&mut mem, query_us, query_buffer, "menuclass");
+        for ansi in [false, true] {
+            mem.write(wc_out, &[0xA5; 0x50]).unwrap();
+            mem.write(menu_out, &[0xA5; 0x18]).unwrap();
+            cpu.set_reg(Reg::R10, 0x0040_0000);
+            cpu.set_reg(Reg::Rdx, query_us);
+            cpu.set_reg(Reg::R8, wc_out);
+            cpu.set_reg(Reg::R9, menu_out);
+            mem.write_u64(0x10_8000 + 0x28, u64::from(ansi) | 0xFFFF_FFFF_0000_0000).unwrap();
+            assert_eq!(nt_user_get_class_info_ex(&mut os, &mut cpu, &mut mem).unwrap(), atom);
+
+            let got = WndClassEx::read(&mem, wc_out).unwrap();
+            assert_eq!(
+                got.menu_name,
+                if ansi { menu.name_a } else { menu.name_w },
+                "lpszMenuName is the client's own menu-name pointer for the charset asked; \
+                 user32's WIN_CreateWindowEx hands it straight to LoadMenuW"
+            );
+            assert_eq!(
+                got,
+                WndClassEx { menu_name: got.menu_name, class_name: query_buffer, ..registered },
+                "every other field is the registered one, the class name is the caller's buffer"
+            );
+            assert_eq!(mem.read_u32(wc_out).unwrap(), 0xA5A5_A5A5, "cbSize is the caller's");
+            assert_eq!(ClientMenuName::read(&mem, menu_out).unwrap(), menu);
+        }
+
+        mem.write(wc_out, &[0xA5; 0x50]).unwrap();
+        write_class_name(&mut mem, query_us, query_buffer, "NoSuchClass");
+        assert_eq!(nt_user_get_class_info_ex(&mut os, &mut cpu, &mut mem).unwrap(), 0);
+        assert_eq!(
+            mem.read_u64(wc_out + 0x38).unwrap(),
+            0xA5A5_A5A5_A5A5_A5A5,
+            "an unknown class writes nothing"
+        );
+    }
+
     fn window_for_create(wndproc: u64) -> (WinOs, VirtualMemory, u32) {
         let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
         os.win32k_state.classes.push((
             CLASS_ATOM_BASE,
-            Class { name: "TestClass".into(), wndproc, style: 0, background: 0, wnd_extra: 16 },
+            Class {
+                name: "TestClass".into(),
+                wndproc,
+                style: 0,
+                background: 0,
+                wnd_extra: 16,
+                client: ClassClient::default(),
+            },
         ));
         let hwnd = alloc_handle(&mut os);
         os.win32k_state.windows.push((

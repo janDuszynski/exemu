@@ -604,3 +604,37 @@ fn wow64win_win32k_thunks_tail_jump_into_win32u_stubs() {
     let idx = ssdt_index64(&u, FIRST).unwrap_or_else(|| panic!("win32u!{FIRST} is a syscall stub"));
     assert_ne!(idx & 0x1000, 0, "a win32k service index carries the table-1 bit: {idx:#x}");
 }
+
+#[test]
+fn wow64_dll_asks_the_64bit_ntdll_for_the_wow64_unix_funcs_class() {
+    if !have_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    const MEMORY_WINE_UNIX_FUNCS: u32 = 1000;
+    const MEMORY_WINE_UNIX_WOW64_FUNCS: u32 = 1001;
+    let w = load(&format!("{DLLS64}/wow64.dll"));
+    let mut cmp_native = vec![0x3D];
+    cmp_native.extend_from_slice(&MEMORY_WINE_UNIX_FUNCS.to_le_bytes());
+    let at = find_text(&w, &cmp_native).expect("wow64_NtQueryVirtualMemory tests for MemoryWineUnixFuncs");
+    assert_eq!(w.at(at + 5, 1), &[0x74], "…and branches on it");
+    let mut cmp_wow64 = vec![0x3D];
+    cmp_wow64.extend_from_slice(&MEMORY_WINE_UNIX_WOW64_FUNCS.to_le_bytes());
+    assert_eq!(
+        w.at(at + 7, 5),
+        cmp_wow64.as_slice(),
+        "a 32-bit caller asking for the wow64 class directly is refused by the thunk itself",
+    );
+    let mut mov_r8d = vec![0x41, 0xB8];
+    mov_r8d.extend_from_slice(&MEMORY_WINE_UNIX_WOW64_FUNCS.to_le_bytes());
+    let taken = at + 7 + u32::from(w.at(at + 6, 1)[0]);
+    let window = w.at(taken, 0x30);
+    let rewrite = window
+        .windows(mov_r8d.len())
+        .position(|win| win == mov_r8d.as_slice())
+        .expect("the taken branch rewrites the class in r8d to MemoryWineUnixWow64Funcs");
+    assert!(
+        window[rewrite..].windows(2).any(|win| win == [0xFF, 0x15]),
+        "…before calling the 64-bit NtQueryVirtualMemory through its IAT",
+    );
+}

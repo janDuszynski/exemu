@@ -81,6 +81,25 @@ end-to-end on the default path.
 - The Firefox and SteamSetup Wine-path entries now have `--jit` twins in
   `corpus.toml`, pinned to the interpreter numbers.
 
+### 32-bit GUI programs get their windows on the WoW64 path (W5)
+- **`NtUserGetClassInfoEx` never filled the `WNDCLASSEXW` it was handed.**
+  user32's `WIN_CreateWindowEx` reads `lpszMenuName` from that struct and passes
+  it to `LoadMenuW`, so every window was created from uninitialised stack. Under
+  WoW64 `wow64win` copied 64-bit stack garbage into the 32-bit struct, and
+  Minesweeper and xmsol died in `kernelbase!get_res_nameW` reading `0x400c4bc`.
+  The kernel now remembers the whole registered class, including the client's
+  menu-name pointers, and answers with it. Minesweeper now creates its main
+  window, shows it and paints it once; xmsol shows its window maximised.
+- **A 32-bit `ws2_32.dll` can initialise.** `wow64.dll` rewrites a 32-bit DLL's
+  `MemoryWineUnixFuncs` query into `MemoryWineUnixWow64Funcs`, which exemu
+  refused, so `ws2_32`'s `DllMain` returned FALSE and anything importing it
+  (xmplay through wininet) failed with `0xC0000142`. putty-32bit now gets as far
+  as creating its windows.
+- **`NtProtectVirtualMemory` now changes the main image's page protection.** It
+  used to update bookkeeping only, so a packer that unprotects a read-only
+  section before unpacking into it (xmplay's petite stub) faulted on its first
+  write. The old protection reported is the section's own.
+
 ### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
 - **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
   `0x20..=0x37` are the stock objects, so a guest had **72 GDI handles for its

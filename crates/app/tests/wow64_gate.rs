@@ -409,6 +409,31 @@ fn a_32bit_guest_wndproc_gets_its_creation_messages() {
         proc.peek_u32(s::data_va(s::data::SEND_RESULT)).unwrap(),
     );
 
+    let class_cell = |off: u32| proc.peek_u32(s::data_va(s::data::WNDCLASS + off)).unwrap();
+    let info_cell = |off: u32| proc.peek_u32(s::data_va(s::data::WNDCLASSEX + off)).unwrap();
+    assert_eq!(
+        proc.peek_u32(s::data_va(s::data::INFO_ATOM)).unwrap(),
+        proc.peek_u32(s::data_va(s::data::ATOM)).unwrap(),
+        "GetClassInfoExW answers the atom RegisterClassW returned",
+    );
+    for (what, registered, answered, want) in [
+        ("style", s::wndclassw::STYLE, s::wndclassexw::STYLE, s::CLASS_STYLE),
+        ("cbClsExtra", s::wndclassw::CLS_EXTRA, s::wndclassexw::CLS_EXTRA, s::CLASS_CLS_EXTRA),
+        ("cbWndExtra", s::wndclassw::WND_EXTRA, s::wndclassexw::WND_EXTRA, s::CLASS_WND_EXTRA),
+        ("hbrBackground", s::wndclassw::BACKGROUND, s::wndclassexw::BACKGROUND, s::CLASS_BACKGROUND),
+        ("lpszMenuName", s::wndclassw::MENU_NAME, s::wndclassexw::MENU_NAME, s::CLASS_MENU_NAME),
+    ] {
+        assert_eq!(class_cell(registered), want, "the guest registered {what} {want:#x}");
+        assert_eq!(
+            info_cell(answered),
+            want,
+            "GetClassInfoExW's {what} came back through wow64win's 64-to-32 copy of the kernel's answer",
+        );
+    }
+    assert_eq!(info_cell(s::wndclassexw::WNDPROC), class_cell(s::wndclassw::WNDPROC), "lpfnWndProc");
+    assert_eq!(info_cell(s::wndclassexw::INSTANCE), class_cell(s::wndclassw::INSTANCE), "hInstance");
+    assert_eq!(info_cell(s::wndclassexw::CLASS_NAME), class_cell(s::wndclassw::CLASS_NAME), "lpszClassName");
+
     assert_eq!(seen, s::seen::ALL, "WM_NCCREATE, WM_CREATE and the private probe all arrived");
     let hwnd = proc.peek_u32(s::data_va(s::data::HWND)).unwrap();
     assert_ne!(hwnd, 0, "CreateWindowExW returned a window");

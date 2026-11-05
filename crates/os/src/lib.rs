@@ -25,6 +25,7 @@ mod unixlib;
 mod vm;
 mod win;
 mod win32k;
+mod wndclass;
 pub use win32k::abi as win32k_abi;
 pub mod winedebug;
 pub mod wow64;

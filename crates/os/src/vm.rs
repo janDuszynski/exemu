@@ -41,6 +41,20 @@ fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) & !(a - 1)
 }
 
+const PAGE_PROTECTION_MASK: u32 = 0xff;
+
+fn perm_from_protect(protect: u32) -> Option<Perm> {
+    Some(match protect & PAGE_PROTECTION_MASK {
+        0x01 => Perm::NONE,
+        0x02 => Perm::READ,
+        0x04 | 0x08 => Perm::RW,
+        0x10 => Perm::EXEC,
+        0x20 => Perm::RX,
+        0x40 | 0x80 => Perm::RWX,
+        _ => return None,
+    })
+}
+
 fn protect_from_perm(p: Perm) -> u32 {
     match (p.contains(Perm::EXEC), p.contains(Perm::WRITE), p.contains(Perm::READ)) {
         (true, true, _) => 0x40,
@@ -296,6 +310,7 @@ impl WinOs {
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 const STATUS_INVALID_PARAMETER: u32 = 0xC000_000D;
 const STATUS_NO_MEMORY: u32 = 0xC000_0017;
+const STATUS_INVALID_PAGE_PROTECTION: u32 = 0xC000_0045;
 
 pub(crate) const MEMORY_BASIC_INFORMATION: u32 = 0;
 
@@ -355,17 +370,56 @@ impl WinOs {
         mem: &mut dyn Memory,
     ) -> Result<u32> {
         let base_ptr = self.syscall_arg(cpu, mem, 1)?;
+        let size_ptr = self.syscall_arg(cpu, mem, 2)?;
         let new_protect = self.syscall_arg(cpu, mem, 3)? as u32;
         let old_ptr = self.syscall_arg(cpu, mem, 4)?;
         if base_ptr == 0 {
             return Ok(STATUS_INVALID_PARAMETER);
         }
         let addr = mem.read_u64(base_ptr)?;
-        let old = self.vm_protect_region(addr, new_protect);
+        let size = if size_ptr != 0 { mem.read_u64(size_ptr)? } else { 0 };
+        let old = match self.protect_mapped_image_pages(mem, addr, size, new_protect) {
+            Ok(Some(old)) => old,
+            Ok(None) => self.vm_protect_region(addr, new_protect),
+            Err(status) => return Ok(status),
+        };
         if old_ptr != 0 {
             mem.write_u32(old_ptr, old)?;
         }
         Ok(STATUS_SUCCESS)
+    }
+
+    fn protect_mapped_image_pages(
+        &self,
+        mem: &mut dyn Memory,
+        addr: u64,
+        size: u64,
+        new_protect: u32,
+    ) -> std::result::Result<Option<u32>, u32> {
+        if self.vm_region_bounds(addr).is_some() {
+            return Ok(None);
+        }
+        let start = addr & !(PAGE - 1);
+        let old_perm = match mem.next_region(start) {
+            Some((rb, _, perm)) if rb <= start => perm,
+            _ => return Ok(None),
+        };
+        let new_perm = perm_from_protect(new_protect).ok_or(STATUS_INVALID_PAGE_PROTECTION)?;
+        let end = align_up(addr.saturating_add(size.max(1)), PAGE);
+        let mut at = start;
+        while at < end {
+            let Some((rb, rsize, perm)) = mem.next_region(at) else { break };
+            if rb >= end {
+                break;
+            }
+            let covered = rb >= start && rb + rsize <= end;
+            let perm_now = if covered { new_perm } else { perm.union(new_perm) };
+            if perm_now != perm {
+                let _ = mem.protect(rb, rsize, perm_now);
+            }
+            at = (rb + rsize).max(at + PAGE);
+        }
+        Ok(Some(protect_from_perm(old_perm)))
     }
 
     pub(crate) fn nt_query_virtual_memory_basic(
@@ -432,6 +486,65 @@ mod tests {
     use super::*;
     use crate::WinConfig;
     use exemu_memory::VirtualMemory;
+
+    fn protect_syscall(os: &mut WinOs, mem: &mut VirtualMemory, addr: u64, size: u64, protect: u32) -> (u32, u32) {
+        use exemu_core::Reg;
+        let (base_cell, size_cell, old_cell, gsp) = (0x9_0000u64, 0x9_0008u64, 0x9_0010u64, 0x9_0800u64);
+        mem.write_u64(base_cell, addr).unwrap();
+        mem.write_u64(size_cell, size).unwrap();
+        mem.write_u32(old_cell, 0xA5A5_A5A5).unwrap();
+        mem.write_u64(gsp + 0x28, old_cell).unwrap();
+        os.set_syscall_guest_rsp_for_test(gsp);
+        let mut cpu = CpuState::default();
+        cpu.set_reg(Reg::R10, u64::MAX);
+        cpu.set_reg(Reg::Rdx, base_cell);
+        cpu.set_reg(Reg::R8, size_cell);
+        cpu.set_reg(Reg::R9, protect as u64);
+        let status = os.nt_protect_virtual_memory(&mut cpu, mem).unwrap();
+        (status, mem.read_u32(old_cell).unwrap())
+    }
+
+    #[test]
+    fn protecting_a_mapped_image_section_changes_what_the_guest_may_do() {
+        const PAGE_READONLY: u32 = 0x02;
+        const PAGE_READWRITE: u32 = 0x04;
+        const PAGE_EXECUTE_READ: u32 = 0x20;
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x9_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        mem.map_fixed(0x40_1000, 0x2000, Perm::RX, ".text").unwrap();
+        mem.map_fixed(0x40_3000, 0x4000, Perm::READ, ".rsrc").unwrap();
+        let mut os = WinOs::new(WinConfig { is_64bit: true, echo: false, ..WinConfig::default() });
+
+        assert!(mem.write_u8(0x40_4da0, 0).is_err(), "the unpacked section starts read-only");
+        let (status, old) = protect_syscall(&mut os, &mut mem, 0x40_4da0, 0x7000 - 0x4da0, PAGE_READWRITE);
+        assert_eq!(status, STATUS_SUCCESS);
+        assert_eq!(old, PAGE_READONLY, "the old protection is the section's own, as VirtualQuery reports it");
+        mem.write_u8(0x40_4da0, 0xAA).expect("a packer's stub writes where it was just allowed to");
+        mem.write_u8(0x40_6fff, 0xAA).expect("…up to the last page of the request");
+
+        let (status, old) = protect_syscall(&mut os, &mut mem, 0x40_1000, 0x2000, PAGE_READONLY);
+        assert_eq!((status, old), (STATUS_SUCCESS, PAGE_EXECUTE_READ));
+        assert_eq!(
+            mem.next_region(0x40_1000).map(|(_, _, p)| p),
+            Some(Perm::READ),
+            "a request that covers the whole section applies exactly, removing execute"
+        );
+
+        let (status, _) = protect_syscall(&mut os, &mut mem, 0x40_3000, 0x1000, 0x1234);
+        assert_eq!(status, STATUS_INVALID_PAGE_PROTECTION);
+    }
+
+    #[test]
+    fn protecting_tracked_memory_keeps_its_bookkeeping_answer() {
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x9_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        let mut os = WinOs::new(WinConfig { is_64bit: true, echo: false, ..WinConfig::default() });
+        let base = os.vm_alloc_region(&mut mem, 0, 0x2000, MEM_COMMIT, 0x04).unwrap();
+        let (status, old) = protect_syscall(&mut os, &mut mem, base, 0x1000, 0x02);
+        assert_eq!((status, old), (STATUS_SUCCESS, 0x04));
+        let (_, old) = protect_syscall(&mut os, &mut mem, base, 0x1000, 0x04);
+        assert_eq!(old, 0x02, "the VirtualAlloc'd region remembers what it was last set to");
+    }
 
     #[test]
     fn zero_bits_ceiling_covers_both_documented_forms() {
