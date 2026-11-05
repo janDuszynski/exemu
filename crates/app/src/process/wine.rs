@@ -81,6 +81,7 @@ pub(super) fn map_wine_debug_pages(mem: &mut VirtualMemory, teb_base: u64, peb_a
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exemu_core::Memory;
     use exemu_cpu::GS_BASE;
 
     #[test]
