@@ -59,6 +59,50 @@ fn a_32bit_guest_builds_a_menu_and_runs_an_accelerator_through_wine_user32() {
     assert_eq!(cell(s::data::DELETE_RESULT), 1, "DeleteMenu found its item");
     assert_eq!(cell(s::data::COUNT_AFTER_DELETE), 1, "…and the menu is one item shorter");
 
+    let rect = |off: u32| -> [i32; 4] {
+        let mut r = [0i32; 4];
+        for (i, v) in r.iter_mut().enumerate() {
+            *v = cell(off + i as u32 * 4) as i32;
+        }
+        r
+    };
+    let (wx, wy, ww, wh) = (s::WINDOW_X as i32, s::WINDOW_Y as i32, s::WINDOW_W as i32, s::WINDOW_H as i32);
+    let band = cell(s::data::SYSTEM_MENU_HEIGHT) as i32;
+    assert!(band > 0, "GetSystemMetrics(SM_CYMENU) is no longer zero");
+    assert_eq!(rect(s::data::CLIENT_BEFORE), [0, 0, ww, wh], "no menu: the client is the whole window");
+    assert_eq!(rect(s::data::CLIENT_AFTER), [0, 0, ww, wh - band], "SetMenu took one menu band off the client");
+    assert_eq!(rect(s::data::WINDOW_RECT), [wx, wy, wx + ww, wy + wh], "the window rectangle did not change");
+
+    assert_eq!(cell(s::data::ITEM0_OK), 1, "GetMenuItemRect item 0");
+    assert_eq!(cell(s::data::ITEM1_OK), 1, "GetMenuItemRect item 1");
+    assert_eq!(cell(s::data::ITEM_BEYOND_OK), 0, "item 2 does not exist");
+    assert_eq!(rect(s::data::BEYOND_RECT), [0; 4], "a failed GetMenuItemRect writes nothing");
+    let (item0, item1) = (rect(s::data::ITEM0_RECT), rect(s::data::ITEM1_RECT));
+    assert_eq!(cell(s::data::BAR_INFO_OK), 1, "GetMenuBarInfo(OBJID_MENU, 0)");
+    assert_eq!(cell(s::data::BAR_INFO_ITEM1_OK), 1, "GetMenuBarInfo(OBJID_MENU, 1)");
+    assert_eq!(cell(s::data::BAR_INFO_BEYOND_OK), 0, "the bar has two items, not three");
+    assert_eq!(cell(s::data::BEYOND_INFO + s::menubarinfo32::HMENU), 0, "a failed GetMenuBarInfo writes nothing");
+    let bar = rect(s::data::BAR_INFO + s::menubarinfo32::RC_BAR);
+    assert_eq!(cell(s::data::BAR_INFO + s::menubarinfo32::HMENU), menu, "the bar's menu");
+    assert_eq!(cell(s::data::BAR_INFO + s::menubarinfo32::FLAGS), 0, "the bar is not focused");
+    assert_eq!(
+        rect(s::data::BAR_INFO_ITEM1 + s::menubarinfo32::RC_BAR),
+        item0,
+        "item 1 of GetMenuBarInfo is position 0 of GetMenuItemRect"
+    );
+
+    assert_eq!(item0[0], bar[0], "item 0 starts at the bar's left edge");
+    assert_eq!(bar[0], wx, "the bar starts at the window's left edge");
+    assert_eq!(bar[2], wx + ww, "and spans its width");
+    assert!(item0[0] < item0[2] && item1[0] < item1[2], "items have width");
+    assert!(item0[2] <= item1[0], "items do not overlap: {item0:?} then {item1:?}");
+    assert_eq!((item0[1], item0[3]), (item1[1], item1[3]), "both items share the row");
+    let band_bottom = wy + band;
+    for r in [item0, item1, bar] {
+        assert!(r[1] >= wy && r[3] <= band_bottom, "{r:?} sits inside the top non-client band {wy}..{band_bottom}");
+    }
+    assert_eq!(bar[3] - bar[1] + 1, band, "bar height plus its divider line is the client's loss");
+
     assert_ne!(cell(s::data::HACCEL), 0, "CreateAcceleratorTableW returned a table");
     assert_eq!(cell(s::data::TRANSLATE_HIT), 1, "F5 is in the table: TranslateAcceleratorW translated it");
     assert_eq!(cell(s::data::COMMANDS_AFTER_HIT), 1, "…and the window procedure got one WM_COMMAND");

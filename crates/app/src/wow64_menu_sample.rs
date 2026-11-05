@@ -15,6 +15,21 @@ pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WINDOW_STYLE: u32 = 0x00CF_0000;
 
+pub const OBJID_MENU: u32 = 0xFFFF_FFFD;
+pub const MENU_BAR_INFO_CB_SIZE: u32 = 0x20;
+pub const SM_CYMENU: u32 = 15;
+pub const WINDOW_X: u32 = 10;
+pub const WINDOW_Y: u32 = 20;
+pub const WINDOW_W: u32 = 200;
+pub const WINDOW_H: u32 = 120;
+
+pub mod menubarinfo32 {
+    pub const RC_BAR: u32 = 0x04;
+    pub const HMENU: u32 = 0x14;
+    pub const HWND_MENU: u32 = 0x18;
+    pub const FLAGS: u32 = 0x1c;
+}
+
 pub const MF_BYCOMMAND: u32 = 0x0000;
 pub const MF_GRAYED: u32 = 0x0001;
 pub const MF_CHECKED: u32 = 0x0008;
@@ -56,7 +71,23 @@ pub mod data {
     pub const MSG_HIT: u32 = 0x80;
     pub const MSG_MISS: u32 = 0xc0;
     pub const WNDCLASS: u32 = 0x100;
-    pub const LEN: u32 = 0x200;
+    pub const CLIENT_BEFORE: u32 = 0x200;
+    pub const CLIENT_AFTER: u32 = 0x210;
+    pub const WINDOW_RECT: u32 = 0x220;
+    pub const ITEM0_RECT: u32 = 0x230;
+    pub const ITEM1_RECT: u32 = 0x240;
+    pub const BAR_INFO: u32 = 0x250;
+    pub const BAR_INFO_ITEM1: u32 = 0x270;
+    pub const ITEM0_OK: u32 = 0x290;
+    pub const ITEM1_OK: u32 = 0x294;
+    pub const ITEM_BEYOND_OK: u32 = 0x298;
+    pub const BAR_INFO_OK: u32 = 0x29c;
+    pub const BAR_INFO_ITEM1_OK: u32 = 0x2a0;
+    pub const BAR_INFO_BEYOND_OK: u32 = 0x2a4;
+    pub const SYSTEM_MENU_HEIGHT: u32 = 0x2a8;
+    pub const BEYOND_RECT: u32 = 0x2b0;
+    pub const BEYOND_INFO: u32 = 0x2c0;
+    pub const LEN: u32 = 0x300;
 }
 
 mod wndclassw {
@@ -95,6 +126,11 @@ const IMPORTS: [(&str, &[&str]); 2] = [
             "CreateAcceleratorTableW",
             "TranslateAcceleratorW",
             "DestroyAcceleratorTable",
+            "GetClientRect",
+            "GetWindowRect",
+            "GetMenuItemRect",
+            "GetMenuBarInfo",
+            "GetSystemMetrics",
         ],
     ),
     ("ntdll.dll", &["NtTerminateProcess"]),
@@ -115,7 +151,12 @@ const I_DELETE_MENU: u32 = 11;
 const I_CREATE_ACCEL: u32 = 12;
 const I_TRANSLATE_ACCEL: u32 = 13;
 const I_DESTROY_ACCEL: u32 = 14;
-const I_TERMINATE: u32 = 15;
+const I_GET_CLIENT_RECT: u32 = 15;
+const I_GET_WINDOW_RECT: u32 = 16;
+const I_GET_MENU_ITEM_RECT: u32 = 17;
+const I_GET_MENU_BAR_INFO: u32 = 18;
+const I_GET_SYSTEM_METRICS: u32 = 19;
+const I_TERMINATE: u32 = 20;
 
 struct Strings {
     class_va: u32,
@@ -412,12 +453,48 @@ fn build_text(iat: &dyn Fn(u32) -> u32, strings: &Strings) -> Vec<u8> {
     a.call_iat(iat(I_GET_MENU_ITEM_COUNT));
     a.store_eax(cell(data::COUNT_BEFORE));
 
+    let rect_call = |a: &mut Asm, slot: u32, out: u32| {
+        a.push_imm(cell(out));
+        a.push_cell(cell(data::HWND));
+        a.call_iat(iat(slot));
+    };
+    rect_call(&mut a, I_GET_CLIENT_RECT, data::CLIENT_BEFORE);
     a.push_cell(cell(data::HMENU));
     a.push_cell(cell(data::HWND));
     a.call_iat(iat(I_SET_MENU));
     a.push_cell(cell(data::HWND));
     a.call_iat(iat(I_GET_MENU));
     a.store_eax(cell(data::GET_MENU));
+    rect_call(&mut a, I_GET_CLIENT_RECT, data::CLIENT_AFTER);
+    rect_call(&mut a, I_GET_WINDOW_RECT, data::WINDOW_RECT);
+    a.push_imm(SM_CYMENU);
+    a.call_iat(iat(I_GET_SYSTEM_METRICS));
+    a.store_eax(cell(data::SYSTEM_MENU_HEIGHT));
+
+    let item_rect = |a: &mut Asm, pos: u32, out: u32, ok: u32| {
+        a.push_imm(cell(out));
+        a.push_imm(pos);
+        a.push_cell(cell(data::HMENU));
+        a.push_cell(cell(data::HWND));
+        a.call_iat(iat(I_GET_MENU_ITEM_RECT));
+        a.store_eax(cell(ok));
+    };
+    item_rect(&mut a, 0, data::ITEM0_RECT, data::ITEM0_OK);
+    item_rect(&mut a, 1, data::ITEM1_RECT, data::ITEM1_OK);
+    item_rect(&mut a, 2, data::BEYOND_RECT, data::ITEM_BEYOND_OK);
+
+    let bar_info = |a: &mut Asm, item: u32, out: u32, ok: u32| {
+        a.store_imm(cell(out), MENU_BAR_INFO_CB_SIZE);
+        a.push_imm(cell(out));
+        a.push_imm(item);
+        a.push_imm(OBJID_MENU);
+        a.push_cell(cell(data::HWND));
+        a.call_iat(iat(I_GET_MENU_BAR_INFO));
+        a.store_eax(cell(ok));
+    };
+    bar_info(&mut a, 0, data::BAR_INFO, data::BAR_INFO_OK);
+    bar_info(&mut a, 1, data::BAR_INFO_ITEM1, data::BAR_INFO_ITEM1_OK);
+    bar_info(&mut a, 3, data::BEYOND_INFO, data::BAR_INFO_BEYOND_OK);
 
     let menu_call = |a: &mut Asm, slot: u32, id: u32, flags: u32| {
         a.push_imm(flags);
