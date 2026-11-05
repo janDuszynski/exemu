@@ -1342,7 +1342,7 @@ fn point_fp(seed: &mut Seed, base: u8, rng: &mut Rng, val_bytes: &[u8]) -> i8 {
 }
 
 fn build_x87(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
-    match rng.below(9) {
+    match rng.below(11) {
         0 => x87_arith_reg(rng, seed),
         1 => x87_arith_mem(rng, bits, seed),
         2 => x87_load_mem(rng, bits, seed),
@@ -1352,7 +1352,8 @@ fn build_x87(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
         6 => x87_misc(rng, seed),
         7 => x87_transcendental(rng, seed),
         8 => x87_reduce(rng, seed),
-        _ => x87_control(rng, bits, seed),
+        9 => x87_control(rng, bits, seed),
+        _ => x87_env(rng, bits, seed),
     }
 }
 
@@ -1526,6 +1527,117 @@ fn x87_control(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
 }
 
 const FX_AREA: u64 = DATA_BASE + 0x400;
+
+fn random_ext_garbage(rng: &mut Rng) -> u128 {
+    u128::from(rng.next_u64()) | (u128::from(rng.next_u32() & 0xFFFF) << 64)
+}
+
+fn x87_env_register(rng: &mut Rng) -> (u128, u16) {
+    match rng.below(5) {
+        0 => (random_ext_garbage(rng), 0b11),
+        1 => (0, 0b00),
+        2 => (f64_to_ext_seed(fpu_edge_f64(rng)), 0b00),
+        3 => (f64_to_ext_seed(fpu_edge_f64(rng)), 0b00),
+        _ => (random_ext_garbage(rng), 0b00),
+    }
+}
+
+fn x87_env_control(rng: &mut Rng) -> (u16, u16) {
+    let cw = 0x007F | ((*rng.pick(&[0u32, 2, 3]) as u16) << 8) | ((rng.below(4) as u16) << 10);
+    let sw = ((rng.below(8) as u16) << 11) | (rng.next_u32() as u16 & 0x4700);
+    (cw, sw)
+}
+
+fn seed_x87_env_registers(rng: &mut Rng, seed: &mut Seed) {
+    let mut tw = 0u16;
+    for i in 0..8usize {
+        let (v, tag) = x87_env_register(rng);
+        seed.st[i] = v;
+        tw |= tag << (i * 2);
+    }
+    seed.tw = tw;
+    let (cw, sw) = x87_env_control(rng);
+    seed.cw = cw;
+    seed.sw = sw;
+    seed.fip = u64::from(rng.next_u32());
+    seed.fdp = u64::from(rng.next_u32());
+    seed.fop = rng.next_u32() as u16 & 0x07FF;
+    seed.fcs = rng.next_u32() as u16;
+    seed.fds = rng.next_u32() as u16;
+}
+
+fn fill_x87_env_image(rng: &mut Rng, seed: &mut Seed, env16: bool) {
+    let base = (FX_AREA - DATA_BASE) as usize;
+    for b in &mut seed.data[base..base + 128] {
+        *b = 0;
+    }
+    let (cw, sw) = x87_env_control(rng);
+    let tw: u16 = rng.next_u32() as u16;
+    let put16 = |data: &mut Vec<u8>, off: usize, v: u16| data[base + off..base + off + 2].copy_from_slice(&v.to_le_bytes());
+    let put32 = |data: &mut Vec<u8>, off: usize, v: u32| data[base + off..base + off + 4].copy_from_slice(&v.to_le_bytes());
+    let regs = if env16 {
+        put16(&mut seed.data, 0, cw);
+        put16(&mut seed.data, 2, sw);
+        put16(&mut seed.data, 4, tw);
+        put16(&mut seed.data, 6, rng.next_u32() as u16);
+        put16(&mut seed.data, 8, rng.next_u32() as u16);
+        put16(&mut seed.data, 10, rng.next_u32() as u16);
+        put16(&mut seed.data, 12, rng.next_u32() as u16);
+        14
+    } else {
+        put32(&mut seed.data, 0, u32::from(cw));
+        put32(&mut seed.data, 4, u32::from(sw));
+        put32(&mut seed.data, 8, u32::from(tw));
+        put32(&mut seed.data, 12, rng.next_u32());
+        put32(&mut seed.data, 16, rng.next_u32() & 0x07FF_FFFF);
+        put32(&mut seed.data, 20, rng.next_u32());
+        put32(&mut seed.data, 24, rng.next_u32() & 0xFFFF);
+        28
+    };
+    for i in 0..8usize {
+        let (v, _) = x87_env_register(rng);
+        let off = base + regs + i * 10;
+        seed.data[off..off + 10].copy_from_slice(&v.to_le_bytes()[..10]);
+    }
+}
+
+pub fn is_x87_env_label(label: &str) -> bool {
+    ["fnsave", "frstor", "fnstenv", "fldenv"].iter().any(|p| label.starts_with(p))
+}
+
+fn x87_env(rng: &mut Rng, bits: Bits, seed: &mut Seed) -> Trial {
+    let _ = bits;
+    let env16 = rng.boolean();
+    let kind = rng.below(7);
+    let base = point_fx(seed, rng);
+    seed_x87_env_registers(rng, seed);
+    if matches!(kind, 1 | 3) {
+        fill_x87_env_image(rng, seed, env16);
+    }
+    let mut b = Vec::new();
+    let emit = |b: &mut Vec<u8>, esc: u8, reg: u8| {
+        if env16 {
+            b.push(0x66);
+        }
+        b.push(esc);
+        push_mem(b, reg, base, 0);
+    };
+    let label = match kind {
+        0 => { emit(&mut b, 0xDD, 6); "fnsave" }
+        1 => { emit(&mut b, 0xDD, 4); "frstor" }
+        2 => { emit(&mut b, 0xD9, 6); "fnstenv" }
+        3 => { emit(&mut b, 0xD9, 4); "fldenv" }
+        4 => { emit(&mut b, 0xDD, 6); emit(&mut b, 0xDD, 4); "fnsave;frstor" }
+        5 => { emit(&mut b, 0xD9, 6); emit(&mut b, 0xD9, 4); "fnstenv;fldenv" }
+        _ => { emit(&mut b, 0xDD, 6); emit(&mut b, 0xD9, 4); "fnsave;fldenv" }
+    };
+    let fop_high = (FX_AREA - DATA_BASE) as usize + 18;
+    Trial {
+        xmm_nan: 0, ymm256: false, assert_upper_zero: 0, fpu: true, fpu_approx: 0, sw_mask: 0xFFFF, bytes: b,
+        defined_flags: 0, skip_reg: 0, subset_reg: 0, subset_ignore: 0, skip_mem: if env16 { Vec::new() } else { vec![fop_high, fop_high + 1] },
+        label: format!("{label}{}", if env16 { " m16" } else { " m32" }),
+    }
+}
 
 fn fill_fxsave_image(rng: &mut Rng, seed: &mut Seed, rexw: bool) {
     let base = (FX_AREA - DATA_BASE) as usize;
@@ -2509,5 +2621,25 @@ fn xmm_seed(rng: &mut Rng) -> u128 {
             let lo = *rng.pick(&F64_EDGES) as u128;
             lo | ((rng.next_u64() as u128) << 64)
         }
+    }
+}
+
+#[cfg(test)]
+mod x87_env_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn x87_env_generator_reaches_every_instruction_form_in_both_sizes() {
+        let mut labels = BTreeSet::new();
+        for index in 0..200_000u64 {
+            let mut rng = Rng::new(7 ^ index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut seed = seed(&mut rng);
+            let trial = build(&mut rng, Bits::B32, &mut seed);
+            if is_x87_env_label(&trial.label) {
+                labels.insert(trial.label);
+            }
+        }
+        assert_eq!(labels.len(), 14, "{labels:?}");
     }
 }

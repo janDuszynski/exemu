@@ -266,8 +266,8 @@ fn unicorn_main(argv: &[String]) {
             println!("{}", render(d));
         }
         println!(
-            "  -> {} trials, {} divergences, {} both-faulted (skipped), {} one-faulted",
-            s.trials, s.divergences, s.both_faulted, s.one_faulted
+            "  -> {} trials, {} divergences, {} both-faulted (skipped), {} one-faulted, {} x87-env compared",
+            s.trials, s.divergences, s.both_faulted, s.one_faulted, s.x87_env_compared
         );
         total_div += s.divergences;
     }

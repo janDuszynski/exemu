@@ -128,9 +128,12 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         s.rflags = seed.rflags;
         s.xmm = seed.xmm;
         s.ymm_hi = seed.ymm_hi;
-        s.x87.st = seed.st;
         s.x87.cw = seed.cw;
         s.x87.sw = seed.sw;
+        for i in 0..8u8 {
+            let phys = s.x87.phys(i);
+            s.x87.st[phys] = seed.st[i as usize];
+        }
         s.x87.tw = seed.tw;
         s.x87.fip = seed.fip;
         s.x87.fdp = seed.fdp;
@@ -140,7 +143,12 @@ fn run_exemu(bits: Bits, code: &[u8], seed: &Seed) -> Outcome {
         s.rip = CODE_BASE;
     }
     let mut hooks = NoHooks;
-    match cpu.step(&mut mem, &mut hooks) {
+    let end = CODE_BASE + code.len() as u64;
+    let mut outcome = cpu.step(&mut mem, &mut hooks);
+    while matches!(outcome, Ok(Exit::Continue)) && cpu.state().rip < end {
+        outcome = cpu.step(&mut mem, &mut hooks);
+    }
+    match outcome {
         Ok(Exit::Continue) => {
             let (gpr, rflags, ip, xmm, ymm_hi, sw, cw) = {
                 let s = cpu.state();
@@ -419,6 +427,7 @@ pub struct Summary {
     pub divergences: u64,
     pub both_faulted: u64,
     pub one_faulted: u64,
+    pub x87_env_compared: u64,
     pub first: Vec<Divergence>,
 }
 
@@ -434,7 +443,7 @@ pub fn fuzz(cfg: &FuzzConfig) -> Summary {
         Bits::B32 => 8,
         Bits::B64 => 16,
     };
-    let mut summary = Summary { trials: 0, divergences: 0, both_faulted: 0, one_faulted: 0, first: Vec::new() };
+    let mut summary = Summary { trials: 0, divergences: 0, both_faulted: 0, one_faulted: 0, x87_env_compared: 0, first: Vec::new() };
     for index in 0..cfg.count {
         let (trial, seed) = trial_at(cfg.bits, cfg.seed, index);
         summary.trials += 1;
@@ -445,9 +454,14 @@ pub fn fuzz(cfg: &FuzzConfig) -> Summary {
                 summary.both_faulted += 1;
                 None
             }
-            (Outcome::Ok(a), Outcome::Ok(b)) => diff(cfg.bits, a, b, &trial, nreg).map(|reason| {
-                (reason, regs_str(cfg.bits, a, nreg), regs_str(cfg.bits, b, nreg))
-            }),
+            (Outcome::Ok(a), Outcome::Ok(b)) => {
+                if gen::is_x87_env_label(&trial.label) {
+                    summary.x87_env_compared += 1;
+                }
+                diff(cfg.bits, a, b, &trial, nreg).map(|reason| {
+                    (reason, regs_str(cfg.bits, a, nreg), regs_str(cfg.bits, b, nreg))
+                })
+            }
             (a, b) => {
                 summary.one_faulted += 1;
                 let ex_s = match a {
