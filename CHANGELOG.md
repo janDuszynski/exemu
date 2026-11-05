@@ -95,6 +95,12 @@ end-to-end on the default path.
   the window. `NtUserGetKeyState` reports the keys the host driver pressed.
   Minesweeper's `LoadMenuW` now returns a menu and xmsol builds its whole menu bar.
   Not yet: drawing the bar, `WM_INITMENU` before an accelerator, popup tracking.
+- **The menu bar has a layout.** `NtUserGetMenuItemRect`, `NtUserGetMenuBarInfo`
+  and `NtUserCalcMenuBar` answer from a Wine-style left-to-right layout with
+  wrapping, break and right-justify rules (`win32k/menu/layout.rs`). A window with
+  a menu loses `SM_CYMENU` (now 19, was 0) from its client height; its window
+  rectangle is unchanged. Metrics are approximations of Wine's, not read from the
+  pinned DLLs. Not yet: drawing the bar, popup tracking, the system menu.
 - **A WoW64 caller's `GetWindowLong` index was read as a large positive offset.**
   `wow64win` zero-extends the 32-bit `INT` index, so `GWL_STYLE` and `GWLP_ID`
   never matched; the index is now sign-extended from 32 bits.
