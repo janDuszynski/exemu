@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use exemu_app::{gui_sample, load_and_run, RunConfig};
+use exemu_app::{gdi_sample, gui_sample, load_and_run, RunConfig};
 use exemu_gui::{DriverCall, OffscreenPresenter, PresenterDriver, RecordingDriver};
 
 const WINE_DLLS: &str = "../../example_exe/wine-dlls/x86_64-windows";
@@ -508,4 +508,54 @@ fn gui_sample_first_frame_matches_golden_on_wine() {
             rpix.len()
         );
     }
+}
+
+#[test]
+fn gdi_sample_blits_stretches_and_reads_back_exact_pixels_on_wine() {
+    if !Path::new(WINE_DLLS).join("win32u.dll").exists() {
+        eprintln!("SKIP: {WINE_DLLS}/win32u.dll not present (Wine DLL set is git-ignored)");
+        return;
+    }
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let exe = gdi_sample::build();
+    let res = load_and_run(
+        &exe,
+        RunConfig {
+            echo: false,
+            max_steps: 60_000_000,
+            wine_boot_dir: Some(WINE_DLLS.to_string()),
+            driver: Some(Box::new(RecordingDriver::new(Arc::clone(&log)))),
+            ..RunConfig::default()
+        },
+    )
+    .expect("gdi_sample should run to completion");
+
+    let wrong: Vec<_> = gdi_sample::READBACKS
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| (res.exit_code as u32) >> i & 1 == 1)
+        .map(|(_, (x, y, want))| format!("({x},{y}) wanted COLORREF {want:#08x}"))
+        .collect();
+    assert!(wrong.is_empty(), "GetPixel through Wine's gdi32 disagreed at: {wrong:?}");
+    assert_eq!(res.exit_code, 0);
+
+    let calls = log.lock().unwrap();
+    let non_blank = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            DriverCall::FlushSurface { w, h, non_blank, .. }
+                if (*w, *h) == gdi_sample::WINDOW_SIZE =>
+            {
+                Some(*non_blank)
+            }
+            _ => None,
+        })
+        .expect("the window surface was presented after the drawing");
+    assert_eq!(
+        non_blank,
+        gdi_sample::NON_WHITE_PIXELS,
+        "the presented frame holds exactly the union of the blits, the DIBs, the line and the tiles"
+    );
 }

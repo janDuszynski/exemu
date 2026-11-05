@@ -14,9 +14,15 @@ const PAINT_LINE1: &str = "Hello from a real GUI window!";
 const PAINT_LINE2: &str = "Drawn by exemu's emulated Win32 GDI.";
 
 pub fn build() -> Vec<u8> {
-    let r = Rdata::build();
+    let r = Rdata::layout(
+        import_plan(),
+        &[wide(CLASS_NAME), wide(WINDOW_TITLE), wide(PAINT_LINE1), wide(PAINT_LINE2)],
+    );
     let text = build_text(&r);
+    pe_image(&r, &text)
+}
 
+pub(crate) fn pe_image(r: &Rdata, text: &[u8]) -> Vec<u8> {
     let headers_raw = FILE_ALIGN as usize;
     let text_ptr = headers_raw;
     let text_raw = align_up(text.len(), FILE_ALIGN as usize);
@@ -68,7 +74,7 @@ pub fn build() -> Vec<u8> {
     write_section(&mut f, sec, b".text", text.len() as u32, TEXT_RVA, text_raw as u32, text_ptr as u32, 0x6000_0020);
     write_section(&mut f, sec + 40, b".rdata", r.bytes.len() as u32, RDATA_RVA, rdata_raw as u32, rdata_ptr as u32, 0x4000_0040);
 
-    f[text_ptr..text_ptr + text.len()].copy_from_slice(&text);
+    f[text_ptr..text_ptr + text.len()].copy_from_slice(text);
     f[rdata_ptr..rdata_ptr + r.bytes.len()].copy_from_slice(&r.bytes);
     f
 }
@@ -97,22 +103,24 @@ fn import_plan() -> Vec<(&'static str, Vec<&'static str>)> {
     ]
 }
 
-struct Rdata {
+pub(crate) struct Rdata {
     bytes: Vec<u8>,
     import_dir_off: u32,
     import_dir_size: u32,
     iat_off: u32,
     iat_size: u32,
     iat: HashMap<String, u32>,
-    class_name: u32,
-    window_title: u32,
-    line1: u32,
-    line2: u32,
+    blobs: Vec<u32>,
+}
+
+pub(crate) fn wide(s: &str) -> Vec<u8> {
+    let mut v: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    v.extend_from_slice(&[0, 0]);
+    v
 }
 
 impl Rdata {
-    fn build() -> Rdata {
-        let plan = import_plan();
+    pub(crate) fn layout(plan: Vec<(&'static str, Vec<&'static str>)>, blobs: &[Vec<u8>]) -> Rdata {
         let n_dlls = plan.len();
         let total_funcs: usize = plan.iter().map(|(_, fs)| fs.len()).sum();
 
@@ -139,20 +147,12 @@ impl Rdata {
             dll_name_rva.push(RDATA_RVA + pos);
             pos += dll.len() as u32 + 1;
         }
-        let wide = |s: &str| -> Vec<u8> {
-            let mut v: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-            v.extend_from_slice(&[0, 0]);
-            v
-        };
         pos = align_up_u32(pos, 2);
-        let class_name = RDATA_RVA + pos;
-        pos += wide(CLASS_NAME).len() as u32;
-        let window_title = RDATA_RVA + pos;
-        pos += wide(WINDOW_TITLE).len() as u32;
-        let line1 = RDATA_RVA + pos;
-        pos += wide(PAINT_LINE1).len() as u32;
-        let line2 = RDATA_RVA + pos;
-        pos += wide(PAINT_LINE2).len() as u32;
+        let mut blob_rva: Vec<u32> = Vec::with_capacity(blobs.len());
+        for blob in blobs {
+            blob_rva.push(RDATA_RVA + pos);
+            pos += blob.len() as u32;
+        }
 
         let mut b = vec![0u8; pos as usize];
 
@@ -190,17 +190,20 @@ impl Rdata {
             let off = (dll_name_rva[d] - RDATA_RVA) as usize;
             b[off..off + dll.len()].copy_from_slice(dll.as_bytes());
         }
-        for (rva, s) in [(class_name, CLASS_NAME), (window_title, WINDOW_TITLE), (line1, PAINT_LINE1), (line2, PAINT_LINE2)] {
+        for (rva, blob) in blob_rva.iter().zip(blobs) {
             let off = (rva - RDATA_RVA) as usize;
-            let w = wide(s);
-            b[off..off + w.len()].copy_from_slice(&w);
+            b[off..off + blob.len()].copy_from_slice(blob);
         }
 
-        Rdata { bytes: b, import_dir_off, import_dir_size, iat_off, iat_size, iat, class_name, window_title, line1, line2 }
+        Rdata { bytes: b, import_dir_off, import_dir_size, iat_off, iat_size, iat, blobs: blob_rva }
     }
 
-    fn slot(&self, name: &str) -> u32 {
+    pub(crate) fn slot(&self, name: &str) -> u32 {
         *self.iat.get(name).expect("import present")
+    }
+
+    pub(crate) fn blob(&self, i: usize) -> u32 {
+        self.blobs[i]
     }
 }
 
@@ -214,14 +217,14 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.sub_rsp(0xE8);
     a.lea_label(RAX, "wndproc");
     a.mov_at_rsp_reg(0x68, RAX);
-    a.lea_rip(RAX, r.class_name);
+    a.lea_rip(RAX, r.blob(0));
     a.mov_at_rsp_reg(0xA0, RAX);
     a.lea_rsp(RCX, 0x60);
     a.call_iat(r.slot("RegisterClassW"));
 
     a.xor32(RCX);
-    a.lea_rip(RDX, r.class_name);
-    a.lea_rip(R8, r.window_title);
+    a.lea_rip(RDX, r.blob(0));
+    a.lea_rip(R8, r.blob(1));
     a.mov32(R9, 0x00CF_0000);
     a.mov_at_rsp_imm(0x20, 120);
     a.mov_at_rsp_imm(0x28, 120);
@@ -244,7 +247,7 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.mov_reg_reg(RCX, RAX);
     a.mov32(RDX, 12);
     a.mov32(R8, 12);
-    a.lea_rip(R9, r.line1);
+    a.lea_rip(R9, r.blob(2));
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE1) as i32);
     a.call_iat(r.slot("TextOutW"));
     a.mov_reg_at_rsp(RCX, 0x60);
@@ -323,13 +326,13 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.mov_reg_at_rsp(RCX, 0x78);
     a.mov32(RDX, 60);
     a.mov32(R8, 80);
-    a.lea_rip(R9, r.line1);
+    a.lea_rip(R9, r.blob(2));
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE1) as i32);
     a.call_iat(r.slot("TextOutW"));
     a.mov_reg_at_rsp(RCX, 0x78);
     a.mov32(RDX, 60);
     a.mov32(R8, 130);
-    a.lea_rip(R9, r.line2);
+    a.lea_rip(R9, r.blob(3));
     a.mov_at_rsp_imm(0x20, wlen(PAINT_LINE2) as i32);
     a.call_iat(r.slot("TextOutW"));
     a.mov_reg_at_rsp(RCX, 0x70);
@@ -344,29 +347,36 @@ fn build_text(r: &Rdata) -> Vec<u8> {
     a.finish()
 }
 
-const RAX: u8 = 0;
-const RCX: u8 = 1;
-const RDX: u8 = 2;
-const RBX: u8 = 3;
-const R8: u8 = 8;
-const R9: u8 = 9;
+pub(crate) const RAX: u8 = 0;
+pub(crate) const RCX: u8 = 1;
+pub(crate) const RDX: u8 = 2;
+pub(crate) const RBX: u8 = 3;
+pub(crate) const R8: u8 = 8;
+pub(crate) const R9: u8 = 9;
 
-struct Asm {
+#[derive(Clone, Copy)]
+pub(crate) enum Arg {
+    Imm(u32),
+    Slot(i32),
+    Rva(u32),
+}
+
+pub(crate) struct Asm {
     code: Vec<u8>,
     labels: HashMap<String, usize>,
     fixups: Vec<(usize, String)>,
 }
 
 impl Asm {
-    fn new() -> Asm {
+    pub(crate) fn new() -> Asm {
         Asm { code: Vec::new(), labels: HashMap::new(), fixups: Vec::new() }
     }
 
-    fn label(&mut self, name: &str) {
+    pub(crate) fn label(&mut self, name: &str) {
         self.labels.insert(name.to_string(), self.code.len());
     }
 
-    fn modrm_rsp(&mut self, reg: u8, disp: i32) {
+    pub(crate) fn modrm_rsp(&mut self, reg: u8, disp: i32) {
         let reg = reg & 7;
         if (-128..=127).contains(&disp) {
             self.code.push(0x40 | (reg << 3) | 0x04);
@@ -379,7 +389,7 @@ impl Asm {
         }
     }
 
-    fn rex(&mut self, r: u8, b: u8) {
+    pub(crate) fn rex(&mut self, r: u8, b: u8) {
         let mut rex = 0x48;
         if r >= 8 {
             rex |= 0x04;
@@ -390,44 +400,44 @@ impl Asm {
         self.code.push(rex);
     }
 
-    fn sub_rsp(&mut self, n: u32) {
+    pub(crate) fn sub_rsp(&mut self, n: u32) {
         self.code.extend_from_slice(&[0x48, 0x81, 0xEC]);
         self.code.extend_from_slice(&n.to_le_bytes());
     }
-    fn add_rsp(&mut self, n: u32) {
+    pub(crate) fn add_rsp(&mut self, n: u32) {
         self.code.extend_from_slice(&[0x48, 0x81, 0xC4]);
         self.code.extend_from_slice(&n.to_le_bytes());
     }
 
-    fn mov_at_rsp_reg(&mut self, disp: i32, reg: u8) {
+    pub(crate) fn mov_at_rsp_reg(&mut self, disp: i32, reg: u8) {
         self.rex(reg, RBX );
         self.code.push(0x89);
         self.modrm_rsp(reg, disp);
     }
-    fn mov_reg_at_rsp(&mut self, reg: u8, disp: i32) {
+    pub(crate) fn mov_reg_at_rsp(&mut self, reg: u8, disp: i32) {
         self.rex(reg, RBX);
         self.code.push(0x8B);
         self.modrm_rsp(reg, disp);
     }
-    fn mov_reg32_at_rsp(&mut self, reg: u8, disp: i32) {
+    pub(crate) fn mov_reg32_at_rsp(&mut self, reg: u8, disp: i32) {
         if reg >= 8 {
             self.code.push(0x44);
         }
         self.code.push(0x8B);
         self.modrm_rsp(reg, disp);
     }
-    fn lea_rsp(&mut self, reg: u8, disp: i32) {
+    pub(crate) fn lea_rsp(&mut self, reg: u8, disp: i32) {
         self.rex(reg, RBX);
         self.code.push(0x8D);
         self.modrm_rsp(reg, disp);
     }
-    fn mov_at_rsp_imm(&mut self, disp: i32, imm: i32) {
+    pub(crate) fn mov_at_rsp_imm(&mut self, disp: i32, imm: i32) {
         self.code.extend_from_slice(&[0x48, 0xC7]);
         self.modrm_rsp(0, disp);
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
-    fn mov_reg_reg(&mut self, dst: u8, src: u8) {
+    pub(crate) fn mov_reg_reg(&mut self, dst: u8, src: u8) {
         let mut rex = 0x48;
         if src >= 8 {
             rex |= 0x04;
@@ -440,14 +450,14 @@ impl Asm {
         self.code.push(0xC0 | ((src & 7) << 3) | (dst & 7));
     }
 
-    fn mov32(&mut self, reg: u8, imm: u32) {
+    pub(crate) fn mov32(&mut self, reg: u8, imm: u32) {
         if reg >= 8 {
             self.code.push(0x41);
         }
         self.code.push(0xB8 | (reg & 7));
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
-    fn xor32(&mut self, reg: u8) {
+    pub(crate) fn xor32(&mut self, reg: u8) {
         if reg >= 8 {
             self.code.push(0x45);
         }
@@ -455,34 +465,34 @@ impl Asm {
         self.code.push(0xC0 | ((reg & 7) << 3) | (reg & 7));
     }
 
-    fn test_eax(&mut self) {
+    pub(crate) fn test_eax(&mut self) {
         self.code.extend_from_slice(&[0x85, 0xC0]);
     }
-    fn cmp_rdx_imm8(&mut self, imm: i8) {
+    pub(crate) fn cmp_rdx_imm8(&mut self, imm: i8) {
         self.code.extend_from_slice(&[0x48, 0x83, 0xFA, imm as u8]);
     }
-    fn cmp_rdx_imm32(&mut self, imm: i32) {
+    pub(crate) fn cmp_rdx_imm32(&mut self, imm: i32) {
         self.code.extend_from_slice(&[0x48, 0x81, 0xFA]);
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
-    fn int3(&mut self) {
+    pub(crate) fn int3(&mut self) {
         self.code.push(0xCC);
     }
-    fn ret(&mut self) {
+    pub(crate) fn ret(&mut self) {
         self.code.push(0xC3);
     }
 
-    fn je(&mut self, label: &str) {
+    pub(crate) fn je(&mut self, label: &str) {
         self.code.extend_from_slice(&[0x0F, 0x84]);
         self.fixups.push((self.code.len(), label.to_string()));
         self.code.extend_from_slice(&[0, 0, 0, 0]);
     }
-    fn jmp(&mut self, label: &str) {
+    pub(crate) fn jmp(&mut self, label: &str) {
         self.code.push(0xE9);
         self.fixups.push((self.code.len(), label.to_string()));
         self.code.extend_from_slice(&[0, 0, 0, 0]);
     }
-    fn lea_label(&mut self, reg: u8, label: &str) {
+    pub(crate) fn lea_label(&mut self, reg: u8, label: &str) {
         self.rex(reg, RBX);
         self.code.push(0x8D);
         self.code.push(0x05 | ((reg & 7) << 3));
@@ -490,7 +500,7 @@ impl Asm {
         self.code.extend_from_slice(&[0, 0, 0, 0]);
     }
 
-    fn lea_rip(&mut self, reg: u8, target_rva: u32) {
+    pub(crate) fn lea_rip(&mut self, reg: u8, target_rva: u32) {
         self.rex(reg, RBX);
         self.code.push(0x8D);
         self.code.push(0x05 | ((reg & 7) << 3));
@@ -499,14 +509,14 @@ impl Asm {
         self.code.extend_from_slice(&(disp as i32).to_le_bytes());
     }
 
-    fn call_iat(&mut self, slot_rva: u32) {
+    pub(crate) fn call_iat(&mut self, slot_rva: u32) {
         self.code.extend_from_slice(&[0xFF, 0x15]);
         let next = TEXT_RVA as i64 + self.code.len() as i64 + 4;
         let disp = slot_rva as i64 - next;
         self.code.extend_from_slice(&(disp as i32).to_le_bytes());
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         for (pos, label) in &self.fixups {
             let target = *self.labels.get(label).unwrap_or_else(|| panic!("label {label}"));
             let rel = target as i32 - (*pos as i32 + 4);
@@ -514,6 +524,35 @@ impl Asm {
         }
         self.code
     }
+    pub(crate) fn cmp_eax_imm(&mut self, imm: u32) {
+        self.code.push(0x3D);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    pub(crate) fn or_ebx_imm(&mut self, imm: u32) {
+        self.code.extend_from_slice(&[0x81, 0xCB]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    pub(crate) fn load_arg(&mut self, reg: u8, arg: Arg) {
+        match arg {
+            Arg::Imm(v) => self.mov32(reg, v),
+            Arg::Slot(d) => self.mov_reg_at_rsp(reg, d),
+            Arg::Rva(r) => self.lea_rip(reg, r),
+        }
+    }
+
+    pub(crate) fn call(&mut self, slot_rva: u32, args: &[Arg]) {
+        for (i, a) in args.iter().enumerate().skip(4) {
+            self.load_arg(RAX, *a);
+            self.mov_at_rsp_reg(0x20 + 8 * (i as i32 - 4), RAX);
+        }
+        for (reg, a) in [RCX, RDX, R8, R9].into_iter().zip(args.iter()) {
+            self.load_arg(reg, *a);
+        }
+        self.call_iat(slot_rva);
+    }
+
 }
 
 #[allow(clippy::too_many_arguments)]

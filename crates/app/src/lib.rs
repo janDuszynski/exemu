@@ -8,6 +8,7 @@ pub mod comctl_sample;
 pub mod comdlg_sample;
 mod config;
 mod kuser;
+pub mod gdi_sample;
 pub mod gui_sample;
 pub mod image_loader;
 mod memory_map;
