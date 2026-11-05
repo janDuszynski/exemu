@@ -1091,6 +1091,56 @@ mod tests {
         assert!(short > 0, "no budget ever ended inside a block");
     }
 
+    const LONG_BODY: [u8; 15] = [
+        0xB9, 0x08, 0x00, 0x00, 0x00,
+        0xEB, 0x00,
+        0x83, 0xC0, 0x01,
+        0xFF, 0xC9,
+        0x75, 0xF9,
+        DECLINED,
+    ];
+
+    #[test]
+    fn a_link_into_the_longest_cached_block_never_overshoots() {
+        let mut linked_any = 0;
+        for budget in 0..=30u64 {
+            let mut mem = mem_with(&LONG_BODY);
+            let mut linked = Jit::new(64 * 1024).unwrap();
+            let mut cold = Jit::new(64 * 1024).unwrap();
+            let mut warm = CpuState::new();
+            warm.rip = CODE;
+            assert_eq!(linked.run(&mut warm, &mut mem, Mode::Long, 1000), Run::SideExit { insns: 26 });
+            let (mut a, mut b) = (CpuState::new(), CpuState::new());
+            a.rip = CODE;
+            b.rip = CODE;
+            let taken = linked.stats().links_taken;
+            let chained = linked.run(&mut a, &mut mem, Mode::Long, budget).insns();
+            let stepped = cold.run(&mut b, &mut mem, Mode::Long, budget).insns();
+            linked_any += linked.stats().links_taken - taken;
+            assert!(u64::from(chained) <= budget, "budget {budget}: retired {chained}");
+            assert_eq!(chained, stepped, "budget {budget}: retired a different amount");
+            assert_eq!(a.rip, b.rip, "budget {budget}: stopped at a different instruction");
+            assert_eq!(a.gpr, b.gpr, "budget {budget}");
+        }
+        assert!(linked_any > 0, "no link was ever taken, so the limit proved nothing");
+    }
+
+    #[test]
+    fn a_budget_beyond_u32_is_clamped_and_still_links() {
+        let mut mem = mem_with(&LOOP);
+        let mut jit = Jit::new(64 * 1024).unwrap();
+        let mut warm = CpuState::new();
+        warm.rip = CODE;
+        jit.run(&mut warm, &mut mem, Mode::Long, 1000);
+        for budget in [u64::from(u32::MAX), u64::MAX] {
+            let taken = jit.stats().links_taken;
+            let mut st = CpuState::new();
+            st.rip = CODE;
+            assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, budget), Run::SideExit { insns: 18 });
+            assert!(jit.stats().links_taken > taken, "budget {budget}: the loop never linked");
+        }
+    }
+
     #[test]
     fn a_store_into_a_linked_block_is_never_executed_stale() {
         let mut mem = VirtualMemory::new();
