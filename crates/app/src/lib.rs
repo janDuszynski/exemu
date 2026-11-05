@@ -21,6 +21,7 @@ pub mod winsxs;
 pub mod wow64_boot;
 pub mod wow64_gui_sample;
 pub mod wow64_image;
+pub mod wow64_menu_sample;
 pub mod wow64_sample;
 pub mod spawn;
 pub mod spawn_sample;

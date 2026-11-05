@@ -4,6 +4,12 @@ use crate::api::read_wstr;
 use crate::wndclass::{ClassClient, ClientMenuName, WndClassEx};
 use crate::WinOs;
 
+mod accel;
+mod keystate;
+mod menu;
+#[cfg(test)]
+mod rig;
+
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 
 const WIN32K_FIRST: u32 = 0x1084;
@@ -752,6 +758,9 @@ pub(crate) struct Win32kState {
     capture: u32,
     focus: u32,
     active: u32,
+    menus: menu::MenuState,
+    accels: accel::AccelState,
+    keys: keystate::KeyState,
 }
 
 impl Win32kState {
@@ -1029,6 +1038,9 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_GET_ICON_SIZE, nt_user_get_icon_size);
     os.set_win32k_handler(NT_USER_FIND_EXISTING_CURSOR_ICON, nt_user_find_existing_cursor_icon);
     os.set_win32k_handler(NT_USER_DESTROY_CURSOR, nt_user_destroy_cursor);
+    menu::register(os);
+    accel::register(os);
+    keystate::register(os);
 }
 
 fn alloc_handle(os: &mut WinOs) -> u32 {
@@ -1355,6 +1367,8 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
     let wnd_extra = class.map(|c| c.wnd_extra).unwrap_or(0) as usize;
 
     let hwnd = alloc_handle(os);
+    let attached_menu = u32::try_from(menu).is_ok_and(|m| os.win32k_state.menus.contains(m));
+    let window_id = if style & WS_CHILD != 0 || attached_menu { menu } else { 0 };
     os.win32k_state.windows.push((
         hwnd,
         Window {
@@ -1371,7 +1385,7 @@ fn nt_user_create_window_ex(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Me
             surface: None,
             extra: vec![0u8; wnd_extra],
             user_data: 0,
-            id: if style & WS_CHILD != 0 { menu } else { 0 },
+            id: window_id,
             instance,
             props: Vec::new(),
             dialog_info: 0,
@@ -1991,6 +2005,7 @@ fn nt_user_call_two_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memo
             os.return_u64_from_syscall(handle);
             Ok(0)
         }
+        menu::CALL_TWO_PARAM_GET_MENU_INFO => Ok(menu::get_menu_info(os, mem, a, b)),
         _ => Ok(0),
     }
 }
@@ -2003,7 +2018,7 @@ fn nt_user_call_hwnd_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Mem
         call_hwnd_param::GET_WINDOW_LONG
         | call_hwnd_param::GET_WINDOW_LONG_PTR_A
         | call_hwnd_param::GET_WINDOW_LONG_PTR_W => {
-            let value = get_window_long(os, hwnd, param as i64);
+            let value = get_window_long(os, hwnd, i64::from(param as i32));
             os.return_u64_from_syscall(value);
             Ok(0)
         }
@@ -2068,6 +2083,7 @@ fn nt_user_call_one_param(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memo
             Ok(h)
         }
         call_one_param::GET_SYSTEM_METRICS => Ok(system_metric(arg as u32)),
+        menu::CALL_ONE_PARAM_GET_MENU_ITEM_COUNT => Ok(menu::item_count(os, arg)),
         _ => Ok(0),
     }
 }
@@ -2523,6 +2539,7 @@ fn route_raw_input(
     lp: u64,
     ev: exemu_core::InputEvent,
 ) -> Result<bool> {
+    os.win32k_state.keys.note(ev);
     let Some((msg, wparam)) = input_message(ev) else { return Ok(false) };
     let Some((x, y)) = input_point(ev) else {
         let target = keyboard_target(os, ev.hwnd());
