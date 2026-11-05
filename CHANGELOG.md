@@ -26,6 +26,24 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 1059, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### x87 environment save and restore: FNSAVE, FRSTOR, FNSTENV, FLDENV
+- **`tcc.exe` on the Wine path stopped at instruction 5,194,411 on an unimplemented
+  `DD /6` (FNSAVE).** The interpreter now implements the whole family in both
+  operand sizes: the 32-bit protected-mode layout (28 bytes for the environment,
+  108 with the registers) and the 16-bit one under a `66` prefix (14 and 94).
+  The saved tag word is computed from register contents (valid, zero, special,
+  empty), FNSAVE re-initialises the FPU like FNINIT, and FRSTOR/FLDENV load the
+  control, status and tag words and the pointer fields. The last-instruction
+  pointers are stored as loaded; exemu does not update them per instruction.
+- **Oracle.** The x87 category gained the four instructions plus the
+  `fnsave;frstor`, `fnstenv;fldenv` and `fnsave;fldenv` round trips with random
+  stack contents, tags, TOP, control and status words against Unicorn, 0
+  divergences over 1M trials per bitness. The category had never run its
+  control cases: its dispatcher drew from `below(9)` while matching nine
+  numbered arms and a fallthrough.
+- The oracle seeded the stack by physical index while Unicorn takes ST-relative
+  writes; every earlier x87 trial ran at TOP 0, where the two agree.
+
 ### `exemu-os` depends on `exemu-core` alone, and `exemu-app` is split by concern
 - **The `os → cpu` edge is gone.** Its only use was the 32-bit TEB base, which
   was already `exemu_core::cpu::DEFAULT_FS_BASE`. The segment selectors
