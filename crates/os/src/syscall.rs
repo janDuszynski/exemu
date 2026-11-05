@@ -112,7 +112,7 @@ impl WinOs {
             1 => cpu.reg(Reg::Rdx),
             2 => cpu.reg(Reg::R8),
             3 => cpu.reg(Reg::R9),
-            n => mem.read_u64(self.syscall_guest_rsp + 0x28 + (n as u64 - 4) * 8)?,
+            n => mem.read_u64_at(self.syscall_guest_rsp, 0x28 + (n as u64 - 4) * 8)?,
         })
     }
 
@@ -139,22 +139,22 @@ impl WinOs {
 
     fn save_context(&self, cpu: &CpuState, mem: &mut dyn Memory) -> Result<SavedContext> {
         if let Some(base) = self.frame_base() {
-            mem.write_u64(base + frame::RBX, cpu.reg(Reg::Rbx))?;
-            mem.write_u64(base + frame::RBP, cpu.reg(Reg::Rbp))?;
-            mem.write_u64(base + frame::RSI, cpu.reg(Reg::Rsi))?;
-            mem.write_u64(base + frame::RDI, cpu.reg(Reg::Rdi))?;
-            mem.write_u64(base + frame::RSP, cpu.rsp())?;
-            mem.write_u64(base + frame::R12, cpu.reg(Reg::R12))?;
-            mem.write_u64(base + frame::R13, cpu.reg(Reg::R13))?;
-            mem.write_u64(base + frame::R14, cpu.reg(Reg::R14))?;
-            mem.write_u64(base + frame::R15, cpu.reg(Reg::R15))?;
-            mem.write_u64(base + frame::RIP, cpu.reg(Reg::Rcx))?;
-            mem.write_u64(base + frame::FLAGS, cpu.reg(Reg::R11))?;
+            mem.write_u64_at(base, frame::RBX, cpu.reg(Reg::Rbx))?;
+            mem.write_u64_at(base, frame::RBP, cpu.reg(Reg::Rbp))?;
+            mem.write_u64_at(base, frame::RSI, cpu.reg(Reg::Rsi))?;
+            mem.write_u64_at(base, frame::RDI, cpu.reg(Reg::Rdi))?;
+            mem.write_u64_at(base, frame::RSP, cpu.rsp())?;
+            mem.write_u64_at(base, frame::R12, cpu.reg(Reg::R12))?;
+            mem.write_u64_at(base, frame::R13, cpu.reg(Reg::R13))?;
+            mem.write_u64_at(base, frame::R14, cpu.reg(Reg::R14))?;
+            mem.write_u64_at(base, frame::R15, cpu.reg(Reg::R15))?;
+            mem.write_u64_at(base, frame::RIP, cpu.reg(Reg::Rcx))?;
+            mem.write_u64_at(base, frame::FLAGS, cpu.reg(Reg::R11))?;
             for n in frame::XMM_FIRST..=frame::XMM_LAST {
                 let off = frame::XMM_BASE + (n - frame::XMM_FIRST) as u64 * 16;
                 let v = cpu.xmm(n);
-                mem.write_u64(base + off, v as u64)?;
-                mem.write_u64(base + off + 8, (v >> 64) as u64)?;
+                mem.write_u64_at(base, off, v as u64)?;
+                mem.write_u64_at(base, off + 8, (v >> 64) as u64)?;
             }
             Ok(SavedContext::Teb(base))
         } else {
@@ -202,23 +202,23 @@ impl WinOs {
             SavedContext::Teb(base) => {
                 let base = *base;
                 let gpr = [
-                    mem.read_u64(base + frame::RBX)?,
-                    mem.read_u64(base + frame::RBP)?,
-                    mem.read_u64(base + frame::RSI)?,
-                    mem.read_u64(base + frame::RDI)?,
-                    mem.read_u64(base + frame::RSP)?,
-                    mem.read_u64(base + frame::R12)?,
-                    mem.read_u64(base + frame::R13)?,
-                    mem.read_u64(base + frame::R14)?,
-                    mem.read_u64(base + frame::R15)?,
+                    mem.read_u64_at(base, frame::RBX)?,
+                    mem.read_u64_at(base, frame::RBP)?,
+                    mem.read_u64_at(base, frame::RSI)?,
+                    mem.read_u64_at(base, frame::RDI)?,
+                    mem.read_u64_at(base, frame::RSP)?,
+                    mem.read_u64_at(base, frame::R12)?,
+                    mem.read_u64_at(base, frame::R13)?,
+                    mem.read_u64_at(base, frame::R14)?,
+                    mem.read_u64_at(base, frame::R15)?,
                 ];
                 non_vol(cpu, gpr);
-                cpu.rip = mem.read_u64(base + frame::RIP)?;
-                cpu.rflags = mem.read_u64(base + frame::FLAGS)?;
+                cpu.rip = mem.read_u64_at(base, frame::RIP)?;
+                cpu.rflags = mem.read_u64_at(base, frame::FLAGS)?;
                 for n in frame::XMM_FIRST..=frame::XMM_LAST {
                     let off = frame::XMM_BASE + (n - frame::XMM_FIRST) as u64 * 16;
-                    let lo = mem.read_u64(base + off)? as u128;
-                    let hi = mem.read_u64(base + off + 8)? as u128;
+                    let lo = mem.read_u64_at(base, off)? as u128;
+                    let hi = mem.read_u64_at(base, off + 8)? as u128;
                     cpu.set_xmm_keep_upper(n, lo | (hi << 64));
                 }
             }
