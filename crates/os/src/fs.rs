@@ -283,9 +283,9 @@ impl WinOs {
         }
         let units: Vec<u16> = s.encode_utf16().take(max - 1).collect();
         for (i, u) in units.iter().enumerate() {
-            mem.write_u16(addr + (i as u64) * 2, *u)?;
+            mem.write_u16_at(addr, (i as u64) * 2, *u)?;
         }
-        mem.write_u16(addr + (units.len() as u64) * 2, 0)?;
+        mem.write_u16_at(addr, (units.len() as u64) * 2, 0)?;
         Ok(units.len() as u64)
     }
 
@@ -416,14 +416,14 @@ fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry, wide: bool
     };
     mem.write_u32(ptr, attrs)?;
 
-    mem.write_u32(ptr + 4, entry.ctime as u32)?;
-    mem.write_u32(ptr + 8, (entry.ctime >> 32) as u32)?;
-    mem.write_u32(ptr + 12, entry.atime as u32)?;
-    mem.write_u32(ptr + 16, (entry.atime >> 32) as u32)?;
-    mem.write_u32(ptr + 20, entry.mtime as u32)?;
-    mem.write_u32(ptr + 24, (entry.mtime >> 32) as u32)?;
-    mem.write_u32(ptr + 28, (entry.size >> 32) as u32)?;
-    mem.write_u32(ptr + 32, entry.size as u32)?;
+    mem.write_u32_at(ptr, 4, entry.ctime as u32)?;
+    mem.write_u32_at(ptr, 8, (entry.ctime >> 32) as u32)?;
+    mem.write_u32_at(ptr, 12, entry.atime as u32)?;
+    mem.write_u32_at(ptr, 16, (entry.atime >> 32) as u32)?;
+    mem.write_u32_at(ptr, 20, entry.mtime as u32)?;
+    mem.write_u32_at(ptr, 24, (entry.mtime >> 32) as u32)?;
+    mem.write_u32_at(ptr, 28, (entry.size >> 32) as u32)?;
+    mem.write_u32_at(ptr, 32, entry.size as u32)?;
 
     if wide {
         WinOs::write_wstr(mem, ptr + 44, &entry.name, 260)?;
@@ -530,8 +530,8 @@ impl WinOs {
         if objattr == 0 {
             return None;
         }
-        let root_dir = mem.read_u64(objattr + 8).ok()?;
-        let name_ptr = mem.read_u64(objattr + 0x10).ok()?;
+        let root_dir = mem.read_u64_at(objattr, 8).ok()?;
+        let name_ptr = mem.read_u64_at(objattr, 0x10).ok()?;
         let name = read_unicode_string(mem, name_ptr)?;
         let name = strip_nt_prefix(&name);
 
@@ -744,12 +744,12 @@ impl WinOs {
             .map(|d| d.as_secs() * 10_000_000 + d.subsec_nanos() as u64 / 100 + FILETIME_EPOCH_DIFF)
             .unwrap_or(FILETIME_EPOCH_DIFF);
         mem.write_u64(info, ft)?;
-        mem.write_u64(info + 0x08, ft)?;
-        mem.write_u64(info + 0x10, ft)?;
-        mem.write_u64(info + 0x18, ft)?;
+        mem.write_u64_at(info, 0x08, ft)?;
+        mem.write_u64_at(info, 0x10, ft)?;
+        mem.write_u64_at(info, 0x18, ft)?;
         let attrs = if meta.is_dir() { NT_FILE_ATTRIBUTE_DIRECTORY } else { NT_FILE_ATTRIBUTE_NORMAL };
-        mem.write_u32(info + 0x20, attrs)?;
-        mem.write_u32(info + 0x24, 0)?;
+        mem.write_u32_at(info, 0x20, attrs)?;
+        mem.write_u32_at(info, 0x24, 0)?;
         Ok(STATUS_SUCCESS)
     }
 
@@ -873,7 +873,7 @@ impl WinOs {
                     }
                     let zero = [0u8; 0x18];
                     mem.write(info, &zero)?;
-                    mem.write_u32(info + 0x10, 1)?;
+                    mem.write_u32_at(info, 0x10, 1)?;
                     write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 0x18)?;
                     Ok(STATUS_SUCCESS)
                 }
@@ -907,9 +907,9 @@ impl WinOs {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
                 mem.write_u64(info, size)?;
-                mem.write_u64(info + 8, size)?;
-                mem.write_u32(info + 0x10, 1)?;
-                mem.write_u32(info + 0x14, 0)?;
+                mem.write_u64_at(info, 8, size)?;
+                mem.write_u32_at(info, 0x10, 1)?;
+                mem.write_u32_at(info, 0x14, 0)?;
                 write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 0x18)?;
                 Ok(STATUS_SUCCESS)
             }
@@ -953,7 +953,7 @@ impl WinOs {
                         return Ok(STATUS_BUFFER_TOO_SMALL);
                     }
                     mem.write_u32(info, FILE_DEVICE_NAMED_PIPE)?;
-                    mem.write_u32(info + 4, 0)?;
+                    mem.write_u32_at(info, 4, 0)?;
                     write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 8)?;
                     Ok(STATUS_SUCCESS)
                 }
@@ -972,9 +972,9 @@ impl WinOs {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
                 mem.write_u64(info, 0x0010_0000)?;
-                mem.write_u64(info + 8, 0x0008_0000)?;
-                mem.write_u32(info + 0x10, 8)?;
-                mem.write_u32(info + 0x14, 512)?;
+                mem.write_u64_at(info, 8, 0x0008_0000)?;
+                mem.write_u32_at(info, 0x10, 8)?;
+                mem.write_u32_at(info, 0x14, 512)?;
                 write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 0x18)?;
                 Ok(STATUS_SUCCESS)
             }
@@ -983,7 +983,7 @@ impl WinOs {
                     return Ok(STATUS_BUFFER_TOO_SMALL);
                 }
                 mem.write_u32(info, 7)?;
-                mem.write_u32(info + 4, 0)?;
+                mem.write_u32_at(info, 4, 0)?;
                 write_iosb(mem, iosb_ptr, STATUS_SUCCESS, 8)?;
                 Ok(STATUS_SUCCESS)
             }
@@ -1080,14 +1080,14 @@ pub(crate) fn read_unicode_string(mem: &dyn Memory, ptr: u64) -> Option<String> 
         return None;
     }
     let length = mem.read_u16(ptr).ok()? as u64;
-    let buffer = mem.read_u64(ptr + 8).ok()?;
+    let buffer = mem.read_u64_at(ptr, 8).ok()?;
     if buffer == 0 {
         return Some(String::new());
     }
     let units = (length / 2) as usize;
     let mut v = Vec::with_capacity(units);
     for i in 0..units {
-        v.push(mem.read_u16(buffer + (i as u64) * 2).ok()?);
+        v.push(mem.read_u16_at(buffer, (i as u64) * 2).ok()?);
     }
     Some(String::from_utf16_lossy(&v))
 }
@@ -1106,8 +1106,8 @@ fn write_iosb(mem: &mut dyn Memory, ptr: u64, status: u32, information: u64) -> 
         return Ok(());
     }
     mem.write_u32(ptr, status)?;
-    mem.write_u32(ptr + 4, 0)?;
-    mem.write_u64(ptr + 8, information)?;
+    mem.write_u32_at(ptr, 4, 0)?;
+    mem.write_u64_at(ptr, 8, information)?;
     Ok(())
 }
 
@@ -1136,17 +1136,17 @@ fn write_dir_information(
     let zero = vec![0u8; class.name_off as usize];
     mem.write(ptr, &zero)?;
     mem.write_u32(ptr, 0)?;
-    mem.write_u64(ptr + 0x08, entry.ctime)?;
-    mem.write_u64(ptr + 0x10, entry.atime)?;
-    mem.write_u64(ptr + 0x18, entry.mtime)?;
-    mem.write_u64(ptr + 0x20, entry.mtime)?;
-    mem.write_u64(ptr + 0x28, entry.size)?;
-    mem.write_u64(ptr + 0x30, entry.size)?;
+    mem.write_u64_at(ptr, 0x08, entry.ctime)?;
+    mem.write_u64_at(ptr, 0x10, entry.atime)?;
+    mem.write_u64_at(ptr, 0x18, entry.mtime)?;
+    mem.write_u64_at(ptr, 0x20, entry.mtime)?;
+    mem.write_u64_at(ptr, 0x28, entry.size)?;
+    mem.write_u64_at(ptr, 0x30, entry.size)?;
     let attrs: u32 = if entry.is_dir { FILE_ATTRIBUTE_DIRECTORY as u32 } else { FILE_ATTRIBUTE_NORMAL as u32 };
-    mem.write_u32(ptr + 0x38, attrs)?;
-    mem.write_u32(ptr + 0x3C, name_bytes as u32)?;
+    mem.write_u32_at(ptr, 0x38, attrs)?;
+    mem.write_u32_at(ptr, 0x3C, name_bytes as u32)?;
     for (i, u) in name_units.iter().enumerate() {
-        mem.write_u16(ptr + class.name_off + (i as u64) * 2, *u)?;
+        mem.write_u16_at(ptr, class.name_off + (i as u64) * 2, *u)?;
     }
     Ok(())
 }
