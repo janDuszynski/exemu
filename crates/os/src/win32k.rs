@@ -1,6 +1,7 @@
 use exemu_core::{CpuState, Memory, Perm, Result, WindowParams};
 
 mod draw;
+mod paint;
 
 use crate::api::read_wstr;
 use crate::wndclass::{ClassClient, ClientMenuName, WndClassEx};
@@ -554,6 +555,7 @@ struct Class {
 }
 
 #[allow(dead_code)]
+#[derive(Default)]
 struct Window {
     class_atom: u16,
     class_name: String,
@@ -1029,6 +1031,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_FIND_EXISTING_CURSOR_ICON, nt_user_find_existing_cursor_icon);
     os.set_win32k_handler(NT_USER_DESTROY_CURSOR, nt_user_destroy_cursor);
     draw::register(os);
+    paint::register(os);
 }
 
 fn alloc_handle(os: &mut WinOs) -> u32 {
@@ -3151,7 +3154,7 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 }
 
 pub mod abi {
-    pub const SYSCALLS: [(&str, u32); 47] = [
+    pub const SYSCALLS: [(&str, u32); 50] = [
         ("NtUserBuildHwndList", super::NT_USER_BUILD_HWND_LIST),
         ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
         ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
@@ -3199,6 +3202,9 @@ pub mod abi {
         ("NtGdiLineTo", super::draw::NT_GDI_LINE_TO),
         ("NtGdiCreatePatternBrushInternal", super::draw::NT_GDI_CREATE_PATTERN_BRUSH),
         ("NtGdiOpenDCW", super::draw::NT_GDI_OPEN_DCW),
+        ("NtUserMoveWindow", super::paint::NT_USER_MOVE_WINDOW),
+        ("NtUserInvalidateRect", super::paint::NT_USER_INVALIDATE_RECT),
+        ("NtUserRedrawWindow", super::paint::NT_USER_REDRAW_WINDOW),
     ];
 
     pub const CALL_HWND: [(&str, u64); 7] = [
