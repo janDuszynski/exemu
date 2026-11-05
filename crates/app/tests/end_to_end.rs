@@ -161,4 +161,8 @@ fn a_null_deref_fault_names_the_stubs_that_returned_zero() {
     }
     assert!(report.contains(".exe+0x"), "the rip trail is module-attributed; report:\n{report}");
     assert!(report.contains("loaded modules:"), "the report lists the mapped images; report:\n{report}");
+    assert!(
+        report.contains(": unmapped, between nothing and \""),
+        "the faulting address is placed in the memory map, below every region; report:\n{report}"
+    );
 }

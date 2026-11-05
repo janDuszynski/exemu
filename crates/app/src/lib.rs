@@ -6,10 +6,12 @@ pub mod cab_sample;
 pub mod comctl_sample;
 pub mod comdlg_sample;
 pub mod gui_sample;
+mod memory_map;
 pub mod sample;
 pub mod shell_link_sample;
 pub mod shell_sample;
 pub mod socket_sample;
+pub mod prefix_dirs;
 pub mod winsxs;
 pub mod wow64_boot;
 pub mod wow64_gui_sample;
@@ -393,6 +395,7 @@ impl Process {
                 (false, Some(d32)) => d32.clone(),
                 _ => std::path::PathBuf::from(dir),
             };
+            prefix_dirs::stage_prefix_dirs(&sandbox);
             let _ = winsxs::stage_comctl6(&sandbox, &prefix, winsxs::arch_for(image.is_64bit));
         }
 
@@ -1157,9 +1160,10 @@ impl Process {
 
         if std::env::var_os("EXEMU_DBG").is_some() {
             eprintln!(
-                "[exemu] delivering exception {code:#010x} to the guest, faulting address {}
+                "[exemu] delivering exception {code:#010x} to the guest, faulting address {} ({})
 {}",
                 self.addr_note(address),
+                memory_map::locate(self.mem.regions(), address),
                 self.fault_report(
                     &format!("guest exception {code:#010x} (address {address:#x})"),
                     None,
@@ -1260,6 +1264,10 @@ impl Process {
             }
         }
 
+        if let Some(EmuError::Unmapped { addr, .. } | EmuError::Permission { addr, .. }) = err {
+            let _ = writeln!(o, "  faulting address {addr:#x}: {}", memory_map::locate(self.mem.regions(), *addr));
+        }
+
         let _ = writeln!(o, "  faulted after {steps} instructions");
         let _ = writeln!(
             o,
@@ -1320,6 +1328,9 @@ impl Process {
                     let _ = write!(o, " ← {}", self.addr_note(*f));
                 }
             }
+        }
+        if std::env::var_os("EXEMU_DBG").is_some() {
+            let _ = write!(o, "\n{}", memory_map::dump(self.mem.regions()));
         }
         let modules = self.os.loaded_modules();
         if !modules.is_empty() {

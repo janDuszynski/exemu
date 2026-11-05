@@ -51,6 +51,8 @@ const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const SCN_MEM_READ: u32 = 0x4000_0000;
 const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
+const SECTION_HEADER_SIZE: usize = 40;
+
 pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     let r = Reader::new(bytes);
 
@@ -109,35 +111,27 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     let (delay_dir_rva, delay_dir_size) = dir(DIR_DELAY_IMPORT)?;
 
     let sec_table = opt + size_opt_header;
+    let headers = (0..num_sections)
+        .map(|i| SectionHeader::read(&r, sec_table + i * SECTION_HEADER_SIZE))
+        .collect::<Result<Vec<_>>>()?;
+    let raw_limits = raw_copy_limits(&headers)?;
     let mut sections = Vec::with_capacity(num_sections);
-    for i in 0..num_sections {
-        let s = sec_table + i * 40;
-        let name = {
-            let raw = r.bytes(s, 8)?;
-            let end = raw.iter().position(|&b| b == 0).unwrap_or(8);
-            String::from_utf8_lossy(&raw[..end]).into_owned()
-        };
-        let virtual_size = r.u32(s + 8)?;
-        let rva = r.u32(s + 12)?;
-        let size_raw = r.u32(s + 16)? as usize;
-        let ptr_raw = r.u32(s + 20)? as usize;
-        let chars = r.u32(s + 36)?;
-
-        let data = if size_raw == 0 || chars & SCN_CNT_UNINIT_DATA != 0 {
+    for (h, limit) in headers.into_iter().zip(raw_limits) {
+        let data = if h.size_raw == 0 || h.chars & SCN_CNT_UNINIT_DATA != 0 {
             Vec::new()
         } else {
-            let avail = r.len().saturating_sub(ptr_raw).min(size_raw);
-            r.bytes(ptr_raw, avail)?
+            let avail = r.len().saturating_sub(h.ptr_raw).min(h.size_raw).min(limit);
+            r.bytes(h.ptr_raw, avail)?
         };
 
         sections.push(Section {
-            name,
-            rva,
-            virtual_size,
+            name: h.name,
+            rva: h.rva,
+            virtual_size: h.virtual_size,
             data,
-            readable: chars & SCN_MEM_READ != 0,
-            writable: chars & SCN_MEM_WRITE != 0,
-            executable: chars & SCN_MEM_EXECUTE != 0,
+            readable: h.chars & SCN_MEM_READ != 0,
+            writable: h.chars & SCN_MEM_WRITE != 0,
+            executable: h.chars & SCN_MEM_EXECUTE != 0,
         });
     }
 
@@ -201,26 +195,79 @@ pub fn parse(bytes: &[u8]) -> Result<PeImage> {
     })
 }
 
+struct SectionHeader {
+    name: String,
+    virtual_size: u32,
+    rva: u32,
+    size_raw: usize,
+    ptr_raw: usize,
+    chars: u32,
+}
+
+impl SectionHeader {
+    fn read(r: &Reader, at: usize) -> Result<SectionHeader> {
+        let raw_name = r.bytes(at, 8)?;
+        let name_len = raw_name.iter().position(|&b| b == 0).unwrap_or(8);
+        Ok(SectionHeader {
+            name: String::from_utf8_lossy(&raw_name[..name_len]).into_owned(),
+            virtual_size: r.u32(at + 8)?,
+            rva: r.u32(at + 12)?,
+            size_raw: r.u32(at + 16)? as usize,
+            ptr_raw: r.u32(at + 20)? as usize,
+            chars: r.u32(at + 36)?,
+        })
+    }
+
+    fn virtual_span(&self) -> u64 {
+        if self.virtual_size != 0 {
+            u64::from(self.virtual_size)
+        } else {
+            self.size_raw as u64
+        }
+    }
+
+    fn virtual_end(&self) -> u64 {
+        u64::from(self.rva) + self.virtual_span()
+    }
+}
+
+fn raw_copy_limits(headers: &[SectionHeader]) -> Result<Vec<usize>> {
+    let mut by_rva: Vec<usize> = (0..headers.len()).collect();
+    by_rva.sort_by_key(|&i| (headers[i].rva, headers[i].virtual_span()));
+    let mut limits = vec![usize::MAX; headers.len()];
+    for pair in by_rva.windows(2) {
+        let (cur, next) = (&headers[pair[0]], &headers[pair[1]]);
+        if cur.virtual_end() > u64::from(next.rva) {
+            return Err(EmuError::InvalidPe(format!(
+                "section {:?} at rva {:#x} overlaps section {:?} at rva {:#x}",
+                cur.name, cur.rva, next.name, next.rva
+            )));
+        }
+        limits[pair[0]] = (next.rva - cur.rva) as usize;
+    }
+    Ok(limits)
+}
+
 fn parse_exports(
     sections: &[Section],
     dir_rva: u32,
     dir_size: u32,
 ) -> Result<(Vec<Export>, Option<String>)> {
-    let ordinal_base = slice_u32(sections, dir_rva + 16)?;
-    let num_funcs = slice_u32(sections, dir_rva + 20)?;
-    let num_names = slice_u32(sections, dir_rva + 24)?;
-    let funcs_rva = slice_u32(sections, dir_rva + 28)?;
-    let names_rva = slice_u32(sections, dir_rva + 32)?;
-    let ords_rva = slice_u32(sections, dir_rva + 36)?;
-    let name_ptr = slice_u32(sections, dir_rva + 12)?;
+    let ordinal_base = slice_u32(sections, dir_rva.wrapping_add(16))?;
+    let num_funcs = slice_u32(sections, dir_rva.wrapping_add(20))?;
+    let num_names = slice_u32(sections, dir_rva.wrapping_add(24))?;
+    let funcs_rva = slice_u32(sections, dir_rva.wrapping_add(28))?;
+    let names_rva = slice_u32(sections, dir_rva.wrapping_add(32))?;
+    let ords_rva = slice_u32(sections, dir_rva.wrapping_add(36))?;
+    let name_ptr = slice_u32(sections, dir_rva.wrapping_add(12))?;
     let dll_name = if name_ptr != 0 { cstr_at_rva(sections, name_ptr).ok() } else { None };
 
     let dir_end = dir_rva.saturating_add(dir_size);
 
     let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     for i in 0..num_names {
-        let name_rva = slice_u32(sections, names_rva + i * 4)?;
-        let ord_index = slice_u16(sections, ords_rva + i * 2)? as u32;
+        let name_rva = slice_u32(sections, names_rva.wrapping_add(i.wrapping_mul(4)))?;
+        let ord_index = slice_u16(sections, ords_rva.wrapping_add(i.wrapping_mul(2)))? as u32;
         if let Ok(nm) = cstr_at_rva(sections, name_rva) {
             names.insert(ord_index, nm);
         }
@@ -228,7 +275,7 @@ fn parse_exports(
 
     let mut exports = Vec::new();
     for i in 0..num_funcs {
-        let func_rva = slice_u32(sections, funcs_rva + i * 4)?;
+        let func_rva = slice_u32(sections, funcs_rva.wrapping_add(i.wrapping_mul(4)))?;
         if func_rva == 0 {
             continue;
         }
@@ -239,7 +286,7 @@ fn parse_exports(
         };
         exports.push(Export {
             name: names.get(&i).cloned(),
-            ordinal: (ordinal_base + i) as u16,
+            ordinal: ordinal_base.wrapping_add(i) as u16,
             rva: func_rva,
             forwarder,
         });
@@ -250,22 +297,22 @@ fn parse_exports(
 fn parse_relocs(sections: &[Section], dir_rva: u32, dir_size: u32) -> Result<Vec<Reloc>> {
     let mut relocs = Vec::new();
     let mut off = 0u32;
-    while off + 8 <= dir_size {
-        let page_rva = slice_u32(sections, dir_rva + off)?;
-        let block_size = slice_u32(sections, dir_rva + off + 4)?;
+    while off.checked_add(8).is_some_and(|end| end <= dir_size) {
+        let page_rva = slice_u32(sections, dir_rva.wrapping_add(off))?;
+        let block_size = slice_u32(sections, dir_rva.wrapping_add(off).wrapping_add(4))?;
         if block_size < 8 {
             break;
         }
         let entries = (block_size - 8) / 2;
         for e in 0..entries {
-            let v = slice_u16(sections, dir_rva + off + 8 + e * 2)?;
+            let v = slice_u16(sections, dir_rva.wrapping_add(off).wrapping_add(8).wrapping_add(e.wrapping_mul(2)))?;
             let kind = (v >> 12) as u8;
             let word_off = (v & 0x0FFF) as u32;
             if kind != 0 {
-                relocs.push(Reloc { rva: page_rva + word_off, kind });
+                relocs.push(Reloc { rva: page_rva.wrapping_add(word_off), kind });
             }
         }
-        off += block_size;
+        off = off.saturating_add(block_size);
     }
     Ok(relocs)
 }
@@ -281,11 +328,11 @@ fn parse_tls(sections: &[Section], dir_rva: u32, image_base: u64, is_64bit: bool
     let p: u32 = if is_64bit { 8 } else { 4 };
 
     let start_address_of_raw_data = ptr(dir_rva)?;
-    let end_address_of_raw_data = ptr(dir_rva + p)?;
-    let address_of_index = ptr(dir_rva + 2 * p)?;
-    let address_of_callbacks = ptr(dir_rva + 3 * p)?;
-    let size_of_zero_fill = slice_u32(sections, dir_rva + 4 * p)?;
-    let characteristics = slice_u32(sections, dir_rva + 4 * p + 4)?;
+    let end_address_of_raw_data = ptr(dir_rva.wrapping_add(p))?;
+    let address_of_index = ptr(dir_rva.wrapping_add(2 * p))?;
+    let address_of_callbacks = ptr(dir_rva.wrapping_add(3 * p))?;
+    let size_of_zero_fill = slice_u32(sections, dir_rva.wrapping_add(4 * p))?;
+    let characteristics = slice_u32(sections, dir_rva.wrapping_add(4 * p + 4))?;
 
     let va_to_rva = |va: u64| -> Option<u32> {
         if va == 0 {
@@ -297,10 +344,10 @@ fn parse_tls(sections: &[Section], dir_rva: u32, image_base: u64, is_64bit: bool
     let raw_template = match (va_to_rva(start_address_of_raw_data), end_address_of_raw_data) {
         (Some(start_rva), end) if end > start_address_of_raw_data => {
             let len = (end - start_address_of_raw_data) as usize;
-            let mut buf = Vec::with_capacity(len);
+            let mut buf = Vec::new();
             let mut ok = true;
             for i in 0..len {
-                match slice_u8(sections, start_rva + i as u32) {
+                match slice_u8(sections, start_rva.wrapping_add(i as u32)) {
                     Ok(b) => buf.push(b),
                     Err(_) => {
                         ok = false;
@@ -323,7 +370,7 @@ fn parse_tls(sections: &[Section], dir_rva: u32, image_base: u64, is_64bit: bool
                 Some(rva) => callback_rvas.push(rva),
                 None => break,
             }
-            arr_rva += p;
+            arr_rva = arr_rva.wrapping_add(p);
         }
     }
 
@@ -342,7 +389,7 @@ fn parse_tls(sections: &[Section], dir_rva: u32, image_base: u64, is_64bit: bool
 fn read_at_rva(sections: &[Section], rva: u32) -> Option<(&Section, usize)> {
     for s in sections {
         let vsize = s.virtual_size.max(s.data.len() as u32);
-        if rva >= s.rva && rva < s.rva + vsize {
+        if rva >= s.rva && u64::from(rva) < u64::from(s.rva) + u64::from(vsize) {
             return Some((s, (rva - s.rva) as usize));
         }
     }
@@ -363,7 +410,7 @@ pub(crate) fn slice_u16(sections: &[Section], rva: u32) -> Result<u16> {
         .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} not in any section")))?;
     let b = s
         .data
-        .get(off..off + 2)
+        .get(off..off.saturating_add(2))
         .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} past section data")))?;
     Ok(u16::from_le_bytes([b[0], b[1]]))
 }
@@ -373,7 +420,7 @@ pub(crate) fn slice_u32(sections: &[Section], rva: u32) -> Result<u32> {
         .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} not in any section")))?;
     let b = s
         .data
-        .get(off..off + 4)
+        .get(off..off.saturating_add(4))
         .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} past section data")))?;
     Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
@@ -383,7 +430,7 @@ fn slice_u64(sections: &[Section], rva: u32) -> Result<u64> {
         .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} not in any section")))?;
     let b = s
         .data
-        .get(off..off + 8)
+        .get(off..off.saturating_add(8))
         .ok_or_else(|| EmuError::InvalidPe(format!("rva {rva:#x} past section data")))?;
     let mut arr = [0u8; 8];
     arr.copy_from_slice(b);
@@ -393,12 +440,12 @@ fn slice_u64(sections: &[Section], rva: u32) -> Result<u64> {
 fn cstr_at_rva(sections: &[Section], rva: u32) -> Result<String> {
     let (s, off) = read_at_rva(sections, rva)
         .ok_or_else(|| EmuError::InvalidPe(format!("string rva {rva:#x} not in any section")))?;
-    let end = s.data[off..]
-        .iter()
-        .position(|&b| b == 0)
-        .map(|p| off + p)
-        .unwrap_or(s.data.len());
-    Ok(String::from_utf8_lossy(&s.data[off..end]).into_owned())
+    let tail = s
+        .data
+        .get(off..)
+        .ok_or_else(|| EmuError::InvalidPe(format!("string rva {rva:#x} past section data")))?;
+    let len = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    Ok(String::from_utf8_lossy(&tail[..len]).into_owned())
 }
 
 fn parse_imports(sections: &[Section], dir_rva: u32, is_64bit: bool) -> Result<Vec<Import>> {
@@ -417,8 +464,8 @@ fn parse_imports(sections: &[Section], dir_rva: u32, is_64bit: bool) -> Result<V
     let mut desc = dir_rva;
     loop {
         let orig_first_thunk = slice_u32(sections, desc)?;
-        let name_rva = slice_u32(sections, desc + 12)?;
-        let first_thunk = slice_u32(sections, desc + 16)?;
+        let name_rva = slice_u32(sections, desc.wrapping_add(12))?;
+        let first_thunk = slice_u32(sections, desc.wrapping_add(16))?;
 
         if orig_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
             break;
@@ -430,22 +477,22 @@ fn parse_imports(sections: &[Section], dir_rva: u32, is_64bit: bool) -> Result<V
 
         let mut i = 0u32;
         loop {
-            let thunk = read_thunk(sections, lookup + i * thunk_size)?;
+            let thunk = read_thunk(sections, lookup.wrapping_add(i.wrapping_mul(thunk_size)))?;
             if thunk == 0 {
                 break;
             }
-            let iat_rva = first_thunk + i * thunk_size;
+            let iat_rva = first_thunk.wrapping_add(i.wrapping_mul(thunk_size));
             let symbol = if thunk & ordinal_flag != 0 {
                 ImportSymbol::Ordinal((thunk & 0xFFFF) as u16)
             } else {
                 let by_name_rva = (thunk & 0x7FFF_FFFF) as u32;
-                ImportSymbol::Named(cstr_at_rva(sections, by_name_rva + 2)?)
+                ImportSymbol::Named(cstr_at_rva(sections, by_name_rva.wrapping_add(2))?)
             };
             imports.push(Import { dll: dll.clone(), symbol, iat_rva });
             i += 1;
         }
 
-        desc += 20;
+        desc = desc.wrapping_add(20);
     }
 
     Ok(imports)
@@ -472,9 +519,9 @@ fn parse_delay_imports(
     let mut desc = dir_rva;
     loop {
         let attributes = slice_u32(sections, desc)?;
-        let name_field = slice_u32(sections, desc + 4)?;
-        let iat_field = slice_u32(sections, desc + 12)?;
-        let int_field = slice_u32(sections, desc + 16)?;
+        let name_field = slice_u32(sections, desc.wrapping_add(4))?;
+        let iat_field = slice_u32(sections, desc.wrapping_add(12))?;
+        let int_field = slice_u32(sections, desc.wrapping_add(16))?;
 
         if attributes == 0 && name_field == 0 && iat_field == 0 && int_field == 0 {
             break;
@@ -494,21 +541,21 @@ fn parse_delay_imports(
         let int_rva0 = to_rva(int_field);
 
         let Ok(dll) = cstr_at_rva(sections, name_rva).map(|s| s.to_ascii_lowercase()) else {
-            desc += 32;
+            desc = desc.wrapping_add(32);
             continue;
         };
 
         let mut i = 0u32;
-        while let Ok(thunk) = read_thunk(sections, int_rva0 + i * thunk_size) {
+        while let Ok(thunk) = read_thunk(sections, int_rva0.wrapping_add(i.wrapping_mul(thunk_size))) {
             if thunk == 0 {
                 break;
             }
-            let iat_rva = iat_rva0 + i * thunk_size;
+            let iat_rva = iat_rva0.wrapping_add(i.wrapping_mul(thunk_size));
             let symbol = if thunk & ordinal_flag != 0 {
                 ImportSymbol::Ordinal((thunk & 0xFFFF) as u16)
             } else {
                 let by_name_rva = (thunk & 0x7FFF_FFFF) as u32;
-                match cstr_at_rva(sections, by_name_rva + 2) {
+                match cstr_at_rva(sections, by_name_rva.wrapping_add(2)) {
                     Ok(name) => ImportSymbol::Named(name),
                     Err(_) => break,
                 }
@@ -517,7 +564,7 @@ fn parse_delay_imports(
             i += 1;
         }
 
-        desc += 32;
+        desc = desc.wrapping_add(32);
     }
 
     Ok(imports)
@@ -772,6 +819,86 @@ mod tests {
         assert_eq!(imports[0].dll, "a.dll");
         assert_eq!(imports[0].symbol, ImportSymbol::Ordinal(7));
         assert_eq!(imports[0].iat_rva, RVA + iat_off as u32);
+    }
+
+    fn one_section(rva: u32, virtual_size: u32, data: Vec<u8>) -> Vec<Section> {
+        vec![Section {
+            name: ".t".into(),
+            rva,
+            virtual_size,
+            data,
+            readable: true,
+            writable: false,
+            executable: false,
+        }]
+    }
+
+    #[test]
+    fn string_rva_in_the_zero_filled_tail_is_an_error() {
+        let sections = one_section(0x1000, 0x1000, vec![b'a'; 0x10]);
+        assert!(cstr_at_rva(&sections, 0x1800).is_err());
+    }
+
+    #[test]
+    fn rva_arithmetic_at_the_top_of_the_address_space_does_not_panic() {
+        let sections = one_section(u32::MAX - 0x10, 0x100, vec![0; 0x10]);
+        assert!(slice_u32(&sections, u32::MAX - 2).is_err());
+        assert!(parse_exports(&sections, u32::MAX - 0x10, 0x100).is_err());
+        assert!(parse_relocs(&sections, u32::MAX - 0x10, u32::MAX).is_ok());
+    }
+
+    const TEST_SEC_TABLE: usize = 0x80 + 4 + 20 + 0xF0;
+
+    fn pe_with_sections(
+        count: u16,
+        file_len: usize,
+        header: impl Fn(usize) -> (u32, u32, u32, u32),
+    ) -> Vec<u8> {
+        let mut f = minimal_pe_no_tls();
+        f.resize(file_len.max(TEST_SEC_TABLE + usize::from(count) * SECTION_HEADER_SIZE), 0);
+        f[0x80 + 4 + 2..0x80 + 4 + 4].copy_from_slice(&count.to_le_bytes());
+        let template = f[TEST_SEC_TABLE..TEST_SEC_TABLE + SECTION_HEADER_SIZE].to_vec();
+        for i in 0..usize::from(count) {
+            let s = TEST_SEC_TABLE + i * SECTION_HEADER_SIZE;
+            f[s..s + SECTION_HEADER_SIZE].copy_from_slice(&template);
+            let (rva, virtual_size, size_raw, ptr_raw) = header(i);
+            put_le32(&mut f, s + 8, virtual_size);
+            put_le32(&mut f, s + 12, rva);
+            put_le32(&mut f, s + 16, size_raw);
+            put_le32(&mut f, s + 20, ptr_raw);
+        }
+        f
+    }
+
+    #[test]
+    fn sections_sharing_raw_data_load() {
+        let len = 0x600u32;
+        let f = pe_with_sections(2, len as usize, |i| (0x1000 * (i as u32 + 1), 0x1000, len, 0));
+        let pe = parse(&f).expect("two sections over the same file bytes are a valid image");
+        assert_eq!(pe.sections.len(), 2);
+        assert_eq!(pe.sections[0].data, f);
+        assert_eq!(pe.sections[1].data, f);
+    }
+
+    #[test]
+    fn a_mutated_section_count_over_one_virtual_range_is_refused() {
+        let f = pe_with_sections(1000, 0x10000, |_| (0x1000, 0x1000, 0x10000, 0));
+        match parse(&f) {
+            Err(EmuError::InvalidPe(why)) => assert!(why.contains("overlaps"), "{why}"),
+            other => panic!("expected an overlap refusal, got {:?}", other.map(|p| p.sections.len())),
+        }
+    }
+
+    #[test]
+    fn section_raw_data_stops_at_the_next_section() {
+        let len = 0x4000u32;
+        let f = pe_with_sections(64, len as usize, |i| (0x1000 * (i as u32 + 1), 0x10, len, 0));
+        let pe = parse(&f).expect("ascending sections with small virtual sizes are a valid layout");
+        let (last, rest) = pe.sections.split_last().unwrap();
+        assert!(rest.iter().all(|s| s.data.len() == 0x1000));
+        assert_eq!(last.data.len(), len as usize);
+        let copied: usize = pe.sections.iter().map(|s| s.data.len()).sum();
+        assert_eq!(copied, 63 * 0x1000 + len as usize);
     }
 
     fn put_le32(d: &mut [u8], off: usize, v: u32) {
