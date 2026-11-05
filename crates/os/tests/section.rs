@@ -5,6 +5,8 @@ use exemu_cpu::{Bits, Interpreter, GS_BASE};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
 
+mod support;
+
 const CODE: u64 = 0x0000_0000_0040_0000;
 const STACK_TOP: u64 = 0x0000_0010_0000_1000;
 const SCRATCH: u64 = 0x0000_0000_5000_0000;
@@ -65,13 +67,14 @@ fn setup(sandbox: &std::path::Path) -> (WinOs, VirtualMemory) {
     mem.map(Region::new("stack", STACK_TOP - 0x2000, 0x2000, Perm::RW)).unwrap();
     mem.map(Region::new("scratch", SCRATCH, 0x1000, Perm::RW)).unwrap();
     mem.map(Region::new("teb", GS_BASE, TEB_SIZE, Perm::RW)).unwrap();
-    let os = WinOs::new(WinConfig {
+    let mut os = WinOs::new(WinConfig {
         is_64bit: true,
         echo: false,
         teb_base: GS_BASE,
         sandbox: sandbox.to_string_lossy().into_owned(),
         ..WinConfig::default()
     });
+    os.set_image_loader(Box::new(support::LoaderImages));
     (os, mem)
 }
 

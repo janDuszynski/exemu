@@ -97,7 +97,7 @@ impl WinOs {
         let is_image = alloc_attrs & SEC_IMAGE != 0;
 
         let image = if is_image && !data.is_empty() {
-            exemu_loader::parse(&data).ok().map(|pe| SectionImage {
+            self.images.parse(&data).ok().map(|pe| SectionImage {
                 image_base: pe.image_base,
                 size_of_image: pe.size_of_image as u64,
                 entry_rva: pe.entry_rva,

@@ -210,6 +210,7 @@ pub struct WinOs {
     children: Vec<process::ChildProcess>,
     next_pid: u32,
     spawner: Box<dyn exemu_core::ProcessSpawner>,
+    images: Box<dyn exemu_core::ImageLoader>,
     spawn_depth: u32,
     child_failure: Option<String>,
     children_created: u32,
@@ -320,6 +321,7 @@ impl WinOs {
             children: Vec::new(),
             next_pid: FIRST_CHILD_PROCESS_ID,
             spawner: Box::new(exemu_core::NoSpawner),
+            images: Box::new(exemu_core::NoImageLoader),
             spawn_depth: 0,
             child_failure: None,
             children_created: 0,
@@ -586,7 +588,7 @@ impl WinOs {
     }
 
     pub fn resolve_import(&mut self, dll: &str, symbol: &ImportSymbol) -> u64 {
-        let dll_cow: std::borrow::Cow<str> = match exemu_loader::resolve_api_set(dll) {
+        let dll_cow: std::borrow::Cow<str> = match self.images.api_set_host(dll) {
             Some(host) => std::borrow::Cow::Borrowed(host),
             None => std::borrow::Cow::Borrowed(dll),
         };

@@ -104,6 +104,10 @@ pub struct CpuState {
 pub const DEFAULT_GS_BASE: u64 = 0x0000_7FFF_0000_0000;
 pub const DEFAULT_FS_BASE: u64 = 0x7EFD_0000;
 
+pub const SEL_CS64: u16 = 0x33;
+pub const SEL_CS32: u16 = 0x23;
+pub const SEL_DATA: u16 = 0x2b;
+
 impl Default for CpuState {
     fn default() -> Self {
         Self::new()

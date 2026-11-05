@@ -26,6 +26,30 @@ written from public NT/PE specs and Wine's published architecture docs.
 Tests grew 199 → 1059, clippy clean at `-D warnings`; 7-Zip still installs
 end-to-end on the default path.
 
+### `exemu-os` depends on `exemu-core` alone, and `exemu-app` is split by concern
+- **The `os → cpu` edge is gone.** Its only use was the 32-bit TEB base, which
+  was already `exemu_core::cpu::DEFAULT_FS_BASE`. The segment selectors
+  (`0x33`, `0x23`, `0x2b`), defined once in `cpu` and twice more in `os`, now
+  live once in `exemu_core::cpu`; `exemu_os::wow64::SEL_*` are `u32` views of
+  them for the 32-bit `CONTEXT`.
+- **The `os → loader` edge is gone.** Runtime PE loads (`LoadLibrary` plugins,
+  the Wine core, `NtCreateSection(SEC_IMAGE)`) and api-set and forwarder
+  resolution go through a new `exemu_core::ImageLoader` seam.
+  `exemu-app` injects `image_loader::PeImageLoader`, which delegates to
+  `exemu-loader`. A `WinOs` nobody injects gets `NoImageLoader` and loads no
+  guest DLL at all. The WoW64 bring-up mapper (`Wow64Image`, `map_image`,
+  `image_view`, `bind_imports`) moved from `exemu_os::wow64` to
+  `exemu_app::wow64_image`, the only crate that called it.
+- **`crates/app/src/lib.rs` went from 1,606 lines to 29.** It is now the crate
+  root: `config.rs` (run config and results), `kuser.rs`
+  (`KUSER_SHARED_DATA`), `cmdline.rs`, and `process/` with `load.rs` (bring-up),
+  `run.rs` (the run loop), `debug.rs` (debugger serving), `exception.rs`
+  (guest exception delivery) and `fault.rs` (fault reports). Every public path
+  is unchanged.
+- No behavior change: tests 1086 → 1088 (two new ones pin the adapter's
+  forwarder and api-set paths, which no corpus pin can see), clippy clean, and
+  all 11 corpus pins identical to the instruction.
+
 ### The file dialog runs: `FileOpenDlgProc95` receives its first message (W6.2)
 - **exemu's GDI handle table was the icon bug.** It held 128 slots, of which
   `0x20..=0x37` are the stock objects, so a guest had **72 GDI handles for its
