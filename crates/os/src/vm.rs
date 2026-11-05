@@ -405,7 +405,11 @@ impl WinOs {
             _ => return Ok(None),
         };
         let new_perm = perm_from_protect(new_protect).ok_or(STATUS_INVALID_PAGE_PROTECTION)?;
-        let end = align_up(addr.saturating_add(size.max(1)), PAGE);
+        let end = addr
+            .checked_add(size.max(1))
+            .and_then(|e| e.checked_add(PAGE - 1))
+            .ok_or(STATUS_INVALID_PARAMETER)?
+            & !(PAGE - 1);
         let mut at = start;
         while at < end {
             let Some((rb, rsize, perm)) = mem.next_region(at) else { break };
@@ -532,6 +536,19 @@ mod tests {
 
         let (status, _) = protect_syscall(&mut os, &mut mem, 0x40_3000, 0x1000, 0x1234);
         assert_eq!(status, STATUS_INVALID_PAGE_PROTECTION);
+    }
+
+    #[test]
+    fn a_protect_range_past_the_top_of_memory_is_refused() {
+        let mut mem = VirtualMemory::new();
+        mem.map_fixed(0x9_0000, 0x1000, Perm::RW, "scratch").unwrap();
+        mem.map_fixed(0x40_3000, 0x4000, Perm::READ, ".rsrc").unwrap();
+        let mut os = WinOs::new(WinConfig { is_64bit: true, echo: false, ..WinConfig::default() });
+        for size in [u64::MAX, u64::MAX - 0x40_3000] {
+            let (status, old) = protect_syscall(&mut os, &mut mem, 0x40_3000, size, 0x04);
+            assert_eq!((status, old), (STATUS_INVALID_PARAMETER, 0xA5A5_A5A5), "size {size:#x}");
+        }
+        assert_eq!(mem.next_region(0x40_3000).map(|(_, _, p)| p), Some(Perm::READ));
     }
 
     #[test]
