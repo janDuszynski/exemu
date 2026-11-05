@@ -345,7 +345,7 @@ fn report_jit(report: &Option<exemu_app::JitReport>, steps: u64) {
 fn print_opcode_profile() {
     #[cfg(feature = "opcode-profile")]
     {
-        eprintln!("\n{}", exemu_cpu::profile::report(60));
+        eprintln!("\n{}", exemu_app::opcode_profile_report(60));
     }
     #[cfg(not(feature = "opcode-profile"))]
     {
@@ -459,7 +459,8 @@ fn report_sandbox(sandbox: &std::path::Path) {
 fn cmd_info(rest: &[String]) -> Result<u8, String> {
     let path = rest.first().ok_or("info: missing <file.exe>")?;
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let image = exemu_loader::parse(&bytes).map_err(|e| e.to_string())?;
+    let info = exemu_app::inspect(&bytes).map_err(|e| e.to_string())?;
+    let image = &info.image;
 
     println!("PE image: {path}");
     println!("  format       : {}", if image.is_64bit { "PE32+ (x86-64)" } else { "PE32 (x86-32)" });
@@ -518,56 +519,27 @@ fn cmd_info(rest: &[String]) -> Result<u8, String> {
         }
     }
 
-    let res_entries = exemu_loader::list_resources(&bytes);
-    if !res_entries.is_empty() {
-        use std::collections::BTreeMap;
-        let mut by_type: BTreeMap<u32, (Option<String>, usize)> = BTreeMap::new();
-        for e in &res_entries {
-            let entry = by_type.entry(e.type_id).or_insert_with(|| (e.type_name.clone(), 0));
-            entry.1 += 1;
-        }
-        println!("\n  resources ({} entries):", res_entries.len());
-        for (tid, (tname, count)) in &by_type {
-            let label = if let Some(n) = tname {
-                format!("named:{n}")
-            } else {
-                exemu_loader::rt_name(*tid)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("type#{tid}"))
-            };
-            println!("    {label:<20} {count} entrie(s)");
+    if info.resource_entries > 0 {
+        println!("\n  resources ({} entries):", info.resource_entries);
+        for t in &info.resource_types {
+            println!("    {:<20} {} entrie(s)", t.label, t.count);
         }
 
-        if let Some(info) = exemu_loader::find_version_info(&bytes) {
-            let (ma, mi, pa, bu) = info.file_version();
+        if let Some((ma, mi, pa, bu)) = info.file_version {
             println!("  version              : {ma}.{mi}.{pa}.{bu}");
         }
+    }
 
-        let dialogs = exemu_loader::parse_dialogs(&bytes);
-        if !dialogs.is_empty() {
-            let mut ids: Vec<_> = dialogs.keys().copied().collect();
-            ids.sort();
-            println!("\n  dialogs ({}):", dialogs.len());
-            for id in ids {
-                let d = &dialogs[&id];
-                println!("    #{id} \"{}\" ({}x{} du, {} controls)", d.title, d.cx, d.cy, d.controls.len());
-                for c in &d.controls {
-                    println!("      id={:<5} {:?} {:?}", c.id, c.kind, c.text);
-                }
-            }
-        }
-    } else {
-        let dialogs = exemu_loader::parse_dialogs(&bytes);
-        if !dialogs.is_empty() {
-            let mut ids: Vec<_> = dialogs.keys().copied().collect();
-            ids.sort();
-            println!("\n  dialogs ({}):", dialogs.len());
-            for id in ids {
-                let d = &dialogs[&id];
-                println!("    #{id} \"{}\" ({}x{} du, {} controls)", d.title, d.cx, d.cy, d.controls.len());
-                for c in &d.controls {
-                    println!("      id={:<5} {:?} {:?}", c.id, c.kind, c.text);
-                }
+    let dialogs = &info.dialogs;
+    if !dialogs.is_empty() {
+        let mut ids: Vec<_> = dialogs.keys().copied().collect();
+        ids.sort();
+        println!("\n  dialogs ({}):", dialogs.len());
+        for id in ids {
+            let d = &dialogs[&id];
+            println!("    #{id} \"{}\" ({}x{} du, {} controls)", d.title, d.cx, d.cy, d.controls.len());
+            for c in &d.controls {
+                println!("      id={:<5} {:?} {:?}", c.id, c.kind, c.text);
             }
         }
     }

@@ -10,8 +10,12 @@ use crate::wow64_boot;
 mod debug;
 mod exception;
 mod fault;
+mod layout;
 mod load;
 mod run;
+mod sandbox;
+mod wine;
+mod wow64;
 
 pub struct Process {
     mem: VirtualMemory,

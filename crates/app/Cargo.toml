@@ -17,6 +17,9 @@ exemu-jit = { workspace = true }
 exemu-os = { workspace = true }
 exemu-gui = { workspace = true }
 
+[features]
+opcode-profile = ["exemu-cpu/profile"]
+
 [dev-dependencies]
 # Decode the OffscreenPresenter's first-frame PNG for the golden-image gate (W4.10).
 png = "0.17"

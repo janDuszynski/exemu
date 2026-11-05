@@ -3,7 +3,6 @@ use exemu_cpu::{Bits, Interpreter};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
 
-mod support;
 
 fn put_u16(f: &mut [u8], at: usize, v: u16) {
     f[at..at + 2].copy_from_slice(&v.to_le_bytes());
@@ -248,7 +247,7 @@ fn setup_os() -> (WinOs, VirtualMemory, u64, tempdir::Guard, std::path::PathBuf)
         ..WinConfig::default()
     };
     let mut os = WinOs::new(cfg);
-    os.set_image_loader(Box::new(support::LoaderImages));
+    os.set_image_loader(Box::new(exemu_loader::PeImageLoader));
     os.init_ldr(&mut mem).unwrap();
     (os, mem, peb_addr, sandbox, sandbox_root)
 }

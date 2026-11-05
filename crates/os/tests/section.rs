@@ -5,7 +5,6 @@ use exemu_cpu::{Bits, Interpreter, GS_BASE};
 use exemu_memory::VirtualMemory;
 use exemu_os::{WinConfig, WinOs};
 
-mod support;
 
 const CODE: u64 = 0x0000_0000_0040_0000;
 const STACK_TOP: u64 = 0x0000_0010_0000_1000;
@@ -74,7 +73,7 @@ fn setup(sandbox: &std::path::Path) -> (WinOs, VirtualMemory) {
         sandbox: sandbox.to_string_lossy().into_owned(),
         ..WinConfig::default()
     });
-    os.set_image_loader(Box::new(support::LoaderImages));
+    os.set_image_loader(Box::new(exemu_loader::PeImageLoader));
     (os, mem)
 }
 

@@ -196,9 +196,7 @@ dependencies = [
  "exemu-app",
  "exemu-audio",
  "exemu-core",
- "exemu-cpu",
  "exemu-gui",
- "exemu-loader",
 ]
 
 [[package]]
