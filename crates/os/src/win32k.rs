@@ -1,5 +1,7 @@
 use exemu_core::{CpuState, Memory, Perm, Result, WindowParams};
 
+mod draw;
+
 use crate::api::read_wstr;
 use crate::wndclass::{ClassClient, ClientMenuName, WndClassEx};
 use crate::WinOs;
@@ -266,15 +268,12 @@ const DC_ATTR_ORG_X: u64 = 0x48;
 const DC_ATTR_ORG_Y: u64 = 0x4C;
 const DC_ATTR_BK_COLOR: u64 = 0x0C;
 const DC_ATTR_TEXT_COLOR: u64 = 0x18;
+const DEFAULT_BK_COLOR: u32 = 0x00FF_FFFF;
 
 mod dc_dword {
     pub const BK_COLOR: u64 = 0x64;
     pub const TEXT_COLOR: u64 = 0x66;
 }
-
-const PATCOPY: u32 = 0x00F0_0021;
-const BLACKNESS: u32 = 0x0000_0042;
-const WHITENESS: u32 = 0x00FF_0062;
 
 const GDI_PEB_TABLE_PTR_OFF: u64 = 0xF8;
 const GDI_PEB32_TABLE_PTR_OFF: u64 = 0x94;
@@ -752,6 +751,7 @@ pub(crate) struct Win32kState {
     capture: u32,
     focus: u32,
     active: u32,
+    draw: draw::DrawState,
 }
 
 impl Win32kState {
@@ -1002,7 +1002,6 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_GDI_CREATE_PEN, nt_gdi_create_pen);
     os.set_win32k_handler(NT_GDI_SELECT_BRUSH, nt_gdi_select_brush);
     os.set_win32k_handler(NT_GDI_SELECT_PEN, nt_gdi_select_pen);
-    os.set_win32k_handler(NT_GDI_PAT_BLT, nt_gdi_pat_blt);
     os.set_win32k_handler(NT_GDI_GET_AND_SET_DC_DWORD, nt_gdi_get_and_set_dc_dword);
     os.set_win32k_handler(NT_GDI_SELECT_FONT, nt_gdi_select_font);
     os.set_win32k_handler(NT_GDI_CREATE_RECT_RGN, nt_gdi_create_rect_rgn);
@@ -1029,6 +1028,7 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_GET_ICON_SIZE, nt_user_get_icon_size);
     os.set_win32k_handler(NT_USER_FIND_EXISTING_CURSOR_ICON, nt_user_find_existing_cursor_icon);
     os.set_win32k_handler(NT_USER_DESTROY_CURSOR, nt_user_destroy_cursor);
+    draw::register(os);
 }
 
 fn alloc_handle(os: &mut WinOs) -> u32 {
@@ -2243,6 +2243,7 @@ fn alloc_dc(os: &mut WinOs, mem: &mut dyn Memory, hwnd: u32) -> Result<u32> {
     let clip = os.win32k_state.window_visible_rect(hwnd);
     mem.write_u32(obj + DC_ATTR_ORG_X, org.0 as u32)?;
     mem.write_u32(obj + DC_ATTR_ORG_Y, org.1 as u32)?;
+    mem.write_u32(obj + DC_ATTR_BK_COLOR, DEFAULT_BK_COLOR)?;
     os.win32k_state.dcs.push((hdc, Dc { hwnd, brush: 0, org, clip, bitmap: 0, font: STOCK_SYSTEM_FONT }));
     Ok(hdc)
 }
@@ -3141,7 +3142,7 @@ fn nt_gdi_rectangle(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) ->
 }
 
 pub mod abi {
-    pub const SYSCALLS: [(&str, u32); 38] = [
+    pub const SYSCALLS: [(&str, u32); 41] = [
         ("NtUserBuildHwndList", super::NT_USER_BUILD_HWND_LIST),
         ("NtUserWindowFromPoint", super::NT_USER_WINDOW_FROM_POINT),
         ("NtUserChildWindowFromPointEx", super::NT_USER_CHILD_WINDOW_FROM_POINT_EX),
@@ -3180,6 +3181,9 @@ pub mod abi {
         ("NtGdiCreateSolidBrush", super::NT_GDI_CREATE_SOLID_BRUSH),
         ("NtGdiCreatePen", super::NT_GDI_CREATE_PEN),
         ("NtGdiGetAndSetDCDword", super::NT_GDI_GET_AND_SET_DC_DWORD),
+        ("NtGdiBitBlt", super::draw::NT_GDI_BIT_BLT),
+        ("NtGdiStretchBlt", super::draw::NT_GDI_STRETCH_BLT),
+        ("NtGdiGetPixel", super::draw::NT_GDI_GET_PIXEL),
     ];
 
     pub const CALL_HWND: [(&str, u64); 7] = [
@@ -3462,6 +3466,7 @@ fn alloc_memory_dc(os: &mut WinOs, mem: &mut dyn Memory) -> Result<u32> {
     };
     mem.write_u32(obj + DC_ATTR_ORG_X, 0)?;
     mem.write_u32(obj + DC_ATTR_ORG_Y, 0)?;
+    mem.write_u32(obj + DC_ATTR_BK_COLOR, DEFAULT_BK_COLOR)?;
     let dc = Dc {
         hwnd: 0,
         brush: 0,
@@ -3822,6 +3827,7 @@ fn free_gdi_object(os: &mut WinOs, mem: &mut dyn Memory, handle: u32) -> Result<
     os.win32k_state.brushes.retain(|(h, _)| *h != handle);
     os.win32k_state.dcs.retain(|(h, _)| *h != handle);
     os.win32k_state.bitmaps.retain(|(h, _)| *h != handle);
+    os.win32k_state.draw.forget(handle);
     os.win32k_state.fonts.retain(|(s, _)| *s != slot as u32);
     Ok(())
 }
@@ -3885,31 +3891,6 @@ fn gdi_client_object(os: &WinOs, mem: &dyn Memory, handle: u32) -> Option<u64> {
         return None;
     }
     mem.read_u64(entry + GDI_ENTRY_OBJECT_OFF).ok()
-}
-
-fn nt_gdi_pat_blt(os: &mut WinOs, cpu: &mut CpuState, mem: &mut dyn Memory) -> Result<u32> {
-    let hdc = os.syscall_arg(cpu, mem, 0)? as u32;
-    let x = os.syscall_arg(cpu, mem, 1)? as i32;
-    let y = os.syscall_arg(cpu, mem, 2)? as i32;
-    let cx = os.syscall_arg(cpu, mem, 3)? as i32;
-    let cy = os.syscall_arg(cpu, mem, 4)? as i32;
-    let rop = os.syscall_arg(cpu, mem, 5)? as u32;
-
-    let brush = os.win32k_state.dc(hdc).map(|d| d.brush).unwrap_or(0);
-    let bgra = match rop {
-        BLACKNESS => 0xFF00_0000,
-        WHITENESS => 0xFFFF_FFFF,
-        PATCOPY => match os.win32k_state.brushes.iter().find(|(h, _)| *h == brush) {
-            Some((_, color)) => colorref_to_bgra(*color),
-            None => return Ok(1),
-        },
-        _ => return Ok(0),
-    };
-    let Some(target) = dc_surface(os, hdc) else {
-        return Ok(0);
-    };
-    fill_rect(mem, &target, x, y, cx, cy, bgra)?;
-    Ok(1)
 }
 
 fn fill_rect(
