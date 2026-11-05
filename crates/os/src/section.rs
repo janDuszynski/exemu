@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, SeekFrom};
 
-use exemu_core::{CpuState, Memory, Perm, Result};
+use exemu_core::{checked_align_up, CpuState, Memory, Perm, Result};
 
 use crate::vm::{VmAlloc, MEM_IMAGE, MEM_MAPPED};
 use crate::WinOs;
@@ -26,11 +26,6 @@ pub(crate) const SSDT_NT_CREATE_SECTION: u32 = 0x4a;
 pub(crate) const SSDT_NT_MAP_VIEW_OF_SECTION: u32 = 0x28;
 pub(crate) const SSDT_NT_UNMAP_VIEW_OF_SECTION: u32 = 0x2a;
 pub(crate) const SSDT_NT_QUERY_SECTION: u32 = 0x51;
-
-#[inline]
-fn align_up(v: u64, a: u64) -> u64 {
-    (v + a - 1) & !(a - 1)
-}
 
 pub(crate) struct SectionImage {
     pub image_base: u64,
@@ -122,7 +117,10 @@ impl WinOs {
 
         let requested = if max_size_ptr != 0 { mem.read_u64(max_size_ptr)? } else { 0 };
         let image_size = image.as_ref().map(|i| i.size_of_image).unwrap_or(0);
-        let size = align_up(requested.max(image_size).max(data.len() as u64).max(1), PAGE);
+        let Some(size) = checked_align_up(requested.max(image_size).max(data.len() as u64).max(1), PAGE)
+        else {
+            return Ok(STATUS_NO_MEMORY);
+        };
 
         let mtype = if is_image { MEM_IMAGE } else { MEM_MAPPED };
         let handle = self.next_handle;
@@ -219,10 +217,11 @@ impl WinOs {
 
         let offset = if offset_ptr != 0 { mem.read_u64(offset_ptr)? } else { 0 };
         let want = if size_ptr != 0 { mem.read_u64(size_ptr)? } else { 0 };
-        let view_size = if want != 0 {
-            align_up(want, PAGE)
-        } else {
-            align_up(sec_size.saturating_sub(offset).max(1), PAGE)
+        let Some(view_size) = checked_align_up(
+            if want != 0 { want } else { sec_size.saturating_sub(offset).max(1) },
+            PAGE,
+        ) else {
+            return Ok(STATUS_NO_MEMORY);
         };
 
         let req_base = mem.read_u64(base_ptr)?;
@@ -271,7 +270,9 @@ impl WinOs {
         let section = &self.sections[&section_handle];
         let protect = section.protect;
         let img = section.image.as_ref().expect("image view requires parsed PE");
-        let view_size = align_up(img.size_of_image.max(PAGE), PAGE);
+        let Some(view_size) = checked_align_up(img.size_of_image.max(PAGE), PAGE) else {
+            return Ok(STATUS_NO_MEMORY);
+        };
         let headers = img.headers.clone();
         let dll_name = img.dll_name.clone();
         let sections: Vec<(u32, u32, Vec<u8>)> = img
