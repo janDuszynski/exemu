@@ -208,21 +208,22 @@ impl MenuState {
     }
 
     pub(super) fn find(&self, handle: u32, id: u32, flags: u32) -> Option<Slot> {
-        self.find_at(handle, id, flags, 0)
+        self.find_at(handle, id, flags, 0, &mut Vec::new())
     }
 
-    fn find_at(&self, handle: u32, id: u32, flags: u32, depth: usize) -> Option<Slot> {
+    fn find_at(&self, handle: u32, id: u32, flags: u32, depth: usize, searched: &mut Vec<u32>) -> Option<Slot> {
         let menu = self.menu(handle)?;
         if flags & mf::BYPOSITION != 0 {
             let pos = usize::try_from(id).ok()?;
             return (pos < menu.items.len()).then_some((handle, pos));
         }
-        if depth >= MENU_DEPTH_MAX {
+        if depth >= MENU_DEPTH_MAX || searched.contains(&handle) {
             return None;
         }
+        searched.push(handle);
         for (pos, item) in menu.items.iter().enumerate() {
             if item.is_popup() {
-                if let Some(found) = self.find_at(item.submenu, id, flags, depth + 1) {
+                if let Some(found) = self.find_at(item.submenu, id, flags, depth + 1, searched) {
                     return Some(found);
                 }
             } else if item.id == id {
@@ -419,16 +420,24 @@ impl MenuState {
     }
 
     fn destroy(&mut self, handle: u32) -> bool {
-        let Some(index) = self.menus.iter().position(|(h, _)| *h == handle) else { return false };
-        let (_, menu) = self.menus.remove(index);
-        for item in menu.items.iter().filter(|i| i.is_popup()) {
-            self.destroy(item.submenu);
+        if !self.contains(handle) {
+            return false;
+        }
+        let mut pending = vec![handle];
+        while let Some(next) = pending.pop() {
+            let Some(index) = self.menus.iter().position(|(h, _)| *h == next) else { continue };
+            let (_, menu) = self.menus.remove(index);
+            pending.extend(menu.items.iter().filter(|i| i.is_popup()).map(|i| i.submenu));
         }
         true
     }
 
-    fn set_info(&mut self, handle: u32, mask: u32, values: &MenuInfo, depth: usize) {
+    fn set_info(&mut self, handle: u32, mask: u32, values: &MenuInfo, depth: usize, applied: &mut Vec<u32>) {
+        if applied.contains(&handle) {
+            return;
+        }
         let Some(menu) = self.menu_mut(handle) else { return };
+        applied.push(handle);
         if mask & mim::MAXHEIGHT != 0 {
             menu.max_height = values.max_height;
         }
@@ -448,7 +457,7 @@ impl MenuState {
             let subs: Vec<u32> =
                 menu.items.iter().filter(|i| i.is_popup()).map(|i| i.submenu).collect();
             for sub in subs {
-                self.set_info(sub, mask, values, depth + 1);
+                self.set_info(sub, mask, values, depth + 1, applied);
             }
         }
     }
@@ -770,7 +779,7 @@ fn set_menu_info(os: &mut WinOs, mem: &mut dyn Memory, handle: u32, at: u64) -> 
     if mask & !mim::SETTABLE != 0 || !os.win32k_state.menus.contains(handle) {
         return Ok(0);
     }
-    os.win32k_state.menus.set_info(handle, mask, &values, 0);
+    os.win32k_state.menus.set_info(handle, mask, &values, 0, &mut Vec::new());
     Ok(1)
 }
 

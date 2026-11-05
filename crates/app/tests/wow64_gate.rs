@@ -460,3 +460,27 @@ fn a_32bit_guest_wndproc_gets_its_creation_messages() {
         "every stdcall frame the kernel built was popped by the callee it was handed to",
     );
 }
+
+#[test]
+fn a_32bit_guest_loads_crypt32_through_the_wine_loader() {
+    if !have_wow64_set() {
+        eprintln!("SKIP: the pinned Wine WoW64 set is not present (git-ignored)");
+        return;
+    }
+    let exe = wow64_sample::build_load_crypt32();
+    let mut cfg = wine_loader_config("crypt32");
+    cfg.max_steps = 120_000_000;
+    let mut proc = Process::load(&exe, &mut cfg).expect("WoW64 boot");
+    let r = proc.run_borrowed().expect("the WoW64 guest ran");
+    let status = proc.peek_u32(wow64_sample::data_va(wow64_sample::data::STATUS)).unwrap();
+    let handle = proc.peek_u32(wow64_sample::data_va(wow64_sample::data::BASE)).unwrap();
+    eprintln!("32-bit LdrLoadDll(crypt32.dll): exit {} status {status:#x} handle {handle:#x} after {} steps", r.exit_code, r.steps);
+    assert_eq!(
+        r.exit_code,
+        wow64_sample::WOW64_LOAD_OK_EXIT,
+        "LdrLoadDll status {status:#x}: a 32-bit crypt32 whose __wine_init_unix_call is refused fails DllMain, \
+         and the load comes back STATUS_DLL_INIT_FAILED"
+    );
+    assert_eq!(status, 0, "STATUS_SUCCESS");
+    assert_ne!(handle, 0, "the loader wrote a module handle");
+}
