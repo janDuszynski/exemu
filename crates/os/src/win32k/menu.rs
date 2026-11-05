@@ -807,4 +807,14 @@ fn read_back_menu_info(os: &WinOs, mem: &mut dyn Memory, handle: u32, at: u64) -
 }
 
 #[cfg(test)]
+pub(super) fn test_menu_with_command(os: &mut WinOs, id: u32, state: u32) -> u32 {
+    let handle = alloc_handle(os);
+    let menus = &mut os.win32k_state.menus;
+    menus.create(handle);
+    let info = ItemInfo { mask: miim::ID | miim::STATE, id, state, ..ItemInfo::default() };
+    menus.insert_item(handle, NO_ITEM, mf::BYPOSITION, &info);
+    handle
+}
+
+#[cfg(test)]
 mod tests;

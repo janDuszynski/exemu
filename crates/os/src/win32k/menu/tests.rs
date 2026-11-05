@@ -1,60 +1,32 @@
 use super::*;
-use crate::syscall::SyscallHandler;
-use exemu_core::{Perm, Reg};
-use exemu_memory::VirtualMemory;
+use crate::win32k::rig::{Rig, SCRATCH};
 
-const SCRATCH: u64 = 0x2_0000;
 const INFO: u64 = SCRATCH;
 const TEXT: u64 = SCRATCH + 0x200;
 const COUNTED: u64 = SCRATCH + 0x100;
 const COUNTED_TEXT: u64 = SCRATCH + 0x800;
 const OUT: u64 = SCRATCH + 0x400;
-const STACK: u64 = SCRATCH + 0x3000;
-const REGISTER_ARGS: usize = 4;
-const STACK_ARGS_OFFSET: u64 = 0x28;
 
-struct Rig {
-    os: WinOs,
-    mem: VirtualMemory,
+trait MenuRig {
+    fn menu(&mut self) -> u32;
+    fn popup(&mut self) -> u32;
+    fn put_info(&mut self, mask: u32, kind: u32, state: u32, id: u32, sub: u32, text: Option<&str>);
+    fn thunked(&mut self, menu: u32, pos: u32, flags: u32, which: u64) -> u32;
+    fn append(&mut self, menu: u32, id: u32, state: u32, text: &str) -> u32;
+    fn append_popup(&mut self, menu: u32, sub: u32, text: &str) -> u32;
+    fn check(&mut self, menu: u32, id: u32, flags: u32) -> u32;
+    fn enable(&mut self, menu: u32, id: u32, flags: u32) -> u32;
+    fn state(&mut self, menu: u32, id: u32, flags: u32) -> u32;
+    fn items(&self, menu: u32) -> Vec<Item>;
 }
 
-impl Rig {
-    fn new() -> Rig {
-        let mut mem = VirtualMemory::new();
-        mem.map_fixed(SCRATCH, 0x4000, Perm::RW, "scratch").unwrap();
-        let mut os = WinOs::new(crate::WinConfig { is_64bit: true, ..Default::default() });
-        os.set_syscall_guest_rsp_for_test(STACK);
-        Rig { os, mem }
-    }
-
-    fn call(&mut self, handler: SyscallHandler, args: &[u64]) -> u32 {
-        let mut cpu = CpuState::default();
-        cpu.set_rsp(STACK);
-        let regs = [Reg::R10, Reg::Rdx, Reg::R8, Reg::R9];
-        for (reg, value) in regs.iter().zip(args) {
-            cpu.set_reg(*reg, *value);
-        }
-        for (i, value) in args.iter().enumerate().skip(REGISTER_ARGS) {
-            let at = STACK + STACK_ARGS_OFFSET + (i - REGISTER_ARGS) as u64 * 8;
-            self.mem.write_u64(at, *value).unwrap();
-        }
-        handler(&mut self.os, &mut cpu, &mut self.mem).unwrap()
-    }
-
+impl MenuRig for Rig {
     fn menu(&mut self) -> u32 {
         self.call(nt_user_create_menu, &[])
     }
 
     fn popup(&mut self) -> u32 {
         self.call(nt_user_create_popup_menu, &[])
-    }
-
-    fn wide(&mut self, at: u64, text: &str) {
-        let mut bytes = Vec::new();
-        for u in text.encode_utf16().chain([0]) {
-            bytes.extend_from_slice(&u.to_le_bytes());
-        }
-        self.mem.write(at, &bytes).unwrap();
     }
 
     fn put_info(&mut self, mask: u32, kind: u32, state: u32, id: u32, sub: u32, text: Option<&str>) {
@@ -88,34 +60,6 @@ impl Rig {
         let mask = miim::SUBMENU | miim::STRING | miim::FTYPE;
         self.put_info(mask, 0, 0, 0, sub, Some(text));
         self.thunked(menu, NO_ITEM, mf::BYPOSITION, method::INSERT_ITEM)
-    }
-
-    fn window(&mut self, style: u32) -> u32 {
-        let hwnd = alloc_handle(&mut self.os);
-        self.os.win32k_state.windows.push((
-            hwnd,
-            super::super::Window {
-                class_atom: 0,
-                class_name: "C".into(),
-                title: String::new(),
-                rect: [0, 0, 100, 100],
-                style,
-                ex_style: 0,
-                parent: 0,
-                shown: true,
-                wndproc: 0,
-                needs_paint: false,
-                surface: None,
-                extra: vec![0u8; 16],
-                user_data: 0,
-                id: 0,
-                instance: 0,
-                props: Vec::new(),
-                dialog_info: 0,
-                dialog_cancelled: false,
-            },
-        ));
-        hwnd
     }
 
     fn check(&mut self, menu: u32, id: u32, flags: u32) -> u32 {

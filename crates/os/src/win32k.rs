@@ -4,7 +4,11 @@ use crate::api::read_wstr;
 use crate::wndclass::{ClassClient, ClientMenuName, WndClassEx};
 use crate::WinOs;
 
+mod accel;
+mod keystate;
 mod menu;
+#[cfg(test)]
+mod rig;
 
 const STATUS_SUCCESS: u32 = 0x0000_0000;
 
@@ -755,6 +759,8 @@ pub(crate) struct Win32kState {
     focus: u32,
     active: u32,
     menus: menu::MenuState,
+    accels: accel::AccelState,
+    keys: keystate::KeyState,
 }
 
 impl Win32kState {
@@ -1033,6 +1039,8 @@ pub(crate) fn register(os: &mut WinOs) {
     os.set_win32k_handler(NT_USER_FIND_EXISTING_CURSOR_ICON, nt_user_find_existing_cursor_icon);
     os.set_win32k_handler(NT_USER_DESTROY_CURSOR, nt_user_destroy_cursor);
     menu::register(os);
+    accel::register(os);
+    keystate::register(os);
 }
 
 fn alloc_handle(os: &mut WinOs) -> u32 {
@@ -2531,6 +2539,7 @@ fn route_raw_input(
     lp: u64,
     ev: exemu_core::InputEvent,
 ) -> Result<bool> {
+    os.win32k_state.keys.note(ev);
     let Some((msg, wparam)) = input_message(ev) else { return Ok(false) };
     let Some((x, y)) = input_point(ev) else {
         let target = keyboard_target(os, ev.hwnd());
