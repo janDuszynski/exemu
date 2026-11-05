@@ -29,6 +29,22 @@ pub const NEW_ID: u32 = 100;
 pub const OPEN_ID: u32 = 101;
 pub const MISSING_ID: u32 = 999;
 
+pub const MAPVK_VK_TO_VSC: u32 = 0;
+pub const MAPVK_VSC_TO_VK: u32 = 1;
+pub const MAPVK_VK_TO_CHAR: u32 = 2;
+pub const MAPVK_VSC_TO_VK_EX: u32 = 3;
+pub const MAPVK_VK_TO_VSC_EX: u32 = 4;
+pub const VK_A: u32 = 0x41;
+pub const VK_LEFT: u32 = 0x25;
+pub const SCAN_A: u32 = 0x1E;
+pub const SCAN_F5: u32 = 0x3F;
+pub const SCAN_CTRL: u32 = 0x1D;
+pub const SCAN_DELETE: u32 = 0x53;
+pub const SCAN_RIGHT_CTRL_E0: u32 = 0xE01D;
+pub const KEY_NAME_SCAN_SHIFT: u32 = 16;
+pub const KEY_NAME_EXTENDED: u32 = 1 << 24;
+pub const KEY_NAME_CAPACITY: u32 = 32;
+
 pub mod data {
     pub const COMMANDS: u32 = 0x00;
     pub const LAST_WPARAM: u32 = 0x04;
@@ -56,6 +72,16 @@ pub mod data {
     pub const MSG_HIT: u32 = 0x80;
     pub const MSG_MISS: u32 = 0xc0;
     pub const WNDCLASS: u32 = 0x100;
+    pub const KEY_NAME_CTRL: u32 = 0x140;
+    pub const KEY_NAME_DELETE: u32 = 0x180;
+    pub const KEY_NAME_CTRL_LEN: u32 = 0x1c0;
+    pub const KEY_NAME_DELETE_LEN: u32 = 0x1c4;
+    pub const KEY_LAYOUT: u32 = 0x1c8;
+    pub const MAP_F5_TO_VSC: u32 = 0x1cc;
+    pub const MAP_VSC_TO_A: u32 = 0x1d0;
+    pub const MAP_A_TO_CHAR: u32 = 0x1d4;
+    pub const MAP_RCTRL_EX: u32 = 0x1d8;
+    pub const MAP_LEFT_TO_VSC_EX: u32 = 0x1dc;
     pub const LEN: u32 = 0x200;
 }
 
@@ -95,6 +121,9 @@ const IMPORTS: [(&str, &[&str]); 2] = [
             "CreateAcceleratorTableW",
             "TranslateAcceleratorW",
             "DestroyAcceleratorTable",
+            "MapVirtualKeyW",
+            "GetKeyNameTextW",
+            "GetKeyboardLayout",
         ],
     ),
     ("ntdll.dll", &["NtTerminateProcess"]),
@@ -115,7 +144,10 @@ const I_DELETE_MENU: u32 = 11;
 const I_CREATE_ACCEL: u32 = 12;
 const I_TRANSLATE_ACCEL: u32 = 13;
 const I_DESTROY_ACCEL: u32 = 14;
-const I_TERMINATE: u32 = 15;
+const I_MAP_VIRTUAL_KEY: u32 = 15;
+const I_GET_KEY_NAME_TEXT: u32 = 16;
+const I_GET_KEYBOARD_LAYOUT: u32 = 17;
+const I_TERMINATE: u32 = 18;
 
 struct Strings {
     class_va: u32,
@@ -477,6 +509,37 @@ fn build_text(iat: &dyn Fn(u32) -> u32, strings: &Strings) -> Vec<u8> {
     a.store_eax(cell(data::DESTROY_ACCEL));
     translate(&mut a, data::MSG_HIT);
     a.store_eax(cell(data::TRANSLATE_AFTER_DESTROY));
+
+    a.push_imm(0);
+    a.call_iat(iat(I_GET_KEYBOARD_LAYOUT));
+    a.store_eax(cell(data::KEY_LAYOUT));
+
+    let map_key = |a: &mut Asm, code: u32, map_type: u32, out: u32| {
+        a.push_imm(map_type);
+        a.push_imm(code);
+        a.call_iat(iat(I_MAP_VIRTUAL_KEY));
+        a.store_eax(cell(out));
+    };
+    map_key(&mut a, VK_F5, MAPVK_VK_TO_VSC, data::MAP_F5_TO_VSC);
+    map_key(&mut a, SCAN_A, MAPVK_VSC_TO_VK, data::MAP_VSC_TO_A);
+    map_key(&mut a, VK_A, MAPVK_VK_TO_CHAR, data::MAP_A_TO_CHAR);
+    map_key(&mut a, SCAN_RIGHT_CTRL_E0, MAPVK_VSC_TO_VK_EX, data::MAP_RCTRL_EX);
+    map_key(&mut a, VK_LEFT, MAPVK_VK_TO_VSC_EX, data::MAP_LEFT_TO_VSC_EX);
+
+    let key_name = |a: &mut Asm, lparam: u32, buffer: u32, len_out: u32| {
+        a.push_imm(KEY_NAME_CAPACITY);
+        a.push_imm(cell(buffer));
+        a.push_imm(lparam);
+        a.call_iat(iat(I_GET_KEY_NAME_TEXT));
+        a.store_eax(cell(len_out));
+    };
+    key_name(&mut a, SCAN_CTRL << KEY_NAME_SCAN_SHIFT, data::KEY_NAME_CTRL, data::KEY_NAME_CTRL_LEN);
+    key_name(
+        &mut a,
+        (SCAN_DELETE << KEY_NAME_SCAN_SHIFT) | KEY_NAME_EXTENDED,
+        data::KEY_NAME_DELETE,
+        data::KEY_NAME_DELETE_LEN,
+    );
 
     a.exit(iat(I_TERMINATE), MENU_OK_EXIT as u32);
     a.code.push(0xF4);

@@ -7,6 +7,8 @@ const WINE_DLLS32: &str = "../../example_exe/wine-dlls/i386-windows";
 const MAX_STEPS: u64 = 120_000_000;
 const NO_SUCH_ITEM: u32 = u32::MAX;
 const COMMAND_FROM_ACCELERATOR: u32 = 1 << 16;
+const US_ENGLISH_HKL: u32 = 0x0409_0409;
+const VK_RCONTROL: u32 = 0xA3;
 
 fn have_wow64_set() -> bool {
     wow64_boot::Wow64Dirs { dir64: Path::new(WINE_DLLS64), dir32: Path::new(WINE_DLLS32) }.complete()
@@ -73,4 +75,26 @@ fn a_32bit_guest_builds_a_menu_and_runs_an_accelerator_through_wine_user32() {
     assert_eq!(cell(s::data::DESTROY_ACCEL), 1, "DestroyAcceleratorTable released the table");
     assert_eq!(cell(s::data::TRANSLATE_AFTER_DESTROY), 0, "a destroyed table translates nothing");
     assert_eq!(cell(s::data::COMMANDS), 1, "the dead table delivered nothing either");
+
+    assert_eq!(cell(s::data::KEY_LAYOUT), US_ENGLISH_HKL, "GetKeyboardLayout reports the one modelled layout");
+    assert_eq!(cell(s::data::MAP_F5_TO_VSC), s::SCAN_F5, "MapVirtualKeyW(VK_F5, MAPVK_VK_TO_VSC)");
+    assert_eq!(cell(s::data::MAP_VSC_TO_A), s::VK_A, "MapVirtualKeyW(0x1E, MAPVK_VSC_TO_VK) is 'A'");
+    assert_eq!(cell(s::data::MAP_A_TO_CHAR), s::VK_A, "MapVirtualKeyW('A', MAPVK_VK_TO_CHAR)");
+    assert_eq!(cell(s::data::MAP_RCTRL_EX), VK_RCONTROL, "0xE01D with MAPVK_VSC_TO_VK_EX is right control");
+    assert_eq!(cell(s::data::MAP_LEFT_TO_VSC_EX), 0xE04B, "VK_LEFT with MAPVK_VK_TO_VSC_EX carries the E0 prefix");
+    assert_eq!(cell(s::data::KEY_NAME_CTRL_LEN), 4, "GetKeyNameTextW returns the length of \"Ctrl\"");
+    assert_eq!(wide_at(&proc, s::data::KEY_NAME_CTRL, 4), "Ctrl");
+    assert_eq!(cell(s::data::KEY_NAME_DELETE_LEN), 6, "the extended bit selects \"Delete\" over \"Num Del\"");
+    assert_eq!(wide_at(&proc, s::data::KEY_NAME_DELETE, 6), "Delete");
+}
+
+fn wide_at(proc: &Process, off: u32, units: u32) -> String {
+    let at = s::data_va(off);
+    let units: Vec<u16> = (0..units)
+        .map(|i| {
+            let lo = proc.peek_u32(at + u64::from(i) * 2).unwrap();
+            lo as u16
+        })
+        .collect();
+    String::from_utf16(&units).unwrap()
 }
