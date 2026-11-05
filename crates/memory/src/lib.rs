@@ -30,6 +30,14 @@ pub struct VirtualMemory {
 
 const HINT_SLOTS: usize = 8;
 
+#[inline]
+fn access_width(size: u8, verb: &str) -> Result<usize> {
+    match size {
+        1 | 2 | 4 | 8 => Ok(usize::from(size)),
+        _ => Err(EmuError::Unsupported(format!("memory {verb} of {size} bytes"))),
+    }
+}
+
 fn zeroed(size: u64) -> Result<Vec<u8>> {
     let too_large = || EmuError::Unsupported(format!("cannot back a {size:#x}-byte region"));
     let len = usize::try_from(size).map_err(|_| too_large())?;
@@ -233,13 +241,7 @@ impl Memory for VirtualMemory {
     }
 
     fn read_uint(&self, addr: u64, size: u8) -> Result<u64> {
-        let len = match size {
-            1 => 1usize,
-            2 => 2,
-            4 => 4,
-            8 => 8,
-            _ => return Err(EmuError::Unsupported(format!("memory read of {size} bytes"))),
-        };
+        let len = access_width(size, "read")?;
         let (idx, start, end) = self.locate(addr, len, Perm::READ, "read")?;
         let b = &self.regions[idx].bytes[start..end];
         self.note_watched_access(addr, len, WatchKind::Read);
@@ -252,13 +254,7 @@ impl Memory for VirtualMemory {
     }
 
     fn write_uint(&mut self, addr: u64, size: u8, v: u64) -> Result<()> {
-        let len = match size {
-            1 => 1usize,
-            2 => 2,
-            4 => 4,
-            8 => 8,
-            _ => return Err(EmuError::Unsupported(format!("memory write of {size} bytes"))),
-        };
+        let len = access_width(size, "write")?;
         let (idx, start, end) = self.locate(addr, len, Perm::WRITE, "write")?;
         let m = &mut self.regions[idx];
         let is_exec = m.region.perm.contains(Perm::EXEC);
