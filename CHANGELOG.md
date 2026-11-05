@@ -111,6 +111,12 @@ end-to-end on the default path.
   refused, so `ws2_32`'s `DllMain` returned FALSE and anything importing it
   (xmplay through wininet) failed with `0xC0000142`. putty-32bit now gets as far
   as creating its windows.
+- **A 32-bit `crypt32.dll` can initialise too.** The same
+  `MemoryWineUnixWow64Funcs` rewrite was refused for `crypt32`, so its
+  `DllMain` returned FALSE and a 32-bit guest that loads it died with
+  `0xC0000142`. All seven of its unix calls ignore their parameter block, so
+  the 64-bit table is safe to serve under 32-bit argument structs. A WoW64
+  sample that `LdrLoadDll`s `crypt32.dll` now gets a module handle.
 - **`NtProtectVirtualMemory` now changes the main image's page protection.** It
   used to update bookkeeping only, so a packer that unprotects a read-only
   section before unpacking into it (xmplay's petite stub) faulted on its first

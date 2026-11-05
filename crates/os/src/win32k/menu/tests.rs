@@ -289,6 +289,44 @@ fn a_menu_that_contains_itself_does_not_loop() {
 }
 
 #[test]
+fn a_menu_reachable_by_many_paths_is_searched_once() {
+    let mut rig = Rig::new();
+    let m = rig.menu();
+    for name in ["a", "b", "c"] {
+        rig.append_popup(m, m, name);
+    }
+    assert_eq!(rig.state(m, 12345, 0), NO_ITEM, "three self-references stay a linear search");
+    let shared = rig.popup();
+    rig.append(shared, 7, 0, "Seven");
+    let top = rig.menu();
+    for name in ["x", "y"] {
+        rig.append_popup(top, shared, name);
+    }
+    assert_ne!(rig.state(top, 7, 0), NO_ITEM, "an item under a shared submenu is still found");
+
+    rig.mem.write_u32(INFO + menuinfo::CB_SIZE, menuinfo::SIZE).unwrap();
+    rig.mem.write_u32(INFO + menuinfo::MASK, mim::HELPID | mim::APPLYTOSUBMENUS).unwrap();
+    rig.mem.write_u32(INFO + menuinfo::HELP_ID, 5).unwrap();
+    assert_eq!(rig.call(nt_user_thunked_menu_info, &[u64::from(m), INFO]), 1, "a cycle applies once");
+    assert_eq!(rig.call(nt_user_thunked_menu_info, &[u64::from(top), INFO]), 1);
+    assert_eq!(rig.os.win32k_state.menus.menu(shared).unwrap().help_id, 5);
+}
+
+#[test]
+fn destroying_a_long_chain_of_submenus_does_not_recurse() {
+    let mut rig = Rig::new();
+    let first = rig.menu();
+    let mut prev = first;
+    for _ in 0..20_000 {
+        let next = rig.popup();
+        rig.append_popup(prev, next, "n");
+        prev = next;
+    }
+    assert_eq!(rig.call(nt_user_destroy_menu, &[u64::from(first)]), 1);
+    assert!(!rig.os.win32k_state.menus.contains(prev), "the deepest menu went with the chain");
+}
+
+#[test]
 fn set_menu_attaches_through_the_window_id_that_get_menu_reads() {
     let mut rig = Rig::new();
     let m = rig.menu();

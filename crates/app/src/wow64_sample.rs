@@ -12,6 +12,12 @@ pub const WOW64_FAIL_STATUS_EXIT: i32 = 92;
 pub const WOW64_FAIL_BASE_EXIT: i32 = 93;
 pub const WOW64_FAIL_SENTINEL_EXIT: i32 = 94;
 
+pub const WOW64_LOAD_OK_EXIT: i32 = 71;
+pub const WOW64_LOAD_FAIL_STATUS_EXIT: i32 = 72;
+pub const WOW64_LOAD_FAIL_HANDLE_EXIT: i32 = 73;
+
+const LOAD_TARGET: &str = "crypt32.dll";
+
 pub const WOW64_SENTINEL: u32 = 0xCAFE_BABE;
 pub const WOW64_ALLOC_SIZE: u32 = 0x2000;
 
@@ -63,6 +69,7 @@ pub enum Program {
     Alloc,
     Seh,
     UnhandledFault,
+    LoadCrypt32,
 }
 
 pub fn build() -> Vec<u8> {
@@ -77,8 +84,16 @@ pub fn build_unhandled_fault() -> Vec<u8> {
     build_program(Program::UnhandledFault)
 }
 
+pub fn build_load_crypt32() -> Vec<u8> {
+    build_program(Program::LoadCrypt32)
+}
+
 pub fn build_program(program: Program) -> Vec<u8> {
-    let names = ["NtAllocateVirtualMemory", "NtTerminateProcess"];
+    let first_import = match program {
+        Program::LoadCrypt32 => "LdrLoadDll",
+        _ => "NtAllocateVirtualMemory",
+    };
+    let names = [first_import, "NtTerminateProcess"];
 
     let import_dir_off = 0u32;
     let import_dir_size = 2 * 20;
@@ -99,6 +114,12 @@ pub fn build_program(program: Program) -> Vec<u8> {
     let dllname_rva = RDATA_RVA + pos;
     let dllname = b"ntdll.dll\0";
     pos += dllname.len() as u32;
+    pos = align_up_u32(pos, 4);
+    let unicode_string_rva = RDATA_RVA + pos;
+    pos += 8;
+    let wide_name_rva = RDATA_RVA + pos;
+    let wide_name: Vec<u8> = LOAD_TARGET.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    pos += wide_name.len() as u32;
 
     let mut rd = vec![0u8; pos as usize];
     put_u32(&mut rd, import_dir_off as usize, RDATA_RVA + ilt_off);
@@ -114,12 +135,19 @@ pub fn build_program(program: Program) -> Vec<u8> {
     }
     let doff = (dllname_rva - RDATA_RVA) as usize;
     rd[doff..doff + dllname.len()].copy_from_slice(dllname);
+    let uoff = (unicode_string_rva - RDATA_RVA) as usize;
+    put_u16(&mut rd, uoff, wide_name.len() as u16);
+    put_u16(&mut rd, uoff + 2, wide_name.len() as u16);
+    put_u32(&mut rd, uoff + 4, IMAGE_BASE + wide_name_rva);
+    let woff = (wide_name_rva - RDATA_RVA) as usize;
+    rd[woff..woff + wide_name.len()].copy_from_slice(&wide_name);
 
     let iat = |i: u32| IMAGE_BASE + RDATA_RVA + iat_off + i * 4;
     let text = match program {
         Program::Alloc => build_text(iat(0), iat(1)),
         Program::Seh => build_text_seh(iat(1)),
         Program::UnhandledFault => build_text_unhandled_fault(iat(1)),
+        Program::LoadCrypt32 => build_text_load(iat(0), iat(1), IMAGE_BASE + unicode_string_rva),
     };
 
     let headers_raw = FILE_ALIGN as usize;
@@ -313,6 +341,38 @@ fn build_text_seh(iat_terminate: u32) -> Vec<u8> {
     emit_store_imm(&mut c, cell(data::SEH_HANDLED), WOW64_SEH_HANDLED);
     c.extend_from_slice(&[0x31, 0xC0]);
     c.push(0xC3);
+    c
+}
+
+fn build_text_load(iat_load: u32, iat_terminate: u32, unicode_string: u32) -> Vec<u8> {
+    let handle_cell = IMAGE_BASE + DATA_RVA + data::BASE;
+    let status_cell = IMAGE_BASE + DATA_RVA + data::STATUS;
+    let mut c: Vec<u8> = Vec::new();
+    for imm in [handle_cell, unicode_string, 0, 0] {
+        c.push(0x68);
+        c.extend_from_slice(&imm.to_le_bytes());
+    }
+    c.extend_from_slice(&[0xFF, 0x15]);
+    c.extend_from_slice(&iat_load.to_le_bytes());
+    c.push(0xA3);
+    c.extend_from_slice(&status_cell.to_le_bytes());
+
+    c.extend_from_slice(&[0x85, 0xC0]);
+    let jz_status = c.len();
+    c.extend_from_slice(&[0x74, 0x00]);
+    emit_exit(&mut c, iat_terminate, WOW64_LOAD_FAIL_STATUS_EXIT as u32);
+    patch_rel8(&mut c, jz_status);
+
+    c.push(0xA1);
+    c.extend_from_slice(&handle_cell.to_le_bytes());
+    c.extend_from_slice(&[0x85, 0xC0]);
+    let jnz_handle = c.len();
+    c.extend_from_slice(&[0x75, 0x00]);
+    emit_exit(&mut c, iat_terminate, WOW64_LOAD_FAIL_HANDLE_EXIT as u32);
+    patch_rel8(&mut c, jnz_handle);
+
+    emit_exit(&mut c, iat_terminate, WOW64_LOAD_OK_EXIT as u32);
+    c.push(0xF4);
     c
 }
 
