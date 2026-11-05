@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+
+use exemu_core::PeImage;
 use exemu_cpu::{FS_BASE_32, GS_BASE};
 
 use crate::wow64_boot;
@@ -77,4 +80,14 @@ impl Layout {
             ..Layout::for_bits(true)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BootCtx<'a> {
+    pub(super) lay: &'a Layout,
+    pub(super) image: &'a PeImage,
+    pub(super) base: u64,
+    pub(super) stack_top: u64,
+    pub(super) wine_dll_dir: &'a Option<String>,
+    pub(super) wow64_dir32: &'a Option<PathBuf>,
 }

@@ -14,6 +14,7 @@ mod layout;
 mod load;
 mod run;
 mod sandbox;
+mod wine;
 
 pub struct Process {
     mem: VirtualMemory,
