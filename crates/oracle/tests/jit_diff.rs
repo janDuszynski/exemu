@@ -37,8 +37,9 @@ fn run_cut(bits: Bits, count: u64, seed: u64, layouts: LayoutMix) {
     assert!(s.insns > count / 2, "only {} instructions compiled in {} trials", s.insns, s.trials);
     assert!(s.links_taken > count / 4, "only {} native links taken", s.links_taken);
     assert!(
-        s.budget_stops > count / 2,
-        "only {} chains stopped short of a block that would cross the budget",
+        s.budget_refusals > count / 2,
+        "only {} chains refused a block that would cross a budget with room left ({} stops in all)",
+        s.budget_refusals,
         s.budget_stops
     );
 }

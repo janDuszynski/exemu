@@ -169,7 +169,10 @@ fn jit_main(argv: &[String]) {
             println!("     {} block entries reached by a native link", s.links_taken);
         }
         if s.budget_stops != 0 {
-            println!("     {} chains stopped short of a block that would cross the budget", s.budget_stops);
+            println!(
+                "     {} chains stopped at a budget, {} of them short of a block that would cross it",
+                s.budget_stops, s.budget_refusals
+            );
         }
         total_div += s.divergences;
     }

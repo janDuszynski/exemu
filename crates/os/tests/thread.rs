@@ -385,5 +385,5 @@ fn a_jitted_thread_is_preempted_at_the_interpreters_instruction() {
     assert_eq!(got.gpr, want.gpr, "registers");
     assert_eq!(got.rflags, want.rflags, "flags");
     assert!(jit.stats().insns_executed > steps / 2, "the JIT barely ran, so this proved nothing");
-    assert!(jit.stats().budget_stops > 0, "no timeslice ever ended inside a block");
+    assert!(jit.stats().budget_refusals > 0, "no timeslice ever ended inside a block");
 }

@@ -130,7 +130,7 @@ fn a_budget_that_ends_inside_a_block_is_met_to_the_instruction() {
             }
         }
         let s = jit.stats();
-        assert!(s.budget_stops > 0, "{bits:?}: no budget ever ended inside a block");
+        assert!(s.budget_refusals > 0, "{bits:?}: no block was ever refused with budget left");
         assert!(s.links_taken > 0, "{bits:?}: no native link was ever taken");
         assert!(s.insns_executed > natural, "{bits:?}: the JIT barely ran");
     }

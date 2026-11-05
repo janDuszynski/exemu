@@ -48,6 +48,7 @@ pub struct JitStats {
     pub breakpoint_stops: u64,
     pub watch_stops: u64,
     pub budget_stops: u64,
+    pub budget_refusals: u64,
     pub tlb_fills: u64,
     pub tlb_denied: u64,
     pub tlb_resets: u64,
@@ -426,6 +427,7 @@ impl Jit {
             self.pending = NO_SLOT;
             if retired + u64::from(insns) > budget {
                 self.stats.budget_stops += 1;
+                self.stats.budget_refusals += u64::from(retired < budget);
                 return Run::SideExit { insns: retired as u32 };
             }
 
@@ -952,6 +954,7 @@ mod tests {
         assert_eq!(st.rip, CODE + 7, "stopped before the block that does not fit");
         assert_eq!(jit.stats().blocks_executed, 1);
         assert_eq!(jit.stats().budget_stops, 1);
+        assert_eq!(jit.stats().budget_refusals, 1, "a block was refused with room left");
     }
 
     #[test]
@@ -963,6 +966,8 @@ mod tests {
         assert_eq!(jit.run(&mut st, &mut mem, Mode::Long, 0), Run::SideExit { insns: 0 });
         assert_eq!(st.rip, CODE);
         assert_eq!(st.gpr[0], 0);
+        assert_eq!(jit.stats().budget_stops, 1);
+        assert_eq!(jit.stats().budget_refusals, 0, "a zero budget refuses nothing it could have run");
     }
 
     #[test]

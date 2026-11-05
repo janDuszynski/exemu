@@ -235,6 +235,7 @@ pub struct JitSummary {
     pub armed_tlb_fills: u64,
     pub debug_split: u64,
     pub budget_stops: u64,
+    pub budget_refusals: u64,
 }
 
 impl JitSummary {
@@ -800,6 +801,7 @@ pub fn fuzz(cfg: &JitFuzzConfig) -> Result<JitSummary, String> {
     s.breakpoint_stops = jit.stats().breakpoint_stops;
     s.watch_stops = jit.stats().watch_stops;
     s.budget_stops = jit.stats().budget_stops;
+    s.budget_refusals = jit.stats().budget_refusals;
     Ok(s)
 }
 
