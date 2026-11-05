@@ -1,7 +1,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use exemu_core::{CpuState, Memory, Result};
+use exemu_core::{guest_addr, CpuState, Memory, Result};
 
 use crate::WinOs;
 
@@ -426,9 +426,9 @@ fn write_find_data(mem: &mut dyn Memory, ptr: u64, entry: &FindEntry, wide: bool
     mem.write_u32_at(ptr, 32, entry.size as u32)?;
 
     if wide {
-        WinOs::write_wstr(mem, ptr + 44, &entry.name, 260)?;
+        WinOs::write_wstr(mem, guest_addr(ptr, 44, 0)?, &entry.name, 260)?;
     } else {
-        crate::api::write_astr(mem, ptr + 44, &entry.name, 260)?;
+        crate::api::write_astr(mem, guest_addr(ptr, 44, 0)?, &entry.name, 260)?;
     }
     Ok(())
 }
