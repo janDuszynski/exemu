@@ -714,7 +714,7 @@ fn demo_pattern(w: u32, h: u32) -> Vec<u8> {
     let mut px = vec![0u8; (w as usize) * (h as usize) * 4];
     for y in 0..h {
         for x in 0..w {
-            let o = ((y * w + x) * 4) as usize;
+            let o = ((y as usize) * (w as usize) + x as usize) * 4;
             let border = x < 2 || y < 2 || x + 2 >= w || y + 2 >= h;
             let green_sq = x >= w / 4 && x < w / 2 && y >= h / 4 && y < h / 2;
             let (b, g, r) = if border {
@@ -722,7 +722,7 @@ fn demo_pattern(w: u32, h: u32) -> Vec<u8> {
             } else if green_sq {
                 (0, 200, 0)
             } else {
-                let r = (x * 255 / w) as u8;
+                let r = (u64::from(x) * 255 / u64::from(w)) as u8;
                 (255 - r, 0, r)
             };
             px[o] = b;

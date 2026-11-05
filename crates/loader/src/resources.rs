@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use exemu_core::gui::{Control, ControlKind, DialogTemplate};
@@ -27,6 +28,8 @@ pub const RT_ANICURSOR: u32 = 21;
 pub const RT_ANIICON: u32 = 22;
 pub const RT_HTML: u32 = 23;
 pub const RT_MANIFEST: u32 = 24;
+
+const MAX_WALKED_DIR_ENTRIES: usize = 1 << 20;
 
 pub const LANG_ANY: u16 = 0xFFFF;
 
@@ -84,8 +87,8 @@ fn resource_root(bytes: &[u8]) -> Option<(usize, impl Fn(u32) -> Option<usize> +
 
     let rva2off = move |rva: u32| -> Option<usize> {
         for &(va, size, rawp) in &sections {
-            if rva >= va && rva < va + size {
-                return Some((rawp + (rva - va)) as usize);
+            if rva >= va && u64::from(rva) < u64::from(va) + u64::from(size) {
+                return Some(rawp as usize + (rva - va) as usize);
             }
         }
         None
@@ -95,10 +98,11 @@ fn resource_root(bytes: &[u8]) -> Option<(usize, impl Fn(u32) -> Option<usize> +
     Some((res_base, rva2off))
 }
 
-fn dir_entries(r: &Reader, off: usize) -> Option<Vec<(u32, usize, bool)>> {
+fn dir_entries(r: &Reader, off: usize, budget: &Cell<usize>) -> Option<Vec<(u32, usize, bool)>> {
     let n_named = r.u16(off + 12).ok()? as usize;
     let n_id = r.u16(off + 14).ok()? as usize;
     let total = n_named.saturating_add(n_id);
+    budget.set(budget.get().checked_sub(total)?);
     let mut v = Vec::with_capacity(total);
     let mut e = off + 16;
     for _ in 0..total {
@@ -119,8 +123,9 @@ pub fn find_resource<'a>(
 ) -> Option<&'a [u8]> {
     let r = Reader::new(bytes);
     let (res_base, rva2off) = resource_root(bytes)?;
+    let budget = Cell::new(MAX_WALKED_DIR_ENTRIES);
 
-    for (raw_name, sub_off, is_dir) in dir_entries(&r, res_base)? {
+    for (raw_name, sub_off, is_dir) in dir_entries(&r, res_base, &budget)? {
         if !is_dir {
             continue;
         }
@@ -128,7 +133,7 @@ pub fn find_resource<'a>(
         if entry_name != ResourceName::Id(type_id) {
             continue;
         }
-        for (raw_name2, name_off, name_is_dir) in dir_entries(&r, res_base + sub_off)? {
+        for (raw_name2, name_off, name_is_dir) in dir_entries(&r, res_base + sub_off, &budget)? {
             if !name_is_dir {
                 continue;
             }
@@ -136,7 +141,7 @@ pub fn find_resource<'a>(
             if &entry_name2 != name {
                 continue;
             }
-            let lang_entries = dir_entries(&r, res_base + name_off)?;
+            let lang_entries = dir_entries(&r, res_base + name_off, &budget)?;
             let data_off = if lang == LANG_ANY {
                 lang_entries.iter().find(|(_, _, d)| !*d).map(|&(_, off, _)| off)
             } else {
@@ -156,7 +161,7 @@ pub fn find_resource<'a>(
             let size = r.u32(de + 4).ok()? as usize;
             let doff = rva2off(data_rva)?;
             let end = doff.checked_add(size)?.min(bytes.len());
-            return Some(&bytes[doff..end]);
+            return bytes.get(doff..end);
         }
     }
     None
@@ -184,10 +189,11 @@ pub fn list_resources(bytes: &[u8]) -> Vec<ResourceEntry> {
     let Some((res_base, _rva2off)) = resource_root(bytes) else {
         return Vec::new();
     };
+    let budget = Cell::new(MAX_WALKED_DIR_ENTRIES);
 
     let mut out = Vec::new();
 
-    let Some(type_entries) = dir_entries(&r, res_base) else {
+    let Some(type_entries) = dir_entries(&r, res_base, &budget) else {
         return out;
     };
 
@@ -214,7 +220,7 @@ pub fn list_resources(bytes: &[u8]) -> Vec<ResourceEntry> {
             (raw_type & 0x7fff_ffff, None)
         };
 
-        let Some(name_entries) = dir_entries(&r, res_base + type_sub_off) else {
+        let Some(name_entries) = dir_entries(&r, res_base + type_sub_off, &budget) else {
             continue;
         };
 
@@ -224,7 +230,7 @@ pub fn list_resources(bytes: &[u8]) -> Vec<ResourceEntry> {
             }
             let res_name = ResourceName::from_entry(raw_name, res_base, &r);
 
-            let Some(lang_entries) = dir_entries(&r, res_base + name_sub_off) else {
+            let Some(lang_entries) = dir_entries(&r, res_base + name_sub_off, &budget) else {
                 continue;
             };
 
@@ -277,7 +283,7 @@ pub fn parse_string_block(block_data: &[u8]) -> Vec<String> {
     let mut result = Vec::with_capacity(16);
     let mut pos = 0usize;
     for _ in 0..16 {
-        if pos + 2 > block_data.len() {
+        if pos.saturating_add(2) > block_data.len() {
             result.push(String::new());
             continue;
         }
@@ -349,7 +355,7 @@ pub fn parse_version_info(data: &[u8]) -> Option<FixedFileInfo> {
         u32::from_le_bytes([w[0], w[1], w[2], w[3]]) == VS_FIXED_FILE_INFO_SIGNATURE
     })?;
 
-    if pos + 52 > data.len() {
+    if pos.saturating_add(52) > data.len() {
         return None;
     }
     let b = &data[pos..pos + 52];
@@ -379,9 +385,10 @@ pub fn parse_dialogs(bytes: &[u8]) -> HashMap<u32, DialogTemplate> {
 fn try_parse(bytes: &[u8]) -> Option<HashMap<u32, DialogTemplate>> {
     let r = Reader::new(bytes);
     let (res_base, rva2off) = resource_root(bytes)?;
+    let budget = Cell::new(MAX_WALKED_DIR_ENTRIES);
     let mut out = HashMap::new();
 
-    for (raw_type, sub_off, is_dir) in dir_entries(&r, res_base)? {
+    for (raw_type, sub_off, is_dir) in dir_entries(&r, res_base, &budget)? {
         if !is_dir {
             continue;
         }
@@ -389,7 +396,7 @@ fn try_parse(bytes: &[u8]) -> Option<HashMap<u32, DialogTemplate>> {
         if name != ResourceName::Id(RT_DIALOG) {
             continue;
         }
-        for (raw_dlg, name_off, name_is_dir) in dir_entries(&r, res_base + sub_off)? {
+        for (raw_dlg, name_off, name_is_dir) in dir_entries(&r, res_base + sub_off, &budget)? {
             if !name_is_dir {
                 continue;
             }
@@ -397,7 +404,7 @@ fn try_parse(bytes: &[u8]) -> Option<HashMap<u32, DialogTemplate>> {
                 ResourceName::Id(id) => id,
                 ResourceName::Name(_) => continue,
             };
-            for (_lang, data_off, data_is_dir) in dir_entries(&r, res_base + name_off)? {
+            for (_lang, data_off, data_is_dir) in dir_entries(&r, res_base + name_off, &budget)? {
                 if data_is_dir {
                     continue;
                 }
@@ -405,7 +412,9 @@ fn try_parse(bytes: &[u8]) -> Option<HashMap<u32, DialogTemplate>> {
                 let data_rva = r.u32(de).ok()?;
                 let size = r.u32(de + 4).ok()? as usize;
                 let doff = rva2off(data_rva)?;
-                if let Some(tpl) = parse_dialog(&bytes[doff..(doff + size).min(bytes.len())]) {
+                let end = doff.saturating_add(size).min(bytes.len());
+                let Some(raw) = bytes.get(doff..end) else { continue };
+                if let Some(tpl) = parse_dialog(raw) {
                     out.insert(dlg_id, tpl);
                 }
             }

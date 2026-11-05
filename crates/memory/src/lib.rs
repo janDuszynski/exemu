@@ -30,13 +30,20 @@ pub struct VirtualMemory {
 
 const HINT_SLOTS: usize = 8;
 
+fn zeroed(size: u64) -> Result<Vec<u8>> {
+    let too_large = || EmuError::Unsupported(format!("cannot back a {size:#x}-byte region"));
+    let len = usize::try_from(size).map_err(|_| too_large())?;
+    Vec::<u8>::new().try_reserve_exact(len).map_err(|_| too_large())?;
+    Ok(vec![0u8; len])
+}
+
 impl VirtualMemory {
     pub fn new() -> Self {
         VirtualMemory::default()
     }
 
     pub fn map(&mut self, region: Region) -> Result<()> {
-        let bytes = vec![0u8; region.size as usize];
+        let bytes = zeroed(region.size)?;
         self.insert(region, bytes)
     }
 
@@ -49,7 +56,7 @@ impl VirtualMemory {
         perm: Perm,
     ) -> Result<()> {
         let size = size.max(data.len() as u64);
-        let mut bytes = vec![0u8; size as usize];
+        let mut bytes = zeroed(size)?;
         bytes[..data.len()].copy_from_slice(data);
         self.insert(Region::new(name, base, size, perm), bytes)
     }
@@ -360,6 +367,20 @@ mod tests {
         assert_eq!(m.read_u64(0x1100).unwrap(), 0xdead_beef_cafe_babe);
         assert_eq!(m.read_u32(0x1100).unwrap(), 0xcafe_babe);
         assert_eq!(m.read_u8(0x1100).unwrap(), 0xbe);
+    }
+
+    #[test]
+    fn mapping_an_impossibly_large_region_is_an_error() {
+        let mut m = VirtualMemory::new();
+        assert!(matches!(
+            m.map(Region::new("huge", 0x1000, u64::MAX, Perm::RW)),
+            Err(EmuError::Unsupported(_))
+        ));
+        assert!(matches!(
+            m.map_with_data("huge", 0x1000, u64::MAX >> 1, &[], Perm::RW),
+            Err(EmuError::Unsupported(_))
+        ));
+        assert_eq!(m.mapped_bytes(), 0);
     }
 
     #[test]
