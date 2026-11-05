@@ -317,7 +317,7 @@ impl WinOs {
         if objattr == 0 {
             return Ok(None);
         }
-        let name_ptr = mem.read_u64(objattr + 0x10)?;
+        let name_ptr = mem.read_u64_at(objattr, 0x10)?;
         let Some(raw) = crate::fs::read_unicode_string(mem, name_ptr) else {
             return Ok(None);
         };
